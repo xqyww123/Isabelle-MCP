@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "isabelle-lsp": {
+      "command": "python",
+      "args": [
+        "-m",
+        "isa_lsp.server"
+      ],
+      "env": {
+        "ISABELLE_SESSION": "HOL",
+        "PYTHONPATH": "${workspaceFolder}/src"
+      },
+      "description": "Isabelle LSP MCP server for theorem proving assistance",
+      "disabled": false
+    }
+  }
+}
