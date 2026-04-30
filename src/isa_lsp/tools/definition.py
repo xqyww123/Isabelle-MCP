@@ -49,8 +49,8 @@ async def declaration_location(
     try:
         response = await client.get_definition(file_path, lsp_line, lsp_col)
         check_pide_response(response, "get_definition", allow_none=True)
-    except Exception as e:
-        raise IsabelleToolError(f"Failed to get definition: {e}")
+    except Exception as exc:
+        raise IsabelleToolError(f"Failed to get definition: {exc}") from exc
 
     # Extract symbol at query position
     symbol = _extract_symbol_at_position(file_path, line, column)
@@ -78,7 +78,7 @@ async def declaration_location(
     )
 
 
-def _parse_location(loc: dict) -> Location:
+def _parse_location(loc: dict) -> Location | None:
     """Parse LSP Location or LocationLink to our model.
 
     Args:

@@ -61,6 +61,9 @@ class MockLSPClient:
         self.completion_response = None
         self.definition_response = None
         self.highlights_response = None
+        self.goal_response: list[str] = []
+        self.dynamic_output_response = ""
+        self.preview_response: dict[str, Any] = {"content": ""}
 
     async def start(self):
         """Mock start."""
@@ -112,6 +115,29 @@ class MockLSPClient:
     async def get_highlights(self, file_path: str, line: int, character: int):
         """Mock get highlights."""
         return self.highlights_response
+
+    async def get_goals_at_position(self, file_path: str, line: int, character: int):
+        """Mock get proof goals."""
+        return self.goal_response
+
+    async def get_dynamic_output(
+        self,
+        file_path: str,
+        line: int,
+        character: int = 0,
+        timeout: float = 2.0,
+    ):
+        """Mock dynamic output HTML."""
+        return self.dynamic_output_response
+
+    async def request_preview(
+        self,
+        file_path: str,
+        column: int = 0,
+        timeout: float = 30.0,
+    ):
+        """Mock preview response."""
+        return self.preview_response
 
     def get_cached_diagnostics(self, file_path: str) -> list[dict[str, Any]]:
         """Mock get cached diagnostics."""

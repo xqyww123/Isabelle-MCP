@@ -9,12 +9,12 @@ from pathlib import Path
 
 from isa_lsp.lsp_client import IsabelleLSPClient
 from isa_lsp.tools import (
-    hover_info,
     completions,
     declaration_location,
-    document_highlights,
     diagnostic_messages,
+    document_highlights,
     goal,
+    hover_info,
     session_info,
 )
 

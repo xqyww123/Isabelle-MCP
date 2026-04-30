@@ -227,7 +227,7 @@ class TestDiagnosticsTool:
         """Test that diagnostics auto-opens document."""
         assert temp_theory_file not in mock_lsp_client.open_documents
 
-        result = await diagnostic_messages(mock_lsp_client, temp_theory_file)
+        await diagnostic_messages(mock_lsp_client, temp_theory_file)
 
         assert temp_theory_file in mock_lsp_client.open_documents
 

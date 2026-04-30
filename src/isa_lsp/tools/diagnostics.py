@@ -81,7 +81,7 @@ async def diagnostic_messages(
     processing_complete = client.is_processing_complete(file_path)
 
     # Check for failed dependencies (not implemented in MVP - would need to parse special diagnostics)
-    failed_dependencies = []
+    failed_dependencies: list[str] = []
 
     return DiagnosticsResult(
         success=success,

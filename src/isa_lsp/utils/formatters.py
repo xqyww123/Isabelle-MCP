@@ -188,7 +188,7 @@ def extract_symbol_from_range(text: str, start: int, end: int) -> str:
 
 def extract_symbol_from_lsp_range(
     file_path: str,
-    lsp_range: dict
+    lsp_range: dict[str, Any],
 ) -> str:
     """Extract symbol text from a file using LSP range.
 
@@ -212,10 +212,10 @@ def extract_symbol_from_lsp_range(
         start = lsp_range['start']
         end = lsp_range['end']
 
-        start_line = start['line']
-        start_char = start['character']
-        end_line = end['line']
-        end_char = end['character']
+        start_line = int(start["line"])
+        start_char = int(start["character"])
+        end_line = int(end["line"])
+        end_char = int(end["character"])
 
         with open(file_path, encoding='utf-8') as f:
             lines = f.readlines()
@@ -227,7 +227,7 @@ def extract_symbol_from_lsp_range(
                 return line[start_char:end_char]
 
         # Multi-line range (rare)
-        result = []
+        result: list[str] = []
         for line_idx in range(start_line, end_line + 1):
             if line_idx >= len(lines):
                 break
@@ -243,7 +243,7 @@ def extract_symbol_from_lsp_range(
 
         return ''.join(result).strip()
 
-    except (OSError, KeyError, FileNotFoundError, IndexError):
+    except (OSError, KeyError, FileNotFoundError, IndexError, TypeError, ValueError):
         return ""
 
 
@@ -276,20 +276,20 @@ def format_hover_content(contents: Any) -> str:
     if isinstance(contents, dict):
         # MarkupContent format
         if "value" in contents:
-            return contents["value"]
+            return str(contents["value"])
         # MarkedString format
         if "language" in contents and "value" in contents:
-            return contents["value"]
+            return str(contents["value"])
 
     if isinstance(contents, list):
         # Array of MarkedString or strings
-        result = []
+        result: list[str] = []
         for item in contents:
             if isinstance(item, str):
                 result.append(item)
             elif isinstance(item, dict):
                 if "value" in item:
-                    result.append(item["value"])
+                    result.append(str(item["value"]))
         return "\n".join(result)
 
     return str(contents)

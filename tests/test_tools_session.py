@@ -95,7 +95,7 @@ class TestBuildSessionTool:
             mock_process.returncode = 0
             mock_subprocess.return_value = mock_process
 
-            result = await build_session(mock_lsp_client, "HOL", clean=True)
+            await build_session(mock_lsp_client, "HOL", clean=True)
 
             # Verify clean flag was used
             call_args = mock_subprocess.call_args[0]

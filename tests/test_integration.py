@@ -220,7 +220,7 @@ class TestErrorHandling:
         try:
             # Try to query hover without opening document
             # Should auto-open, but let's test error handling
-            result = await hover_info(
+            await hover_info(
                 client,
                 "/nonexistent/file.thy",
                 1,

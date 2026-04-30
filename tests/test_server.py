@@ -187,7 +187,7 @@ class TestMCPServerTools:
                 mock_process.returncode = 0
                 mock_subprocess.return_value = mock_process
 
-                result = await isabelle_build("HOL", clean=True)
+                await isabelle_build("HOL", clean=True)
 
         call_args = mock_subprocess.call_args[0]
         assert "-c" in call_args

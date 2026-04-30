@@ -48,8 +48,8 @@ async def document_highlights(
     try:
         response = await client.get_highlights(file_path, lsp_line, lsp_col)
         check_pide_response(response, "get_highlights", allow_none=True)
-    except Exception as e:
-        raise IsabelleToolError(f"Failed to get highlights: {e}")
+    except Exception as exc:
+        raise IsabelleToolError(f"Failed to get highlights: {exc}") from exc
 
     # Extract symbol at query position
     from isa_lsp.tools.definition import _extract_symbol_at_position
@@ -71,7 +71,7 @@ async def document_highlights(
     )
 
 
-def _parse_highlight(highlight: dict) -> Highlight:
+def _parse_highlight(highlight: dict) -> Highlight | None:
     """Parse LSP DocumentHighlight to our model.
 
     Args:

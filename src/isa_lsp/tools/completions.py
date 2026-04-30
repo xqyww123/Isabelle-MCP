@@ -52,8 +52,8 @@ async def completions(
     try:
         response = await client.get_completions(file_path, lsp_line, lsp_col)
         check_pide_response(response, "get_completions", allow_none=True)
-    except Exception as e:
-        raise IsabelleToolError(f"Failed to get completions: {e}")
+    except Exception as exc:
+        raise IsabelleToolError(f"Failed to get completions: {exc}") from exc
 
     # Parse response
     items = []
@@ -127,7 +127,7 @@ def _parse_completion_item(item: dict) -> CompletionItem:
     return CompletionItem(
         label=item.get("label", ""),
         kind=kind,
-        detail=item.get("detail"),
+        detail=str(item.get("detail") or ""),
         documentation=_extract_documentation(item.get("documentation")),
         insert_text=insert_text,
     )
@@ -141,7 +141,7 @@ def _extract_documentation(doc: Any) -> str | None:
         return doc
     elif isinstance(doc, dict):
         # MarkupContent
-        return doc.get("value", "")
+        return str(doc.get("value", ""))
     else:
         return str(doc)
 
@@ -173,7 +173,7 @@ def _sort_by_relevance(items: list[CompletionItem], prefix: str) -> list[Complet
     Returns:
         Sorted list
     """
-    def sort_key(item: CompletionItem):
+    def sort_key(item: CompletionItem) -> tuple[int, str]:
         label_lower = item.label.lower()
 
         if label_lower.startswith(prefix):

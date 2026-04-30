@@ -132,8 +132,8 @@ async def build_session(
             session=session,
         )
 
-    except Exception as e:
-        raise IsabelleToolError(f"Failed to build session '{session}': {e}")
+    except Exception as exc:
+        raise IsabelleToolError(f"Failed to build session '{session}': {exc}") from exc
 
 
 # ============================================================================

@@ -6,12 +6,26 @@ to AI agents via the Model Context Protocol.
 """
 
 import logging
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastmcp import FastMCP
 
 from isa_lsp.instructions import get_instructions
 from isa_lsp.lsp_client import IsabelleLSPClient
+from isa_lsp.models import (
+    BuildStatus,
+    CommandOutputResult,
+    CompletionsResult,
+    DeclarationLocation,
+    DiagnosticsResult,
+    GoalState,
+    HighlightsResult,
+    HoverInfo,
+    PreviewResult,
+    SessionInfo,
+)
 from isa_lsp.tools import (
     build_session,
     command_output,
@@ -38,7 +52,7 @@ _lsp_client: IsabelleLSPClient | None = None
 
 
 @asynccontextmanager
-async def server_lifespan(app):
+async def server_lifespan(app: Any) -> AsyncIterator[None]:
     """Manage LSP client lifecycle.
 
     Args:
@@ -77,7 +91,7 @@ mcp = FastMCP("Isabelle LSP", lifespan=server_lifespan)
 # Helper Functions
 # ============================================================================
 
-async def _ensure_lsp_started():
+async def _ensure_lsp_started() -> IsabelleLSPClient:
     """Ensure LSP client is started (lazy initialization)."""
     global _lsp_client
 
@@ -112,7 +126,7 @@ async def isabelle_hover(
     file_path: str,
     line: int,
     column: int,
-):
+) -> HoverInfo:
     """Get type and documentation for symbol at position.
 
     Args:
@@ -133,7 +147,7 @@ async def isabelle_completions(
     line: int,
     column: int,
     max_completions: int = 50,
-):
+) -> CompletionsResult:
     """Get completion suggestions at position.
 
     Args:
@@ -155,7 +169,7 @@ async def isabelle_definition(
     file_path: str,
     line: int,
     column: int,
-):
+) -> DeclarationLocation:
     """Find where a symbol is defined.
 
     Args:
@@ -176,7 +190,7 @@ async def isabelle_highlights(
     file_path: str,
     line: int,
     column: int,
-):
+) -> HighlightsResult:
     """Find all occurrences of symbol in document.
 
     Args:
@@ -198,7 +212,7 @@ async def isabelle_diagnostics(
     start_line: int | None = None,
     end_line: int | None = None,
     interactive: bool = False,
-):
+) -> DiagnosticsResult:
     """Get compiler diagnostics (errors, warnings) for file.
 
     Args:
@@ -225,7 +239,7 @@ async def isabelle_goal(
     file_path: str,
     line: int,
     column: int | None = None,
-):
+) -> GoalState:
     """Get proof goals at position. **MOST IMPORTANT tool - use often!**
 
     Omitting column shows how a tactic transforms the proof state:
@@ -249,7 +263,7 @@ async def isabelle_goal(
 async def isabelle_command_output(
     file_path: str,
     line: int,
-):
+) -> CommandOutputResult:
     """Get prover output messages for command at line.
 
     Args:
@@ -268,7 +282,7 @@ async def isabelle_command_output(
 async def isabelle_preview(
     file_path: str,
     line: int | None = None,
-):
+) -> PreviewResult:
     """Generate HTML preview of theory content.
 
     Args:
@@ -288,7 +302,7 @@ async def isabelle_preview(
 # ============================================================================
 
 @mcp.tool()
-async def isabelle_session_info():
+async def isabelle_session_info() -> SessionInfo:
     """Get information about current Isabelle session.
 
     Returns:
@@ -302,7 +316,7 @@ async def isabelle_session_info():
 async def isabelle_build(
     session: str,
     clean: bool = False,
-):
+) -> BuildStatus:
     """Build an Isabelle session to generate heap images.
 
     Args:
@@ -321,7 +335,7 @@ async def isabelle_build(
 # Server entry point
 # ============================================================================
 
-def main():
+def main() -> None:
     """Run the MCP server."""
     import sys
 

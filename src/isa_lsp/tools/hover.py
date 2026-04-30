@@ -51,8 +51,8 @@ async def hover_info(
     try:
         response = await client.get_hover(file_path, lsp_line, lsp_col)
         check_pide_response(response, "get_hover", allow_none=True)
-    except Exception as e:
-        raise IsabelleToolError(f"Failed to get hover info: {e}")
+    except Exception as exc:
+        raise IsabelleToolError(f"Failed to get hover info: {exc}") from exc
 
     # Parse response
     symbol = ""
@@ -115,5 +115,4 @@ async def hover_info(
         line_context=line_context,
         diagnostics=diagnostics_at_position,
     )
-
 

@@ -2,18 +2,16 @@
 Command output tool implementation (PIDE dynamic output).
 """
 
-import logging
 from typing import Annotated
 
 from pydantic import Field
 
 from isa_lsp.lsp_client import IsabelleLSPClient
-from isa_lsp.models import CommandOutputResult
+from isa_lsp.models import CommandOutputResult, OutputMessage
 from isa_lsp.utils import (
     get_line_from_file,
+    parse_command_output_html,
 )
-
-logger = logging.getLogger(__name__)
 
 
 async def command_output(
@@ -35,10 +33,8 @@ async def command_output(
         IsabelleToolError: If document not open
 
     Note:
-        This tool relies on PIDE/dynamic_output notifications which are
-        sent when the caret moves. In MVP, we don't have full support for
-        capturing these notifications. Full implementation would require
-        extending lsp_client.py with a dynamic output cache.
+        This tool relies on PIDE/dynamic_output notifications, which are
+        triggered by caret movement and cached by IsabelleLSPClient.
     """
     # Ensure document is open
     if file_path not in client.open_documents:
@@ -47,10 +43,16 @@ async def command_output(
     # Get line context
     line_context = get_line_from_file(file_path, line)
 
-    # MVP stub: PIDE/dynamic_output caching not implemented yet
-    logger.warning("PIDE dynamic output not implemented; returning empty messages")
+    html = await client.get_dynamic_output(file_path, line - 1)
+    parsed_messages = parse_command_output_html(html)
 
     return CommandOutputResult(
         line_context=line_context,
-        messages=[],
+        messages=[
+            OutputMessage(
+                kind=str(item.get("kind", "writeln")),
+                message=str(item.get("text", "")),
+            )
+            for item in parsed_messages
+        ],
     )

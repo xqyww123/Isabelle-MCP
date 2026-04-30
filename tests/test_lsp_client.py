@@ -272,6 +272,69 @@ class TestIsabelleLSPClient:
         with pytest.raises(IsabelleToolError, match="timed out"):
             await client.request("test/method", {}, timeout=0.1)
 
+    @pytest.mark.asyncio
+    async def test_read_message_with_multiple_headers(self):
+        """Test LSP message framing with more than Content-Length."""
+        client = IsabelleLSPClient()
+        message = {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}}
+        content = json.dumps(message).encode("utf-8")
+
+        client.process = MagicMock()
+        client.process.stdout = MagicMock()
+        client.process.stdout.readline = AsyncMock(
+            side_effect=[
+                f"Content-Length: {len(content)}\r\n".encode("ascii"),
+                b"Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n",
+                b"\r\n",
+            ]
+        )
+        client.process.stdout.readexactly = AsyncMock(return_value=content)
+
+        assert await client._read_message() == message
+
+    @pytest.mark.asyncio
+    async def test_handle_state_output_resolves_waiter(self):
+        """Test PIDE/state_output resolves the matching proof-state waiter."""
+        client = IsabelleLSPClient()
+        future = asyncio.get_running_loop().create_future()
+        client._state_output_waiters[7] = future
+
+        client._handle_state_output({"id": 7, "content": "<pre>1. P</pre>"})
+
+        assert future.done()
+        assert future.result() == "<pre>1. P</pre>"
+        assert 7 not in client._state_output_waiters
+
+    @pytest.mark.asyncio
+    async def test_handle_dynamic_output_caches_and_resolves_waiter(self):
+        """Test PIDE/dynamic_output updates cache and notifies waiters."""
+        client = IsabelleLSPClient()
+        future = asyncio.get_running_loop().create_future()
+        client._dynamic_output_waiters.append(future)
+
+        client._handle_dynamic_output({"content": "<div class='writeln'>ok</div>"})
+
+        assert future.done()
+        assert future.result() == "<div class='writeln'>ok</div>"
+        assert client._dynamic_output_cache == "<div class='writeln'>ok</div>"
+
+    @pytest.mark.asyncio
+    async def test_handle_preview_response_resolves_matching_waiter(self):
+        """Test PIDE/preview_response resolves only the matching URI/column waiter."""
+        client = IsabelleLSPClient()
+        future = asyncio.get_running_loop().create_future()
+        client._preview_waiters[("file:///tmp/Test.thy", 0)] = future
+
+        client._handle_preview_response({
+            "uri": "file:///tmp/Test.thy",
+            "column": 0,
+            "content": "<html>Preview</html>",
+        })
+
+        assert future.done()
+        assert future.result()["content"] == "<html>Preview</html>"
+        assert ("file:///tmp/Test.thy", 0) not in client._preview_waiters
+
     def test_uri_conversion(self):
         """Test file path to URI conversion in client."""
         from isa_lsp.utils import file_path_to_uri

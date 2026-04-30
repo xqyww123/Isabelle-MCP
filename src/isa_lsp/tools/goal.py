@@ -4,20 +4,13 @@ Proof goal state tool implementation - MOST IMPORTANT TOOL.
 This tool uses PIDE state panels to query proof goals at a position.
 """
 
-import logging
 from typing import Annotated
 
 from pydantic import Field
 
 from isa_lsp.lsp_client import IsabelleLSPClient
 from isa_lsp.models import GoalState
-from isa_lsp.utils import (
-    IsabelleToolError,
-    file_path_to_uri,
-    get_line_from_file,
-)
-
-logger = logging.getLogger(__name__)
+from isa_lsp.utils import get_line_from_file
 
 
 async def goal(
@@ -54,19 +47,16 @@ async def goal(
     # Get line context
     line_context = get_line_from_file(file_path, line)
 
-    # Get URI
-    uri = file_path_to_uri(file_path)
-
     if column is None:
         # Get before/after by querying line start and line end
-        goals_before = await _query_goals_at_position(
-            client, uri, line - 1, 0  # Line start (0-indexed)
+        goals_before = await client.get_goals_at_position(
+            file_path, line - 1, 0  # Line start (0-indexed)
         )
 
         # Get line length for end position
         line_length = len(line_context)
-        goals_after = await _query_goals_at_position(
-            client, uri, line - 1, line_length  # Line end (0-indexed)
+        goals_after = await client.get_goals_at_position(
+            file_path, line - 1, line_length  # Line end (0-indexed)
         )
 
         return GoalState(
@@ -78,8 +68,8 @@ async def goal(
         )
     else:
         # Get goals at specific column
-        goals = await _query_goals_at_position(
-            client, uri, line - 1, column - 1  # 0-indexed
+        goals = await client.get_goals_at_position(
+            file_path, line - 1, column - 1  # 0-indexed
         )
 
         return GoalState(
@@ -89,39 +79,3 @@ async def goal(
             goals_after=None,
             context=None,  # TODO: Extract context from HTML if available
         )
-
-
-async def _query_goals_at_position(
-    client: IsabelleLSPClient,
-    uri: str,
-    line: int,
-    character: int,
-    timeout: float = 5.0
-) -> list[str]:
-    """Query proof goals at specific position using PIDE state panel.
-
-    Args:
-        client: LSP client instance
-        uri: File URI
-        line: Line number (0-indexed for LSP)
-        character: Character position (0-indexed for LSP)
-        timeout: Timeout in seconds
-
-    Returns:
-        List of goal strings
-
-    Raises:
-        IsabelleToolError: On timeout or PIDE error
-    """
-    # MVP stub: send caret update but cannot receive PIDE/state_output yet
-    try:
-        await client.notify("PIDE/caret_update", {
-            "uri": uri,
-            "line": line,
-            "character": character,
-        })
-    except Exception as e:
-        raise IsabelleToolError(f"Failed to update caret: {e}")
-
-    logger.warning("PIDE state panel not implemented; goal query returns empty list")
-    return []
