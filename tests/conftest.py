@@ -1,8 +1,3 @@
-"""
-Pytest configuration and shared fixtures.
-"""
-
-import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +6,6 @@ import pytest
 
 @pytest.fixture
 def temp_theory_file(tmp_path):
-    """Create a temporary theory file for testing."""
     theory_file = tmp_path / "Test.thy"
     theory_file.write_text(
         'theory Test\n'
@@ -31,7 +25,6 @@ def temp_theory_file(tmp_path):
 
 @pytest.fixture
 def temp_theory_with_errors(tmp_path):
-    """Create a temporary theory file with errors."""
     theory_file = tmp_path / "TestError.thy"
     theory_file.write_text(
         'theory TestError\n'
@@ -39,7 +32,7 @@ def temp_theory_with_errors(tmp_path):
         'begin\n'
         '\n'
         'lemma false_lemma: "False"\n'
-        '  by auto  (* This will fail *)\n'
+        '  by auto\n'
         '\n'
         'end\n'
     )
@@ -56,7 +49,6 @@ class MockLSPClient:
         self.diagnostics_cache: dict[str, list[dict[str, Any]]] = {}
         self.processing_status: dict[str, bool] = {}
 
-        # Mock responses
         self.hover_response = None
         self.completion_response = None
         self.definition_response = None
@@ -66,206 +58,114 @@ class MockLSPClient:
         self.preview_response: dict[str, Any] = {"content": ""}
 
     async def start(self):
-        """Mock start."""
         self.initialized = True
 
     async def shutdown(self):
-        """Mock shutdown."""
         self.initialized = False
 
-    async def initialize(self):
-        """Mock initialize."""
-        self.initialized = True
-
-    async def open_document(self, file_path: str):
-        """Mock open document."""
+    async def open_document(
+        self,
+        file_path: str,
+        content: str | None = None,
+        *,
+        wait_for_diagnostics: bool = True,
+        diagnostic_timeout: float = 2.0,
+    ):
         if not Path(file_path).exists():
             raise FileNotFoundError(f"File not found: {file_path}")
-
-        with open(file_path) as f:
-            content = f.read()
-
+        if content is None:
+            with open(file_path) as f:
+                content = f.read()
         self.open_documents[file_path] = {
-            'uri': f"file://{file_path}",
-            'version': 1,
-            'content': content,
+            'uri': f"file://{file_path}", 'version': 1, 'content': content,
         }
-        # Don't automatically mark as processing complete when opening
-        # Tests can set this explicitly if needed
         if file_path not in self.processing_status:
             self.processing_status[file_path] = False
 
     async def close_document(self, file_path: str):
-        """Mock close document."""
-        if file_path in self.open_documents:
-            del self.open_documents[file_path]
+        self.open_documents.pop(file_path, None)
 
     async def get_hover(self, file_path: str, line: int, character: int):
-        """Mock get hover."""
         return self.hover_response
 
     async def get_completions(self, file_path: str, line: int, character: int):
-        """Mock get completions."""
         return self.completion_response
 
     async def get_definition(self, file_path: str, line: int, character: int):
-        """Mock get definition."""
         return self.definition_response
 
     async def get_highlights(self, file_path: str, line: int, character: int):
-        """Mock get highlights."""
         return self.highlights_response
 
     async def get_goals_at_position(self, file_path: str, line: int, character: int):
-        """Mock get proof goals."""
         return self.goal_response
 
-    async def get_dynamic_output(
-        self,
-        file_path: str,
-        line: int,
-        character: int = 0,
-        timeout: float = 2.0,
-    ):
-        """Mock dynamic output HTML."""
+    async def get_dynamic_output(self, file_path: str, line: int, character: int = 0, timeout: float = 2.0):
         return self.dynamic_output_response
 
-    async def request_preview(
-        self,
-        file_path: str,
-        column: int = 0,
-        timeout: float = 30.0,
-    ):
-        """Mock preview response."""
+    async def request_preview(self, file_path: str, column: int = 0, timeout: float = 30.0):
         return self.preview_response
 
     def get_cached_diagnostics(self, file_path: str) -> list[dict[str, Any]]:
-        """Mock get cached diagnostics."""
         return self.diagnostics_cache.get(file_path, [])
 
-    def is_processing_complete(self, file_path: str) -> bool:
-        """Mock processing complete check."""
+    def diagnostics_settled(self, file_path: str, settle_time: float = 1.0) -> bool:
         return self.processing_status.get(file_path, False)
 
     async def notify(self, method: str, params: dict[str, Any]):
-        """Mock notify."""
         pass
 
     async def request(self, method: str, params: dict[str, Any]):
-        """Mock request."""
         return {}
 
 
 @pytest.fixture
 def mock_lsp_client():
-    """Provide a mock LSP client."""
     return MockLSPClient()
 
 
 @pytest.fixture
 def sample_hover_response():
-    """Sample LSP hover response."""
     return {
-        "contents": {
-            "kind": "markdown",
-            "value": "**my_const** :: nat\n\nDefined as: `my_const = 42`"
-        },
+        "contents": {"kind": "markdown", "value": "**my_const** :: nat\n\nDefined as: `my_const = 42`"},
         "range": {
             "start": {"line": 4, "character": 11},
-            "end": {"line": 4, "character": 19}
-        }
+            "end": {"line": 4, "character": 19},
+        },
     }
 
 
 @pytest.fixture
 def sample_completion_response():
-    """Sample LSP completion response."""
     return {
         "isIncomplete": False,
         "items": [
-            {
-                "label": "lemma",
-                "kind": 14,  # Keyword
-                "detail": "Isabelle keyword",
-                "documentation": "Start a lemma proof"
-            },
-            {
-                "label": "theorem",
-                "kind": 14,
-                "detail": "Isabelle keyword",
-                "documentation": "Start a theorem proof"
-            },
-            {
-                "label": "apply",
-                "kind": 14,
-                "detail": "Proof method",
-                "documentation": "Apply a proof method"
-            }
-        ]
+            {"label": "lemma", "kind": 14, "detail": "Isabelle keyword"},
+            {"label": "theorem", "kind": 14, "detail": "Isabelle keyword"},
+            {"label": "apply", "kind": 14, "detail": "Proof method"},
+        ],
     }
 
 
 @pytest.fixture
 def sample_definition_response():
-    """Sample LSP definition response."""
-    return [
-        {
-            "uri": "file:///path/to/Test.thy",
-            "range": {
-                "start": {"line": 4, "character": 11},
-                "end": {"line": 4, "character": 19}
-            }
-        }
-    ]
+    return [{
+        "uri": "file:///path/to/Test.thy",
+        "range": {"start": {"line": 4, "character": 11}, "end": {"line": 4, "character": 19}},
+    }]
 
 
 @pytest.fixture
 def sample_highlights_response():
-    """Sample LSP highlights response."""
     return [
-        {
-            "range": {
-                "start": {"line": 4, "character": 11},
-                "end": {"line": 4, "character": 19}
-            },
-            "kind": 1  # Text
-        },
-        {
-            "range": {
-                "start": {"line": 7, "character": 20},
-                "end": {"line": 7, "character": 28}
-            },
-            "kind": 2  # Read
-        }
+        {"range": {"start": {"line": 4, "character": 11}, "end": {"line": 4, "character": 19}}, "kind": 1},
+        {"range": {"start": {"line": 7, "character": 20}, "end": {"line": 7, "character": 28}}, "kind": 2},
     ]
 
 
 @pytest.fixture
 def sample_diagnostics():
-    """Sample diagnostics."""
     return [
-        {
-            "range": {
-                "start": {"line": 4, "character": 0},
-                "end": {"line": 4, "character": 10}
-            },
-            "severity": 1,  # Error
-            "message": "Type error: expected nat, got bool"
-        },
-        {
-            "range": {
-                "start": {"line": 7, "character": 0},
-                "end": {"line": 7, "character": 5}
-            },
-            "severity": 2,  # Warning
-            "message": "Unused variable"
-        }
+        {"range": {"start": {"line": 4, "character": 0}, "end": {"line": 4, "character": 10}}, "severity": 1, "message": "Type error: expected nat, got bool"},
+        {"range": {"start": {"line": 7, "character": 0}, "end": {"line": 7, "character": 5}}, "severity": 2, "message": "Unused variable"},
     ]
-
-
-@pytest.fixture
-def event_loop():
-    """Create an event loop for async tests."""
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()

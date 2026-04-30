@@ -1,213 +1,46 @@
-"""
-User-facing instructions for the Isabelle LSP MCP server.
-
-This module provides helpful guidance to AI agents using this MCP server.
-"""
-
-INSTRUCTIONS = """
+INSTRUCTIONS = """\
 # Isabelle LSP MCP Server
 
-You now have access to Isabelle theorem prover tools via the Language Server Protocol.
+## Tools
 
-## Available Tools
+### Standard LSP (5 tools)
 
-### Standard LSP Tools (5 tools)
+1. **isabelle_hover** — type info and documentation for symbol at position
+2. **isabelle_completions** — completion suggestions, sorted by relevance
+3. **isabelle_definition** — jump to symbol definition
+4. **isabelle_highlights** — all occurrences of symbol in document
+5. **isabelle_diagnostics** — errors, warnings, processing status
 
-1. **isabelle_hover**: Get type and documentation for symbols
-   - Use when you need to understand what a symbol means
-   - Shows type information, definitions, and documentation
+### PIDE Extensions (3 tools)
 
-2. **isabelle_completions**: Get completion suggestions
-   - Use when writing new code to see available symbols
-   - Returns sorted suggestions based on relevance
+6. **isabelle_goal** ⭐ — proof goals at position; omit column for before/after diff
+7. **isabelle_command_output** — prover messages for a command
+8. **isabelle_preview** — HTML preview of theory
 
-3. **isabelle_definition**: Find where symbols are defined
-   - Use to jump to definition of theorems, functions, types
-   - Returns file path and position
+### Session Management (2 tools)
 
-4. **isabelle_highlights**: Find all occurrences of a symbol
-   - Use to see where a symbol is used throughout the document
-   - Helps understand scope and usage patterns
+9.  **isabelle_session_info** — current session and available sessions
+10. **isabelle_build** — build session heap images
 
-5. **isabelle_diagnostics**: Get compiler errors and warnings
-   - **Use frequently** to check if code is valid
-   - Returns errors, warnings, and processing status
+## Key conventions
 
-### PIDE Extension Tools (3 tools)
+- All positions are **1-indexed** (line 1, column 1 = first character).
+- Always use **absolute paths**.
+- Check `processing_complete` in diagnostics before relying on results.
+- PIDE tools (goal, command_output, preview) are best-effort; fall back to diagnostics on timeout.
 
-6. **isabelle_goal**: Get proof goals at position ⭐ **MOST IMPORTANT**
-   - **Use this tool extensively** when working with proofs
-   - Omit column to see before/after tactic transformation
-   - Shows what remains to be proven
+## Recommended workflow
 
-7. **isabelle_command_output**: Get prover output messages
-   - Use to see detailed messages from Isabelle commands
-   - Useful for debugging failed proofs
+1. **isabelle_diagnostics** — always check code validity first.
+2. **isabelle_goal** — use extensively during proof development (omit column to see tactic effect).
+3. **isabelle_hover** + **isabelle_definition** — understand symbols.
+4. No `isabelle_edit` tool exists; modify files with your editor, then re-check with diagnostics/goals.
 
-8. **isabelle_preview**: Generate HTML preview of theory
-   - Use to export formatted documentation
-   - Useful for viewing rendered output
+## Session configuration
 
-### Session Management Tools (2 tools)
-
-9. **isabelle_session_info**: Get current session information
-   - Use to check which logic image is loaded
-   - Shows available sessions
-
-10. **isabelle_build**: Build Isabelle session heap images
-    - Use when you need to build or rebuild a session
-    - Required before using new session logic
-
-## Workflow Recommendations
-
-### 1. Checking Code Validity
-
-Always use **isabelle_diagnostics** to verify code:
-
-```
-result = isabelle_diagnostics(file_path="/path/to/Theory.thy")
-if result.success:
-    print("No errors!")
-else:
-    for diag in result.items:
-        if diag.severity == "error":
-            print(f"Error at line {diag.line}: {diag.message}")
-```
-
-### 2. Working with Proofs
-
-Use **isabelle_goal** frequently to understand proof state:
-
-```
-# See how a tactic transforms the goal
-state = isabelle_goal(
-    file_path="/path/to/Proof.thy",
-    line=42  # Tactic line - omit column
-)
-
-print("Before:", state.goals_before)
-print("After:", state.goals_after)
-```
-
-### 3. Understanding Symbols
-
-Combine **isabelle_hover** and **isabelle_definition**:
-
-```
-# Get quick info
-info = isabelle_hover(file_path=path, line=10, column=5)
-print(info.info)
-
-# Jump to definition
-loc = isabelle_definition(file_path=path, line=10, column=5)
-for definition in loc.locations:
-    print(f"Defined at {definition.file_path}:{definition.line}")
-```
-
-### 4. Code Completion
-
-Use **isabelle_completions** when writing new code:
-
-```
-completions = isabelle_completions(
-    file_path=path,
-    line=15,
-    column=8,
-    max_completions=20
-)
-
-for item in completions.items:
-    print(f"{item.label}: {item.detail}")
-```
-
-## Important Notes
-
-### Position Indexing
-- All line and column numbers are **1-indexed**
-- Line 1, column 1 = first character of the file
-
-### File Paths
-- Always use **absolute paths** for file_path parameters
-- Relative paths will fail
-
-### Document Processing
-- Isabelle processes documents incrementally
-- Check `processing_complete` in diagnostics result
-- Wait for processing to complete before querying goals
-
-### MVP Limitations
-
-The following features are implemented, but have protocol-level reliability
-limits because Isabelle exposes them as asynchronous PIDE notifications:
-
-1. **isabelle_goal**:
-   - Uses `PIDE/state_init`, `PIDE/caret_update`, `PIDE/state_output`, and
-     `PIDE/state_exit`
-   - Waits for Isabelle's server-assigned state panel id
-   - Goal parsing from HTML is heuristic, and `context` is currently `None`
-   - May timeout if no proof-state output is available at the requested position
-
-2. **isabelle_command_output**:
-   - Uses `PIDE/dynamic_output`
-   - Isabelle's notification contains only HTML content, not file/line metadata
-   - The client serializes these queries and avoids reusing output from another
-     requested position; no fresh output means an empty message list
-
-3. **isabelle_preview**:
-   - Uses `PIDE/preview_request` and waits for a matching `PIDE/preview_response`
-   - May timeout if Isabelle does not generate preview content for the file
-
-There is no `isabelle_edit` tool in the current server. Modify files with your
-normal editor or filesystem tools, then use diagnostics/goals to re-check.
-
-### Session Configuration
-
-The default session is **HOL**. To use a different session:
-
-```bash
-# Set environment variable before starting MCP server
-export ISABELLE_SESSION=Main
-```
-
-Or use **isabelle_build** to build and switch sessions.
-
-## Error Handling
-
-All tools raise **IsabelleToolError** on failure. Handle errors gracefully:
-
-```python
-from isa_lsp.utils import IsabelleToolError
-
-try:
-    result = isabelle_hover(file_path=path, line=1, column=1)
-except IsabelleToolError as e:
-    print(f"Error: {e}")
-```
-
-## Best Practices
-
-1. **Always check diagnostics** before querying goals or other tools
-2. **Use isabelle_goal frequently** when working with proofs
-3. **Provide absolute file paths** for all operations
-4. **Wait for processing** to complete before complex queries
-5. **Handle errors** gracefully with try/except blocks
-6. **Treat PIDE goal/output/preview as best-effort** and fall back to diagnostics
-   when a PIDE notification times out
-
-## Getting Help
-
-For more information, see:
-- README.md: Installation and setup
-- SPECIFICATION.md: Complete feature documentation
-- API_DESIGN.md: Detailed API specifications
-- ARCHITECTURE.md: System design and implementation notes
+Default session is **HOL**. Override via `ISABELLE_SESSION` env var before starting the MCP server.
 """
 
 
 def get_instructions() -> str:
-    """Get user-facing instructions for the MCP server.
-
-    Returns:
-        Markdown-formatted instructions
-    """
     return INSTRUCTIONS

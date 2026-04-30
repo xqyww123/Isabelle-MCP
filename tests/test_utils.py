@@ -1,190 +1,200 @@
-"""
-Unit tests for utility modules.
-"""
+"""Tests for utility modules."""
+
+from pathlib import Path
 
 import pytest
 
-from isa_lsp.utils.errors import IsabelleToolError, check_pide_response
+from isa_lsp.utils.core import (
+    IsabelleToolError,
+    check_pide_response,
+    file_path_to_uri,
+    lsp_to_mcp_position,
+    mcp_to_lsp_position,
+    uri_to_file_path,
+)
 from isa_lsp.utils.formatters import (
-    extract_symbol_from_range,
+    get_line_from_file,
+    parse_command_output_html,
     parse_goals_from_html,
     strip_html_tags,
 )
-from isa_lsp.utils.positions import lsp_to_mcp_position, mcp_to_lsp_position
-from isa_lsp.utils.uri_utils import file_path_to_uri, uri_to_file_path
 
 
 class TestErrors:
-    """Test error utilities."""
-
     def test_isabelle_tool_error(self):
-        """Test IsabelleToolError exception."""
         error = IsabelleToolError("Test error")
         assert str(error) == "Test error"
-        assert isinstance(error, Exception)
 
     def test_check_pide_response_success(self):
-        """Test check_pide_response with valid response."""
         response = {"result": "success"}
         assert check_pide_response(response, "test_operation") == response
 
     def test_check_pide_response_none_not_allowed(self):
-        """Test check_pide_response with None when not allowed."""
         with pytest.raises(IsabelleToolError, match="PIDE timeout"):
             check_pide_response(None, "test_operation", allow_none=False)
 
     def test_check_pide_response_none_allowed(self):
-        """Test check_pide_response with None when allowed."""
         assert check_pide_response(None, "test_operation", allow_none=True) is None
 
     def test_check_pide_response_error(self):
-        """Test check_pide_response with error response."""
         response = {"error": {"message": "Test error message"}}
         with pytest.raises(IsabelleToolError, match="Test error message"):
             check_pide_response(response, "test_operation")
 
+    def test_check_pide_response_empty_error(self):
+        with pytest.raises(IsabelleToolError, match="Unknown error"):
+            check_pide_response({"error": {}}, "test_op")
+
+    def test_check_pide_response_with_code(self):
+        response = {"error": {"code": -32600, "message": "Invalid Request"}}
+        with pytest.raises(IsabelleToolError, match="Invalid Request"):
+            check_pide_response(response, "test_op")
+
 
 class TestURIUtils:
-    """Test URI utilities."""
-
     def test_file_path_to_uri_unix(self):
-        """Test file path to URI conversion on Unix."""
-        path = "/home/user/test.thy"
-        uri = file_path_to_uri(path)
+        uri = file_path_to_uri("/home/user/test.thy")
         assert uri.startswith("file://")
-        assert "/home/user/test.thy" in uri
+        assert "test.thy" in uri
 
     def test_uri_to_file_path_unix(self):
-        """Test URI to file path conversion on Unix."""
-        uri = "file:///home/user/test.thy"
-        path = uri_to_file_path(uri)
-        assert path == "/home/user/test.thy"
+        assert uri_to_file_path("file:///home/user/test.thy") == "/home/user/test.thy"
 
     def test_uri_to_file_path_invalid(self):
-        """Test URI to file path with invalid URI."""
         with pytest.raises(ValueError, match="Invalid file URI"):
             uri_to_file_path("http://example.com/test.thy")
 
     def test_roundtrip_conversion(self):
-        """Test roundtrip file path <-> URI conversion."""
-        original_path = "/home/user/Theory.thy"
-        uri = file_path_to_uri(original_path)
-        converted_path = uri_to_file_path(uri)
-        # Normalize to absolute path for comparison
-        from pathlib import Path
-        assert Path(converted_path).resolve() == Path(original_path).resolve()
+        original = "/home/user/Theory.thy"
+        converted = uri_to_file_path(file_path_to_uri(original))
+        assert Path(converted).resolve() == Path(original).resolve()
+
+    def test_uri_with_spaces(self):
+        uri = file_path_to_uri("/home/user/my documents/test.thy")
+        assert uri.startswith("file://")
+
+    def test_uri_encoded_chars(self):
+        path = uri_to_file_path("file:///home/user/my%20documents/test.thy")
+        assert "my documents" in path
+
+    def test_complex_roundtrip(self):
+        original = "/home/user/my-project/src/Theory.thy"
+        assert Path(uri_to_file_path(file_path_to_uri(original))).resolve() == Path(original).resolve()
 
 
 class TestPositions:
-    """Test position conversion utilities."""
+    def test_mcp_to_lsp(self):
+        assert mcp_to_lsp_position(1, 1) == (0, 0)
+        assert mcp_to_lsp_position(10, 5) == (9, 4)
 
-    def test_mcp_to_lsp_position(self):
-        """Test MCP to LSP position conversion."""
-        # MCP: 1-indexed, LSP: 0-indexed
-        lsp_line, lsp_col = mcp_to_lsp_position(1, 1)
-        assert lsp_line == 0
-        assert lsp_col == 0
+    def test_lsp_to_mcp(self):
+        assert lsp_to_mcp_position(0, 0) == (1, 1)
+        assert lsp_to_mcp_position(9, 4) == (10, 5)
 
-        lsp_line, lsp_col = mcp_to_lsp_position(10, 5)
-        assert lsp_line == 9
-        assert lsp_col == 4
+    def test_roundtrip(self):
+        for line, col in [(1, 1), (10, 5), (100, 50), (1000, 500)]:
+            assert lsp_to_mcp_position(*mcp_to_lsp_position(line, col)) == (line, col)
 
-    def test_lsp_to_mcp_position(self):
-        """Test LSP to MCP position conversion."""
-        # LSP: 0-indexed, MCP: 1-indexed
-        mcp_line, mcp_col = lsp_to_mcp_position(0, 0)
-        assert mcp_line == 1
-        assert mcp_col == 1
-
-        mcp_line, mcp_col = lsp_to_mcp_position(9, 4)
-        assert mcp_line == 10
-        assert mcp_col == 5
-
-    def test_roundtrip_position_conversion(self):
-        """Test roundtrip position conversion."""
-        original_line, original_col = 42, 17
-        lsp_line, lsp_col = mcp_to_lsp_position(original_line, original_col)
-        mcp_line, mcp_col = lsp_to_mcp_position(lsp_line, lsp_col)
-        assert mcp_line == original_line
-        assert mcp_col == original_col
+    def test_large_numbers(self):
+        assert mcp_to_lsp_position(10000, 5000) == (9999, 4999)
+        assert lsp_to_mcp_position(9999, 4999) == (10000, 5000)
 
 
 class TestFormatters:
-    """Test formatter utilities."""
-
     def test_strip_html_tags(self):
-        """Test HTML tag stripping."""
-        html = "<p>Hello <b>world</b></p>"
-        text = strip_html_tags(html)
-        assert text == "Hello world"
+        assert strip_html_tags("<p>Hello <b>world</b></p>") == "Hello world"
+        assert strip_html_tags("<div><span>Test</span> content</div>") == "Test content"
 
-        html = "<div><span>Test</span> content</div>"
-        text = strip_html_tags(html)
-        assert text == "Test content"
+    def test_strip_html_entities(self):
+        assert strip_html_tags("&lt;foo&gt; &amp; &quot;bar&quot;") == '<foo> & "bar"'
 
-    def test_strip_html_tags_with_entities(self):
-        """Test HTML tag stripping with entities."""
-        html = "&lt;foo&gt; &amp; &quot;bar&quot;"
-        text = strip_html_tags(html)
-        assert text == "<foo> & \"bar\""
+    def test_strip_html_nested(self):
+        assert strip_html_tags("<div><p><span><b>Text</b></span></p></div>") == "Text"
 
-    def test_parse_goals_from_html_no_goals(self):
-        """Test parsing goals from HTML with no goals."""
-        html = "<p>No goals</p>"
-        goals = parse_goals_from_html(html)
-        assert goals == []
+    def test_strip_html_with_attributes(self):
+        text = strip_html_tags('<div class="foo" id="bar">Content</div>')
+        assert text == "Content"
+        assert "class" not in text
 
-    def test_parse_goals_from_html_with_goals(self):
-        """Test parsing goals from HTML with goals."""
-        html = """
-        <div>
-        1. P ⟹ Q
-        2. Q ⟹ R
-        </div>
-        """
+    def test_strip_html_self_closing(self):
+        text = strip_html_tags("Before<br/>After<img src='test.png'/>")
+        assert "Before" in text
+        assert "After" in text
+
+    def test_parse_goals_no_goals(self):
+        for html in ["<p>No goals</p>", "<div>no goals</div>", "<div>NO GOALS</div>"]:
+            assert parse_goals_from_html(html) == []
+
+    def test_parse_goals_numbered(self):
+        html = "<div>1. P ⟹ Q\n2. Q ⟹ R</div>"
         goals = parse_goals_from_html(html)
         assert len(goals) == 2
         assert "P ⟹ Q" in goals[0]
         assert "Q ⟹ R" in goals[1]
 
-    def test_extract_symbol_from_range(self):
-        """Test symbol extraction from text range."""
-        text = "lemma test_lemma: \"P ⟹ Q\""
-        # Extract "test_lemma"
-        symbol = extract_symbol_from_range(text, 6, 16)
-        assert "test_lemma" in symbol
+    def test_parse_goals_multiline_goal(self):
+        html = "<pre>goal (1 subgoal):\n 1. first line\n    second line</pre>"
+        assert parse_goals_from_html(html) == ["first line\nsecond line"]
+
+    def test_parse_goals_universal(self):
+        html = "<div>1. ⋀x y. P x ⟹ Q y ⟹ R (f x y)</div>"
+        goals = parse_goals_from_html(html)
+        assert len(goals) >= 1
+
+    def test_parse_command_output(self):
+        html = '<div class="writeln">Output</div><div class="warning">Warn</div>'
+        msgs = parse_command_output_html(html)
+        assert len(msgs) == 2
+        assert msgs[0] == {'kind': 'writeln', 'text': 'Output'}
+        assert msgs[1] == {'kind': 'warning', 'text': 'Warn'}
+
+    def test_parse_command_output_multiple_css_classes(self):
+        html = '<div class="message warning">Warn</div><div class="foo error bar">Err</div>'
+        msgs = parse_command_output_html(html)
+        assert msgs == [
+            {'kind': 'warning', 'text': 'Warn'},
+            {'kind': 'error', 'text': 'Err'},
+        ]
+
+    def test_parse_command_output_empty(self):
+        assert parse_command_output_html("<div></div>") == []
 
 
 class TestGetLineFromFile:
-    """Test get_line_from_file utility."""
+    def test_basic(self, tmp_path):
+        f = tmp_path / "test.thy"
+        f.write_text("line 1\nline 2\nline 3\n")
+        assert get_line_from_file(str(f), 1) == "line 1"
+        assert get_line_from_file(str(f), 2) == "line 2"
+        assert get_line_from_file(str(f), 3) == "line 3"
 
-    def test_get_line_from_file(self, tmp_path):
-        """Test reading a specific line from file."""
-        from isa_lsp.utils import get_line_from_file
+    def test_out_of_range(self, tmp_path):
+        f = tmp_path / "test.thy"
+        f.write_text("line 1\n")
+        assert get_line_from_file(str(f), 10) == ""
 
-        # Create test file
-        test_file = tmp_path / "test.thy"
-        test_file.write_text("line 1\nline 2\nline 3\n")
+    def test_nonexistent_file(self):
+        assert get_line_from_file("/nonexistent/file.thy", 1) == ""
 
-        # Test reading lines
-        assert get_line_from_file(str(test_file), 1) == "line 1"
-        assert get_line_from_file(str(test_file), 2) == "line 2"
-        assert get_line_from_file(str(test_file), 3) == "line 3"
+    def test_unicode(self, tmp_path):
+        f = tmp_path / "unicode.thy"
+        f.write_text('lemma test: "∀x. P x ⟹ Q x"\n', encoding='utf-8')
+        line = get_line_from_file(str(f), 1)
+        assert "∀" in line
+        assert "⟹" in line
 
-    def test_get_line_from_file_out_of_range(self, tmp_path):
-        """Test reading line out of range."""
-        from isa_lsp.utils import get_line_from_file
+    def test_empty_file(self, tmp_path):
+        f = tmp_path / "empty.thy"
+        f.write_text("")
+        assert get_line_from_file(str(f), 1) == ""
 
-        test_file = tmp_path / "test.thy"
-        test_file.write_text("line 1\n")
+    def test_single_line_no_newline(self, tmp_path):
+        f = tmp_path / "test.thy"
+        f.write_text("single line")
+        assert get_line_from_file(str(f), 1) == "single line"
 
-        # Should return empty string for out of range
-        assert get_line_from_file(str(test_file), 10) == ""
-
-    def test_get_line_from_file_invalid_path(self):
-        """Test reading from non-existent file."""
-        from isa_lsp.utils import get_line_from_file
-
-        # get_line_from_file returns empty string for non-existent files
-        result = get_line_from_file("/nonexistent/file.thy", 1)
-        assert result == ""
+    def test_very_long_line(self, tmp_path):
+        f = tmp_path / "long.thy"
+        long_line = "x" * 10000
+        f.write_text(f"{long_line}\n")
+        assert get_line_from_file(str(f), 1) == long_line

@@ -1,11 +1,4 @@
-"""
-Code completion tool implementation.
-"""
-
 import re
-from typing import Annotated, Any
-
-from pydantic import Field
 
 from isa_lsp.lsp_client import IsabelleLSPClient
 from isa_lsp.models import CompletionItem, CompletionsResult
@@ -20,29 +13,14 @@ from isa_lsp.utils import (
 
 async def completions(
     client: IsabelleLSPClient,
-    file_path: Annotated[str, Field(description="Absolute path to .thy file")],
-    line: Annotated[int, Field(description="Line number (1-indexed)", ge=1)],
-    column: Annotated[int, Field(description="Column number (1-indexed)", ge=1)],
-    max_completions: Annotated[int, Field(
-        description="Maximum number of completions to return", ge=1
-    )] = 32,
+    file_path: str,
+    line: int,
+    column: int,
+    max_completions: int = 32,
 ) -> CompletionsResult:
-    """Get code completion suggestions.
-
-    Args:
-        client: LSP client instance
-        file_path: Absolute path to theory file
-        line: Line number (1-indexed)
-        column: Column number (1-indexed)
-        max_completions: Maximum results to return
-
-    Returns:
-        CompletionsResult with completion items
-
-    Raises:
-        IsabelleToolError: If document not open or LSP error
-    """
     validate_position(line, column)
+    if max_completions < 1:
+        raise IsabelleToolError(f"max_completions must be >= 1, got {max_completions}")
 
     if file_path not in client.open_documents:
         await client.open_document(file_path)
@@ -55,133 +33,69 @@ async def completions(
     except Exception as exc:
         raise IsabelleToolError(f"Failed to get completions: {exc}") from exc
 
-    # Parse response
-    items = []
+    items: list[CompletionItem] = []
+    raw_items: list[dict] = []
+    if isinstance(response, dict):
+        raw_response_items = response.get("items", [])
+        if isinstance(raw_response_items, list):
+            raw_items = [item for item in raw_response_items if isinstance(item, dict)]
+    elif isinstance(response, list):
+        raw_items = [item for item in response if isinstance(item, dict)]
 
-    if response and isinstance(response, dict):
-        # Extract completion items
-        completion_items = response.get("items", [])
-
-        # Get line context for prefix matching
+    if raw_items:
         line_content = get_line_from_file(file_path, line)
         prefix = _extract_prefix(line_content, column)
 
-        # Parse and filter items
-        parsed_items = []
-        for item in completion_items:
-            parsed_item = _parse_completion_item(item)
-            # Filter out invalid items (missing or empty label)
-            if parsed_item.label and parsed_item.label.strip():
-                parsed_items.append(parsed_item)
+        parsed = [_parse_item(it) for it in raw_items]
+        parsed = [it for it in parsed if it.label.strip()]
+        _sort_by_relevance(parsed, prefix)
+        items = parsed[:max_completions]
 
-        # Sort by relevance
-        sorted_items = _sort_by_relevance(parsed_items, prefix)
-
-        # Limit results
-        items = sorted_items[:max_completions]
-
-    # Get line context
-    line_context = get_line_from_file(file_path, line)
-
-    return CompletionsResult(
-        items=items,
-        line_context=line_context,
-    )
+    return CompletionsResult(items=items, line_context=get_line_from_file(file_path, line))
 
 
-def _parse_completion_item(item: dict) -> CompletionItem:
-    """Parse LSP completion item to our model.
+_KIND_MAP = {
+    1: "text", 2: "method", 3: "function", 4: "constructor",
+    5: "field", 6: "variable", 7: "class", 9: "module",
+    14: "keyword", 15: "file", 21: "constant",
+}
 
-    Args:
-        item: LSP CompletionItem dictionary
 
-    Returns:
-        CompletionItem model
-    """
-    # Map LSP kind enum to string
-    kind_mapping = {
-        1: "text",
-        2: "method",
-        3: "function",
-        4: "constructor",
-        5: "field",
-        6: "variable",
-        7: "class",
-        9: "module",
-        14: "keyword",
-        15: "file",
-        21: "constant",
-    }
-
-    kind = kind_mapping.get(item.get("kind", 1), "text")
-
-    # Extract insert text
+def _parse_item(item: dict) -> CompletionItem:
+    kind = _KIND_MAP.get(item.get("kind", 1), "text")
     insert_text = item.get("insertText", item.get("label", ""))
+    text_edit = item.get("textEdit")
+    if isinstance(text_edit, dict) and "newText" in text_edit:
+        insert_text = text_edit["newText"]
 
-    # Check for textEdit
-    if "textEdit" in item:
-        text_edit = item["textEdit"]
-        if "newText" in text_edit:
-            insert_text = text_edit["newText"]
+    doc = item.get("documentation")
+    if isinstance(doc, dict):
+        doc = str(doc.get("value", ""))
+    elif doc is not None:
+        doc = str(doc)
 
     return CompletionItem(
         label=item.get("label", ""),
         kind=kind,
         detail=str(item.get("detail") or ""),
-        documentation=_extract_documentation(item.get("documentation")),
+        documentation=doc,
         insert_text=insert_text,
     )
 
 
-def _extract_documentation(doc: Any) -> str | None:
-    """Extract documentation string from various formats."""
-    if doc is None:
-        return None
-    elif isinstance(doc, str):
-        return doc
-    elif isinstance(doc, dict):
-        # MarkupContent
-        return str(doc.get("value", ""))
-    else:
-        return str(doc)
-
-
 def _extract_prefix(line: str, column: int) -> str:
-    """Extract word prefix before cursor position.
-
-    Args:
-        line: Line content
-        column: Column (1-indexed)
-
-    Returns:
-        Prefix string (lowercase)
-    """
     text_before = line[:column - 1] if column <= len(line) + 1 else line
     words = re.split(r'[\s()\[\]{},:;.]+', text_before)
-    prefix = words[-1] if words else ""
-
-    return prefix.lower()
+    return (words[-1] if words else "").lower()
 
 
-def _sort_by_relevance(items: list[CompletionItem], prefix: str) -> list[CompletionItem]:
-    """Sort completions by relevance to prefix.
+def _sort_by_relevance(items: list[CompletionItem], prefix: str) -> None:
+    def key(item: CompletionItem) -> tuple[int, str]:
+        label = item.label.lower()
+        if label.startswith(prefix):
+            return (0, label)
+        if prefix in label:
+            return (1, label)
+        return (2, label)
 
-    Args:
-        items: List of completion items
-        prefix: Prefix string (lowercase)
-
-    Returns:
-        Sorted list
-    """
-    def sort_key(item: CompletionItem) -> tuple[int, str]:
-        label_lower = item.label.lower()
-
-        if label_lower.startswith(prefix):
-            return (0, label_lower)  # Exact prefix match (highest priority)
-        elif prefix in label_lower:
-            return (1, label_lower)  # Contains prefix (medium priority)
-        else:
-            return (2, label_lower)  # Alphabetical (lowest priority)
-
-    items.sort(key=sort_key)
-    return items
+    items.sort(key=key)
