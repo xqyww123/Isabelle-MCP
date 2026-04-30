@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from fastmcp import FastMCP
 
 from isa_lsp.lsp_client import IsabelleLSPClient
+from isa_lsp.utils import IsabelleToolError
 from isa_lsp.tools import (
     hover_info,
     completions,
@@ -39,33 +40,59 @@ _lsp_client: Optional[IsabelleLSPClient] = None
 
 
 @asynccontextmanager
-async def server_lifespan():
-    """Manage LSP client lifecycle."""
+async def server_lifespan(app):
+    """Manage LSP client lifecycle.
+
+    Args:
+        app: FastMCP application instance (required by FastMCP lifespan protocol)
+    """
     global _lsp_client
 
     # Default session (can be overridden via environment variable)
     import os
     logic = os.environ.get("ISABELLE_SESSION", "HOL")
 
-    logger.info(f"Starting Isabelle LSP client with session: {logic}")
+    logger.info(f"Creating Isabelle LSP client with session: {logic}")
 
-    # Create and start LSP client
+    # Create LSP client (but don't start it yet - lazy initialization)
     _lsp_client = IsabelleLSPClient(logic=logic)
-    await _lsp_client.start()
 
-    logger.info("Isabelle LSP client started successfully")
+    logger.info("Isabelle LSP client ready for lazy initialization")
 
     try:
         yield
     finally:
-        # Cleanup on shutdown
-        logger.info("Shutting down Isabelle LSP client")
-        await _lsp_client.shutdown()
-        logger.info("Isabelle LSP client shut down successfully")
+        # Cleanup on shutdown (only if started)
+        if _lsp_client.process is not None:
+            logger.info("Shutting down Isabelle LSP client")
+            await _lsp_client.shutdown()
+            logger.info("Isabelle LSP client shut down successfully")
+        else:
+            logger.info("Isabelle LSP client was never started, no cleanup needed")
 
 
 # Create FastMCP server
 mcp = FastMCP("Isabelle LSP", lifespan=server_lifespan)
+
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+async def _ensure_lsp_started():
+    """Ensure LSP client is started (lazy initialization)."""
+    global _lsp_client
+
+    if _lsp_client is None:
+        raise IsabelleToolError("LSP client not initialized")
+
+    # Start LSP client if not already started
+    if _lsp_client.process is None:
+        logger.info("Starting Isabelle LSP client (lazy initialization)")
+        await _lsp_client.start()
+        logger.info("Isabelle LSP client started successfully")
+
+    return _lsp_client
 
 
 # ============================================================================
@@ -98,7 +125,8 @@ async def isabelle_hover(
     Returns:
         HoverInfo with symbol information
     """
-    return await hover_info(_lsp_client, file_path, line, column)
+    client = await _ensure_lsp_started()
+    return await hover_info(client, file_path, line, column)
 
 
 @mcp.tool()
@@ -119,7 +147,9 @@ async def isabelle_completions(
     Returns:
         CompletionsResult with sorted completion items
     """
-    return await completions(_lsp_client, file_path, line, column, max_completions)
+    client = await _ensure_lsp_started()
+
+    return await completions(client, file_path, line, column, max_completions)
 
 
 @mcp.tool()
@@ -138,7 +168,9 @@ async def isabelle_definition(
     Returns:
         DeclarationLocation with symbol and definition locations
     """
-    return await declaration_location(_lsp_client, file_path, line, column)
+    client = await _ensure_lsp_started()
+
+    return await declaration_location(client, file_path, line, column)
 
 
 @mcp.tool()
@@ -157,7 +189,9 @@ async def isabelle_highlights(
     Returns:
         HighlightsResult with symbol and highlight locations
     """
-    return await document_highlights(_lsp_client, file_path, line, column)
+    client = await _ensure_lsp_started()
+
+    return await document_highlights(client, file_path, line, column)
 
 
 @mcp.tool()
@@ -207,7 +241,9 @@ async def isabelle_goal(
     Returns:
         GoalState with goals and context
     """
-    return await goal(_lsp_client, file_path, line, column)
+    client = await _ensure_lsp_started()
+
+    return await goal(client, file_path, line, column)
 
 
 @mcp.tool()
@@ -224,7 +260,9 @@ async def isabelle_command_output(
     Returns:
         CommandOutputResult with messages
     """
-    return await command_output(_lsp_client, file_path, line)
+    client = await _ensure_lsp_started()
+
+    return await command_output(client, file_path, line)
 
 
 @mcp.tool()
@@ -241,7 +279,9 @@ async def isabelle_preview(
     Returns:
         PreviewResult with HTML content
     """
-    return await preview_document(_lsp_client, file_path, line)
+    client = await _ensure_lsp_started()
+
+    return await preview_document(client, file_path, line)
 
 
 # ============================================================================
@@ -272,7 +312,9 @@ async def isabelle_build(
     Returns:
         BuildStatus with success flag and build messages
     """
-    return await build_session(_lsp_client, session, clean)
+    client = await _ensure_lsp_started()
+
+    return await build_session(client, session, clean)
 
 
 # ============================================================================

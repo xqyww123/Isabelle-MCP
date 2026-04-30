@@ -147,6 +147,7 @@ cython_debug/
 Thumbs.db
 *.sublime-project
 *.sublime-workspace
+*.code-workspace
 
 # Project-specific
 
