@@ -3,10 +3,10 @@ Pytest configuration and shared fixtures.
 """
 
 import asyncio
-import pytest
 from pathlib import Path
-from typing import Dict, Any, Optional, List
-from unittest.mock import AsyncMock, MagicMock
+from typing import Any
+
+import pytest
 
 
 @pytest.fixture
@@ -52,9 +52,9 @@ class MockLSPClient:
     def __init__(self):
         self.logic = "HOL"
         self.initialized = True
-        self.open_documents: Dict[str, Dict[str, Any]] = {}
-        self.diagnostics_cache: Dict[str, List[Dict[str, Any]]] = {}
-        self.processing_status: Dict[str, bool] = {}
+        self.open_documents: dict[str, dict[str, Any]] = {}
+        self.diagnostics_cache: dict[str, list[dict[str, Any]]] = {}
+        self.processing_status: dict[str, bool] = {}
 
         # Mock responses
         self.hover_response = None
@@ -79,7 +79,7 @@ class MockLSPClient:
         if not Path(file_path).exists():
             raise FileNotFoundError(f"File not found: {file_path}")
 
-        with open(file_path, 'r') as f:
+        with open(file_path) as f:
             content = f.read()
 
         self.open_documents[file_path] = {
@@ -113,7 +113,7 @@ class MockLSPClient:
         """Mock get highlights."""
         return self.highlights_response
 
-    def get_cached_diagnostics(self, file_path: str) -> List[Dict[str, Any]]:
+    def get_cached_diagnostics(self, file_path: str) -> list[dict[str, Any]]:
         """Mock get cached diagnostics."""
         return self.diagnostics_cache.get(file_path, [])
 
@@ -121,11 +121,11 @@ class MockLSPClient:
         """Mock processing complete check."""
         return self.processing_status.get(file_path, False)
 
-    async def notify(self, method: str, params: Dict[str, Any]):
+    async def notify(self, method: str, params: dict[str, Any]):
         """Mock notify."""
         pass
 
-    async def request(self, method: str, params: Dict[str, Any]):
+    async def request(self, method: str, params: dict[str, Any]):
         """Mock request."""
         return {}
 

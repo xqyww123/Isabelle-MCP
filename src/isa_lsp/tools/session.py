@@ -5,12 +5,12 @@ These tools manage Isabelle session configuration and build status.
 """
 
 import asyncio
-from typing import Annotated, Optional, List
+from typing import Annotated
 
 from pydantic import Field
 
 from isa_lsp.lsp_client import IsabelleLSPClient
-from isa_lsp.models import SessionInfo, BuildStatus
+from isa_lsp.models import BuildStatus, SessionInfo
 from isa_lsp.utils import IsabelleToolError
 
 
@@ -77,7 +77,6 @@ async def build_session(
         After building a session, you need to restart the LSP client with
         the new session to use it.
     """
-    import subprocess
     import logging
 
     logger = logging.getLogger(__name__)

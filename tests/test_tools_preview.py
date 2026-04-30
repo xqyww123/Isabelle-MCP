@@ -3,12 +3,8 @@ Unit tests for preview tool.
 """
 
 import pytest
+
 from isa_lsp.tools.preview import preview_document
-from isa_lsp.utils import IsabelleToolError
-
-
-# Mark all preview tests as expected to fail in MVP
-pytestmark = pytest.mark.xfail(reason="Preview tool has MVP limitations - not fully implemented")
 
 
 class TestPreviewTool:

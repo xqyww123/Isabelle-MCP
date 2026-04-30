@@ -8,11 +8,9 @@ import asyncio
 import json
 import logging
 import re
-import subprocess
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from isa_lsp.utils import (
     IsabelleToolError,
@@ -36,8 +34,8 @@ class DocumentState:
 @dataclass
 class DiagnosticCache:
     """Cache for diagnostics received via publishDiagnostics notifications."""
-    diagnostics: Dict[str, List[Dict]] = field(default_factory=dict)
-    last_update: Dict[str, float] = field(default_factory=dict)
+    diagnostics: dict[str, list[dict]] = field(default_factory=dict)
+    last_update: dict[str, float] = field(default_factory=dict)
 
 
 class IsabelleLSPClient:
@@ -55,7 +53,7 @@ class IsabelleLSPClient:
     def __init__(
         self,
         logic: str = "HOL",
-        session_dirs: Optional[List[str]] = None,
+        session_dirs: list[str] | None = None,
         verbose: bool = False,
     ):
         self.logic = logic
@@ -63,21 +61,21 @@ class IsabelleLSPClient:
         self.verbose = verbose
 
         # Process management
-        self.process: Optional[asyncio.subprocess.Process] = None
-        self.reader_task: Optional[asyncio.Task] = None
+        self.process: asyncio.subprocess.Process | None = None
+        self.reader_task: asyncio.Task | None = None
 
         # Request/response correlation
         self.request_id = 0
-        self.pending_requests: Dict[int, asyncio.Future] = {}
+        self.pending_requests: dict[int, asyncio.Future] = {}
 
         # Document state
-        self.open_documents: Dict[str, DocumentState] = {}
+        self.open_documents: dict[str, DocumentState] = {}
 
         # Diagnostics cache
         self.diagnostic_cache = DiagnosticCache()
 
         # Server info
-        self.server_capabilities: Dict[str, Any] = {}
+        self.server_capabilities: dict[str, Any] = {}
         self.isabelle_version: str = ""
         self.start_time: float = 0.0
 
@@ -119,7 +117,7 @@ class IsabelleLSPClient:
 
         logger.info("LSP client started successfully")
 
-    async def initialize(self) -> Dict[str, Any]:
+    async def initialize(self) -> dict[str, Any]:
         """Send LSP initialize request.
 
         Returns:
@@ -191,7 +189,7 @@ class IsabelleLSPClient:
     async def request(
         self,
         method: str,
-        params: Dict[str, Any],
+        params: dict[str, Any],
         timeout: float = 30.0
     ) -> Any:
         """Send LSP request and wait for response.
@@ -232,7 +230,7 @@ class IsabelleLSPClient:
             self.pending_requests.pop(req_id, None)
             raise IsabelleToolError(f"LSP request '{method}' timed out after {timeout}s")
 
-    async def notify(self, method: str, params: Dict[str, Any]) -> None:
+    async def notify(self, method: str, params: dict[str, Any]) -> None:
         """Send LSP notification (no response expected).
 
         Args:
@@ -247,7 +245,7 @@ class IsabelleLSPClient:
 
         await self._send(message)
 
-    async def _send(self, message: Dict) -> None:
+    async def _send(self, message: dict) -> None:
         """Send JSON-RPC message with LSP framing.
 
         Args:
@@ -307,7 +305,7 @@ class IsabelleLSPClient:
         except Exception as e:
             logger.error(f"Error in read loop: {e}", exc_info=True)
 
-    async def _handle_message(self, message: Dict) -> None:
+    async def _handle_message(self, message: dict) -> None:
         """Handle incoming LSP message.
 
         Args:
@@ -365,7 +363,7 @@ class IsabelleLSPClient:
     async def open_document(
         self,
         file_path: str,
-        content: Optional[str] = None
+        content: str | None = None
     ) -> None:
         """Open document in LSP session.
 
@@ -379,7 +377,7 @@ class IsabelleLSPClient:
 
         # Read content if not provided
         if content is None:
-            with open(file_path, 'r', encoding='utf-8') as f:
+            with open(file_path, encoding='utf-8') as f:
                 content = f.read()
 
         uri = file_path_to_uri(file_path)
@@ -432,7 +430,7 @@ class IsabelleLSPClient:
         file_path: str,
         line: int,
         character: int
-    ) -> Optional[Dict]:
+    ) -> dict | None:
         """Get hover information at position.
 
         Args:
@@ -459,7 +457,7 @@ class IsabelleLSPClient:
         file_path: str,
         line: int,
         character: int
-    ) -> Optional[Dict]:
+    ) -> dict | None:
         """Get completions at position.
 
         Args:
@@ -486,7 +484,7 @@ class IsabelleLSPClient:
         file_path: str,
         line: int,
         character: int
-    ) -> Optional[Any]:
+    ) -> Any | None:
         """Get definition location at position.
 
         Args:
@@ -513,7 +511,7 @@ class IsabelleLSPClient:
         file_path: str,
         line: int,
         character: int
-    ) -> Optional[List[Dict]]:
+    ) -> list[dict] | None:
         """Get document highlights at position.
 
         Args:
@@ -535,7 +533,7 @@ class IsabelleLSPClient:
 
         return result
 
-    def get_cached_diagnostics(self, file_path: str) -> List[Dict]:
+    def get_cached_diagnostics(self, file_path: str) -> list[dict]:
         """Get cached diagnostics for file.
 
         Args:
@@ -549,11 +547,9 @@ class IsabelleLSPClient:
     def is_processing_complete(self, file_path: str) -> bool:
         """Check if PIDE finished processing file (heuristic).
 
-        Args:
-            file_path: Absolute path to theory file
-
-        Returns:
-            True if likely complete (no updates in last 0.5s)
+        Returns False for files never seen (no diagnostics received yet).
+        Returns True if no diagnostic updates in last 0.5s.
         """
-        last_update = self.diagnostic_cache.last_update.get(file_path, 0)
-        return (time.time() - last_update) > 0.5
+        if file_path not in self.diagnostic_cache.last_update:
+            return False
+        return (time.time() - self.diagnostic_cache.last_update[file_path]) > 0.5

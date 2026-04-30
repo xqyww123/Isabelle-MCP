@@ -2,19 +2,21 @@
 Hover information tool implementation.
 """
 
-from typing import Annotated, Optional
+from typing import Annotated
 
 from pydantic import Field
 
 from isa_lsp.lsp_client import IsabelleLSPClient
-from isa_lsp.models import HoverInfo, DiagnosticMessage
+from isa_lsp.models import DiagnosticMessage, HoverInfo
 from isa_lsp.utils import (
     IsabelleToolError,
     check_pide_response,
-    mcp_to_lsp_position,
-    lsp_to_mcp_position,
-    get_line_from_file,
     extract_symbol_from_lsp_range,
+    get_line_from_file,
+    lsp_to_mcp_position,
+    mcp_to_lsp_position,
+    severity_int_to_string,
+    validate_position,
 )
 
 
@@ -38,11 +40,11 @@ async def hover_info(
     Raises:
         IsabelleToolError: If document not open or LSP error
     """
-    # Ensure document is open
+    validate_position(line, column)
+
     if file_path not in client.open_documents:
         await client.open_document(file_path)
 
-    # Convert to 0-indexed for LSP
     lsp_line, lsp_col = mcp_to_lsp_position(line, column)
 
     # Call LSP
@@ -99,7 +101,7 @@ async def hover_info(
             )
 
             diagnostics_at_position.append(DiagnosticMessage(
-                severity=_severity_to_string(diag.get("severity", 1)),
+                severity=severity_int_to_string(diag.get("severity", 1)),
                 message=diag.get("message", ""),
                 line=diag_mcp_line,
                 column=diag_mcp_col,
@@ -115,19 +117,3 @@ async def hover_info(
     )
 
 
-def _severity_to_string(severity: int) -> str:
-    """Convert LSP severity enum to string.
-
-    Args:
-        severity: LSP severity (1=Error, 2=Warning, 3=Information, 4=Hint)
-
-    Returns:
-        Severity string
-    """
-    mapping = {
-        1: "error",
-        2: "warning",
-        3: "information",
-        4: "hint",
-    }
-    return mapping.get(severity, "error")

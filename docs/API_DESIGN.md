@@ -6,7 +6,7 @@
 
 ## 1. Overview
 
-This document provides detailed API design and implementation guidance for the 10 MCP tools in Isa-LSP. For high-level specifications, see SPECIFICATION.md. For architecture, see ARCHITECTURE.md.
+This document provides detailed API design and implementation guidance for the 11 MCP tools in Isa-LSP. For high-level specifications, see SPECIFICATION.md. For architecture, see ARCHITECTURE.md.
 
 ---
 
@@ -22,7 +22,13 @@ This document provides detailed API design and implementation guidance for the 1
 | `isabelle_document_highlights` | `textDocument/documentHighlight` | `DocumentHighlightParams` | `DocumentHighlight[]` |
 | `isabelle_diagnostic_messages` | (notifications) | - | Cached from `publishDiagnostics` |
 
-### 2.2 PIDE Extension Methods
+### 2.2 Document Editing Methods
+
+| MCP Tool | LSP Method | Flow |
+|----------|------------|------|
+| `isabelle_edit` | `textDocument/didChange` (Full sync) | Send full content → wait for PIDE reprocessing → return diagnostics |
+
+### 2.3 PIDE Extension Methods
 
 | MCP Tool | PIDE Methods | Flow |
 |----------|--------------|------|
@@ -30,7 +36,7 @@ This document provides detailed API design and implementation guidance for the 1
 | `isabelle_command_output` | `PIDE/dynamic_output` | Notification-based |
 | `isabelle_preview` | `PIDE/preview_request`, `PIDE/preview_response` | Request-response |
 
-### 2.3 Session Management
+### 2.4 Session Management
 
 | MCP Tool | Implementation | External Commands |
 |----------|----------------|-------------------|
@@ -479,7 +485,158 @@ class DiagnosticCache:
 
 ---
 
-### 3.6 `isabelle_goal`
+### 3.6 `isabelle_edit`
+
+**LSP Notification (Client → Server):**
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "textDocument/didChange",
+  "params": {
+    "textDocument": {
+      "uri": "file:///path/to/file.thy",
+      "version": 3
+    },
+    "contentChanges": [
+      {
+        "text": "<full new content of the file>"
+      }
+    ]
+  }
+}
+```
+
+**Server Behavior After didChange:**
+
+| Phase | Delay | Description |
+|-------|-------|-------------|
+| Input debounce | 100ms (`vscode_input_delay`) | Batches rapid consecutive changes |
+| Flush to PIDE | immediate after debounce | Converts pending edits → `Document.Edit_Text` |
+| PIDE processing | variable (depends on file size) | Incremental type-checking and proof processing |
+| Output debounce | 500ms (`vscode_output_delay`) | Batches diagnostic updates |
+| Diagnostics push | after output debounce | `textDocument/publishDiagnostics` notification |
+
+**Implementation Notes:**
+
+1. **Sync Kind**: Isabelle reports `textDocumentSync = 2` (Incremental per LSP spec). However, a client can always send full content replacement (omitting the `range` field in `contentChanges`) even when the server announces Incremental — the LSP spec guarantees this fallback. We use full replacement for simplicity and correctness. The server internally computes diffs via `doc.change()`.
+
+2. **Version Management**: Each `didChange` must increment the version. The tool tracks versions per-document in `DocumentState.version`.
+
+3. **Line-range to full content**: When the user provides `start_line`/`end_line`/`new_text`, the tool computes the full new content from the cached `DocumentState.content`:
+   ```python
+   def apply_line_edit(content: str, start_line: int, end_line: int, new_text: str) -> str:
+       lines = content.splitlines(keepends=True)
+       # Ensure last line has newline for consistent splicing
+       if lines and not lines[-1].endswith('\n'):
+           lines[-1] += '\n'
+
+       # Convert to 0-indexed; end_line is 1-indexed inclusive → exclusive
+       start_idx = min(start_line - 1, len(lines))
+       end_idx = min(end_line, len(lines))
+
+       # When end_idx < start_idx, this is a pure insert (no lines removed)
+       new_lines = new_text.splitlines(keepends=True) if new_text else []
+
+       result_lines = lines[:start_idx] + new_lines + lines[end_idx:]
+       return ''.join(result_lines)
+   ```
+
+4. **Processing detection**: After sending `didChange`, the tool waits for PIDE to finish by monitoring the diagnostics cache:
+   - Poll every 300ms
+   - Consider complete when no new `publishDiagnostics` received for 500ms+
+   - Timeout after 10 seconds (configurable)
+
+   **Known limitation**: This heuristic can produce false positives (PIDE takes >500ms between diagnostic batches → falsely reports completion) and false negatives (file has zero diagnostics → waits until timeout). A more robust approach would track `PIDE/decoration` notifications with `background_running` status, but this is not implemented.
+
+5. **Disk sync**: When `sync_to_disk=True`, write the new content to the file on disk after the LSP change is sent. This keeps the file system consistent for `git`, other editors, and external tools.
+
+   **Warning**: When `sync_to_disk=False`, the LSP buffer diverges from the file on disk. A subsequent `open_document` call (which reads from disk) would overwrite the in-buffer changes. Only use `sync_to_disk=False` when performing a sequence of edits followed by a single explicit disk write, or when the edit is transient (e.g., command injection for sledgehammer).
+
+6. **Auto-open**: If the file is not yet open in the LSP session, automatically open it via `didOpen` before applying the change.
+
+7. **Cache invalidation**: After an edit, previously cached results from other tools (`isabelle_goal`, `isabelle_hover`, etc.) are stale for the edited document. The tool does not automatically invalidate them — callers must re-query after editing.
+
+8. **Concurrency**: Line-range edits splice against `DocumentState.content`. If two `isabelle_edit` calls to the same document overlap, both will compute their splice against the same base content, and the second `change_document` will silently overwrite the first. Callers must serialize edits to the same document.
+
+**Code Snippet:**
+```python
+async def edit_document(
+    client: IsabelleLSPClient,
+    file_path: str,
+    new_content: Optional[str] = None,
+    start_line: Optional[int] = None,
+    end_line: Optional[int] = None,
+    new_text: Optional[str] = None,
+    sync_to_disk: bool = True,
+    wait_for_processing: bool = True,
+) -> EditResult:
+    """Edit theory file and trigger PIDE reprocessing."""
+
+    # Validate: exactly one edit mode
+    has_full = new_content is not None
+    has_range = start_line is not None
+    if has_full == has_range:
+        raise IsabelleToolError(
+            "Provide either new_content (full replacement) "
+            "or start_line/end_line/new_text (line-range edit), not both"
+        )
+
+    # Ensure document is open
+    if file_path not in client.open_documents:
+        await client.open_document(file_path)
+
+    doc = client.open_documents[file_path]
+
+    # Compute new content
+    if has_range:
+        final_content = apply_line_edit(
+            doc.content, start_line, end_line, new_text or ""
+        )
+    else:
+        final_content = new_content
+
+    # Send didChange
+    new_version = await client.change_document(file_path, final_content)
+
+    # Sync to disk
+    if sync_to_disk:
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(final_content)
+
+    # Wait for PIDE reprocessing
+    processing_complete = False
+    if wait_for_processing:
+        processing_complete = await client.wait_for_processing(
+            file_path, timeout=10.0
+        )
+
+    # Collect ALL diagnostics for the document (not just the edited region)
+    diagnostics = client.get_cached_diagnostics(file_path)
+    diag_items = [parse_diagnostic(d) for d in diagnostics]
+
+    # success = no errors anywhere in the document
+    success = all(d.severity != "error" for d in diag_items)
+
+    return EditResult(
+        success=success,
+        version=new_version,
+        content_length=len(final_content),
+        diagnostics=diag_items,
+        processing_complete=processing_complete,
+    )
+```
+
+**Edge Cases:**
+- Empty `new_text` with valid range → deletes the specified lines
+- `start_line > end_line` → pure insertion before `start_line` (no lines removed)
+- `start_line` beyond file length → append at end of file
+- File modified externally since last `didOpen` → the cached content diverges from disk; the tool uses cached content as the base for line-range edits. Use `new_content` for full replacement when in doubt.
+- PIDE timeout → return `processing_complete=false` with whatever diagnostics are available
+- Unicode recoding → server may send `workspace/applyEdit` to normalize Isabelle symbols; currently not handled (logged only)
+
+---
+
+### 3.7 `isabelle_goal`
 
 **PIDE Flow:**
 
@@ -645,7 +802,7 @@ class StatePanelManager:
 
 ---
 
-### 3.7 `isabelle_command_output`
+### 3.8 `isabelle_command_output`
 
 **PIDE Notification (Server → Client):**
 ```json
@@ -704,7 +861,7 @@ def parse_dynamic_output(html: str) -> List[OutputMessage]:
 
 ---
 
-### 3.8 `isabelle_preview`
+### 3.9 `isabelle_preview`
 
 **PIDE Request:**
 ```json
@@ -785,7 +942,7 @@ class PreviewManager:
 
 ---
 
-### 3.9 `isabelle_build`
+### 3.10 `isabelle_build`
 
 **Implementation Steps:**
 
@@ -908,7 +1065,7 @@ async def build_session(
 
 ---
 
-### 3.10 `isabelle_session_info`
+### 3.11 `isabelle_session_info`
 
 **Implementation Notes:**
 - Query LSP client state
@@ -1003,7 +1160,76 @@ async def ensure_document_open(client: IsabelleLSPClient, file_path: str):
     await asyncio.sleep(2.0)
 ```
 
-### 4.4 Error Handling
+### 4.4 Document Change Management
+
+**Protocol context**: Isabelle's `vscode_server` reports `textDocumentSync = 2` (Incremental per LSP spec). However, the LSP spec guarantees that a client can always send full content replacement (omitting `range` in `contentChanges`) regardless of the announced sync kind. We use this full-replacement approach for simplicity.
+
+```python
+async def change_document(self, file_path: str, new_content: str) -> int:
+    """Send textDocument/didChange with full content replacement.
+
+    The server debounces input (100ms vscode_input_delay), flushes to PIDE,
+    and pushes updated diagnostics (debounced 500ms vscode_output_delay).
+
+    Args:
+        file_path: Must be already open (call ensure_document_open first)
+        new_content: Complete new file content
+
+    Returns:
+        New document version number
+    """
+    doc = self.open_documents[file_path]
+    doc.version += 1
+    doc.content = new_content
+
+    await self.notify("textDocument/didChange", {
+        "textDocument": {
+            "uri": doc.uri,
+            "version": doc.version,
+        },
+        "contentChanges": [{"text": new_content}],
+    })
+
+    return doc.version
+
+
+async def wait_for_processing(self, file_path: str, timeout: float = 10.0) -> bool:
+    """Wait for PIDE to finish reprocessing after a change.
+
+    Heuristic: consider complete when no publishDiagnostics received
+    for 500ms+ (matching vscode_output_delay).
+
+    Returns:
+        True if processing completed within timeout
+
+    Known limitations:
+        - False positive: if PIDE takes >500ms between diagnostic batches
+          (e.g., processing a large proof), we falsely report completion
+          before the second batch arrives.
+        - False negative: if the file has zero diagnostics after the edit,
+          no publishDiagnostics is sent at all, so we wait until timeout.
+        - A more robust approach would track PIDE/decoration notifications
+          with background_running status, but this is not yet implemented.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        await asyncio.sleep(0.3)
+        if self.is_processing_complete(file_path):
+            return True
+    return False
+```
+
+**Timing Considerations:**
+
+After `didChange`, there are two debounce delays before the client sees results:
+- `vscode_input_delay` (100ms): server batches rapid edits before flushing to PIDE
+- `vscode_output_delay` (500ms): server batches diagnostic updates before pushing
+
+So the minimum round-trip for a single edit is ~600ms + PIDE processing time.
+For small edits to already-loaded theories, total round-trip is typically 1-2 seconds.
+For large files or complex proofs, it can take 5-10+ seconds.
+
+### 4.5 Error Handling
 
 ```python
 def check_pide_response(response: Any, operation: str, *, allow_none: bool = False):

@@ -2,9 +2,11 @@
 Unit tests for session management tools.
 """
 
+from unittest.mock import AsyncMock, patch
+
 import pytest
-from unittest.mock import patch, AsyncMock
-from isa_lsp.tools.session import session_info, build_session
+
+from isa_lsp.tools.session import build_session, session_info
 from isa_lsp.utils import IsabelleToolError
 
 
@@ -150,7 +152,7 @@ class TestBuildSessionTool:
             mock_process = AsyncMock()
             # Unicode output
             mock_process.communicate = AsyncMock(return_value=(
-                "Building session: ∀ x. P x → Q x".encode('utf-8'),
+                "Building session: ∀ x. P x → Q x".encode(),
                 b""
             ))
             mock_process.returncode = 0

@@ -25,8 +25,9 @@ Isa-LSP is a Model Context Protocol (MCP) server that provides AI agents (like C
 **In Scope (MVP - LSP/PIDE Native Support Only):**
 - 5 standard LSP-based MCP tools (hover, completion, definition, highlights, diagnostics)
 - 3 PIDE-specific MCP tools (proof state, command output, preview)
+- 1 document editing tool (dynamic document changes with PIDE reprocessing)
 - 2 session management tools (build, session info)
-- Document synchronization and state management
+- Document synchronization and state management (`didOpen`, `didChange`, `didClose`)
 - Async notification handling (diagnostics, decorations)
 - Session lifecycle management with optional build support
 
@@ -150,16 +151,24 @@ Isabelle-specific features - **only PIDE-native methods**:
 **Priority**: Low (Documentation generation)
 **Pattern**: New (Isabelle-specific)
 
-### 3.3 Session Management Tools (2 tools)
+### 3.3 Document Editing Tool (1 tool)
 
-#### Tool 9: `isabelle_build`
+#### Tool 9: `isabelle_edit`
+**Purpose**: Edit theory file content and trigger PIDE reprocessing (like editing in VS Code)
+**LSP Mapping**: `textDocument/didChange` (Full sync) ✅
+**Priority**: **HIGH** (Enables interactive theorem proving workflow)
+**Pattern**: New (no Lean equivalent — enables the edit-check-fix loop)
+
+### 3.4 Session Management Tools (2 tools)
+
+#### Tool 10: `isabelle_build`
 **Purpose**: Rebuild session and restart LSP server
 **LSP Mapping**: Spawns new `isabelle vscode_server` process ✅
 **Priority**: Critical (Session initialization)
 **Pattern**: Like `lean_build`
 **Destructive**: Yes (restarts session)
 
-#### Tool 10: `isabelle_session_info`
+#### Tool 11: `isabelle_session_info`
 **Purpose**: Get current session info and capabilities
 **LSP Mapping**: Cached `initialize` response ✅
 **Priority**: Low (Introspection)
@@ -525,9 +534,145 @@ class PreviewResult(BaseModel):
 
 ---
 
-### 4.3 Session Management Tools
+### 4.3 Document Editing Tool
 
-#### 4.3.1 `isabelle_build` 🔨 Destructive
+#### 4.3.1 `isabelle_edit` ✏️ Mutating
+
+**Description**: Edit theory file content and trigger PIDE incremental reprocessing — the same mechanism used when editing in Isabelle/VSCode. This enables the interactive edit-check-fix loop essential for AI-assisted theorem proving.
+
+**Tool Annotations**:
+```python
+ToolAnnotations(
+    title="Edit Document",
+    readOnlyHint=False,
+    idempotentHint=False,
+)
+```
+
+**Input Parameters**:
+```python
+file_path: Annotated[str, Field(description="Absolute path to .thy file")]
+
+# Option A: Full content replacement
+new_content: Annotated[Optional[str], Field(
+    description="Complete new file content. Mutually exclusive with line-range parameters."
+)] = None
+
+# Option B: Line-range replacement
+start_line: Annotated[Optional[int], Field(
+    description="First line to replace (1-indexed, inclusive)", ge=1
+)] = None
+end_line: Annotated[Optional[int], Field(
+    description="Last line to replace (1-indexed, inclusive). "
+    "If end_line < start_line, text is inserted before start_line without removing any lines.", ge=0
+)] = None
+new_text: Annotated[Optional[str], Field(
+    description="Replacement text for the line range"
+)] = None
+
+# Behavior options
+sync_to_disk: Annotated[bool, Field(
+    description="Also write the updated content to the file on disk (default: true)"
+)] = True
+wait_for_processing: Annotated[bool, Field(
+    description="Wait for PIDE to finish reprocessing before returning (default: true)"
+)] = True
+```
+
+**Output Model**:
+```python
+class EditResult(BaseModel):
+    success: bool = Field(description="True if no errors in the entire document after reprocessing")
+    version: int = Field(description="New document version after edit")
+    content_length: int = Field(description="Total length of document after edit (characters)")
+    diagnostics: List[DiagnosticMessage] = Field(
+        default_factory=list,
+        description="All diagnostics for the document after PIDE reprocessing"
+    )
+    processing_complete: bool = Field(
+        description="Whether PIDE finished reprocessing the document"
+    )
+```
+
+**Example: Replace a proof tactic**:
+```json
+// Request
+{
+  "file_path": "/path/to/Theory.thy",
+  "start_line": 42,
+  "end_line": 42,
+  "new_text": "  by (simp add: assms)"
+}
+
+// Response
+{
+  "success": true,
+  "version": 3,
+  "content_length": 1547,
+  "diagnostics": [],
+  "processing_complete": true
+}
+```
+
+**Example: Insert a new lemma (without removing any lines)**:
+```json
+// Request: insert before line 50 (end_line=49 < start_line=50 → pure insert)
+{
+  "file_path": "/path/to/Theory.thy",
+  "start_line": 50,
+  "end_line": 49,
+  "new_text": "lemma new_lemma: \"P ⟶ P\"\n  by auto\n"
+}
+
+// Response
+{
+  "success": true,
+  "version": 4,
+  "content_length": 1612,
+  "diagnostics": [],
+  "processing_complete": true
+}
+```
+
+**Example: Full content replacement**:
+```json
+// Request
+{
+  "file_path": "/path/to/Theory.thy",
+  "new_content": "theory Theory imports Main begin\n\nlemma \"True\" by simp\n\nend"
+}
+
+// Response
+{
+  "success": true,
+  "version": 2,
+  "content_length": 62,
+  "diagnostics": [],
+  "processing_complete": true
+}
+```
+
+**Edge Cases**:
+- File not yet opened → auto-open via `didOpen` before applying change
+- Both `new_content` and line-range params provided → error
+- Neither provided → error
+- `start_line` beyond file length → append at end
+- Empty `new_text` with valid range → delete lines
+- PIDE processing timeout → return `processing_complete=false` with partial diagnostics
+
+**Caveats and Known Limitations**:
+- After an edit, previously cached results from `isabelle_goal`, `isabelle_hover`, etc. are stale. Always re-query after editing.
+- When `sync_to_disk=False`, the LSP buffer diverges from the file on disk. A subsequent `open_document` (which reads from disk) would overwrite the in-buffer changes. Avoid `sync_to_disk=False` unless performing a sequence of edits followed by a single disk write.
+- The `wait_for_processing` heuristic (no new `publishDiagnostics` for 500ms+) can be unreliable: if PIDE takes >500ms between diagnostic batches it may falsely report completion, and if the file has zero diagnostics it will wait until timeout. See API_DESIGN.md Section 3.6 for details.
+- Concurrent edits are not safe: if two `isabelle_edit` calls overlap, the line-range splice may produce incorrect results because both use the same cached content as base. Serialize edit calls.
+
+For protocol details and implementation guidance, see API_DESIGN.md Section 3.6.
+
+---
+
+### 4.4 Session Management Tools
+
+#### 4.4.1 `isabelle_build` 🔨 Destructive
 
 **Description**: Rebuild the session and restart the LSP server. **WARNING: This is destructive and will restart the entire session.**
 
@@ -561,7 +706,7 @@ class BuildResult(BaseModel):
 
 ---
 
-#### 4.3.2 `isabelle_session_info`
+#### 4.4.2 `isabelle_session_info`
 
 **Description**: Get information about the current Isabelle session.
 
@@ -624,10 +769,11 @@ def check_pide_response(response: Any, operation: str, *, allow_none: bool = Fal
 ```python
 INSTRUCTIONS = """## General Rules
 - All line and column numbers are 1-indexed.
-- This MCP does NOT edit files. Use other tools for editing.
+- Use isabelle_edit to modify theory files — changes trigger PIDE reprocessing automatically.
 
 ## Key Tools
 - **isabelle_goal**: Proof state at position. Omit `column` for before/after. MOST IMPORTANT!
+- **isabelle_edit**: Edit theory files with automatic PIDE reprocessing. Supports full replacement or line-range edits.
 - **isabelle_diagnostic_messages**: Compiler errors/warnings. Use after every change.
 - **isabelle_hover_info**: Type signature + docs. Column at START of identifier.
 - **isabelle_completions**: Code completion suggestions.
@@ -638,11 +784,13 @@ INSTRUCTIONS = """## General Rules
 - For hover, use column at the START of the identifier
 
 ## Workflow
-1. Open a theory file in your editor
+1. Open a theory file (automatic on first tool call)
 2. Use isabelle_diagnostic_messages to check for errors
 3. Use isabelle_goal to see proof state
-4. Use isabelle_hover_info to understand symbols
-5. Use isabelle_completions for code assistance
+4. Use isabelle_edit to modify tactics or add lemmas
+5. Check isabelle_diagnostic_messages again to verify changes
+6. Use isabelle_hover_info to understand symbols
+7. Use isabelle_completions for code assistance
 
 ## Return Formats
 All tools return JSON objects (Pydantic models). Lists are wrapped in `items` field.
@@ -656,7 +804,7 @@ Empty list = `{"items": []}`.
 
 ### 7.1 Functional Acceptance
 
-1. ✅ All 10 MCP tools are implemented and functional
+1. ✅ All 11 MCP tools are implemented and functional (including document editing)
 2. ✅ Session initialization works with common logic images (HOL, Pure, Main)
 3. ✅ Standard LSP features (hover, completion, definition) return correct results
 4. ✅ PIDE goal extraction works on simple proof scripts
@@ -692,6 +840,7 @@ Empty list = `{"items": []}`.
 | Goal query | `lean_goal` | `isabelle_goal` | ✅ Same pattern |
 | Optional column | Yes (before/after) | Yes (before/after) | ✅ Same pattern |
 | Diagnostics | `lean_diagnostic_messages` | `isabelle_diagnostic_messages` | ✅ Same pattern |
+| Edit | ❌ (external tool) | `isabelle_edit` | ✅ Built-in edit + reprocess |
 | File outline | `lean_file_outline` | ❌ Not in MVP | LSP doesn't support |
 | Code actions | `lean_code_actions` | ❌ Not in MVP | LSP doesn't support |
 | Hammer | `lean_hammer_premise` | ❌ Not in MVP | Requires command execution |

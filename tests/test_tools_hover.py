@@ -3,8 +3,8 @@ Unit tests for hover tool.
 """
 
 import pytest
+
 from isa_lsp.tools.hover import hover_info
-from isa_lsp.utils import IsabelleToolError
 
 
 class TestHoverTool:

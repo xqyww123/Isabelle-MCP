@@ -5,28 +5,26 @@ This module implements the FastMCP server that provides Isabelle LSP tools
 to AI agents via the Model Context Protocol.
 """
 
-import asyncio
 import logging
-from typing import Optional
 from contextlib import asynccontextmanager
 
 from fastmcp import FastMCP
 
+from isa_lsp.instructions import get_instructions
 from isa_lsp.lsp_client import IsabelleLSPClient
-from isa_lsp.utils import IsabelleToolError
 from isa_lsp.tools import (
-    hover_info,
+    build_session,
+    command_output,
     completions,
     declaration_location,
-    document_highlights,
     diagnostic_messages,
+    document_highlights,
     goal,
-    command_output,
+    hover_info,
     preview_document,
     session_info,
-    build_session,
 )
-from isa_lsp.instructions import get_instructions
+from isa_lsp.utils import IsabelleToolError
 
 # Configure logging
 logging.basicConfig(
@@ -36,7 +34,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Global LSP client instance
-_lsp_client: Optional[IsabelleLSPClient] = None
+_lsp_client: IsabelleLSPClient | None = None
 
 
 @asynccontextmanager
@@ -197,8 +195,8 @@ async def isabelle_highlights(
 @mcp.tool()
 async def isabelle_diagnostics(
     file_path: str,
-    start_line: Optional[int] = None,
-    end_line: Optional[int] = None,
+    start_line: int | None = None,
+    end_line: int | None = None,
     interactive: bool = False,
 ):
     """Get compiler diagnostics (errors, warnings) for file.
@@ -212,8 +210,9 @@ async def isabelle_diagnostics(
     Returns:
         DiagnosticsResult with diagnostics and status
     """
+    client = await _ensure_lsp_started()
     return await diagnostic_messages(
-        _lsp_client, file_path, start_line, end_line, interactive
+        client, file_path, start_line, end_line, interactive
     )
 
 
@@ -225,7 +224,7 @@ async def isabelle_diagnostics(
 async def isabelle_goal(
     file_path: str,
     line: int,
-    column: Optional[int] = None,
+    column: int | None = None,
 ):
     """Get proof goals at position. **MOST IMPORTANT tool - use often!**
 
@@ -268,7 +267,7 @@ async def isabelle_command_output(
 @mcp.tool()
 async def isabelle_preview(
     file_path: str,
-    line: Optional[int] = None,
+    line: int | None = None,
 ):
     """Generate HTML preview of theory content.
 
@@ -295,7 +294,8 @@ async def isabelle_session_info():
     Returns:
         SessionInfo with current session and available sessions
     """
-    return await session_info(_lsp_client)
+    client = await _ensure_lsp_started()
+    return await session_info(client)
 
 
 @mcp.tool()

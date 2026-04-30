@@ -3,14 +3,15 @@ Unit tests for utility modules.
 """
 
 import pytest
+
 from isa_lsp.utils.errors import IsabelleToolError, check_pide_response
-from isa_lsp.utils.uri_utils import file_path_to_uri, uri_to_file_path
-from isa_lsp.utils.positions import mcp_to_lsp_position, lsp_to_mcp_position
 from isa_lsp.utils.formatters import (
-    strip_html_tags,
-    parse_goals_from_html,
     extract_symbol_from_range,
+    parse_goals_from_html,
+    strip_html_tags,
 )
+from isa_lsp.utils.positions import lsp_to_mcp_position, mcp_to_lsp_position
+from isa_lsp.utils.uri_utils import file_path_to_uri, uri_to_file_path
 
 
 class TestErrors:

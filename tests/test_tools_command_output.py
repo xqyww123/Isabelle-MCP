@@ -3,8 +3,8 @@ Unit tests for command_output tool.
 """
 
 import pytest
+
 from isa_lsp.tools.command_output import command_output
-from isa_lsp.utils import IsabelleToolError
 
 
 class TestCommandOutputTool:

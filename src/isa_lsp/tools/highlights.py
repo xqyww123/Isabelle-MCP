@@ -7,12 +7,13 @@ from typing import Annotated
 from pydantic import Field
 
 from isa_lsp.lsp_client import IsabelleLSPClient
-from isa_lsp.models import HighlightsResult, Highlight
+from isa_lsp.models import Highlight, HighlightsResult
 from isa_lsp.utils import (
     IsabelleToolError,
     check_pide_response,
-    mcp_to_lsp_position,
     lsp_to_mcp_position,
+    mcp_to_lsp_position,
+    validate_position,
 )
 
 
@@ -36,11 +37,11 @@ async def document_highlights(
     Raises:
         IsabelleToolError: If document not open or LSP error
     """
-    # Ensure document is open
+    validate_position(line, column)
+
     if file_path not in client.open_documents:
         await client.open_document(file_path)
 
-    # Convert to 0-indexed for LSP
     lsp_line, lsp_col = mcp_to_lsp_position(line, column)
 
     # Call LSP

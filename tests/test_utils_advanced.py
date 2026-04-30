@@ -2,19 +2,21 @@
 Advanced unit tests for utility modules covering edge cases.
 """
 
-import pytest
 from pathlib import Path
-from isa_lsp.utils.errors import IsabelleToolError, check_pide_response
-from isa_lsp.utils.uri_utils import file_path_to_uri, uri_to_file_path
-from isa_lsp.utils.positions import mcp_to_lsp_position, lsp_to_mcp_position
-from isa_lsp.utils.formatters import (
-    strip_html_tags,
-    parse_goals_from_html,
-    extract_symbol_from_range,
-    parse_command_output_html,
-    format_hover_content,
-)
+
+import pytest
+
 from isa_lsp.utils import get_line_from_file
+from isa_lsp.utils.errors import IsabelleToolError, check_pide_response
+from isa_lsp.utils.formatters import (
+    extract_symbol_from_range,
+    format_hover_content,
+    parse_command_output_html,
+    parse_goals_from_html,
+    strip_html_tags,
+)
+from isa_lsp.utils.positions import lsp_to_mcp_position, mcp_to_lsp_position
+from isa_lsp.utils.uri_utils import file_path_to_uri, uri_to_file_path
 
 
 class TestErrorsAdvanced:

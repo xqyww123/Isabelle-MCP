@@ -6,21 +6,20 @@ import pytest
 from pydantic import ValidationError
 
 from isa_lsp.models import (
-    HoverInfo,
+    BuildStatus,
+    CommandOutputResult,
     CompletionItem,
     CompletionsResult,
-    Location,
     DeclarationLocation,
-    Highlight,
-    HighlightsResult,
     DiagnosticMessage,
     DiagnosticsResult,
     GoalState,
+    Highlight,
+    HoverInfo,
+    Location,
     OutputMessage,
-    CommandOutputResult,
     PreviewResult,
     SessionInfo,
-    BuildStatus,
 )
 
 

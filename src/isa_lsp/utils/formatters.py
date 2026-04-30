@@ -2,9 +2,9 @@
 Response formatting utilities for parsing PIDE output.
 """
 
-import re
 import html as html_module
-from typing import List, Any
+import re
+from typing import Any
 
 
 def strip_html_tags(html: str) -> str:
@@ -35,7 +35,7 @@ def strip_html_tags(html: str) -> str:
     return text.strip()
 
 
-def parse_goals_from_html(html: str) -> List[str]:
+def parse_goals_from_html(html: str) -> list[str]:
     """Extract goal text from PIDE HTML output.
 
     Args:
@@ -92,7 +92,7 @@ def parse_goals_from_html(html: str) -> List[str]:
     return goals
 
 
-def parse_command_output_html(html: str) -> List[dict]:
+def parse_command_output_html(html: str) -> list[dict]:
     """Parse PIDE dynamic output HTML into structured messages.
 
     Args:
@@ -153,13 +153,13 @@ def get_line_from_file(file_path: str, line: int) -> str:
         'theory Example imports Main begin'
     """
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
+        with open(file_path, encoding='utf-8') as f:
             lines = f.readlines()
             if 1 <= line <= len(lines):
                 return lines[line - 1].rstrip('\n')
             else:
                 return ""
-    except (FileNotFoundError, IOError):
+    except (OSError, FileNotFoundError):
         return ""
 
 
@@ -217,7 +217,7 @@ def extract_symbol_from_lsp_range(
         end_line = end['line']
         end_char = end['character']
 
-        with open(file_path, 'r', encoding='utf-8') as f:
+        with open(file_path, encoding='utf-8') as f:
             lines = f.readlines()
 
         # Single line range
@@ -243,8 +243,16 @@ def extract_symbol_from_lsp_range(
 
         return ''.join(result).strip()
 
-    except (KeyError, FileNotFoundError, IOError, IndexError):
+    except (OSError, KeyError, FileNotFoundError, IndexError):
         return ""
+
+
+_SEVERITY_MAP = {1: "error", 2: "warning", 3: "information", 4: "hint"}
+
+
+def severity_int_to_string(severity: int) -> str:
+    """Convert LSP severity enum (1=Error, 2=Warning, 3=Information, 4=Hint) to string."""
+    return _SEVERITY_MAP.get(severity, "error")
 
 
 def format_hover_content(contents: Any) -> str:

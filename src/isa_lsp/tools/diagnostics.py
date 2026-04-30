@@ -2,25 +2,25 @@
 Diagnostics tool implementation.
 """
 
-from typing import Annotated, Optional
+from typing import Annotated
 
 from pydantic import Field
 
 from isa_lsp.lsp_client import IsabelleLSPClient
-from isa_lsp.models import DiagnosticsResult, DiagnosticMessage
+from isa_lsp.models import DiagnosticMessage, DiagnosticsResult
 from isa_lsp.utils import (
-    IsabelleToolError,
     lsp_to_mcp_position,
+    severity_int_to_string,
 )
 
 
 async def diagnostic_messages(
     client: IsabelleLSPClient,
     file_path: Annotated[str, Field(description="Absolute path to .thy file")],
-    start_line: Annotated[Optional[int], Field(
+    start_line: Annotated[int | None, Field(
         description="Filter diagnostics from this line (1-indexed)", ge=1
     )] = None,
-    end_line: Annotated[Optional[int], Field(
+    end_line: Annotated[int | None, Field(
         description="Filter diagnostics to this line (1-indexed)", ge=1
     )] = None,
     interactive: Annotated[bool, Field(
@@ -114,14 +114,7 @@ def _parse_diagnostic(diag: dict) -> DiagnosticMessage:
         end.get("character", 0)
     )
 
-    # Map severity enum to string
-    severity_mapping = {
-        1: "error",
-        2: "warning",
-        3: "information",
-        4: "hint",
-    }
-    severity = severity_mapping.get(diag.get("severity", 1), "error")
+    severity = severity_int_to_string(diag.get("severity", 1))
 
     return DiagnosticMessage(
         severity=severity,

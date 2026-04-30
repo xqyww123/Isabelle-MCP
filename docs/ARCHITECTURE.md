@@ -33,7 +33,7 @@ Isa-LSP is a Python-based MCP (Model Context Protocol) server that acts as a bri
 │  └────────────┬─────────────────────────────────────────┘   │
 │               │                                              │
 │  ┌────────────▼─────────────────────────────────────────┐   │
-│  │  MCP Tool Handlers (10 tools)                        │   │
+│  │  MCP Tool Handlers (11 tools)                        │   │
 │  │  - isabelle_hover_info                               │   │
 │  │  - isabelle_completions                              │   │
 │  │  - isabelle_declaration_location                     │   │
@@ -42,6 +42,7 @@ Isa-LSP is a Python-based MCP (Model Context Protocol) server that acts as a bri
 │  │  - isabelle_goal                                     │   │
 │  │  - isabelle_command_output                           │   │
 │  │  - isabelle_preview                                  │   │
+│  │  - isabelle_edit (NEW — dynamic document editing)    │   │
 │  │  - isabelle_build                                    │   │
 │  │  - isabelle_session_info                            │   │
 │  └────────────┬─────────────────────────────────────────┘   │
@@ -74,6 +75,7 @@ Isa-LSP is a Python-based MCP (Model Context Protocol) server that acts as a bri
 │  - Standard LSP methods (hover, completion, definition, etc.)│
 │  - PIDE extensions (state panels, dynamic output, preview)   │
 │  - Document processing and incremental type checking         │
+│  - Document sync: Incremental (textDocumentSync = 2)         │
 │  - Session management (logic images, build system)           │
 └────────────────┬────────────────────────────────────────────┘
                  │
@@ -178,6 +180,9 @@ class IsabelleLSPClient:
 
     async def open_document(self, file_path: str, content: str = None):
         """Open document in LSP session"""
+
+    async def change_document(self, file_path: str, new_content: str):
+        """Send textDocument/didChange with full content (triggers PIDE reprocessing)"""
 
     async def close_document(self, file_path: str):
         """Close document in LSP session"""
@@ -450,7 +455,51 @@ class DocumentManager:
 
 ---
 
-### 2.6 Diagnostic Caching
+### 2.6 Document Editing and Dynamic Reprocessing
+
+**Challenge:** Enable AI agents to edit theory files and have Isabelle incrementally reprocess changes — the same workflow as editing in Isabelle/VSCode.
+
+**Protocol Background:**
+Isabelle's `vscode_server` reports `textDocumentSync = 2` (Incremental per LSP spec). However, a client can always send full content replacement even when the server announces Incremental support — the LSP spec guarantees this fallback. We use full content replacement for simplicity. After receiving a `textDocument/didChange`:
+
+1. **Input debounce** (100ms `vscode_input_delay`): rapid edits are batched via `Delay.last()`
+2. **Flush to PIDE**: pending edits converted to `Document.Edit_Text` and sent to the prover via `session.update()`
+3. **Incremental reprocessing**: PIDE reprocesses only affected commands in the document
+4. **Output debounce** (500ms `vscode_output_delay`): updated diagnostics pushed via `textDocument/publishDiagnostics`
+
+**Solution:** Two new methods on `IsabelleLSPClient` (`change_document`, `wait_for_processing`) + `isabelle_edit` MCP tool. For implementation details and code, see API_DESIGN.md Section 3.6 and Section 4.4.
+
+**Component Interactions:**
+
+```
+isabelle_edit MCP tool
+    │
+    ├─→ Edit Tool Handler (tools/edit.py)
+    │   ├─→ Computes full new content (from line-range or full replacement)
+    │   ├─→ Calls IsabelleLSPClient.change_document()
+    │   ├─→ Optionally writes to disk
+    │   └─→ Calls IsabelleLSPClient.wait_for_processing()
+    │
+    ├─→ IsabelleLSPClient (lsp_client.py)
+    │   ├─→ Manages DocumentState (version, content cache)
+    │   ├─→ Sends textDocument/didChange notification
+    │   └─→ Monitors DiagnosticCache for processing completion
+    │
+    └─→ DiagnosticCache (lsp_client.py)
+        └─→ Updated by publishDiagnostics notifications from vscode_server
+```
+
+**Key Design Decisions:**
+
+- **Full sync** (not incremental): Isabelle's `vscode_server` accepts both. Full sync is simpler and avoids offset computation bugs. The server internally computes diffs from the new content.
+- **Disk sync**: By default, also write to disk so that `git`, other editors, and external tools see consistent state. When `sync_to_disk=False`, the LSP buffer diverges from disk — a subsequent `open_document` (which reads from disk) would overwrite in-buffer changes.
+- **Wait for processing**: By default, wait for PIDE to finish so the returned diagnostics reflect the new state. Can be disabled for batch edits.
+- **Cache invalidation**: After an edit, all previously cached tool results (goals, hover, etc.) for that document are stale. The tool does not invalidate them automatically — callers must re-query.
+- **No concurrent edit safety**: Line-range edits splice against the cached content. Overlapping edit calls can produce incorrect results. Callers must serialize edits to the same document.
+
+---
+
+### 2.7 Diagnostic Caching
 
 **Challenge:** Diagnostics are sent via async notifications, but tools need synchronous access
 
@@ -616,7 +665,46 @@ AI Agent calls isabelle_goal(file, line)
          └─→ Return GoalState model
 ```
 
-### 4.3 Shutdown Flow
+### 4.3 Edit Tool Call Flow
+
+```
+AI Agent calls isabelle_edit(file, start_line=42, end_line=42, new_text="  by simp")
+         │
+         ├─→ MCP Server validates input
+         │   (exactly one of new_content or start_line/end_line/new_text)
+         │
+         ├─→ Get LSP client from context
+         │
+         ├─→ Ensure document is open
+         │   │
+         │   └─→ If not: send textDocument/didOpen, wait for initial processing
+         │
+         ├─→ Compute new full content
+         │   │
+         │   ├─→ If new_content provided: use directly
+         │   └─→ If line range provided: splice new_text into current content
+         │
+         ├─→ Send textDocument/didChange
+         │   │
+         │   ├─→ Increment document version
+         │   ├─→ Update DocumentState.content cache
+         │   └─→ Send notification with full new content
+         │
+         ├─→ (Optional) Write to disk
+         │
+         ├─→ Wait for PIDE reprocessing
+         │   │
+         │   ├─→ Server debounces input (100ms)
+         │   ├─→ PIDE processes changes incrementally
+         │   ├─→ Server pushes publishDiagnostics (debounced 500ms)
+         │   └─→ Client detects processing complete (no updates for 500ms+)
+         │
+         ├─→ Collect diagnostics from cache
+         │
+         └─→ Return EditResult(success, version, diagnostics, processing_complete)
+```
+
+### 4.4 Shutdown Flow
 
 ```
 User calls isabelle_shutdown_session() OR
@@ -837,28 +925,33 @@ pip install -e .
 
 ### 10.1 Command Execution Framework
 
-For Phase 2 features (sledgehammer, find_theorems, try methods):
+For Phase 2 features (sledgehammer, find_theorems, try methods).
+
+Now that `isabelle_edit` provides the `change_document` + `wait_for_processing` foundation, the command execution framework can build on top of it:
 
 **Architecture:**
 ```python
 class CommandExecutor:
-    """Execute Isabelle commands by injecting into theory files"""
+    """Execute Isabelle commands by injecting into theory files.
+
+    Built on top of change_document() from the document editing layer.
+    """
 
     async def execute_command(
         self,
+        client: IsabelleLSPClient,
         file_path: str,
         line: int,
         command: str,
         timeout: float = 30.0
     ) -> CommandResult:
         """
-        1. Read file content
-        2. Insert command at position
-        3. Send didChange
-        4. Wait for diagnostics/output
-        5. Parse results
-        6. Restore original content
-        7. Return structured result
+        1. Save original content from DocumentState
+        2. Inject command at position via change_document()
+        3. Wait for PIDE reprocessing via wait_for_processing()
+        4. Parse command_output / diagnostics for results
+        5. Restore original content via change_document()
+        6. Return structured result
         """
 ```
 
@@ -989,6 +1082,60 @@ State Panel Manager
    │ Extract goal text, strip formatting
    │
    │ Return: GoalState(goals_before=["P x"], goals_after=[], ...)
+   ▼
+AI Agent
+```
+
+### A.3 Document Edit + Reprocessing
+
+```
+AI Agent
+   │ MCP: isabelle_edit(file, start_line=42, end_line=42, new_text="  by simp")
+   │
+   ▼
+MCP Server
+   │ Validate input (line-range mode)
+   │ Ensure document open
+   │
+   ▼
+Edit Tool Handler
+   │ Read current content from DocumentState cache
+   │ Splice new_text into lines 42..42
+   │ Compute full new content
+   │
+   │ JSON-RPC: {"method": "textDocument/didChange",
+   │            "params": {"textDocument": {"uri": "file://...", "version": 2},
+   │                      "contentChanges": [{"text": "<full new content>"}]}}
+   ▼
+isabelle vscode_server
+   │ Receive didChange
+   │ Store as pending_edits
+   │ Debounce (100ms vscode_input_delay)
+   │ Flush pending_edits to PIDE
+   │
+   ▼
+Isabelle PIDE
+   │ Incremental reprocessing
+   │ (only reprocesses affected commands)
+   │
+   │ JSON-RPC: {"method": "textDocument/publishDiagnostics",
+   │            "params": {"uri": "file://...", "diagnostics": [...]}}
+   │ (debounced 500ms vscode_output_delay)
+   ▼
+LSP Client (read loop)
+   │ Cache updated diagnostics
+   │ Update last_update timestamp
+   │
+   ▼
+Edit Tool Handler
+   │ Write new content to disk (sync_to_disk=true)
+   │ Poll: wait until is_processing_complete() → true
+   │   (no new diagnostics for 500ms+)
+   │
+   │ Collect diagnostics from cache
+   │ Compute success = (no errors)
+   │
+   │ Return: EditResult(success=true, version=2, diagnostics=[], ...)
    ▼
 AI Agent
 ```

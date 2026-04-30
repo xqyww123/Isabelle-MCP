@@ -2,17 +2,19 @@
 Code completion tool implementation.
 """
 
-from typing import Annotated
+import re
+from typing import Annotated, Any
 
 from pydantic import Field
 
 from isa_lsp.lsp_client import IsabelleLSPClient
-from isa_lsp.models import CompletionsResult, CompletionItem
+from isa_lsp.models import CompletionItem, CompletionsResult
 from isa_lsp.utils import (
     IsabelleToolError,
     check_pide_response,
-    mcp_to_lsp_position,
     get_line_from_file,
+    mcp_to_lsp_position,
+    validate_position,
 )
 
 
@@ -40,14 +42,13 @@ async def completions(
     Raises:
         IsabelleToolError: If document not open or LSP error
     """
-    # Ensure document is open
+    validate_position(line, column)
+
     if file_path not in client.open_documents:
         await client.open_document(file_path)
 
-    # Convert to 0-indexed for LSP
     lsp_line, lsp_col = mcp_to_lsp_position(line, column)
 
-    # Call LSP
     try:
         response = await client.get_completions(file_path, lsp_line, lsp_col)
         check_pide_response(response, "get_completions", allow_none=True)
@@ -132,15 +133,8 @@ def _parse_completion_item(item: dict) -> CompletionItem:
     )
 
 
-def _extract_documentation(doc: any) -> str:
-    """Extract documentation string from various formats.
-
-    Args:
-        doc: Documentation in various LSP formats
-
-    Returns:
-        Documentation string
-    """
+def _extract_documentation(doc: Any) -> str | None:
+    """Extract documentation string from various formats."""
     if doc is None:
         return None
     elif isinstance(doc, str):
@@ -162,11 +156,7 @@ def _extract_prefix(line: str, column: int) -> str:
     Returns:
         Prefix string (lowercase)
     """
-    # Get text before cursor
     text_before = line[:column - 1] if column <= len(line) + 1 else line
-
-    # Extract last word
-    import re
     words = re.split(r'[\s()\[\]{},:;.]+', text_before)
     prefix = words[-1] if words else ""
 

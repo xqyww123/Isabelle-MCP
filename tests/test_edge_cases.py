@@ -2,10 +2,9 @@
 Edge cases and error handling tests.
 """
 
-import pytest
 import asyncio
-from pathlib import Path
-from unittest.mock import AsyncMock, patch
+
+import pytest
 
 from isa_lsp.utils import IsabelleToolError
 
@@ -58,9 +57,9 @@ class TestConcurrency:
     @pytest.mark.asyncio
     async def test_concurrent_different_tools(self, mock_lsp_client, temp_theory_file):
         """Test concurrent requests to different tools."""
-        from isa_lsp.tools.hover import hover_info
         from isa_lsp.tools.completions import completions
         from isa_lsp.tools.diagnostics import diagnostic_messages
+        from isa_lsp.tools.hover import hover_info
 
         mock_lsp_client.hover_response = {"contents": "test"}
         mock_lsp_client.completion_response = {"items": []}
@@ -146,29 +145,24 @@ class TestInvalidInput:
     async def test_negative_line_number(self, mock_lsp_client, temp_theory_file):
         """Test tools with negative line number."""
         from isa_lsp.tools.hover import hover_info
-        from pydantic import ValidationError
 
-        # Pydantic should validate and reject
-        with pytest.raises((ValidationError, ValueError, IsabelleToolError)):
+        with pytest.raises(IsabelleToolError, match="line must be >= 1"):
             await hover_info(mock_lsp_client, temp_theory_file, -1, 1)
 
     @pytest.mark.asyncio
     async def test_zero_line_number(self, mock_lsp_client, temp_theory_file):
         """Test tools with zero line number."""
         from isa_lsp.tools.hover import hover_info
-        from pydantic import ValidationError
 
-        # Line numbers should be >= 1
-        with pytest.raises((ValidationError, ValueError, IsabelleToolError)):
+        with pytest.raises(IsabelleToolError, match="line must be >= 1"):
             await hover_info(mock_lsp_client, temp_theory_file, 0, 1)
 
     @pytest.mark.asyncio
     async def test_negative_column_number(self, mock_lsp_client, temp_theory_file):
         """Test tools with negative column number."""
         from isa_lsp.tools.hover import hover_info
-        from pydantic import ValidationError
 
-        with pytest.raises((ValidationError, ValueError, IsabelleToolError)):
+        with pytest.raises(IsabelleToolError, match="column must be >= 1"):
             await hover_info(mock_lsp_client, temp_theory_file, 1, -1)
 
     @pytest.mark.asyncio
@@ -205,8 +199,9 @@ class TestModelValidation:
 
     def test_hover_info_invalid_data(self):
         """Test HoverInfo with invalid data."""
-        from isa_lsp.models import HoverInfo
         from pydantic import ValidationError
+
+        from isa_lsp.models import HoverInfo
 
         # Missing required fields
         with pytest.raises(ValidationError):
@@ -218,8 +213,9 @@ class TestModelValidation:
 
     def test_location_invalid_line(self):
         """Test Location with invalid line number."""
-        from isa_lsp.models import Location
         from pydantic import ValidationError
+
+        from isa_lsp.models import Location
 
         # Line must be >= 1
         with pytest.raises(ValidationError):
@@ -227,8 +223,9 @@ class TestModelValidation:
 
     def test_location_invalid_column(self):
         """Test Location with invalid column number."""
-        from isa_lsp.models import Location
         from pydantic import ValidationError
+
+        from isa_lsp.models import Location
 
         # Column must be >= 1
         with pytest.raises(ValidationError):

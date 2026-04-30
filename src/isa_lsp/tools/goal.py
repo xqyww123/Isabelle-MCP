@@ -4,8 +4,8 @@ Proof goal state tool implementation - MOST IMPORTANT TOOL.
 This tool uses PIDE state panels to query proof goals at a position.
 """
 
-import asyncio
-from typing import Annotated, Optional, Dict
+import logging
+from typing import Annotated
 
 from pydantic import Field
 
@@ -14,21 +14,17 @@ from isa_lsp.models import GoalState
 from isa_lsp.utils import (
     IsabelleToolError,
     file_path_to_uri,
-    parse_goals_from_html,
     get_line_from_file,
 )
 
-
-# Global state panel manager
-_state_panels: Dict[int, asyncio.Future] = {}
-_next_panel_id = 1
+logger = logging.getLogger(__name__)
 
 
 async def goal(
     client: IsabelleLSPClient,
     file_path: Annotated[str, Field(description="Absolute path to .thy file")],
     line: Annotated[int, Field(description="Line number (1-indexed)", ge=1)],
-    column: Annotated[Optional[int], Field(
+    column: Annotated[int | None, Field(
         description="Column number (1-indexed). Omit to see before/after tactic transformation.",
         ge=1
     )] = None,
@@ -116,33 +112,8 @@ async def _query_goals_at_position(
 
     Raises:
         IsabelleToolError: On timeout or PIDE error
-
-    Note:
-        This is a simplified implementation. A full implementation would:
-        1. Send PIDE/state_init to create panel
-        2. Send PIDE/caret_update to set position
-        3. Wait for PIDE/state_output notification
-        4. Parse HTML to extract goals
-        5. Send PIDE/state_exit to close panel
-
-        For MVP, we use a simplified approach that relies on the LSP client
-        handling PIDE notifications in the background.
     """
-    global _next_panel_id
-
-    # For MVP: We'll use a simplified approach
-    # In a full implementation, we would:
-    # - Register a handler for PIDE/state_output in the LSP client
-    # - Send state_init, caret_update, wait for output, state_exit
-
-    # Simplified approach: Send caret update and hope for the best
-    # This is a limitation of the MVP - proper implementation requires
-    # extending lsp_client.py with PIDE state panel support
-
-    # TODO: Implement proper state panel mechanism
-    # For now, return a placeholder indicating this needs full implementation
-
-    # Send caret update (this might trigger state updates, but we can't receive them yet)
+    # MVP stub: send caret update but cannot receive PIDE/state_output yet
     try:
         await client.notify("PIDE/caret_update", {
             "uri": uri,
@@ -152,60 +123,5 @@ async def _query_goals_at_position(
     except Exception as e:
         raise IsabelleToolError(f"Failed to update caret: {e}")
 
-    # In MVP, we can't get the actual goals without proper notification handling
-    # Return empty list for now
-    # NOTE: This tool will not work until we implement proper PIDE state panel support
-    # in lsp_client.py
-
-    # Placeholder warning
-    import logging
-    logger = logging.getLogger(__name__)
-    logger.warning(
-        "PIDE state panel support not fully implemented in MVP. "
-        "Goal queries will not return actual goals. "
-        "Full implementation requires extending lsp_client.py with state panel handlers."
-    )
-
-    return []  # TODO: Return actual goals when state panel support is added
-
-
-# ============================================================================
-# NOTE: Full implementation of state panel support
-# ============================================================================
-#
-# To properly implement this tool, we need to extend lsp_client.py with:
-#
-# 1. State panel management:
-#    class StatePanelManager:
-#        def __init__(self):
-#            self.panels: Dict[int, asyncio.Future] = {}
-#            self.next_id = 1
-#
-#        async def create_panel(self, client, uri, line, char):
-#            panel_id = self.next_id
-#            self.next_id += 1
-#            future = asyncio.Future()
-#            self.panels[panel_id] = future
-#
-#            await client.notify("PIDE/state_init", {})
-#            await client.notify("PIDE/caret_update", {
-#                "uri": uri, "line": line, "character": char
-#            })
-#
-#            html = await asyncio.wait_for(future, timeout=5.0)
-#            await client.notify("PIDE/state_exit", {"id": panel_id})
-#
-#            return parse_goals_from_html(html)
-#
-#        def handle_state_output(self, panel_id, html):
-#            if panel_id in self.panels:
-#                self.panels[panel_id].set_result(html)
-#
-# 2. In lsp_client._handle_notification:
-#    elif method == "PIDE/state_output":
-#        panel_id = params.get("id")
-#        html = params.get("content", "")
-#        if hasattr(self, 'state_panel_manager'):
-#            self.state_panel_manager.handle_state_output(panel_id, html)
-#
-# This is left for future enhancement beyond MVP.
+    logger.warning("PIDE state panel not implemented; goal query returns empty list")
+    return []

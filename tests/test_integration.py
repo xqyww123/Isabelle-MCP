@@ -5,9 +5,9 @@ These tests require a running Isabelle installation.
 Mark as integration tests to allow selective execution.
 """
 
-import pytest
 import asyncio
-from pathlib import Path
+
+import pytest
 
 from isa_lsp.lsp_client import IsabelleLSPClient
 from isa_lsp.utils import IsabelleToolError
@@ -29,7 +29,7 @@ class TestLSPClientIntegration:
     async def test_lsp_client_startup(self, lsp_client):
         """Test that LSP client starts successfully."""
         assert lsp_client.process is not None
-        assert lsp_client.initialized is True
+        assert lsp_client.process.returncode is None
 
     @pytest.mark.asyncio
     async def test_open_document(self, lsp_client, tmp_path):
@@ -227,7 +227,7 @@ class TestErrorHandling:
                 1
             )
             # Should raise error or handle gracefully
-        except (IsabelleToolError, FileNotFoundError, Exception) as e:
+        except (IsabelleToolError, FileNotFoundError, Exception):
             # Expected to fail
             assert True
         finally:

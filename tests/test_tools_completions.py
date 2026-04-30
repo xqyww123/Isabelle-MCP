@@ -3,8 +3,8 @@ Unit tests for completions tool.
 """
 
 import pytest
+
 from isa_lsp.tools.completions import completions
-from isa_lsp.utils import IsabelleToolError
 
 
 class TestCompletionsTool:

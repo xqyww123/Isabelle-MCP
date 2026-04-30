@@ -5,10 +5,19 @@ MCP tools use 1-indexed positions (line 1, column 1 = first character)
 LSP uses 0-indexed positions (line 0, character 0 = first character)
 """
 
-from typing import Tuple
+
+from isa_lsp.utils.errors import IsabelleToolError
 
 
-def mcp_to_lsp_position(line: int, column: int) -> Tuple[int, int]:
+def validate_position(line: int, column: int) -> None:
+    """Validate that line and column are >= 1."""
+    if line < 1:
+        raise IsabelleToolError(f"line must be >= 1, got {line}")
+    if column < 1:
+        raise IsabelleToolError(f"column must be >= 1, got {column}")
+
+
+def mcp_to_lsp_position(line: int, column: int) -> tuple[int, int]:
     """Convert MCP position (1-indexed) to LSP position (0-indexed).
 
     Args:
@@ -28,7 +37,7 @@ def mcp_to_lsp_position(line: int, column: int) -> Tuple[int, int]:
     return (line - 1, column - 1)
 
 
-def lsp_to_mcp_position(line: int, character: int) -> Tuple[int, int]:
+def lsp_to_mcp_position(line: int, character: int) -> tuple[int, int]:
     """Convert LSP position (0-indexed) to MCP position (1-indexed).
 
     Args:

@@ -3,8 +3,8 @@ Unit tests for diagnostics tool.
 """
 
 import pytest
+
 from isa_lsp.tools.diagnostics import diagnostic_messages
-from isa_lsp.utils import IsabelleToolError
 
 
 class TestDiagnosticsTool:

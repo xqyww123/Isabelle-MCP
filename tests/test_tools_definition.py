@@ -3,8 +3,8 @@ Unit tests for definition tool.
 """
 
 import pytest
+
 from isa_lsp.tools.definition import declaration_location
-from isa_lsp.utils import IsabelleToolError
 
 
 class TestDefinitionTool:

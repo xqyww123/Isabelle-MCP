@@ -3,8 +3,8 @@ Unit tests for goal tool.
 """
 
 import pytest
+
 from isa_lsp.tools.goal import goal
-from isa_lsp.utils import IsabelleToolError
 
 
 class TestGoalTool:
@@ -111,7 +111,7 @@ class TestGoalTool:
     async def test_goal_column_at_line_end(self, mock_lsp_client, temp_theory_file):
         """Test goal with column at line end."""
         # Get line content to find end
-        with open(temp_theory_file, 'r') as f:
+        with open(temp_theory_file) as f:
             lines = f.readlines()
             line_length = len(lines[4])  # Line 5 (0-indexed)
 

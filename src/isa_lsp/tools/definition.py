@@ -2,6 +2,7 @@
 Go to definition tool implementation.
 """
 
+import re
 from typing import Annotated
 
 from pydantic import Field
@@ -11,10 +12,10 @@ from isa_lsp.models import DeclarationLocation, Location
 from isa_lsp.utils import (
     IsabelleToolError,
     check_pide_response,
-    mcp_to_lsp_position,
     lsp_to_mcp_position,
+    mcp_to_lsp_position,
     uri_to_file_path,
-    extract_symbol_from_range,
+    validate_position,
 )
 
 
@@ -38,14 +39,13 @@ async def declaration_location(
     Raises:
         IsabelleToolError: If document not open or LSP error
     """
-    # Ensure document is open
+    validate_position(line, column)
+
     if file_path not in client.open_documents:
         await client.open_document(file_path)
 
-    # Convert to 0-indexed for LSP
     lsp_line, lsp_col = mcp_to_lsp_position(line, column)
 
-    # Call LSP
     try:
         response = await client.get_definition(file_path, lsp_line, lsp_col)
         check_pide_response(response, "get_definition", allow_none=True)
@@ -132,16 +132,13 @@ def _extract_symbol_at_position(file_path: str, line: int, column: int) -> str:
         Symbol text
     """
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
+        with open(file_path, encoding='utf-8') as f:
             lines = f.readlines()
 
         if line < 1 or line > len(lines):
             return ""
 
         line_content = lines[line - 1]
-
-        # Extract word at column
-        import re
 
         # Find word boundaries
         # Isabelle identifiers can include: letters, digits, _, ., '
