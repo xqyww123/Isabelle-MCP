@@ -306,17 +306,32 @@ class TestIsabelleLSPClient:
         assert 7 not in client._state_output_waiters
 
     @pytest.mark.asyncio
+    async def test_handle_state_output_resolves_init_waiter_with_server_id(self):
+        """Test PIDE/state_output teaches the server-assigned state panel id."""
+        client = IsabelleLSPClient()
+        future = asyncio.get_running_loop().create_future()
+        client._state_init_waiters.append(future)
+
+        client._handle_state_output({"id": 42, "content": "<pre>1. P</pre>"})
+
+        assert future.done()
+        assert future.result() == (42, "<pre>1. P</pre>")
+        assert client._state_init_waiters == []
+
+    @pytest.mark.asyncio
     async def test_handle_dynamic_output_caches_and_resolves_waiter(self):
         """Test PIDE/dynamic_output updates cache and notifies waiters."""
         client = IsabelleLSPClient()
         future = asyncio.get_running_loop().create_future()
-        client._dynamic_output_waiters.append(future)
+        key = ("/tmp/Test.thy", 3, 0)
+        client._dynamic_output_waiters.append((key, future))
 
         client._handle_dynamic_output({"content": "<div class='writeln'>ok</div>"})
 
         assert future.done()
         assert future.result() == "<div class='writeln'>ok</div>"
         assert client._dynamic_output_cache == "<div class='writeln'>ok</div>"
+        assert client._dynamic_output_cache_by_position[key] == "<div class='writeln'>ok</div>"
 
     @pytest.mark.asyncio
     async def test_handle_preview_response_resolves_matching_waiter(self):
@@ -334,6 +349,40 @@ class TestIsabelleLSPClient:
         assert future.done()
         assert future.result()["content"] == "<html>Preview</html>"
         assert ("file:///tmp/Test.thy", 0) not in client._preview_waiters
+
+    @pytest.mark.asyncio
+    async def test_get_goals_at_position_uses_server_assigned_state_id(self):
+        """Test state query learns and exits the server-assigned panel id."""
+        client = IsabelleLSPClient()
+        calls = []
+
+        async def fake_notify(method, params):
+            calls.append((method, params))
+            if method == "PIDE/state_init":
+                client._handle_state_output({"id": 99, "content": "<pre>1. P</pre>"})
+
+        client.notify = AsyncMock(side_effect=fake_notify)
+
+        goals = await client.get_goals_at_position("/tmp/Test.thy", 7, 3)
+
+        assert goals == ["P"]
+        assert calls[0][0] == "PIDE/caret_update"
+        assert calls[1] == ("PIDE/state_init", {})
+        assert calls[-1] == ("PIDE/state_exit", {"id": 99})
+
+    @pytest.mark.asyncio
+    async def test_dynamic_output_timeout_does_not_reuse_other_position_cache(self):
+        """Test command output does not return stale content from another position."""
+        client = IsabelleLSPClient()
+        client.notify = AsyncMock()
+        client._dynamic_output_cache = "<div class='writeln'>old</div>"
+        client._dynamic_output_cache_by_position[("/tmp/Other.thy", 1, 0)] = (
+            "<div class='writeln'>old</div>"
+        )
+
+        result = await client.get_dynamic_output("/tmp/Test.thy", 1, timeout=0.01)
+
+        assert result == ""
 
     def test_uri_conversion(self):
         """Test file path to URI conversion in client."""

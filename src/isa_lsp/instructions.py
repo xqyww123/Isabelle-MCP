@@ -137,21 +137,28 @@ for item in completions.items:
 
 ### MVP Limitations
 
-The following features have limited functionality in this MVP:
+The following features are implemented, but have protocol-level reliability
+limits because Isabelle exposes them as asynchronous PIDE notifications:
 
-1. **isabelle_goal**: Returns empty goals (PIDE state panel not fully implemented)
-   - Full implementation requires state panel handler in LSP client
-   - See goal.py for implementation notes
+1. **isabelle_goal**:
+   - Uses `PIDE/state_init`, `PIDE/caret_update`, `PIDE/state_output`, and
+     `PIDE/state_exit`
+   - Waits for Isabelle's server-assigned state panel id
+   - Goal parsing from HTML is heuristic, and `context` is currently `None`
+   - May timeout if no proof-state output is available at the requested position
 
-2. **isabelle_command_output**: Returns empty messages (dynamic output cache not implemented)
-   - Full implementation requires caching PIDE/dynamic_output notifications
-   - See command_output.py for implementation notes
+2. **isabelle_command_output**:
+   - Uses `PIDE/dynamic_output`
+   - Isabelle's notification contains only HTML content, not file/line metadata
+   - The client serializes these queries and avoids reusing output from another
+     requested position; no fresh output means an empty message list
 
-3. **isabelle_preview**: Returns empty HTML (preview response handler not implemented)
-   - Full implementation requires preview notification handler
-   - See preview.py for implementation notes
+3. **isabelle_preview**:
+   - Uses `PIDE/preview_request` and waits for a matching `PIDE/preview_response`
+   - May timeout if Isabelle does not generate preview content for the file
 
-These limitations will be addressed in future versions beyond MVP.
+There is no `isabelle_edit` tool in the current server. Modify files with your
+normal editor or filesystem tools, then use diagnostics/goals to re-check.
 
 ### Session Configuration
 
@@ -184,6 +191,8 @@ except IsabelleToolError as e:
 3. **Provide absolute file paths** for all operations
 4. **Wait for processing** to complete before complex queries
 5. **Handle errors** gracefully with try/except blocks
+6. **Treat PIDE goal/output/preview as best-effort** and fall back to diagnostics
+   when a PIDE notification times out
 
 ## Getting Help
 

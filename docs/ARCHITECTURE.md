@@ -2,7 +2,12 @@
 
 **Version:** 0.1.0
 **Date:** 2026-03-07
-**Status:** Draft
+**Status:** Draft with current implementation notes
+
+> Documentation reliability note:
+> The current server exposes 10 MCP tools. Older architecture notes in this
+> document mention `isabelle_edit` and 11 tools as a design direction; that tool
+> is not registered in the current codebase.
 
 ## 1. Overview
 
@@ -33,16 +38,15 @@ Isa-LSP is a Python-based MCP (Model Context Protocol) server that acts as a bri
 │  └────────────┬─────────────────────────────────────────┘   │
 │               │                                              │
 │  ┌────────────▼─────────────────────────────────────────┐   │
-│  │  MCP Tool Handlers (11 tools)                        │   │
-│  │  - isabelle_hover_info                               │   │
+│  │  MCP Tool Handlers (10 tools)                        │   │
+│  │  - isabelle_hover                                    │   │
 │  │  - isabelle_completions                              │   │
-│  │  - isabelle_declaration_location                     │   │
-│  │  - isabelle_document_highlights                      │   │
-│  │  - isabelle_diagnostic_messages                      │   │
+│  │  - isabelle_definition                               │   │
+│  │  - isabelle_highlights                               │   │
+│  │  - isabelle_diagnostics                              │   │
 │  │  - isabelle_goal                                     │   │
 │  │  - isabelle_command_output                           │   │
 │  │  - isabelle_preview                                  │   │
-│  │  - isabelle_edit (NEW — dynamic document editing)    │   │
 │  │  - isabelle_build                                    │   │
 │  │  - isabelle_session_info                            │   │
 │  └────────────┬─────────────────────────────────────────┘   │
@@ -327,84 +331,44 @@ async def _read_loop(self):
 
 ### 2.4 PIDE State Panel Management
 
-**Challenge:** PIDE state panels are asynchronous - you send `PIDE/state_init`, update caret, then wait for `PIDE/state_output` notifications.
+**Challenge:** PIDE state panels are asynchronous. Isabelle2024 defines
+`PIDE/state_init` as a notification with no parameters; the server assigns the
+state panel id and reports it in the next `PIDE/state_output` notification.
+The client must update the caret, initialize a panel, learn the server id from
+`state_output`, and use that id for `PIDE/state_exit`.
 
 **Solution:** State machine for panel lifecycle
 
 ```python
 class StatePanelManager:
     def __init__(self):
-        self.panels: Dict[int, StatePanel] = {}
-        self.next_panel_id = 1
-        self.output_futures: Dict[int, asyncio.Future] = {}
+        self.state_lock = asyncio.Lock()
+        self.init_waiters: List[asyncio.Future[tuple[int, str]]] = []
 
-    async def get_goal_state(
-        self,
-        client: IsabelleLSPClient,
-        file_path: str,
-        line: int,
-        column: Optional[int] = None
-    ) -> GoalState:
-        """Get proof goals at position using state panel mechanism"""
-
-        # 1. Create state panel
-        panel_id = self.next_panel_id
-        self.next_panel_id += 1
-
-        future = asyncio.Future()
-        self.output_futures[panel_id] = future
-
-        # 2. Send PIDE/state_init
-        await client.notify("PIDE/state_init", {})
-
-        # 3. Update caret to target position
-        if column is None:
-            # Get both before and after
-            await client.notify("PIDE/caret_update", {
-                "uri": file_path_to_uri(file_path),
-                "line": line - 1,  # Convert to 0-indexed
-                "character": 0
-            })
-
-            # Wait for state output
-            state_before = await asyncio.wait_for(future, timeout=5.0)
-
-            # Move to end of line
-            line_content = client.open_documents[file_path].content.splitlines()[line - 1]
-            await client.notify("PIDE/caret_update", {
-                "uri": file_path_to_uri(file_path),
-                "line": line - 1,
-                "character": len(line_content)
-            })
-
+    async def query_position(self, client, file_path, line, character):
+        """Query proof goals at one LSP position."""
+        async with self.state_lock:
             future = asyncio.Future()
-            self.output_futures[panel_id] = future
-            state_after = await asyncio.wait_for(future, timeout=5.0)
+            self.init_waiters.append(future)
+            panel_id = None
 
-            goals_before = self._parse_goals(state_before)
-            goals_after = self._parse_goals(state_after)
-
-        else:
-            # Get state at specific column
-            await client.notify("PIDE/caret_update", {
-                "uri": file_path_to_uri(file_path),
-                "line": line - 1,
-                "character": column - 1
-            })
-
-            state_output = await asyncio.wait_for(future, timeout=5.0)
-            goals = self._parse_goals(state_output)
-
-        # 4. Close state panel
-        await client.notify("PIDE/state_exit", {"id": panel_id})
-
-        # 5. Return parsed goals
-        return GoalState(...)
+            try:
+                await client.notify("PIDE/caret_update", {
+                    "uri": file_path_to_uri(file_path),
+                    "line": line,
+                    "character": character,
+                })
+                await client.notify("PIDE/state_init", {})
+                panel_id, html = await asyncio.wait_for(future, timeout=5.0)
+                return parse_goals_from_html(html)
+            finally:
+                if panel_id is not None:
+                    await client.notify("PIDE/state_exit", {"id": panel_id})
 
     def handle_state_output(self, panel_id: int, output: str):
         """Handle PIDE/state_output notification"""
-        if panel_id in self.output_futures:
-            self.output_futures[panel_id].set_result(output)
+        if self.init_waiters:
+            self.init_waiters.pop(0).set_result((panel_id, output))
 
     def _parse_goals(self, html_output: str) -> List[str]:
         """Parse goals from HTML output"""
@@ -455,7 +419,7 @@ class DocumentManager:
 
 ---
 
-### 2.6 Document Editing and Dynamic Reprocessing
+### 2.6 Document Editing and Dynamic Reprocessing (Design Target)
 
 **Challenge:** Enable AI agents to edit theory files and have Isabelle incrementally reprocess changes — the same workflow as editing in Isabelle/VSCode.
 
@@ -467,12 +431,14 @@ Isabelle's `vscode_server` reports `textDocumentSync = 2` (Incremental per LSP s
 3. **Incremental reprocessing**: PIDE reprocesses only affected commands in the document
 4. **Output debounce** (500ms `vscode_output_delay`): updated diagnostics pushed via `textDocument/publishDiagnostics`
 
-**Solution:** Two new methods on `IsabelleLSPClient` (`change_document`, `wait_for_processing`) + `isabelle_edit` MCP tool. For implementation details and code, see API_DESIGN.md Section 3.6 and Section 4.4.
+**Current status:** Not implemented in the current server. The following design
+describes a future `change_document` / `wait_for_processing` layer and an
+`isabelle_edit` MCP tool. For design details, see API_DESIGN.md Section 3.6.
 
 **Component Interactions:**
 
 ```
-isabelle_edit MCP tool
+future isabelle_edit MCP tool
     │
     ├─→ Edit Tool Handler (tools/edit.py)
     │   ├─→ Computes full new content (from line-range or full replacement)
@@ -552,7 +518,7 @@ Each MCP tool follows this pattern:
 
 ```python
 @mcp.tool(
-    "isabelle_hover_info",
+    "isabelle_hover",
     annotations=ToolAnnotations(
         title="Hover Info",
         readOnlyHint=True,
@@ -665,7 +631,7 @@ AI Agent calls isabelle_goal(file, line)
          └─→ Return GoalState model
 ```
 
-### 4.3 Edit Tool Call Flow
+### 4.3 Edit Tool Call Flow (Future Design)
 
 ```
 AI Agent calls isabelle_edit(file, start_line=42, end_line=42, new_text="  by simp")
@@ -927,7 +893,8 @@ pip install -e .
 
 For Phase 2 features (sledgehammer, find_theorems, try methods).
 
-Now that `isabelle_edit` provides the `change_document` + `wait_for_processing` foundation, the command execution framework can build on top of it:
+Once `isabelle_edit` provides a `change_document` + `wait_for_processing`
+foundation, the command execution framework can build on top of it:
 
 **Architecture:**
 ```python
@@ -983,7 +950,7 @@ Optimize goal queries by keeping panels alive:
 
 ```
 AI Agent
-   │ MCP: isabelle_hover_info(file, line=42, col=15)
+   │ MCP: isabelle_hover(file, line=42, col=15)
    │
    ▼
 MCP Server
@@ -1042,41 +1009,43 @@ MCP Server
    │
    ▼
 State Panel Manager
-   │ Create new panel (id=1)
-   │
-   │ PIDE: {"method": "PIDE/state_init"}
    │ PIDE: {"method": "PIDE/caret_update",
    │        "params": {"line": 41, "character": 0}}
+   │ PIDE: {"method": "PIDE/state_init"}
    │
    ▼
 isabelle vscode_server
-   │ Create state panel
    │ Update caret to line start
+   │ Create state panel with server-assigned id
    │ Query PIDE for proof state
    │
    │ PIDE: {"method": "PIDE/state_output",
    │        "params": {"id": 1, "content": "<html>goal (2 subgoals): ...</html>"}}
    ▼
 State Panel Manager
-   │ Receive state_output
+   │ Receive state_output and learn panel id = 1
    │ Store as goals_before
+   │ PIDE: {"method": "PIDE/state_exit", "params": {"id": "<panel_id>"}}
    │
+   │ Repeat the same temporary-panel sequence at line end:
    │ PIDE: {"method": "PIDE/caret_update",
    │        "params": {"line": 41, "character": <end>}}
+   │ PIDE: {"method": "PIDE/state_init"}
    │
    ▼
 isabelle vscode_server
    │ Update caret to line end
+   │ Create state panel with server-assigned id
    │ Query PIDE for proof state
    │
    │ PIDE: {"method": "PIDE/state_output",
    │        "params": {"id": 1, "content": "<html>no goals</html>"}}
    ▼
 State Panel Manager
-   │ Receive state_output
+   │ Receive state_output and learn panel id
    │ Store as goals_after
    │
-   │ PIDE: {"method": "PIDE/state_exit", "params": {"id": 1}}
+   │ PIDE: {"method": "PIDE/state_exit", "params": {"id": "<panel_id>"}}
    │
    │ Parse goals from HTML
    │ Extract goal text, strip formatting
@@ -1086,7 +1055,7 @@ State Panel Manager
 AI Agent
 ```
 
-### A.3 Document Edit + Reprocessing
+### A.3 Document Edit + Reprocessing (Future Design)
 
 ```
 AI Agent

@@ -2,11 +2,15 @@
 
 **Version:** 0.1.0
 **Date:** 2026-03-07
-**Status:** Draft
+**Status:** Draft with current implementation notes
 
 ## 1. Overview
 
-This document provides detailed API design and implementation guidance for the 11 MCP tools in Isa-LSP. For high-level specifications, see SPECIFICATION.md. For architecture, see ARCHITECTURE.md.
+This document provides API design and implementation guidance for Isa-LSP. The
+current server exposes 10 MCP tools. Document editing (`isabelle_edit`) is a
+design target discussed below, not a tool currently registered by the server.
+For high-level specifications, see SPECIFICATION.md. For architecture, see
+ARCHITECTURE.md.
 
 ---
 
@@ -16,23 +20,23 @@ This document provides detailed API design and implementation guidance for the 1
 
 | MCP Tool | LSP Method | Request Params | Response Fields |
 |----------|------------|----------------|-----------------|
-| `isabelle_hover_info` | `textDocument/hover` | `TextDocumentPositionParams` | `Hover` with `contents` and `range` |
+| `isabelle_hover` | `textDocument/hover` | `TextDocumentPositionParams` | `Hover` with `contents` and `range` |
 | `isabelle_completions` | `textDocument/completion` | `CompletionParams` | `CompletionList` with `items[]` |
-| `isabelle_declaration_location` | `textDocument/definition` | `DefinitionParams` | `Location[]` or `LocationLink[]` |
-| `isabelle_document_highlights` | `textDocument/documentHighlight` | `DocumentHighlightParams` | `DocumentHighlight[]` |
-| `isabelle_diagnostic_messages` | (notifications) | - | Cached from `publishDiagnostics` |
+| `isabelle_definition` | `textDocument/definition` | `DefinitionParams` | `Location[]` or `LocationLink[]` |
+| `isabelle_highlights` | `textDocument/documentHighlight` | `DocumentHighlightParams` | `DocumentHighlight[]` |
+| `isabelle_diagnostics` | (notifications) | - | Cached from `publishDiagnostics` |
 
 ### 2.2 Document Editing Methods
 
 | MCP Tool | LSP Method | Flow |
 |----------|------------|------|
-| `isabelle_edit` | `textDocument/didChange` (Full sync) | Send full content → wait for PIDE reprocessing → return diagnostics |
+| `isabelle_edit` | `textDocument/didChange` (Full sync) | Design target only; not implemented in current server |
 
 ### 2.3 PIDE Extension Methods
 
 | MCP Tool | PIDE Methods | Flow |
 |----------|--------------|------|
-| `isabelle_goal` | `PIDE/state_init`, `PIDE/caret_update`, `PIDE/state_output`, `PIDE/state_exit` | Multi-step async |
+| `isabelle_goal` | `PIDE/caret_update`, `PIDE/state_init`, `PIDE/state_output`, `PIDE/state_exit` | Multi-step async; state id assigned by server |
 | `isabelle_command_output` | `PIDE/dynamic_output` | Notification-based |
 | `isabelle_preview` | `PIDE/preview_request`, `PIDE/preview_response` | Request-response |
 
@@ -47,7 +51,7 @@ This document provides detailed API design and implementation guidance for the 1
 
 ## 3. Tool Implementation Details
 
-### 3.1 `isabelle_hover_info`
+### 3.1 `isabelle_hover`
 
 **LSP Request:**
 ```json
@@ -225,7 +229,7 @@ def sort_completions(items: List[CompletionItem], cursor_prefix: str) -> List[Co
 
 ---
 
-### 3.3 `isabelle_declaration_location`
+### 3.3 `isabelle_definition`
 
 **LSP Request:**
 ```json
@@ -319,7 +323,7 @@ async def declaration_location(ctx, file_path, line, column):
 
 ---
 
-### 3.4 `isabelle_document_highlights`
+### 3.4 `isabelle_highlights`
 
 **LSP Request:**
 ```json
@@ -376,7 +380,7 @@ async def declaration_location(ctx, file_path, line, column):
 
 ---
 
-### 3.5 `isabelle_diagnostic_messages`
+### 3.5 `isabelle_diagnostics`
 
 **LSP Notification (Server → Client):**
 ```json
@@ -485,7 +489,10 @@ class DiagnosticCache:
 
 ---
 
-### 3.6 `isabelle_edit`
+### 3.6 `isabelle_edit` (Design Target)
+
+This section describes a future mutating tool. It is not registered in the
+current server.
 
 **LSP Notification (Client → Server):**
 ```json
@@ -641,23 +648,34 @@ async def edit_document(
 **PIDE Flow:**
 
 ```
-1. Send: PIDE/state_init
-   ← No immediate response, panel created internally
-
-2. Send: PIDE/caret_update
+1. Send: PIDE/caret_update
    {"uri": "file:///...", "line": 41, "character": 0}
-   ← Triggers state recomputation
+   ← Updates Isabelle's current caret position
+
+2. Send: PIDE/state_init
+   ← No immediate response. Isabelle creates a state panel internally.
 
 3. Receive: PIDE/state_output
    {"id": <panel_id>, "content": "<html>...goals...</html>", "auto_update": true}
 
-4. Send: PIDE/caret_update
+4. Send: PIDE/state_exit
+   {"id": <panel_id>}
+```
+
+The current implementation opens one temporary state panel per queried position.
+For before/after mode, it performs the sequence twice: once at line start and
+once at line end.
+
+```
+1. Send: PIDE/caret_update
    {"uri": "file:///...", "line": 41, "character": <end_of_line>}
 
-5. Receive: PIDE/state_output
+2. Send: PIDE/state_init
+
+3. Receive: PIDE/state_output
    {"id": <panel_id>, "content": "<html>...goals...</html>"}
 
-6. Send: PIDE/state_exit
+4. Send: PIDE/state_exit
    {"id": <panel_id>}
 ```
 
@@ -704,11 +722,15 @@ def parse_goals_from_html(html: str) -> List[str]:
 ```
 
 **Implementation Notes:**
-1. **Panel ID Management**: Track panel IDs for matching responses
+1. **Panel ID Management**: `PIDE/state_init` has no client-supplied id.
+   Learn the server-assigned id from the first `PIDE/state_output` and use it
+   for `PIDE/state_exit`.
 2. **Async Coordination**: Use `asyncio.Future` for waiting on `state_output`
 3. **Timeout**: 5-10 seconds max wait for state output
 4. **Before/After Pattern**: If column is None, query twice (line start and end)
 5. **Context Extraction**: Parse `<div class="context">` if available
+6. **Concurrency**: Serialize state queries because `PIDE/state_init` responses
+   are matched by the next state output notification.
 
 **Edge Cases:**
 - No proof state available → return empty goals
@@ -720,84 +742,42 @@ def parse_goals_from_html(html: str) -> List[str]:
 ```python
 class StatePanelManager:
     def __init__(self):
-        self.next_panel_id = 1
-        self.output_futures: Dict[int, asyncio.Future] = {}
+        self.state_lock = asyncio.Lock()
+        self.init_waiters: list[asyncio.Future[tuple[int, str]]] = []
 
-    async def get_goals(
-        self,
-        client: IsabelleLSPClient,
-        file_path: str,
-        line: int,
-        column: Optional[int] = None
-    ) -> GoalState:
-        """Get proof goals using state panel mechanism"""
-        panel_id = self.next_panel_id
-        self.next_panel_id += 1
-
-        try:
-            # Initialize panel
-            await client.notify("PIDE/state_init", {})
-
-            if column is None:
-                # Get before and after
-                goals_before = await self._query_position(client, file_path, line, 0, panel_id)
-                line_content = get_line(file_path, line)
-                goals_after = await self._query_position(client, file_path, line, len(line_content), panel_id)
-
-                return GoalState(
-                    line_context=line_content,
-                    goals_before=goals_before,
-                    goals_after=goals_after,
-                    goals=None,
-                    context=None
-                )
-            else:
-                # Get at specific column
-                goals = await self._query_position(client, file_path, line, column - 1, panel_id)
-
-                return GoalState(
-                    line_context=get_line(file_path, line),
-                    goals=goals,
-                    goals_before=None,
-                    goals_after=None,
-                    context=None
-                )
-
-        finally:
-            # Always close panel
-            await client.notify("PIDE/state_exit", {"id": panel_id})
-
-    async def _query_position(
+    async def query_position(
         self,
         client: IsabelleLSPClient,
         file_path: str,
         line: int,
         column: int,
-        panel_id: int
-    ) -> List[str]:
-        """Query goals at specific position"""
-        # Create future for response
-        future = asyncio.Future()
-        self.output_futures[panel_id] = future
+    ) -> list[str]:
+        """Query goals at one LSP position."""
+        uri = file_path_to_uri(file_path)
 
-        # Send caret update
-        await client.notify("PIDE/caret_update", {
-            "uri": file_path_to_uri(file_path),
-            "line": line - 1,  # Convert to 0-indexed
-            "character": column
-        })
+        async with self.state_lock:
+            future = asyncio.Future()
+            self.init_waiters.append(future)
+            panel_id = None
 
-        # Wait for state_output (with timeout)
-        try:
-            html_output = await asyncio.wait_for(future, timeout=5.0)
-            return parse_goals_from_html(html_output)
-        except asyncio.TimeoutError:
-            raise IsabelleToolError("Timeout waiting for proof state")
+            try:
+                await client.notify("PIDE/caret_update", {
+                    "uri": uri,
+                    "line": line - 1,
+                    "character": column,
+                })
+                await client.notify("PIDE/state_init", {})
+
+                panel_id, html_output = await asyncio.wait_for(future, timeout=5.0)
+                return parse_goals_from_html(html_output)
+            finally:
+                if panel_id is not None:
+                    await client.notify("PIDE/state_exit", {"id": panel_id})
 
     def handle_state_output(self, panel_id: int, html_content: str):
         """Called by LSP client when PIDE/state_output received"""
-        if panel_id in self.output_futures:
-            self.output_futures[panel_id].set_result(html_content)
+        if self.init_waiters:
+            self.init_waiters.pop(0).set_result((panel_id, html_content))
 ```
 
 ---
@@ -816,10 +796,14 @@ class StatePanelManager:
 ```
 
 **Implementation Notes:**
-1. **Cache Based**: `dynamic_output` is sent when caret moves
-2. Cache output by file and line number
-3. Parse HTML to extract message type and text
-4. Return messages for requested line
+1. **Notification Based**: `dynamic_output` is sent after caret movement, but
+   the notification payload contains only `content`.
+2. The current client serializes dynamic-output queries so a notification can
+   be associated with the currently requested position.
+3. The client does not reuse output from a different file/line/column. If
+   Isabelle emits no fresh notification and no same-position cache exists, the
+   command output result contains an empty message list.
+4. Parse HTML to extract message type and text.
 
 **Output Types:**
 - `writeln`: Normal prover output

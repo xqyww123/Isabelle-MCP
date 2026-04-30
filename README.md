@@ -8,21 +8,18 @@ Isa-LSP is a Model Context Protocol (MCP) server that bridges AI agents (like Cl
 
 ## Features
 
-### Core LSP Tools (5 tools)
-- ✅ **`isabelle_hover_info`** - Get type signatures and documentation
-- ✅ **`isabelle_completions`** - Code completion suggestions
-- ✅ **`isabelle_declaration_location`** - Navigate to definitions
-- ✅ **`isabelle_document_highlights`** - Find symbol occurrences
-- ✅ **`isabelle_diagnostic_messages`** - Get errors and warnings
+### Current Implementation Status
 
-### PIDE Extensions (3 tools)
-- ⭐ **`isabelle_goal`** - Get proof state (before/after tactics) - **MOST IMPORTANT**
-- ✅ **`isabelle_command_output`** - Get prover messages
-- ✅ **`isabelle_preview`** - Generate HTML documentation
+This README is the authoritative user-facing status for the current code. Some
+files in `docs/` contain design notes and future targets; when they disagree
+with this table, trust this table and the tests.
 
-### Session Management (2 tools)
-- ✅ **`isabelle_build`** - Build session and start LSP server
-- ✅ **`isabelle_session_info`** - Get session information
+| Area | Tools | Status |
+|------|-------|--------|
+| Core LSP | `isabelle_hover`, `isabelle_completions`, `isabelle_definition`, `isabelle_highlights`, `isabelle_diagnostics` | Implemented and covered by unit/integration tests |
+| PIDE extensions | `isabelle_goal`, `isabelle_command_output`, `isabelle_preview` | Implemented as best-effort wrappers around native PIDE notifications; see reliability notes below |
+| Session management | `isabelle_build`, `isabelle_session_info` | Implemented |
+| Document editing | none | Not implemented in the current server |
 
 ### Design Principles
 - 🎯 **LSP-Native Only** - Only wraps features natively supported by `isabelle vscode_server`
@@ -30,6 +27,19 @@ Isa-LSP is a Model Context Protocol (MCP) server that bridges AI agents (like Cl
 - 🔢 **1-Indexed Positions** - Consistent with lean-lsp-mcp (line 1, column 1 = first character)
 - 🚀 **Session Reuse** - Long-lived LSP server for performance
 - 🛡️ **Type-Safe** - Full type hints and validation
+
+### Reliability Notes
+
+- Standard LSP tools are the most reliable part of the project.
+- PIDE state, command output, and preview depend on asynchronous Isabelle
+  notifications. Timeouts are surfaced as tool errors instead of silently
+  returning fabricated results.
+- `isabelle_goal` opens a temporary PIDE state panel and uses the server-assigned
+  panel id from `PIDE/state_output`.
+- `isabelle_command_output` avoids reusing output from a different position; if
+  Isabelle emits no fresh `PIDE/dynamic_output`, it returns no messages.
+- Goal/context parsing from Isabelle's HTML is heuristic. `context` is currently
+  returned as `null`.
 
 ---
 
@@ -151,14 +161,14 @@ result = isabelle_goal(
   "line_context": "  by auto",
   "goals_before": ["⋀x. P x ⟹ Q x", "R y"],
   "goals_after": [],  # Proof complete!
-  "context": "fix x y\nassume \"A x\" \"B y\""
+  "context": null
 }
 ```
 
 ### Example 2: Get Type Information
 
 ```python
-result = isabelle_hover_info(
+result = isabelle_hover(
     file_path="/path/to/theory.thy",
     line=15,
     column=8  # Position at start of "Suc"
@@ -176,7 +186,7 @@ result = isabelle_hover_info(
 ### Example 3: Check for Errors
 
 ```python
-result = isabelle_diagnostic_messages(
+result = isabelle_diagnostics(
     file_path="/path/to/theory.thy",
     start_line=10,
     end_line=20
@@ -349,7 +359,7 @@ ISA_LSP_LOG_LEVEL=DEBUG python -m isa_lsp.server
 
 **Solution**:
 1. PIDE processes incrementally - wait 2-5 seconds
-2. Check `processing_complete` flag in `isabelle_diagnostic_messages`
+2. Check `processing_complete` flag in `isabelle_diagnostics`
 3. Restart session if stuck: call `isabelle_build` again
 
 ### Proof State Shows HTML
@@ -383,6 +393,11 @@ See `docs/SPECIFICATION.md` Appendix B for details on future enhancements.
 - **Build Time**: Session builds can take 1-10 minutes for large logics
 - **Memory Usage**: Each LSP server instance uses ~500MB-1GB RAM
 - **Single Session**: Only one logic session active at a time
+- **PIDE Notification Timing**: Goal, command output, and preview tools may
+  timeout if Isabelle does not emit the expected native notification.
+- **Dynamic Output Identity**: Isabelle's `PIDE/dynamic_output` notification
+  contains only HTML content, not the originating file/line. Isa-LSP serializes
+  these queries and refuses to reuse output from a different requested position.
 
 ---
 
@@ -452,7 +467,7 @@ Isa-LSP follows the design patterns from `lean-lsp-mcp`:
 | List Wrappers | `items` field | `items` field | ✅ Consistent |
 | Goal Query | `lean_goal` | `isabelle_goal` | ✅ Same pattern |
 | Optional Column | Yes (before/after) | Yes (before/after) | ✅ Same pattern |
-| Diagnostics | `lean_diagnostic_messages` | `isabelle_diagnostic_messages` | ✅ Same pattern |
+| Diagnostics | `lean_diagnostic_messages` | `isabelle_diagnostics` | ✅ Same pattern |
 | File Outline | ✅ | ❌ MVP | LSP support differs |
 | Automation | `lean_hammer_premise` | ❌ MVP | Requires command execution |
 
@@ -484,5 +499,5 @@ Isa-LSP follows the design patterns from `lean-lsp-mcp`:
 
 ---
 
-**Status**: Phase 1 (MVP) - LSP-Native Features Only
+**Status**: MVP - standard LSP tools plus best-effort native PIDE notification wrappers
 **Next**: Phase 2 will add command execution framework for sledgehammer, find_theorems, and try_methods

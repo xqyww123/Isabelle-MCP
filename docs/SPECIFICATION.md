@@ -2,7 +2,14 @@
 
 **Version:** 0.1.0
 **Date:** 2026-03-07
-**Status:** Draft - MVP (LSP/PIDE Native Features Only)
+**Status:** Draft with current implementation notes
+
+> Documentation reliability note:
+> This document contains both current behavior and design targets. The current
+> server exposes 10 MCP tools: 5 standard LSP tools, 3 PIDE notification tools,
+> and 2 session tools. It does not currently expose `isabelle_edit`. Sections
+> that discuss document editing or "11 tools" are retained as design notes until
+> that feature is implemented.
 
 ## 1. Executive Summary
 
@@ -25,13 +32,13 @@ Isa-LSP is a Model Context Protocol (MCP) server that provides AI agents (like C
 **In Scope (MVP - LSP/PIDE Native Support Only):**
 - 5 standard LSP-based MCP tools (hover, completion, definition, highlights, diagnostics)
 - 3 PIDE-specific MCP tools (proof state, command output, preview)
-- 1 document editing tool (dynamic document changes with PIDE reprocessing)
 - 2 session management tools (build, session info)
-- Document synchronization and state management (`didOpen`, `didChange`, `didClose`)
-- Async notification handling (diagnostics, decorations)
+- Document open/close state management (`didOpen`, `didClose`)
+- Async notification handling (diagnostics and selected PIDE notifications)
 - Session lifecycle management with optional build support
 
 **Out of Scope:**
+- Document editing (`isabelle_edit`) for the current release
 - Direct VSCode extension integration
 - Non-LSP Isabelle interfaces (jEdit, raw PIDE)
 - **Advanced LSP features not implemented by `isabelle vscode_server`:**
@@ -99,7 +106,7 @@ def tool() -> DiagnosticsResult: ...
 
 Based on `isabelle vscode_server` analysis - **only LSP-native features**:
 
-#### Tool 1: `isabelle_hover_info`
+#### Tool 1: `isabelle_hover`
 **Purpose**: Get type signature and documentation for symbol
 **LSP Mapping**: `textDocument/hover` ✅
 **Priority**: High (Core feature)
@@ -111,19 +118,19 @@ Based on `isabelle vscode_server` analysis - **only LSP-native features**:
 **Priority**: High (Core feature)
 **Pattern**: Like `lean_completions`
 
-#### Tool 3: `isabelle_declaration_location`
+#### Tool 3: `isabelle_definition`
 **Purpose**: Find where a symbol is defined
 **LSP Mapping**: `textDocument/definition` ✅
 **Priority**: High (Navigation)
 **Pattern**: Like `lean_declaration_file`
 
-#### Tool 4: `isabelle_document_highlights`
+#### Tool 4: `isabelle_highlights`
 **Purpose**: Find all occurrences of symbol in document
 **LSP Mapping**: `textDocument/documentHighlight` ✅
 **Priority**: Medium (Navigation)
 **Pattern**: New (no Lean equivalent)
 
-#### Tool 5: `isabelle_diagnostic_messages`
+#### Tool 5: `isabelle_diagnostics`
 **Purpose**: Get compiler diagnostics (errors, warnings, info)
 **LSP Mapping**: Cached `textDocument/publishDiagnostics` notifications ✅
 **Priority**: High (Essential)
@@ -151,12 +158,13 @@ Isabelle-specific features - **only PIDE-native methods**:
 **Priority**: Low (Documentation generation)
 **Pattern**: New (Isabelle-specific)
 
-### 3.3 Document Editing Tool (1 tool)
+### 3.3 Document Editing Tool (Design Target)
 
 #### Tool 9: `isabelle_edit`
 **Purpose**: Edit theory file content and trigger PIDE reprocessing (like editing in VS Code)
-**LSP Mapping**: `textDocument/didChange` (Full sync) ✅
-**Priority**: **HIGH** (Enables interactive theorem proving workflow)
+**Current Status**: Not implemented in the current server
+**LSP Mapping**: `textDocument/didChange` (Full sync)
+**Priority**: **HIGH** if implemented (enables interactive theorem proving workflow)
 **Pattern**: New (no Lean equivalent — enables the edit-check-fix loop)
 
 ### 3.4 Session Management Tools (2 tools)
@@ -180,7 +188,7 @@ Isabelle-specific features - **only PIDE-native methods**:
 
 ### 4.1 Standard LSP Tools
 
-#### 4.1.1 `isabelle_hover_info`
+#### 4.1.1 `isabelle_hover`
 
 **Description**: Get type signature, documentation, and tooltips for the symbol at a position. Use column at the START of the identifier.
 
@@ -263,7 +271,7 @@ class CompletionsResult(BaseModel):
 
 ---
 
-#### 4.1.3 `isabelle_declaration_location`
+#### 4.1.3 `isabelle_definition`
 
 **Description**: Find where a symbol is defined.
 
@@ -300,7 +308,7 @@ class DeclarationLocation(BaseModel):
 
 ---
 
-#### 4.1.4 `isabelle_document_highlights`
+#### 4.1.4 `isabelle_highlights`
 
 **Description**: Find all occurrences of the symbol at the given position within the current document.
 
@@ -335,7 +343,7 @@ class HighlightsResult(BaseModel):
 
 ---
 
-#### 4.1.5 `isabelle_diagnostic_messages`
+#### 4.1.5 `isabelle_diagnostics`
 
 **Description**: Get compiler diagnostics (errors, warnings, information) for a theory file. **This is essential for checking if your changes are correct.**
 
@@ -534,11 +542,13 @@ class PreviewResult(BaseModel):
 
 ---
 
-### 4.3 Document Editing Tool
+### 4.3 Document Editing Tool (Design Target)
 
 #### 4.3.1 `isabelle_edit` ✏️ Mutating
 
-**Description**: Edit theory file content and trigger PIDE incremental reprocessing — the same mechanism used when editing in Isabelle/VSCode. This enables the interactive edit-check-fix loop essential for AI-assisted theorem proving.
+**Description**: Design target for editing theory file content and triggering
+PIDE incremental reprocessing. This tool is not registered in the current
+server.
 
 **Tool Annotations**:
 ```python
@@ -769,13 +779,14 @@ def check_pide_response(response: Any, operation: str, *, allow_none: bool = Fal
 ```python
 INSTRUCTIONS = """## General Rules
 - All line and column numbers are 1-indexed.
-- Use isabelle_edit to modify theory files — changes trigger PIDE reprocessing automatically.
+- Modify theory files with normal filesystem/editor tools, then use diagnostics
+  and goal queries to verify them. `isabelle_edit` is a design target, not a
+  current tool.
 
 ## Key Tools
 - **isabelle_goal**: Proof state at position. Omit `column` for before/after. MOST IMPORTANT!
-- **isabelle_edit**: Edit theory files with automatic PIDE reprocessing. Supports full replacement or line-range edits.
-- **isabelle_diagnostic_messages**: Compiler errors/warnings. Use after every change.
-- **isabelle_hover_info**: Type signature + docs. Column at START of identifier.
+- **isabelle_diagnostics**: Compiler errors/warnings. Use after every change.
+- **isabelle_hover**: Type signature + docs. Column at START of identifier.
 - **isabelle_completions**: Code completion suggestions.
 
 ## Position Conventions
@@ -785,11 +796,11 @@ INSTRUCTIONS = """## General Rules
 
 ## Workflow
 1. Open a theory file (automatic on first tool call)
-2. Use isabelle_diagnostic_messages to check for errors
+2. Use isabelle_diagnostics to check for errors
 3. Use isabelle_goal to see proof state
-4. Use isabelle_edit to modify tactics or add lemmas
-5. Check isabelle_diagnostic_messages again to verify changes
-6. Use isabelle_hover_info to understand symbols
+4. Modify tactics or add lemmas with normal file editing tools
+5. Check isabelle_diagnostics again to verify changes
+6. Use isabelle_hover to understand symbols
 7. Use isabelle_completions for code assistance
 
 ## Return Formats
@@ -800,32 +811,43 @@ Empty list = `{"items": []}`.
 
 ---
 
-## 7. Success Criteria
+## 7. Current Verification Status
 
-### 7.1 Functional Acceptance
+### 7.1 Functional Status
 
-1. ✅ All 11 MCP tools are implemented and functional (including document editing)
-2. ✅ Session initialization works with common logic images (HOL, Pure, Main)
-3. ✅ Standard LSP features (hover, completion, definition) return correct results
-4. ✅ PIDE goal extraction works on simple proof scripts
-5. ✅ Diagnostics correctly reflect errors from Isabelle
-6. ✅ All tools only use LSP/PIDE native methods
+1. Current server registers 10 MCP tools, not 11.
+2. Standard LSP features (hover, completion, definition, highlights,
+   diagnostics) are implemented and covered by tests.
+3. PIDE tools use Isabelle2024 native notifications:
+   - `isabelle_goal` uses `PIDE/caret_update`, `PIDE/state_init`,
+     `PIDE/state_output`, and `PIDE/state_exit`.
+   - `isabelle_command_output` uses `PIDE/dynamic_output`.
+   - `isabelle_preview` uses `PIDE/preview_request` and
+     `PIDE/preview_response`.
+4. PIDE tools are best-effort: they may timeout if Isabelle emits no matching
+   notification for the requested position/file.
+5. `isabelle_edit` is not implemented in the current server.
 
 ### 7.2 Interface Consistency
 
-1. ✅ All tools follow `isabelle_{category}_{action}` naming
-2. ✅ All positions are 1-indexed (explicit in Field descriptions)
-3. ✅ All tools return Pydantic models (no bare lists)
-4. ✅ All list-returning tools use `items` field wrapper
-5. ✅ Error handling uses `IsabelleToolError` consistently
+1. Current tool names are `isabelle_hover`, `isabelle_completions`,
+   `isabelle_definition`, `isabelle_highlights`, `isabelle_diagnostics`,
+   `isabelle_goal`, `isabelle_command_output`, `isabelle_preview`,
+   `isabelle_build`, and `isabelle_session_info`.
+2. All public tool positions are 1-indexed.
+3. Tools return Pydantic models rather than bare lists.
+4. Error handling uses `IsabelleToolError` for expected tool failures.
 
-### 7.3 Quality Acceptance
+### 7.3 Quality Status
 
-1. ✅ Unit test coverage ≥ 70%
-2. ✅ Integration tests cover end-to-end workflows
-3. ✅ All error codes are tested
-4. ✅ Documentation follows lean-lsp-mcp style
-5. ✅ Instructions card is concise and helpful
+Current quality gates expected for this repository:
+
+1. `python -m ruff check .`
+2. `python -m mypy src`
+3. `pyright src`
+4. `python -m pytest -q`
+
+Documentation must not mark future/design-target behavior as implemented.
 
 ---
 
@@ -839,8 +861,8 @@ Empty list = `{"items": []}`.
 | List wrapper | `items` field | `items` field | ✅ Consistent |
 | Goal query | `lean_goal` | `isabelle_goal` | ✅ Same pattern |
 | Optional column | Yes (before/after) | Yes (before/after) | ✅ Same pattern |
-| Diagnostics | `lean_diagnostic_messages` | `isabelle_diagnostic_messages` | ✅ Same pattern |
-| Edit | ❌ (external tool) | `isabelle_edit` | ✅ Built-in edit + reprocess |
+| Diagnostics | `lean_diagnostic_messages` | `isabelle_diagnostics` | ✅ Same pattern |
+| Edit | ❌ (external tool) | Not implemented | Design target only |
 | File outline | `lean_file_outline` | ❌ Not in MVP | LSP doesn't support |
 | Code actions | `lean_code_actions` | ❌ Not in MVP | LSP doesn't support |
 | Hammer | `lean_hammer_premise` | ❌ Not in MVP | Requires command execution |

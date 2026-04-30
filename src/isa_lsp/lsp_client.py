@@ -80,11 +80,17 @@ class IsabelleLSPClient:
         self.diagnostic_cache = DiagnosticCache()
 
         # PIDE extension state
-        self._state_panel_id = 0
+        self._state_lock = asyncio.Lock()
+        self._state_init_waiters: list[asyncio.Future[tuple[int, str]]] = []
         self._state_output_waiters: dict[int, asyncio.Future[str]] = {}
-        self._dynamic_output_waiters: list[asyncio.Future[str]] = []
+        self._dynamic_output_lock = asyncio.Lock()
+        self._dynamic_output_waiters: list[
+            tuple[tuple[str, int, int], asyncio.Future[str]]
+        ] = []
+        self._dynamic_output_cache_by_position: dict[tuple[str, int, int], str] = {}
         self._dynamic_output_cache: str = ""
         self._dynamic_output_last_update: float = 0.0
+        self._preview_lock = asyncio.Lock()
         self._preview_waiters: dict[tuple[str, int], asyncio.Future[JsonDict]] = {}
 
         # Server info
@@ -171,7 +177,7 @@ class IsabelleLSPClient:
                     self.request("shutdown", {}),
                     timeout=5.0
                 )
-            except IsabelleToolError as exc:
+            except (asyncio.TimeoutError, IsabelleToolError) as exc:
                 logger.warning(f"Shutdown request failed: {exc}")
 
             # Send exit notification
@@ -194,8 +200,10 @@ class IsabelleLSPClient:
 
         self.open_documents.clear()
         self.pending_requests.clear()
+        self._state_init_waiters.clear()
         self._state_output_waiters.clear()
         self._dynamic_output_waiters.clear()
+        self._dynamic_output_cache_by_position.clear()
         self._preview_waiters.clear()
 
         logger.info("LSP client shutdown complete")
@@ -447,17 +455,20 @@ class IsabelleLSPClient:
         raw_panel_id = params.get("id")
         html = str(params.get("content", params.get("output", "")))
 
-        panel_id = raw_panel_id if isinstance(raw_panel_id, int) else None
-        if panel_id is None and len(self._state_output_waiters) == 1:
-            panel_id = next(iter(self._state_output_waiters))
+        if not isinstance(raw_panel_id, int):
+            logger.debug("PIDE/state_output without usable panel id")
+            return
+        panel_id = raw_panel_id
 
-        if panel_id is None:
-            logger.debug("PIDE/state_output without matching panel id")
+        if self._state_init_waiters:
+            init_future = self._state_init_waiters.pop(0)
+            if not init_future.done():
+                init_future.set_result((panel_id, html))
             return
 
-        future = self._state_output_waiters.pop(panel_id, None)
-        if future and not future.done():
-            future.set_result(html)
+        state_future = self._state_output_waiters.pop(panel_id, None)
+        if state_future and not state_future.done():
+            state_future.set_result(html)
 
     def _handle_dynamic_output(self, params: Any) -> None:
         """Cache and publish the latest PIDE dynamic output notification."""
@@ -470,7 +481,8 @@ class IsabelleLSPClient:
 
         waiters = self._dynamic_output_waiters
         self._dynamic_output_waiters = []
-        for future in waiters:
+        for key, future in waiters:
+            self._dynamic_output_cache_by_position[key] = html
             if not future.done():
                 future.set_result(html)
 
@@ -493,8 +505,9 @@ class IsabelleLSPClient:
         """Fail outstanding JSON-RPC/PIDE waiters after transport failure."""
         for waiters in (
             self.pending_requests.values(),
+            self._state_init_waiters,
             self._state_output_waiters.values(),
-            self._dynamic_output_waiters,
+            (future for _, future in self._dynamic_output_waiters),
             self._preview_waiters.values(),
         ):
             for future in list(waiters):
@@ -502,8 +515,10 @@ class IsabelleLSPClient:
                     future.set_exception(exc)
 
         self.pending_requests.clear()
+        self._state_init_waiters.clear()
         self._state_output_waiters.clear()
         self._dynamic_output_waiters.clear()
+        self._dynamic_output_cache_by_position.clear()
         self._preview_waiters.clear()
 
     # ========================================================================
@@ -717,27 +732,32 @@ class IsabelleLSPClient:
     ) -> list[str]:
         """Get proof goals at an LSP position using PIDE state panel output."""
         uri = file_path_to_uri(file_path)
-        self._state_panel_id += 1
-        panel_id = self._state_panel_id
-        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
-        self._state_output_waiters[panel_id] = future
 
-        try:
-            await self.notify("PIDE/state_init", {})
-            await self.notify("PIDE/caret_update", {
-                "uri": uri,
-                "line": line,
-                "character": character,
-            })
+        async with self._state_lock:
+            panel_id: int | None = None
+            future: asyncio.Future[tuple[int, str]] = (
+                asyncio.get_running_loop().create_future()
+            )
+            self._state_init_waiters.append(future)
 
-            html = await asyncio.wait_for(future, timeout=timeout)
-            return parse_goals_from_html(html)
-        except asyncio.TimeoutError as exc:
-            raise IsabelleToolError("Timed out waiting for PIDE proof state") from exc
-        finally:
-            self._state_output_waiters.pop(panel_id, None)
-            with contextlib.suppress(IsabelleToolError):
-                await self.notify("PIDE/state_exit", {"id": panel_id})
+            try:
+                await self.notify("PIDE/caret_update", {
+                    "uri": uri,
+                    "line": line,
+                    "character": character,
+                })
+                await self.notify("PIDE/state_init", {})
+
+                panel_id, html = await asyncio.wait_for(future, timeout=timeout)
+                return parse_goals_from_html(html)
+            except asyncio.TimeoutError as exc:
+                raise IsabelleToolError("Timed out waiting for PIDE proof state") from exc
+            finally:
+                with contextlib.suppress(ValueError):
+                    self._state_init_waiters.remove(future)
+                if panel_id is not None:
+                    with contextlib.suppress(IsabelleToolError):
+                        await self.notify("PIDE/state_exit", {"id": panel_id})
 
     async def get_dynamic_output(
         self,
@@ -748,21 +768,26 @@ class IsabelleLSPClient:
     ) -> str:
         """Move the caret and return the latest PIDE dynamic output HTML."""
         uri = file_path_to_uri(file_path)
-        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
-        self._dynamic_output_waiters.append(future)
+        key = (file_path, line, character)
 
-        await self.notify("PIDE/caret_update", {
-            "uri": uri,
-            "line": line,
-            "character": character,
-        })
+        async with self._dynamic_output_lock:
+            future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+            waiter = (key, future)
+            self._dynamic_output_waiters.append(waiter)
 
-        try:
-            return await asyncio.wait_for(future, timeout=timeout)
-        except asyncio.TimeoutError:
-            with contextlib.suppress(ValueError):
-                self._dynamic_output_waiters.remove(future)
-            return self._dynamic_output_cache
+            await self.notify("PIDE/caret_update", {
+                "uri": uri,
+                "line": line,
+                "character": character,
+            })
+
+            try:
+                return await asyncio.wait_for(future, timeout=timeout)
+            except asyncio.TimeoutError:
+                return self._dynamic_output_cache_by_position.get(key, "")
+            finally:
+                with contextlib.suppress(ValueError):
+                    self._dynamic_output_waiters.remove(waiter)
 
     async def request_preview(
         self,
@@ -773,16 +798,18 @@ class IsabelleLSPClient:
         """Request an HTML preview and wait for the matching PIDE response."""
         uri = file_path_to_uri(file_path)
         key = (uri, column)
-        future: asyncio.Future[JsonDict] = asyncio.get_running_loop().create_future()
-        self._preview_waiters[key] = future
 
-        try:
-            await self.notify("PIDE/preview_request", {
-                "uri": uri,
-                "column": column,
-            })
-            return await asyncio.wait_for(future, timeout=timeout)
-        except asyncio.TimeoutError as exc:
-            raise IsabelleToolError("Timed out waiting for PIDE preview") from exc
-        finally:
-            self._preview_waiters.pop(key, None)
+        async with self._preview_lock:
+            future: asyncio.Future[JsonDict] = asyncio.get_running_loop().create_future()
+            self._preview_waiters[key] = future
+
+            try:
+                await self.notify("PIDE/preview_request", {
+                    "uri": uri,
+                    "column": column,
+                })
+                return await asyncio.wait_for(future, timeout=timeout)
+            except asyncio.TimeoutError as exc:
+                raise IsabelleToolError("Timed out waiting for PIDE preview") from exc
+            finally:
+                self._preview_waiters.pop(key, None)
