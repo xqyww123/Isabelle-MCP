@@ -45,7 +45,7 @@ _lsp_client: IsabelleLSPClient | None = None
 @asynccontextmanager
 async def server_lifespan(_app: Any) -> AsyncGenerator[None]:
     global _lsp_client
-    logic = os.environ.get("ISABELLE_SESSION", "HOL")
+    logic = os.environ.get("ISABELLE_SESSION", "Main")
     _lsp_client = IsabelleLSPClient(logic=logic)
     try:
         yield
@@ -200,12 +200,23 @@ async def isabelle_build(session: str, clean: bool = False) -> BuildStatus:
 
 
 def main() -> None:
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "--version":
+    import argparse
+    parser = argparse.ArgumentParser(description="Isabelle LSP MCP Server")
+    parser.add_argument("--version", action="store_true")
+    parser.add_argument("--http", action="store_true", help="Run as HTTP server (shared across clients)")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8371)
+    args = parser.parse_args()
+
+    if args.version:
         from isa_lsp import __version__
         print(f"isa-lsp version {__version__}")
         return
-    mcp.run()
+
+    if args.http:
+        mcp.run(transport="streamable-http", host=args.host, port=args.port)
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":

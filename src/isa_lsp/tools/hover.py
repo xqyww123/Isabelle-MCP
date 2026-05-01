@@ -17,8 +17,7 @@ async def hover_info(
 ) -> HoverInfo:
     validate_position(line, column)
 
-    if file_path not in client.open_documents:
-        await client.open_document(file_path)
+    await client.open_document(file_path)
 
     lsp_line, lsp_col = mcp_to_lsp_position(line, column)
 

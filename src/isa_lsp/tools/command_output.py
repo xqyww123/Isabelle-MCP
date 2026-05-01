@@ -39,8 +39,7 @@ async def command_output(
     if _is_non_command_line(line_context):
         return CommandOutputResult(line_context=line_context)
 
-    if file_path not in client.open_documents:
-        await client.open_document(file_path)
+    await client.open_document(file_path)
 
     messages: list[OutputMessage] = []
     for character in _candidate_characters(line_context):

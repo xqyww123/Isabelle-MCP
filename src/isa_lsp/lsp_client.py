@@ -366,12 +366,23 @@ class IsabelleLSPClient:
         wait_for_diagnostics: bool = True,
         diagnostic_timeout: float = 2.0,
     ) -> None:
-        if file_path in self.open_documents:
-            return
-
         if content is None:
             with open(file_path, encoding='utf-8') as f:
                 content = f.read()
+
+        existing = self.open_documents.get(file_path)
+        if existing is not None:
+            if existing.content == content:
+                logger.info("Document unchanged: %s", file_path)
+                return
+            existing.version += 1
+            existing.content = content
+            logger.info("Sending didChange v%d for %s", existing.version, file_path)
+            await self.notify("textDocument/didChange", {
+                "textDocument": {"uri": existing.uri, "version": existing.version},
+                "contentChanges": [{"text": content}],
+            })
+            return
 
         uri = file_path_to_uri(file_path)
 

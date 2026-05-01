@@ -19,8 +19,7 @@ async def diagnostic_messages(
             f"start_line must be <= end_line, got {start_line} > {end_line}"
         )
 
-    if file_path not in client.open_documents:
-        await client.open_document(file_path)
+    await client.open_document(file_path)
 
     items: list[DiagnosticMessage] = []
     for diag in client.get_cached_diagnostics(file_path):

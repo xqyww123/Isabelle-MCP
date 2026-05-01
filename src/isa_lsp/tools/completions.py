@@ -22,8 +22,7 @@ async def completions(
     if max_completions < 1:
         raise IsabelleToolError(f"max_completions must be >= 1, got {max_completions}")
 
-    if file_path not in client.open_documents:
-        await client.open_document(file_path)
+    await client.open_document(file_path)
 
     lsp_line, lsp_col = mcp_to_lsp_position(line, column)
 

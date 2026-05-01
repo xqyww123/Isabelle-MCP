@@ -9,8 +9,7 @@ async def preview_document(
     if line is not None:
         validate_position(line, 1)
 
-    if file_path not in client.open_documents:
-        await client.open_document(file_path)
+    await client.open_document(file_path)
 
     response = await client.request_preview(file_path)
     return PreviewResult(

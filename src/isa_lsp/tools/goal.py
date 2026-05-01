@@ -11,8 +11,7 @@ async def goal(
 ) -> GoalState:
     validate_position(line, column if column is not None else 1)
 
-    if file_path not in client.open_documents:
-        await client.open_document(file_path)
+    await client.open_document(file_path)
 
     line_context = get_line_from_file(file_path, line)
 
