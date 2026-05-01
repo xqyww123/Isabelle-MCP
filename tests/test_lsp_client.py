@@ -55,6 +55,33 @@ class TestIsabelleLSPClient:
         assert len(client.pending_requests) == 0
 
     @pytest.mark.asyncio
+    async def test_send_without_process_raises(self):
+        client = IsabelleLSPClient()
+        with pytest.raises(IsabelleToolError, match="LSP process not running"):
+            await client._send({"jsonrpc": "2.0", "method": "test", "params": {}})
+
+    @pytest.mark.asyncio
+    async def test_send_broken_pipe_raises_tool_error(self):
+        client = IsabelleLSPClient()
+        client.process = MagicMock()
+        client.process.stdin = MagicMock()
+        client.process.stdin.write = MagicMock(side_effect=BrokenPipeError)
+        client.process.stdin.drain = AsyncMock()
+
+        with pytest.raises(IsabelleToolError, match="Failed to write"):
+            await client._send({"jsonrpc": "2.0", "method": "test", "params": {}})
+
+    @pytest.mark.asyncio
+    async def test_request_send_failure_clears_pending_request(self):
+        client = IsabelleLSPClient()
+        client._send = AsyncMock(side_effect=IsabelleToolError("write failed"))
+
+        with pytest.raises(IsabelleToolError, match="write failed"):
+            await client.request("test/method", {})
+
+        assert client.pending_requests == {}
+
+    @pytest.mark.asyncio
     async def test_handle_response(self):
         client = IsabelleLSPClient()
         future = asyncio.Future()
@@ -79,6 +106,31 @@ class TestIsabelleLSPClient:
 
         assert future.done()
         with pytest.raises(IsabelleToolError, match="Invalid Request"):
+            future.result()
+
+    @pytest.mark.asyncio
+    async def test_handle_malformed_response_fails_request(self):
+        client = IsabelleLSPClient()
+        future = asyncio.Future()
+        client.pending_requests[1] = future
+
+        await client._handle_message({"jsonrpc": "2.0", "id": 1})
+
+        assert future.done()
+        with pytest.raises(IsabelleToolError, match="missing result/error"):
+            future.result()
+        assert 1 not in client.pending_requests
+
+    @pytest.mark.asyncio
+    async def test_handle_non_dict_error_response(self):
+        client = IsabelleLSPClient()
+        future = asyncio.Future()
+        client.pending_requests[1] = future
+
+        await client._handle_message({"jsonrpc": "2.0", "id": 1, "error": "boom"})
+
+        assert future.done()
+        with pytest.raises(IsabelleToolError, match="boom"):
             future.result()
 
     @pytest.mark.asyncio
@@ -309,6 +361,44 @@ class TestIsabelleLSPClient:
         assert await client._read_message() == message
 
     @pytest.mark.asyncio
+    async def test_read_message_missing_content_length_returns_empty_message(self):
+        client = IsabelleLSPClient()
+        client.process = MagicMock()
+        client.process.stdout = MagicMock()
+        client.process.stdout.readline = AsyncMock(side_effect=[
+            b"Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n",
+            b"\r\n",
+        ])
+
+        assert await client._read_message() == {}
+
+    @pytest.mark.asyncio
+    async def test_read_message_invalid_content_length_returns_empty_message(self):
+        client = IsabelleLSPClient()
+        client.process = MagicMock()
+        client.process.stdout = MagicMock()
+        client.process.stdout.readline = AsyncMock(side_effect=[
+            b"Content-Length: nope\r\n",
+            b"\r\n",
+        ])
+
+        assert await client._read_message() == {}
+
+    @pytest.mark.asyncio
+    async def test_read_message_invalid_json_returns_empty_message(self):
+        client = IsabelleLSPClient()
+        content = b"{not json"
+        client.process = MagicMock()
+        client.process.stdout = MagicMock()
+        client.process.stdout.readline = AsyncMock(side_effect=[
+            f"Content-Length: {len(content)}\r\n".encode("ascii"),
+            b"\r\n",
+        ])
+        client.process.stdout.readexactly = AsyncMock(return_value=content)
+
+        assert await client._read_message() == {}
+
+    @pytest.mark.asyncio
     async def test_handle_state_output_resolves_waiter(self):
         client = IsabelleLSPClient()
         future = asyncio.get_running_loop().create_future()
@@ -376,6 +466,16 @@ class TestIsabelleLSPClient:
         assert calls[-1] == ("PIDE/state_exit", {"id": 99})
 
     @pytest.mark.asyncio
+    async def test_get_goals_timeout_cleans_init_waiter(self):
+        client = IsabelleLSPClient()
+        client.notify = AsyncMock()
+
+        with pytest.raises(IsabelleToolError, match="Timed out waiting for PIDE proof state"):
+            await client.get_goals_at_position("/tmp/Test.thy", 7, 3, timeout=0.01)
+
+        assert client._state_init_waiters == []
+
+    @pytest.mark.asyncio
     async def test_dynamic_output_timeout_no_stale_data(self):
         client = IsabelleLSPClient()
         client.notify = AsyncMock()
@@ -414,6 +514,41 @@ class TestIsabelleLSPClient:
         assert await second == "second"
         assert [call[1]["line"] for call in calls] == [1, 2]
 
+    def test_fail_pending_waiters_fails_and_clears_all_waiters(self):
+        client = IsabelleLSPClient()
+        loop = asyncio.get_event_loop()
+        request_future = loop.create_future()
+        state_init_future = loop.create_future()
+        state_output_future = loop.create_future()
+        dynamic_future = loop.create_future()
+        preview_future = loop.create_future()
+
+        client.pending_requests[1] = request_future
+        client._state_init_waiters.append(state_init_future)
+        client._state_output_waiters[7] = state_output_future
+        client._dynamic_output_waiters.append((("/tmp/Test.thy", 1, 0), dynamic_future))
+        client._dynamic_output_cache_by_position[("/tmp/Test.thy", 1, 0)] = "stale"
+        client._preview_waiters[("file:///tmp/Test.thy", 0)] = preview_future
+
+        exc = IsabelleToolError("transport failed")
+        client._fail_pending_waiters(exc)
+
+        for future in (
+            request_future,
+            state_init_future,
+            state_output_future,
+            dynamic_future,
+            preview_future,
+        ):
+            assert future.done()
+            assert future.exception() is exc
+        assert client.pending_requests == {}
+        assert client._state_init_waiters == []
+        assert client._state_output_waiters == {}
+        assert client._dynamic_output_waiters == []
+        assert client._dynamic_output_cache_by_position == {}
+        assert client._preview_waiters == {}
+
     @pytest.mark.asyncio
     async def test_preview_requests_are_serialized(self):
         client = IsabelleLSPClient()
@@ -451,3 +586,13 @@ class TestIsabelleLSPClient:
         assert (await first)["content"] == "first"
         assert (await second)["content"] == "second"
         assert [call[1]["column"] for call in calls] == [0, 1]
+
+    @pytest.mark.asyncio
+    async def test_preview_timeout_cleans_waiter(self):
+        client = IsabelleLSPClient()
+        client.notify = AsyncMock()
+
+        with pytest.raises(IsabelleToolError, match="Timed out waiting for PIDE preview"):
+            await client.request_preview("/tmp/Test.thy", timeout=0.01)
+
+        assert client._preview_waiters == {}

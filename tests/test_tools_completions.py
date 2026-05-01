@@ -67,3 +67,23 @@ class TestCompletionsTool:
     async def test_invalid_max_completions(self, mock_lsp_client, temp_theory_file):
         with pytest.raises(IsabelleToolError, match="max_completions must be >= 1"):
             await completions(mock_lsp_client, temp_theory_file, 8, 1, max_completions=0)
+
+    @pytest.mark.asyncio
+    async def test_malformed_items_are_skipped_or_coerced(self, mock_lsp_client, temp_theory_file):
+        mock_lsp_client.completion_response = {
+            "items": [
+                {"label": None, "kind": 14},
+                {"label": "", "kind": 14},
+                {
+                    "label": "usable",
+                    "kind": 14,
+                    "textEdit": {"newText": 123},
+                    "documentation": {"value": 42},
+                },
+            ]
+        }
+        result = await completions(mock_lsp_client, temp_theory_file, 8, 1)
+        assert len(result.items) == 1
+        assert result.items[0].label == "usable"
+        assert result.items[0].insert_text == "123"
+        assert result.items[0].documentation == "42"

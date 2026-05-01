@@ -220,7 +220,10 @@ class IsabelleLSPClient:
             return {}
 
         content = await self.process.stdout.readexactly(content_length)
-        message = json.loads(content.decode("utf-8"))
+        try:
+            message = json.loads(content.decode("utf-8"))
+        except json.JSONDecodeError:
+            return {}
         return message if isinstance(message, dict) else {}
 
     async def _drain_stderr(self) -> None:
@@ -257,8 +260,16 @@ class IsabelleLSPClient:
                 future.set_result(message["result"])
             elif "error" in message:
                 error = message["error"]
+                if isinstance(error, dict):
+                    error_message = error.get('message', 'Unknown')
+                else:
+                    error_message = str(error)
                 future.set_exception(
-                    IsabelleToolError(f"LSP error: {error.get('message', 'Unknown')}")
+                    IsabelleToolError(f"LSP error: {error_message}")
+                )
+            else:
+                future.set_exception(
+                    IsabelleToolError("LSP response missing result/error")
                 )
         elif "method" in message:
             await self._handle_notification(message["method"], message.get("params", {}))

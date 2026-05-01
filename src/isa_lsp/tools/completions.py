@@ -63,24 +63,31 @@ _KIND_MAP = {
 
 def _parse_item(item: dict) -> CompletionItem:
     kind = _KIND_MAP.get(item.get("kind", 1), "text")
-    insert_text = item.get("insertText", item.get("label", ""))
+    label = _string_or_empty(item.get("label"))
+    insert_text = _string_or_empty(item.get("insertText", label))
     text_edit = item.get("textEdit")
     if isinstance(text_edit, dict) and "newText" in text_edit:
-        insert_text = text_edit["newText"]
+        insert_text = _string_or_empty(text_edit["newText"])
 
     doc = item.get("documentation")
     if isinstance(doc, dict):
-        doc = str(doc.get("value", ""))
+        doc = _string_or_empty(doc.get("value"))
     elif doc is not None:
         doc = str(doc)
 
     return CompletionItem(
-        label=item.get("label", ""),
+        label=label,
         kind=kind,
         detail=str(item.get("detail") or ""),
         documentation=doc,
         insert_text=insert_text,
     )
+
+
+def _string_or_empty(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value)
 
 
 def _extract_prefix(line: str, column: int) -> str:

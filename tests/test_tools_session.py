@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from isa_lsp.tools.session import build_session, session_info
+from isa_lsp.utils import IsabelleToolError
 
 
 class TestSessionTool:
@@ -44,3 +45,9 @@ class TestSessionTool:
             mock_sub.return_value = mock_proc
             await build_session(mock_lsp_client, "HOL", clean=True)
         assert "-c" in mock_sub.call_args[0]
+
+    @pytest.mark.asyncio
+    async def test_build_spawn_failure(self, mock_lsp_client):
+        with patch('asyncio.create_subprocess_exec', side_effect=FileNotFoundError("isabelle")):
+            with pytest.raises(IsabelleToolError, match="Failed to build session 'HOL'"):
+                await build_session(mock_lsp_client, "HOL")
