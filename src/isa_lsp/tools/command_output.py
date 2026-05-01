@@ -3,6 +3,11 @@ from isa_lsp.models import CommandOutputResult, OutputMessage
 from isa_lsp.utils import get_line_from_file, parse_command_output_html, validate_position
 
 
+def _is_non_command_line(line_context: str) -> bool:
+    stripped = line_context.strip()
+    return not stripped or (stripped.startswith("(*") and stripped.endswith("*)"))
+
+
 def _candidate_characters(line_context: str) -> list[int]:
     candidates: list[int] = []
 
@@ -30,6 +35,9 @@ async def command_output(
 ) -> CommandOutputResult:
     validate_position(line, 1)
     line_context = get_line_from_file(file_path, line)
+
+    if _is_non_command_line(line_context):
+        return CommandOutputResult(line_context=line_context)
 
     if file_path not in client.open_documents:
         await client.open_document(file_path)

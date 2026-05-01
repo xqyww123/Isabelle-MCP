@@ -835,6 +835,7 @@ def parse_dynamic_output(html: str) -> List[OutputMessage]:
 **Edge Cases:**
 - No output at line → return empty messages
 - Empty PIDE payload such as `<pre class="source"/>` → return empty messages
+- Empty lines and pure comment lines return empty messages without querying PIDE
 - Unrecognized HTML classes → ignore them
 - Multiple commands on one line are position-sensitive; the line-only tool
   returns the first recognized output from its caret probes

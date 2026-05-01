@@ -80,6 +80,62 @@ class TestCommandOutputTool:
         assert client.calls == [(3, 0), (3, 2), (3, 3)]
 
     @pytest.mark.asyncio
+    async def test_empty_line_returns_without_lsp_query(self, tmp_path):
+        theory_file = tmp_path / "ScratchLike.thy"
+        theory_file.write_text(
+            'theory ScratchLike\n'
+            'imports Main\n'
+            'begin\n'
+            '\n'
+            'thm TrueI\n'
+            'end\n'
+        )
+
+        class Client:
+            open_documents: dict[str, object] = {}
+
+            async def open_document(self, file_path: str):
+                raise AssertionError("empty lines should not open/query the LSP")
+
+            async def get_dynamic_output(
+                self, file_path: str, line: int, character: int = 0, timeout: float = 2.0,
+            ):
+                raise AssertionError("empty lines should not query dynamic output")
+
+        result = await command_output(cast(Any, Client()), str(theory_file), 4)
+
+        assert result.line_context == ""
+        assert result.messages == []
+
+    @pytest.mark.asyncio
+    async def test_comment_only_line_returns_without_lsp_query(self, tmp_path):
+        theory_file = tmp_path / "ScratchLike.thy"
+        theory_file.write_text(
+            'theory ScratchLike\n'
+            'imports Main\n'
+            'begin\n'
+            '(* comment-only line *)\n'
+            'thm TrueI\n'
+            'end\n'
+        )
+
+        class Client:
+            open_documents: dict[str, object] = {}
+
+            async def open_document(self, file_path: str):
+                raise AssertionError("comment-only lines should not open/query the LSP")
+
+            async def get_dynamic_output(
+                self, file_path: str, line: int, character: int = 0, timeout: float = 2.0,
+            ):
+                raise AssertionError("comment-only lines should not query dynamic output")
+
+        result = await command_output(cast(Any, Client()), str(theory_file), 4)
+
+        assert result.line_context == "(* comment-only line *)"
+        assert result.messages == []
+
+    @pytest.mark.asyncio
     async def test_invalid_line(self, mock_lsp_client, temp_theory_file):
         with pytest.raises(IsabelleToolError, match="line must be >= 1"):
             await command_output(mock_lsp_client, temp_theory_file, 0)
