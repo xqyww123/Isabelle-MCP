@@ -177,8 +177,8 @@ Isabelle-specific features - **only PIDE-native methods**:
 **Destructive**: Yes (restarts session)
 
 #### Tool 11: `isabelle_session_info`
-**Purpose**: Get current session info and capabilities
-**LSP Mapping**: Cached `initialize` response ✅
+**Purpose**: Get the current session name
+**LSP Mapping**: In-memory client state ✅
 **Priority**: Low (Introspection)
 **Pattern**: New (info query)
 
@@ -718,7 +718,7 @@ class BuildResult(BaseModel):
 
 #### 4.4.2 `isabelle_session_info`
 
-**Description**: Get information about the current Isabelle session.
+**Description**: Get the name of the current Isabelle session.
 
 **Tool Annotations**:
 ```python
@@ -734,10 +734,7 @@ ToolAnnotations(
 **Output Model**:
 ```python
 class SessionInfo(BaseModel):
-    logic_name: str = Field(description="Current logic/session name")
-    isabelle_version: str = Field(description="Isabelle version")
-    capabilities: Dict[str, Any] = Field(description="LSP server capabilities")
-    uptime_seconds: int = Field(description="Session uptime in seconds")
+    current_session: str = Field(description="Current logic/session name")
 ```
 
 ---

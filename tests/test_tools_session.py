@@ -11,7 +11,6 @@ class TestSessionTool:
     async def test_session_info(self, mock_lsp_client):
         result = await session_info(mock_lsp_client)
         assert result.current_session == "HOL"
-        assert "HOL" in result.available_sessions
 
     @pytest.mark.asyncio
     async def test_build_success(self, mock_lsp_client):

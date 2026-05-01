@@ -9,11 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 async def session_info(client: IsabelleLSPClient) -> SessionInfo:
-    # TODO: query actual available sessions via `isabelle build -n`
-    return SessionInfo(
-        current_session=client.logic,
-        available_sessions=["Pure", "HOL", "HOL-Analysis", "HOL-Algebra", "HOL-Library", "Main", "ZF"],
-    )
+    return SessionInfo(current_session=client.logic)
 
 
 async def build_session(client: IsabelleLSPClient, session: str, clean: bool = False) -> BuildStatus:

@@ -103,7 +103,6 @@ class TestMCPServerTools:
         with _patch_ensure(mock_lsp_client):
             result = await isabelle_session_info()
         assert result.current_session == "HOL"
-        assert len(result.available_sessions) > 0
 
     @pytest.mark.asyncio
     async def test_build(self, mock_lsp_client):

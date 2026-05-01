@@ -1052,9 +1052,9 @@ async def build_session(
 ### 3.11 `isabelle_session_info`
 
 **Implementation Notes:**
-- Query LSP client state
+- Query the current LSP client session name
 - No external calls needed
-- Return cached information
+- Does not enumerate available Isabelle sessions
 
 **Code Snippet:**
 ```python
@@ -1065,12 +1065,7 @@ def session_info(ctx: Context) -> SessionInfo:
     if not client:
         raise IsabelleToolError("No active session")
 
-    return SessionInfo(
-        logic_name=client.logic,
-        isabelle_version=client.isabelle_version,
-        capabilities=client.server_capabilities,
-        uptime_seconds=int(time.time() - client.start_time)
-    )
+    return SessionInfo(current_session=client.logic)
 ```
 
 ---

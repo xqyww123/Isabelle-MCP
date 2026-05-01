@@ -97,7 +97,6 @@ class PreviewResult(BaseModel):
 
 class SessionInfo(BaseModel):
     current_session: str = Field(description="Current logic/session name (e.g., HOL)")
-    available_sessions: list[str] = Field(description="List of available sessions")
 
 
 class BuildStatus(BaseModel):

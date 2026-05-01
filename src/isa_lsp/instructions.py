@@ -19,7 +19,7 @@ INSTRUCTIONS = """\
 
 ### Session Management (2 tools)
 
-9.  **isabelle_session_info** — current session and available sessions
+9.  **isabelle_session_info** — current session
 10. **isabelle_build** — build session heap images
 
 ## Key conventions
