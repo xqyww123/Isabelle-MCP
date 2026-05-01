@@ -156,6 +156,84 @@ class TestFormatters:
             {'kind': 'error', 'text': 'Err'},
         ]
 
+    def test_parse_command_output_isabelle2024_writeln_message(self):
+        html = (
+            '<pre class="source"><span class="writeln_message">'
+            '<span class="block">val<span class="break"> </span>'
+            '<span class="block">it</span><span class="break"> </span>=</span>'
+            '<span class="break"> </span>64:<span class="break"> </span>'
+            '<span class="block">int</span></span></pre>'
+        )
+        assert parse_command_output_html(html) == [
+            {'kind': 'writeln', 'text': 'val it = 64: int'}
+        ]
+
+    def test_parse_command_output_isabelle2024_error_message(self):
+        html = (
+            '<pre class="source"><span class="error_message">'
+            'Undefined fact: &quot;fib.simps&quot;<span class="position">⌂</span>'
+            '</span></pre>'
+        )
+        assert parse_command_output_html(html) == [
+            {'kind': 'error', 'text': 'Undefined fact: "fib.simps"'}
+        ]
+
+    def test_parse_command_output_isabelle2024_state_message(self):
+        html = (
+            '<pre class="source"><span class="state_message">'
+            '<span class="block">proof</span> (prove)\n'
+            '<span class="block">goal</span> (1 subgoal):\n'
+            '<span class="subgoal"> 1. P ⟹ Q</span>'
+            '</span></pre>'
+        )
+        assert parse_command_output_html(html) == [
+            {'kind': 'information', 'text': 'proof (prove) goal (1 subgoal): 1. P ⟹ Q'}
+        ]
+
+    @pytest.mark.parametrize(
+        ("html", "expected"),
+        [
+            (
+                '<pre class="source"><span class="error_message">'
+                'Undefined fact: &quot;fib.simps&quot;<span class="position">⌂</span>'
+                '</span></pre>',
+                [{'kind': 'error', 'text': 'Undefined fact: "fib.simps"'}],
+            ),
+            (
+                '<pre class="source"><span class="writeln_message"><span class="block">'
+                '<span class="block"><span class="block"><a '
+                'href="file:/home/qiyuan/Current/MLML/contrib/Isabelle2024/src/HOL/HOL.thy#100">'
+                '<span class="block">True</span></a></span></span></span></span></pre>',
+                [{'kind': 'writeln', 'text': 'True'}],
+            ),
+            (
+                '<pre class="source"><span class="error_message">Bad context for command '
+                '&quot;<span class="keyword1">apply</span>&quot;'
+                '<span class="position">⌂</span> -- using reset state</span></pre>',
+                [{'kind': 'error', 'text': 'Bad context for command "apply" -- using reset state'}],
+            ),
+            (
+                '<pre class="source"><span class="writeln_message"><span class="block">'
+                '<span class="block">val<span class="break"> </span><span class="block">it</span>'
+                '<span class="break"> </span>=</span><span class="break"> </span>'
+                '&quot;&quot;:<span class="break"> </span><span class="block">string</span>'
+                '</span></span></pre>',
+                [{'kind': 'writeln', 'text': 'val it = "": string'}],
+            ),
+            (
+                '<pre class="source"><span class="writeln_message"><span class="block">'
+                '<span class="block">val<span class="break"> </span><span class="block">it</span>'
+                '<span class="break"> </span>=</span><span class="break"> </span>'
+                '64:<span class="break"> </span><span class="block">int</span>'
+                '</span></span></pre>',
+                [{'kind': 'writeln', 'text': 'val it = 64: int'}],
+            ),
+            ('<pre class="source"/>', []),
+        ],
+    )
+    def test_parse_command_output_real_isabelle2024_scratch_samples(self, html, expected):
+        assert parse_command_output_html(html) == expected
+
     def test_parse_command_output_empty(self):
         assert parse_command_output_html("<div></div>") == []
 

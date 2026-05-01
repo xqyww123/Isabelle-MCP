@@ -41,8 +41,7 @@ async def main():
         # Example 1: Get session info
         print("--- Example 1: Session Information ---")
         info = await session_info(client)
-        print(f"Current session: {info.current_session}")
-        print(f"Available sessions: {', '.join(info.available_sessions[:5])}...\n")
+        print(f"Current session: {info.current_session}\n")
 
         # Example 2: Check diagnostics
         print("--- Example 2: Diagnostics ---")

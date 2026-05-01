@@ -2,6 +2,7 @@
 
 import html as html_module
 import re
+from html.parser import HTMLParser
 from typing import Any
 
 
@@ -46,21 +47,83 @@ def parse_goals_from_html(html: str) -> list[str]:
     return goals
 
 
+_COMMAND_OUTPUT_KIND_BY_CSS_CLASS = {
+    'writeln': 'writeln',
+    'writeln_message': 'writeln',
+    'warning': 'warning',
+    'warning_message': 'warning',
+    'error': 'error',
+    'error_message': 'error',
+    'information': 'information',
+    'information_message': 'information',
+    'state_message': 'information',
+    'tracing': 'writeln',
+    'tracing_message': 'writeln',
+}
+
+
+def _normalize_command_output_text(text: str) -> str:
+    text = text.replace("⌂", "")
+    text = html_module.unescape(text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+class _CommandOutputHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.messages: list[dict[str, str]] = []
+        self._current_kind: str | None = None
+        self._current_text: list[str] = []
+        self._current_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self._current_kind is not None:
+            self._current_depth += 1
+            return
+
+        attr_map = dict(attrs)
+        css_classes = (attr_map.get("class") or "").split()
+        kind = next(
+            (
+                _COMMAND_OUTPUT_KIND_BY_CSS_CLASS[css_class]
+                for css_class in css_classes
+                if css_class in _COMMAND_OUTPUT_KIND_BY_CSS_CLASS
+            ),
+            None,
+        )
+        if kind is None:
+            return
+
+        self._current_kind = kind
+        self._current_text = []
+        self._current_depth = 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._current_kind is None:
+            return
+
+        self._current_depth -= 1
+        if self._current_depth > 0:
+            return
+
+        text = _normalize_command_output_text("".join(self._current_text))
+        if text:
+            self.messages.append({"kind": self._current_kind, "text": text})
+        self._current_kind = None
+        self._current_text = []
+        self._current_depth = 0
+
+    def handle_data(self, data: str) -> None:
+        if self._current_kind is not None:
+            self._current_text.append(data)
+
+
 def parse_command_output_html(html: str) -> list[dict[str, str]]:
-    messages = []
-    kind_map = {
-        'writeln': 'writeln',
-        'warning': 'warning',
-        'error': 'error',
-        'information': 'information',
-        'tracing': 'writeln',
-    }
-    for match in re.finditer(r'<div class=[\'"]([^\'"]+)[\'"]>(.*?)</div>', html, re.DOTALL):
-        css_classes = match.group(1).split()
-        text = strip_html_tags(match.group(2))
-        kind = next((kind_map[css_class] for css_class in css_classes if css_class in kind_map), 'writeln')
-        messages.append({'kind': kind, 'text': text})
-    return messages
+    parser = _CommandOutputHTMLParser()
+    parser.feed(html)
+    parser.close()
+    return parser.messages
 
 
 def get_line_from_file(file_path: str, line: int) -> str:

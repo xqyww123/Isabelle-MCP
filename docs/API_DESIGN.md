@@ -790,7 +790,7 @@ class StatePanelManager:
   "jsonrpc": "2.0",
   "method": "PIDE/dynamic_output",
   "params": {
-    "content": "<html><div class='writeln'>Proof complete</div><div class='warning'>Unused variable</div></html>"
+    "content": "<pre class=\"source\"><span class=\"writeln_message\">val it = 64: int</span></pre>"
   }
 }
 ```
@@ -803,7 +803,14 @@ class StatePanelManager:
 3. The client does not reuse output from a different file/line/column. If
    Isabelle emits no fresh notification and no same-position cache exists, the
    command output result contains an empty message list.
-4. Parse HTML to extract message type and text.
+4. `isabelle_command_output` probes a small set of caret columns on the line:
+   first non-space character, end of the command token, the following
+   character, then column 0. This matches Isabelle output that appears only
+   when the caret is inside a command body.
+5. Parse HTML to extract message type and text. Isabelle2024 commonly emits
+   message spans such as `writeln_message`, `error_message`, and
+   `state_message`; older/simple examples may use `writeln`, `warning`, or
+   `error` classes directly.
 
 **Output Types:**
 - `writeln`: Normal prover output
@@ -815,33 +822,22 @@ class StatePanelManager:
 ```python
 def parse_dynamic_output(html: str) -> List[OutputMessage]:
     """Parse PIDE dynamic output HTML"""
-    messages = []
-
-    # Extract message divs
-    for match in re.finditer(r'<div class=[\'"]([^\'"]+)[\'"]>(.*?)</div>', html, re.DOTALL):
-        kind = match.group(1)
-        text = re.sub(r'<[^>]+>', '', match.group(2)).strip()
-
-        # Map CSS class to message kind
-        kind_map = {
-            'writeln': 'writeln',
-            'warning': 'warning',
-            'error': 'error',
-            'information': 'information'
-        }
-
-        messages.append(OutputMessage(
-            kind=kind_map.get(kind, 'writeln'),
-            text=text
-        ))
-
-    return messages
+    # Use an HTML parser, not regex: Isabelle output is nested markup such as
+    # <pre class="source"><span class="writeln_message">...</span></pre>.
+    # Recognized CSS classes:
+    # - writeln, writeln_message, tracing, tracing_message -> writeln
+    # - warning, warning_message -> warning
+    # - error, error_message -> error
+    # - information, information_message, state_message -> information
+    ...
 ```
 
 **Edge Cases:**
 - No output at line → return empty messages
-- Multiple commands on line → return combined output
-- HTML parsing errors → return raw HTML as single message
+- Empty PIDE payload such as `<pre class="source"/>` → return empty messages
+- Unrecognized HTML classes → ignore them
+- Multiple commands on one line are position-sensitive; the line-only tool
+  returns the first recognized output from its caret probes
 
 ---
 
