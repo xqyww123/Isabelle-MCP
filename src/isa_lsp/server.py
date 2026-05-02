@@ -7,7 +7,10 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
+from isa_lsp.file_watcher import FileWatcher
 from isa_lsp.instructions import get_instructions
 from isa_lsp.lsp_client import IsabelleLSPClient
 from isa_lsp.models import (
@@ -40,16 +43,20 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 _lsp_client: IsabelleLSPClient | None = None
+_file_watcher: FileWatcher | None = None
 
 
 @asynccontextmanager
 async def server_lifespan(_app: Any) -> AsyncGenerator[None]:
-    global _lsp_client
+    global _lsp_client, _file_watcher
     logic = os.environ.get("ISABELLE_SESSION", "Main")
     _lsp_client = IsabelleLSPClient(logic=logic)
+    _file_watcher = FileWatcher()
+    _file_watcher.start()
     try:
         yield
     finally:
+        _file_watcher.stop()
         if _lsp_client.process is not None:
             await _lsp_client.shutdown()
 
@@ -62,7 +69,21 @@ async def _ensure_lsp_started() -> IsabelleLSPClient:
         raise IsabelleToolError("LSP client not initialized")
     if _lsp_client.process is None:
         await _lsp_client.start()
+    if _file_watcher is not None:
+        dirty = _file_watcher.pop_dirty_files()
+        if dirty:
+            await _lsp_client.sync_dirty_files(dirty)
     return _lsp_client
+
+
+@mcp.custom_route("/notify-file-change", methods=["POST"])
+async def notify_file_change(request: Request) -> JSONResponse:
+    data = await request.json()
+    file_path = data.get("file_path", "")
+    if file_path and _file_watcher is not None:
+        _file_watcher.notify_file_changed(file_path)
+        logger.info("Hook notified file change: %s", file_path)
+    return JSONResponse({"ok": True})
 
 
 @mcp.resource("instructions://isabelle-lsp")
@@ -127,7 +148,6 @@ async def isabelle_diagnostics(
     file_path: str,
     start_line: int | None = None,
     end_line: int | None = None,
-    interactive: bool = False,
 ) -> DiagnosticsResult:
     """Get compiler diagnostics (errors, warnings) for file.
 
@@ -135,10 +155,9 @@ async def isabelle_diagnostics(
         file_path: Absolute path to .thy file
         start_line: Filter diagnostics from this line (1-indexed), optional
         end_line: Filter diagnostics to this line (1-indexed), optional
-        interactive: Return verbose PIDE markup (not implemented in MVP)
     """
     return await diagnostic_messages(
-        await _ensure_lsp_started(), file_path, start_line, end_line, interactive
+        await _ensure_lsp_started(), file_path, start_line, end_line
     )
 
 

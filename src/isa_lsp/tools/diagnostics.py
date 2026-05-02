@@ -8,7 +8,6 @@ async def diagnostic_messages(
     file_path: str,
     start_line: int | None = None,
     end_line: int | None = None,
-    interactive: bool = False,
 ) -> DiagnosticsResult:
     if start_line is not None and start_line < 1:
         raise IsabelleToolError(f"start_line must be >= 1, got {start_line}")
@@ -20,6 +19,15 @@ async def diagnostic_messages(
         )
 
     await client.open_document(file_path)
+
+    # Set caret to end_line or end of file so Isabelle processes the needed region
+    doc = client.open_documents.get(file_path)
+    if doc is not None:
+        if end_line is not None:
+            caret_line = end_line - 1  # 0-indexed
+        else:
+            caret_line = doc.content.count("\n")
+        await client.set_caret(file_path, caret_line)
 
     items: list[DiagnosticMessage] = []
     for diag in client.get_cached_diagnostics(file_path):

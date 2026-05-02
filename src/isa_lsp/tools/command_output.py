@@ -40,6 +40,7 @@ async def command_output(
         return CommandOutputResult(line_context=line_context)
 
     await client.open_document(file_path)
+    await client.set_caret(file_path, line - 1)
 
     messages: list[OutputMessage] = []
     for character in _candidate_characters(line_context):

@@ -12,6 +12,7 @@ async def goal(
     validate_position(line, column if column is not None else 1)
 
     await client.open_document(file_path)
+    await client.set_caret(file_path, line - 1)
 
     line_context = get_line_from_file(file_path, line)
 

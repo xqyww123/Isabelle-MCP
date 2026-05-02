@@ -23,6 +23,7 @@ async def completions(
         raise IsabelleToolError(f"max_completions must be >= 1, got {max_completions}")
 
     await client.open_document(file_path)
+    await client.set_caret(file_path, line - 1)
 
     lsp_line, lsp_col = mcp_to_lsp_position(line, column)
 

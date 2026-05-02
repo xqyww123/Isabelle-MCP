@@ -10,6 +10,8 @@ async def preview_document(
         validate_position(line, 1)
 
     await client.open_document(file_path)
+    if line is not None:
+        await client.set_caret(file_path, line - 1)
 
     response = await client.request_preview(file_path)
     return PreviewResult(

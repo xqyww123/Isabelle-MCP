@@ -18,6 +18,7 @@ async def hover_info(
     validate_position(line, column)
 
     await client.open_document(file_path)
+    await client.set_caret(file_path, line - 1)
 
     lsp_line, lsp_col = mcp_to_lsp_position(line, column)
 

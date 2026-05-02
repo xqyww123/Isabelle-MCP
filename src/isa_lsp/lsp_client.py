@@ -61,8 +61,9 @@ class IsabelleLSPClient:
         # Fires once when the first publishDiagnostics arrives for a file.
         self._first_diagnostic_event: dict[str, asyncio.Event] = {}
 
-        # PIDE state panel
+        # PIDE state panel (persistent: one panel for the lifetime of the client)
         self._state_lock = asyncio.Lock()
+        self._state_panel_id: int | None = None
         self._state_init_waiters: list[asyncio.Future[tuple[int, str]]] = []
         self._state_output_waiters: dict[int, asyncio.Future[str]] = {}
 
@@ -80,7 +81,12 @@ class IsabelleLSPClient:
         self.start_time: float = 0.0
 
     async def start(self) -> None:
-        cmd = ["isabelle", "vscode_server", "-l", self.logic]
+        cmd = [
+            "isabelle", "vscode_server", "-l", self.logic,
+            "-o", "vscode_pide_extensions",
+            "-o", "vscode_unicode_symbols",
+            "-o", "vscode_caret_perspective=1",
+        ]
         for d in self.session_dirs:
             cmd.extend(["-d", d])
         if self.verbose:
@@ -108,7 +114,7 @@ class IsabelleLSPClient:
             "processId": None,
             "rootUri": None,
             "capabilities": {},
-        })
+        }, timeout=30.0)
         result = response if isinstance(response, dict) else {}
         if result:
             self.server_capabilities = result.get("capabilities", {})
@@ -118,6 +124,10 @@ class IsabelleLSPClient:
 
     async def shutdown(self) -> None:
         if self.process and self.process.returncode is None:
+            if self._state_panel_id is not None:
+                with contextlib.suppress(IsabelleToolError):
+                    await self.notify("PIDE/state_exit", {"id": self._state_panel_id})
+                self._state_panel_id = None
             try:
                 await asyncio.wait_for(self.request("shutdown", {}), timeout=5.0)
             except (asyncio.TimeoutError, IsabelleToolError):
@@ -131,6 +141,7 @@ class IsabelleLSPClient:
                 self.process.kill()
                 await self.process.wait()
 
+        self._state_panel_id = None
         self.open_documents.clear()
         self.pending_requests.clear()
         self.diagnostic_cache.diagnostics.clear()
@@ -432,6 +443,21 @@ class IsabelleLSPClient:
             return False
         return True
 
+    async def set_caret(self, file_path: str, line: int, character: int = 0) -> None:
+        """Send PIDE/caret_update to tell Isabelle which region to process.
+
+        Line and character are 0-indexed (LSP convention).
+        """
+        doc = self.open_documents.get(file_path)
+        if doc is None:
+            return
+        await self.notify("PIDE/caret_update", {
+            "uri": doc.uri,
+            "line": line,
+            "character": character,
+            "focus": True,
+        })
+
     async def close_document(self, file_path: str) -> None:
         doc = self.open_documents.pop(file_path, None)
         if doc is None:
@@ -440,6 +466,47 @@ class IsabelleLSPClient:
         self.diagnostic_cache.diagnostics.pop(file_path, None)
         self.diagnostic_cache.last_update.pop(file_path, None)
         self._first_diagnostic_event.pop(file_path, None)
+
+    async def sync_dirty_files(self, dirty_paths: set[str]) -> None:
+        """Re-sync open documents that are affected by dirty files.
+
+        .thy files: re-read and didChange if content differs.
+        .ML files: force re-sync all open .thy files (unknown dependency graph).
+        """
+        has_dirty_ml = any(p.endswith(".ML") for p in dirty_paths)
+        thy_to_resync: set[str] = set()
+
+        for path in dirty_paths:
+            if path in self.open_documents:
+                thy_to_resync.add(path)
+
+        if has_dirty_ml:
+            thy_to_resync.update(self.open_documents.keys())
+
+        for path in thy_to_resync:
+            doc = self.open_documents.get(path)
+            if doc is None:
+                continue
+            try:
+                with open(path, encoding="utf-8") as f:
+                    content = f.read()
+            except OSError:
+                continue
+            if content != doc.content:
+                doc.version += 1
+                doc.content = content
+                logger.info("Syncing dirty file: %s v%d", path, doc.version)
+                await self.notify("textDocument/didChange", {
+                    "textDocument": {"uri": doc.uri, "version": doc.version},
+                    "contentChanges": [{"text": content}],
+                })
+            elif has_dirty_ml:
+                doc.version += 1
+                logger.info("Forcing re-sync (ML changed): %s v%d", path, doc.version)
+                await self.notify("textDocument/didChange", {
+                    "textDocument": {"uri": doc.uri, "version": doc.version},
+                    "contentChanges": [{"text": doc.content}],
+                })
 
     # ── Standard LSP queries ────────────────────────────────────────────
 
@@ -504,30 +571,55 @@ class IsabelleLSPClient:
     # ── PIDE extension queries ──────────────────────────────────────────
 
     async def get_goals_at_position(
-        self, file_path: str, line: int, character: int, timeout: float = 5.0,
+        self, file_path: str, line: int, character: int, timeout: float = 10.0,
     ) -> list[str]:
+        """Get proof goals at a position using a persistent PIDE state panel.
+
+        Serialized via _state_lock because the Isabelle caret is global.
+        """
         uri = file_path_to_uri(file_path)
 
         async with self._state_lock:
-            future: asyncio.Future[tuple[int, str]] = asyncio.get_running_loop().create_future()
-            self._state_init_waiters.append(future)
-            panel_id: int | None = None
+            await self.notify("PIDE/caret_update", {
+                "uri": uri, "line": line, "character": character, "focus": True,
+            })
+            # vscode_input_delay = 0.1s — wait for the perspective flush
+            await asyncio.sleep(0.15)
 
-            try:
-                await self.notify("PIDE/caret_update", {
-                    "uri": uri, "line": line, "character": character,
-                })
-                await self.notify("PIDE/state_init", {})
-                panel_id, html = await asyncio.wait_for(future, timeout=timeout)
-                return parse_goals_from_html(html)
-            except asyncio.TimeoutError as exc:
-                raise IsabelleToolError("Timed out waiting for PIDE proof state") from exc
-            finally:
-                with contextlib.suppress(ValueError):
-                    self._state_init_waiters.remove(future)
-                if panel_id is not None:
-                    with contextlib.suppress(IsabelleToolError):
-                        await self.notify("PIDE/state_exit", {"id": panel_id})
+            if self._state_panel_id is not None:
+                html = await self._state_panel_query(self._state_panel_id, timeout=timeout)
+                if html is not None:
+                    return parse_goals_from_html(html)
+                # state_update produced no output (same command or stale panel)
+                with contextlib.suppress(IsabelleToolError):
+                    await self.notify("PIDE/state_exit", {"id": self._state_panel_id})
+                self._state_panel_id = None
+
+            panel_id, html = await self._state_panel_init(timeout=timeout)
+            self._state_panel_id = panel_id
+            return parse_goals_from_html(html)
+
+    async def _state_panel_init(self, timeout: float) -> tuple[int, str]:
+        future: asyncio.Future[tuple[int, str]] = asyncio.get_running_loop().create_future()
+        self._state_init_waiters.append(future)
+        await self.notify("PIDE/state_init", {})
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            with contextlib.suppress(ValueError):
+                self._state_init_waiters.remove(future)
+            raise IsabelleToolError("Timed out waiting for PIDE proof state") from exc
+
+    async def _state_panel_query(self, panel_id: int, timeout: float) -> str | None:
+        """Send state_update and wait for state_output. Returns None on timeout."""
+        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        self._state_output_waiters[panel_id] = future
+        await self.notify("PIDE/state_update", {"id": panel_id})
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            self._state_output_waiters.pop(panel_id, None)
+            return None
 
     async def get_dynamic_output(
         self, file_path: str, line: int, character: int = 0, timeout: float = 2.0,
