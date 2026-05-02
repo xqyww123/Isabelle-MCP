@@ -1,4 +1,4 @@
-theory SimpleTheory
+theory simple_theory
 imports Main
 begin
 

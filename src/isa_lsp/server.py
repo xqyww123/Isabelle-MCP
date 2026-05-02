@@ -146,15 +146,18 @@ async def isabelle_highlights(file_path: str, line: int, column: int) -> Highlig
 @mcp.tool()
 async def isabelle_diagnostics(
     file_path: str,
-    start_line: int | None = None,
-    end_line: int | None = None,
+    start_line: int,
+    end_line: int,
 ) -> DiagnosticsResult:
-    """Get compiler diagnostics (errors, warnings) for file.
+    """Get compiler diagnostics (errors, warnings) for a line range.
+
+    Isabelle processes the file up to end_line (not beyond).
+    Use negative indices to count from the end: -1 = last line, -i = last i-th line.
 
     Args:
         file_path: Absolute path to .thy file
-        start_line: Filter diagnostics from this line (1-indexed), optional
-        end_line: Filter diagnostics to this line (1-indexed), optional
+        start_line: Start line (1-indexed, or negative from end)
+        end_line: End line (1-indexed, or negative from end). Isabelle processes up to here.
     """
     return await diagnostic_messages(
         await _ensure_lsp_started(), file_path, start_line, end_line

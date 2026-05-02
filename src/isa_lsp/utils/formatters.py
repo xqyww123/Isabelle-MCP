@@ -5,6 +5,26 @@ import re
 from html.parser import HTMLParser
 from typing import Any
 
+from bs4 import BeautifulSoup, NavigableString
+
+
+def _pide_html_to_text(el: Any) -> str:
+    """Convert a PIDE HTML element tree to plain text.
+
+    Isabelle's state panel emits deeply nested <span class="block"> with
+    <span class="break"> </span> for token separators.  We turn "break"
+    spans into spaces and recurse into everything else.
+    """
+    parts: list[str] = []
+    for child in el.children:
+        if isinstance(child, NavigableString):
+            parts.append(str(child))
+        elif child.name == "span" and "break" in (child.get("class") or []):
+            parts.append(" ")
+        else:
+            parts.append(_pide_html_to_text(child))
+    return "".join(parts)
+
 
 def strip_html_tags(html: str) -> str:
     text = re.sub(r'<[^>]+>', '', html)
@@ -14,36 +34,20 @@ def strip_html_tags(html: str) -> str:
 
 
 def parse_goals_from_html(html: str) -> list[str]:
-    # Replace tags with newlines to preserve structure
-    text = re.sub(r'<[^>]+>', '\n', html)
-    text = html_module.unescape(text)
-
-    if "no goals" in text.lower():
+    if not html:
         return []
-
+    soup = BeautifulSoup(html, "html.parser")
+    subgoals = soup.find_all("span", class_="subgoal")
+    if not subgoals:
+        if "no goals" in soup.get_text().lower():
+            return []
+        return []
     goals: list[str] = []
-    current_goal: list[str] = []
-
-    def flush_goal() -> None:
-        if current_goal:
-            goals.append("\n".join(current_goal))
-            current_goal.clear()
-
-    for line in text.split('\n'):
-        line = line.strip()
-        if not line:
-            continue
-        if re.match(r'^goal \(\d+ subgoals?\):$', line):
-            continue
-        if re.match(r'^\d+\.', line):
-            flush_goal()
-            current_goal.append(re.sub(r'^\d+\.\s*', '', line))
-        elif re.match(r'^⋀', line):
-            flush_goal()
-            current_goal.append(line)
-        elif current_goal:
-            current_goal.append(line)
-    flush_goal()
+    for sg in subgoals:
+        text = _pide_html_to_text(sg).strip()
+        text = re.sub(r"^\d+\.\s*", "", text)
+        if text:
+            goals.append(text)
     return goals
 
 

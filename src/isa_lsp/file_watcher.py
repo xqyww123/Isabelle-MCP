@@ -3,6 +3,7 @@
 import logging
 import os
 import threading
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -86,11 +87,11 @@ class FileWatcher:
     """
 
     def __init__(self) -> None:
-        self._observer: "Observer | None" = None  # type: ignore[name-defined]
+        self._observer: Any = None
         self._watched_dirs: set[str] = set()
         self._dirty_files: set[str] = set()
         self._lock = threading.Lock()
-        self._handler: "_Handler | None" = None  # type: ignore[name-defined]
+        self._handler: Any = None
         self._inotify_enabled = False
         self._total_dir_watches = 0
         self._total_file_watches = 0

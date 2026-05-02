@@ -788,17 +788,40 @@ All `IsabelleToolError` exceptions are caught by FastMCP and returned as error r
 
 ### 7.3 State Panel Management
 
-**Problem:** Creating state panels for each goal query is slow
+**Design:** Create-use-destroy per query. Each `get_goals_at_position` call
+creates a fresh panel via `PIDE/state_init`, waits for `PIDE/state_output`,
+then immediately destroys the panel via `PIDE/state_exit`. No pooling or reuse.
 
-**Solution:** Future optimization with persistent panels
+**Why no pooling:** Idle panels subscribe to `Session.Caret_Focus` and
+`Session.Commands_Changed`. Every caret move triggers `auto_update()` on
+ALL alive panels, causing unnecessary overlay insertions and ghost
+`state_output` notifications. Panel creation cost is negligible (~1 overlay
+round-trip), so create-and-destroy is both simpler and more efficient.
 
-**Current MVP:**
-- Create panel, query, destroy for each call
-- Acceptable for MVP (< 1s per query)
+**Global caret serialization (known design defect):**
+The Isabelle state panel reads the **global caret** (`resources.get_caret()`)
+to determine which command to query. There is no way to bind a panel to a
+specific position atomically. Concurrent caret moves would cause panels to
+return goals for the wrong position.
 
-**Future Optimization:**
-- Keep one persistent panel per file
-- Reuse panel for multiple queries
+Therefore `_caret_lock` is held for the **entire query-response cycle**
+(caret_update → sleep → state_init → wait for state_output → state_exit).
+All goal and dynamic_output queries are fully serialized. If one query
+triggers slow theory processing (session loading, long import chain), it
+blocks all other queries for the duration — potentially minutes.
+
+Possible future mitigations:
+1. Patch `isabelle vscode_server` to support position-bound state queries
+2. Insert `print_state_query` overlays directly (requires command IDs not
+   exposed by the LSP protocol)
+3. Spawn separate `vscode_server` processes for parallel queries
+
+**Empty proof state detection:**
+Terminal proof commands (`by`, `done`, `qed`) produce empty `print_state`
+output. Isabelle's `state_panel.scala` checks `body.nonEmpty` before sending
+`state_output` — for these commands, no notification is ever sent. The client
+detects this via `STATE_OUTPUT_GRACE` (default 10s): if the server process is
+alive but no `state_output` arrives within the grace period, return `[]`.
 
 ---
 
@@ -932,15 +955,28 @@ Custom Isabelle syntax parser for `isabelle_file_outline`:
 - No need for full semantic analysis
 - Regex-based or simple parser
 
-### 10.3 Persistent State Panels
+### 10.3 Progress Monitoring & Empty State Detection (Implemented)
 
-Optimize goal queries by keeping panels alive:
+**Progress Monitoring (replaces fixed timeouts):**
+`_wait_with_progress(future, stall_timeout)` polls every `PROGRESS_CHECK_INTERVAL` (5s):
+- If the future resolves → return result
+- If `process.returncode` is set → raise (Isabelle crashed)
+- If no server message for `STALL_TIMEOUT` (120s) → raise (Isabelle stalled)
 
-**Approach:**
-- One state panel per open document
-- Update caret position instead of creating new panel
-- Destroy panel when document closes
-- 10x faster goal queries
+All async PIDE methods (`request`, `get_goals_at_position`,
+`get_dynamic_output`, `request_preview`) use progress monitoring instead of
+fixed timeouts. Only lifecycle methods (`initialize`, `shutdown`) retain hard
+deadlines.
+
+**Empty Proof State Detection:**
+`_wait_for_state_output` extends progress monitoring with grace-period logic.
+Terminal proof commands produce no `state_output` (see §7.3). After
+`STATE_OUTPUT_GRACE` (10s) with the Isabelle process still alive, the wait
+returns `None` → `get_goals_at_position` returns `[]`.
+
+**Serialized Caret Access:**
+`_caret_lock` covers the full query lifecycle. See §7.3 for rationale and
+known limitations.
 
 ---
 

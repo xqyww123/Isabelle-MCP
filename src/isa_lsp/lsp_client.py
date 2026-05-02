@@ -6,7 +6,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 from isa_lsp.utils import (
     IsabelleToolError,
@@ -38,6 +38,10 @@ class DiagnosticCache:
 class IsabelleLSPClient:
     """Manages the lifecycle of `isabelle vscode_server` and JSON-RPC 2.0 communication."""
 
+    STALL_TIMEOUT: ClassVar[float] = 120.0
+    PROGRESS_CHECK_INTERVAL: ClassVar[float] = 5.0
+    STATE_OUTPUT_GRACE: ClassVar[float] = 10.0
+
     def __init__(
         self,
         logic: str = "HOL",
@@ -58,27 +62,65 @@ class IsabelleLSPClient:
 
         self.open_documents: dict[str, DocumentState] = {}
         self.diagnostic_cache = DiagnosticCache()
-        # Fires once when the first publishDiagnostics arrives for a file.
         self._first_diagnostic_event: dict[str, asyncio.Event] = {}
 
-        # PIDE state panel (persistent: one panel for the lifetime of the client)
-        self._state_lock = asyncio.Lock()
-        self._state_panel_id: int | None = None
+        # Caret lock: serializes the entire goal/dynamic_output query cycle.
+        # The Isabelle caret is global — see docs/ARCHITECTURE.md §7.3.
+        self._caret_lock = asyncio.Lock()
         self._state_init_waiters: list[asyncio.Future[tuple[int, str]]] = []
-        self._state_output_waiters: dict[int, asyncio.Future[str]] = {}
 
         # PIDE dynamic output
-        self._dynamic_output_lock = asyncio.Lock()
         self._dynamic_output_waiters: list[tuple[tuple[str, int, int], asyncio.Future[str]]] = []
         self._dynamic_output_cache_by_position: dict[tuple[str, int, int], str] = {}
 
         # PIDE preview
-        self._preview_lock = asyncio.Lock()
         self._preview_waiters: dict[tuple[str, int], asyncio.Future[JsonDict]] = {}
+
+        # Server activity tracking for progress monitoring
+        self._last_server_activity: float = 0.0
 
         self.server_capabilities: dict[str, Any] = {}
         self.isabelle_version: str = ""
         self.start_time: float = 0.0
+
+    # ── Progress monitoring ────────────────────────────────────────────
+
+    async def _wait_with_progress(
+        self,
+        future: asyncio.Future[Any],
+        stall_timeout: float | None = None,
+    ) -> Any:
+        """Wait for a future, raising IsabelleToolError if Isabelle stalls or crashes.
+
+        Progress is detected by any incoming server message. If no message
+        arrives for stall_timeout seconds, assumes Isabelle is stuck.
+        """
+        if stall_timeout is None:
+            stall_timeout = self.STALL_TIMEOUT
+        while True:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(future), timeout=self.PROGRESS_CHECK_INTERVAL,
+                )
+            except asyncio.TimeoutError:
+                if future.done():
+                    return future.result()
+                self._check_server_health(stall_timeout)
+
+    def _check_server_health(self, stall_timeout: float) -> None:
+        """Raise IsabelleToolError if the Isabelle process appears dead or stalled."""
+        if self.process is not None and self.process.returncode is not None:
+            raise IsabelleToolError(
+                f"Isabelle process died (exit code {self.process.returncode})"
+            )
+        if self._last_server_activity > 0:
+            elapsed = time.time() - self._last_server_activity
+            if elapsed > stall_timeout:
+                raise IsabelleToolError(
+                    f"Isabelle appears stalled — no server activity for {elapsed:.0f}s"
+                )
+
+    # ── Lifecycle ──────────────────────────────────────────────────────
 
     async def start(self) -> None:
         cmd = [
@@ -105,6 +147,7 @@ class IsabelleLSPClient:
             ) from exc
 
         self.start_time = time.time()
+        self._last_server_activity = self.start_time
         self.reader_task = asyncio.create_task(self._read_loop())
         self.stderr_task = asyncio.create_task(self._drain_stderr())
         await self.initialize()
@@ -124,12 +167,8 @@ class IsabelleLSPClient:
 
     async def shutdown(self) -> None:
         if self.process and self.process.returncode is None:
-            if self._state_panel_id is not None:
-                with contextlib.suppress(IsabelleToolError):
-                    await self.notify("PIDE/state_exit", {"id": self._state_panel_id})
-                self._state_panel_id = None
             try:
-                await asyncio.wait_for(self.request("shutdown", {}), timeout=5.0)
+                await asyncio.wait_for(self.request("shutdown", {}, timeout=5.0), timeout=5.0)
             except (asyncio.TimeoutError, IsabelleToolError):
                 pass
             with contextlib.suppress(IsabelleToolError):
@@ -141,21 +180,26 @@ class IsabelleLSPClient:
                 self.process.kill()
                 await self.process.wait()
 
-        self._state_panel_id = None
         self.open_documents.clear()
         self.pending_requests.clear()
         self.diagnostic_cache.diagnostics.clear()
         self.diagnostic_cache.last_update.clear()
         self._first_diagnostic_event.clear()
         self._state_init_waiters.clear()
-        self._state_output_waiters.clear()
         self._dynamic_output_waiters.clear()
         self._dynamic_output_cache_by_position.clear()
         self._preview_waiters.clear()
 
     # ── JSON-RPC transport ──────────────────────────────────────────────
 
-    async def request(self, method: str, params: dict[str, Any], timeout: float = 30.0) -> Any:
+    async def request(self, method: str, params: dict[str, Any], timeout: float | None = None) -> Any:
+        """Send an LSP request and wait for the response.
+
+        When timeout is None (default), uses progress monitoring — no fixed
+        timeout, but raises IsabelleToolError if the server stalls or crashes.
+        When timeout is set, uses a hard deadline (for lifecycle methods like
+        initialize/shutdown).
+        """
         self.request_id += 1
         req_id = self.request_id
         message = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
@@ -170,10 +214,13 @@ class IsabelleLSPClient:
             raise
 
         try:
-            return await asyncio.wait_for(future, timeout=timeout)
+            if timeout is not None:
+                return await asyncio.wait_for(future, timeout=timeout)
+            return await self._wait_with_progress(future)
         except asyncio.TimeoutError as exc:
-            self.pending_requests.pop(req_id, None)
             raise IsabelleToolError(f"LSP request '{method}' timed out after {timeout}s") from exc
+        finally:
+            self.pending_requests.pop(req_id, None)
 
     async def notify(self, method: str, params: dict[str, Any]) -> None:
         await self._send({"jsonrpc": "2.0", "method": method, "params": params})
@@ -252,7 +299,10 @@ class IsabelleLSPClient:
             pass
 
     async def _cancel_background_tasks(self) -> None:
-        tasks = [t for t in (self.reader_task, self.stderr_task) if t is not None]
+        tasks = [
+            t for t in (self.reader_task, self.stderr_task)
+            if t is not None
+        ]
         for t in tasks:
             t.cancel()
         for t in tasks:
@@ -264,6 +314,14 @@ class IsabelleLSPClient:
     # ── Message dispatch ────────────────────────────────────────────────
 
     async def _handle_message(self, message: JsonDict) -> None:
+        self._last_server_activity = time.time()
+        method = message.get("method", "")
+        msg_id = message.get("id", "")
+        if method:
+            logger.debug("← notification: %s", method)
+        elif msg_id:
+            logger.debug("← response id=%s", msg_id)
+
         if "id" in message and message["id"] in self.pending_requests:
             req_id = message["id"]
             future = self.pending_requests.pop(req_id)
@@ -298,7 +356,6 @@ class IsabelleLSPClient:
             file_path = uri_to_file_path(uri)
             self.diagnostic_cache.diagnostics[file_path] = diagnostics
             self.diagnostic_cache.last_update[file_path] = time.time()
-            # Signal that this file has received its first diagnostic batch.
             event = self._first_diagnostic_event.get(file_path)
             if event is not None and not event.is_set():
                 event.set()
@@ -321,11 +378,6 @@ class IsabelleLSPClient:
             init_future = self._state_init_waiters.pop(0)
             if not init_future.done():
                 init_future.set_result((raw_panel_id, html))
-            return
-
-        state_future = self._state_output_waiters.pop(raw_panel_id, None)
-        if state_future and not state_future.done():
-            state_future.set_result(html)
 
     def _handle_dynamic_output(self, params: Any) -> None:
         if not isinstance(params, dict):
@@ -353,7 +405,6 @@ class IsabelleLSPClient:
         for waiters in (
             self.pending_requests.values(),
             self._state_init_waiters,
-            self._state_output_waiters.values(),
             (future for _, future in self._dynamic_output_waiters),
             self._preview_waiters.values(),
         ):
@@ -362,7 +413,6 @@ class IsabelleLSPClient:
                     future.set_exception(exc)
         self.pending_requests.clear()
         self._state_init_waiters.clear()
-        self._state_output_waiters.clear()
         self._dynamic_output_waiters.clear()
         self._dynamic_output_cache_by_position.clear()
         self._preview_waiters.clear()
@@ -397,7 +447,6 @@ class IsabelleLSPClient:
 
         uri = file_path_to_uri(file_path)
 
-        # Register event *before* sending didOpen to avoid a race.
         event = asyncio.Event()
         self._first_diagnostic_event[file_path] = event
 
@@ -571,91 +620,156 @@ class IsabelleLSPClient:
     # ── PIDE extension queries ──────────────────────────────────────────
 
     async def get_goals_at_position(
-        self, file_path: str, line: int, character: int, timeout: float = 10.0,
+        self, file_path: str, line: int, character: int,
     ) -> list[str]:
-        """Get proof goals at a position using a persistent PIDE state panel.
+        """Get proof goals at a position using PIDE state panels.
 
-        Serialized via _state_lock because the Isabelle caret is global.
+        Terminal proof commands (``by``, ``done``, ``qed``) produce empty
+        proof state — Isabelle's state panel sends no ``state_output`` for
+        them.  We detect this via STATE_OUTPUT_GRACE: if the server stays
+        active but no output arrives within that window, return ``[]``.
         """
         uri = file_path_to_uri(file_path)
+        panel_id: int | None = None
 
-        async with self._state_lock:
-            await self.notify("PIDE/caret_update", {
-                "uri": uri, "line": line, "character": character, "focus": True,
-            })
-            # vscode_input_delay = 0.1s — wait for the perspective flush
-            await asyncio.sleep(0.15)
+        init_future: asyncio.Future[tuple[int, str]] = (
+            asyncio.get_running_loop().create_future()
+        )
 
-            if self._state_panel_id is not None:
-                html = await self._state_panel_query(self._state_panel_id, timeout=timeout)
-                if html is not None:
-                    return parse_goals_from_html(html)
-                # state_update produced no output (same command or stale panel)
-                with contextlib.suppress(IsabelleToolError):
-                    await self.notify("PIDE/state_exit", {"id": self._state_panel_id})
-                self._state_panel_id = None
+        try:
+            async with self._caret_lock:
+                await self.notify("PIDE/caret_update", {
+                    "uri": uri, "line": line, "character": character, "focus": True,
+                })
+                await asyncio.sleep(0.15)
 
-            panel_id, html = await self._state_panel_init(timeout=timeout)
-            self._state_panel_id = panel_id
+                self._state_init_waiters.append(init_future)
+                await self.notify("PIDE/state_init", {})
+
+                try:
+                    result = await self._wait_for_state_output(
+                        init_future, file_path,
+                    )
+                except IsabelleToolError:
+                    with contextlib.suppress(ValueError):
+                        self._state_init_waiters.remove(init_future)
+                    raise self._enrich_timeout_error(file_path)
+
+            if result is None:
+                return []
+            panel_id, html = result
             return parse_goals_from_html(html)
 
-    async def _state_panel_init(self, timeout: float) -> tuple[int, str]:
-        future: asyncio.Future[tuple[int, str]] = asyncio.get_running_loop().create_future()
-        self._state_init_waiters.append(future)
-        await self.notify("PIDE/state_init", {})
-        try:
-            return await asyncio.wait_for(future, timeout=timeout)
-        except asyncio.TimeoutError as exc:
-            with contextlib.suppress(ValueError):
-                self._state_init_waiters.remove(future)
-            raise IsabelleToolError("Timed out waiting for PIDE proof state") from exc
+        finally:
+            if panel_id is not None:
+                with contextlib.suppress(IsabelleToolError):
+                    await self.notify("PIDE/state_exit", {"id": panel_id})
 
-    async def _state_panel_query(self, panel_id: int, timeout: float) -> str | None:
-        """Send state_update and wait for state_output. Returns None on timeout."""
-        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
-        self._state_output_waiters[panel_id] = future
-        await self.notify("PIDE/state_update", {"id": panel_id})
-        try:
-            return await asyncio.wait_for(future, timeout=timeout)
-        except asyncio.TimeoutError:
-            self._state_output_waiters.pop(panel_id, None)
-            return None
+    async def _wait_for_state_output(
+        self,
+        future: asyncio.Future[tuple[int, str]],
+        file_path: str,
+    ) -> tuple[int, str] | None:
+        """Wait for state_output with empty-proof-state detection.
+
+        Returns None when the server is active but no state_output arrives
+        within STATE_OUTPUT_GRACE — the command has no proof state to show.
+        """
+        start = time.time()
+        while True:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(future), timeout=self.PROGRESS_CHECK_INTERVAL,
+                )
+            except asyncio.TimeoutError:
+                if future.done():
+                    return future.result()
+                self._check_server_health(self.STALL_TIMEOUT)
+                elapsed = time.time() - start
+                process_alive = (
+                    self.process is not None
+                    and self.process.returncode is None
+                )
+                if elapsed > self.STATE_OUTPUT_GRACE and process_alive:
+                    with contextlib.suppress(ValueError):
+                        self._state_init_waiters.remove(future)
+                    logger.debug(
+                        "No state_output after %.1fs (server active) — "
+                        "empty proof state at %s",
+                        elapsed, file_path,
+                    )
+                    return None
+
+    def _enrich_timeout_error(self, file_path: str) -> IsabelleToolError:
+        diags = self.diagnostic_cache.diagnostics.get(file_path, [])
+        errors = [
+            d.get("message", "")
+            for d in diags
+            if isinstance(d, dict) and d.get("severity") in (1, 2)
+        ]
+        if errors:
+            summary = "; ".join(errors[:3])
+            if len(errors) > 3:
+                summary += f" (+{len(errors) - 3} more)"
+            return IsabelleToolError(
+                f"Timed out waiting for proof state. "
+                f"File has {len(errors)} error(s): {summary}"
+            )
+        if not diags:
+            return IsabelleToolError(
+                "Timed out waiting for proof state. "
+                "No diagnostics received — file may not have been processed."
+            )
+        return IsabelleToolError("Timed out waiting for proof state.")
 
     async def get_dynamic_output(
-        self, file_path: str, line: int, character: int = 0, timeout: float = 2.0,
+        self, file_path: str, line: int, character: int = 0,
     ) -> str:
+        """Get dynamic output at position (progress-monitored).
+
+        Holds the caret lock for the duration since dynamic output depends
+        on the current caret position (unlike state panels which bind an
+        overlay to a specific command). Returns cached/empty output once the
+        file appears fully processed with no output at this position.
+        """
         uri = file_path_to_uri(file_path)
         key = (file_path, line, character)
 
-        async with self._dynamic_output_lock:
-            future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
-            waiter = (key, future)
-            self._dynamic_output_waiters.append(waiter)
+        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        waiter = (key, future)
+        self._dynamic_output_waiters.append(waiter)
 
-            try:
+        try:
+            async with self._caret_lock:
                 await self.notify("PIDE/caret_update", {
                     "uri": uri, "line": line, "character": character,
                 })
-                return await asyncio.wait_for(future, timeout=timeout)
-            except asyncio.TimeoutError:
-                return self._dynamic_output_cache_by_position.get(key, "")
-            finally:
-                with contextlib.suppress(ValueError):
-                    self._dynamic_output_waiters.remove(waiter)
+                while True:
+                    try:
+                        return await asyncio.wait_for(
+                            asyncio.shield(future), timeout=self.PROGRESS_CHECK_INTERVAL,
+                        )
+                    except asyncio.TimeoutError:
+                        if future.done():
+                            return future.result()
+                        self._check_server_health(self.STALL_TIMEOUT)
+                        if self.diagnostics_settled(file_path, settle_time=3.0):
+                            return self._dynamic_output_cache_by_position.get(key, "")
+        finally:
+            with contextlib.suppress(ValueError):
+                self._dynamic_output_waiters.remove(waiter)
 
     async def request_preview(
-        self, file_path: str, column: int = 0, timeout: float = 30.0,
+        self, file_path: str, column: int = 0,
     ) -> JsonDict:
+        """Request document preview (progress-monitored, no fixed timeout)."""
         uri = file_path_to_uri(file_path)
         key = (uri, column)
-        async with self._preview_lock:
-            future: asyncio.Future[JsonDict] = asyncio.get_running_loop().create_future()
-            self._preview_waiters[key] = future
+        future: asyncio.Future[JsonDict] = asyncio.get_running_loop().create_future()
+        self._preview_waiters[key] = future
 
-            try:
-                await self.notify("PIDE/preview_request", {"uri": uri, "column": column})
-                return await asyncio.wait_for(future, timeout=timeout)
-            except asyncio.TimeoutError as exc:
-                raise IsabelleToolError("Timed out waiting for PIDE preview") from exc
-            finally:
-                self._preview_waiters.pop(key, None)
+        try:
+            await self.notify("PIDE/preview_request", {"uri": uri, "column": column})
+            return await self._wait_with_progress(future)
+        finally:
+            self._preview_waiters.pop(key, None)

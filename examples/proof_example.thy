@@ -1,4 +1,4 @@
-theory ProofExample
+theory proof_example
 imports Main
 begin
 

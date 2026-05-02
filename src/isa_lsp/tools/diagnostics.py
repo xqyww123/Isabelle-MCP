@@ -3,40 +3,47 @@ from isa_lsp.models import DiagnosticMessage, DiagnosticsResult
 from isa_lsp.utils import IsabelleToolError, lsp_to_mcp_position, severity_int_to_string
 
 
+def _resolve_line(value: int, total_lines: int) -> int:
+    """Resolve negative line indices: -1 = last line, -i = last i-th line."""
+    if value < 0:
+        return max(1, total_lines + 1 + value)
+    return value
+
+
 async def diagnostic_messages(
     client: IsabelleLSPClient,
     file_path: str,
-    start_line: int | None = None,
-    end_line: int | None = None,
+    start_line: int,
+    end_line: int,
 ) -> DiagnosticsResult:
-    if start_line is not None and start_line < 1:
+    await client.open_document(file_path)
+
+    doc = client.open_documents.get(file_path)
+    total_lines = (doc.content.count("\n") + 1) if doc else 1
+
+    start_line = _resolve_line(start_line, total_lines)
+    end_line = _resolve_line(end_line, total_lines)
+
+    if start_line < 1:
         raise IsabelleToolError(f"start_line must be >= 1, got {start_line}")
-    if end_line is not None and end_line < 1:
+    if end_line < 1:
         raise IsabelleToolError(f"end_line must be >= 1, got {end_line}")
-    if start_line is not None and end_line is not None and start_line > end_line:
+    if start_line > end_line:
         raise IsabelleToolError(
             f"start_line must be <= end_line, got {start_line} > {end_line}"
         )
 
-    await client.open_document(file_path)
-
-    # Set caret to end_line or end of file so Isabelle processes the needed region
-    doc = client.open_documents.get(file_path)
     if doc is not None:
-        if end_line is not None:
-            caret_line = end_line - 1  # 0-indexed
-        else:
-            caret_line = doc.content.count("\n")
-        await client.set_caret(file_path, caret_line)
+        await client.set_caret(file_path, end_line - 1)
 
     items: list[DiagnosticMessage] = []
     for diag in client.get_cached_diagnostics(file_path):
         diag_line, _ = lsp_to_mcp_position(
             diag.get("range", {}).get("start", {}).get("line", 0), 0
         )
-        if start_line is not None and diag_line < start_line:
+        if diag_line < start_line:
             continue
-        if end_line is not None and diag_line > end_line:
+        if diag_line > end_line:
             continue
         items.append(_parse_diagnostic(diag))
 
