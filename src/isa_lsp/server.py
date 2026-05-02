@@ -37,7 +37,7 @@ from isa_lsp.tools import (
     preview_document,
     session_info,
 )
-from isa_lsp.utils import IsabelleToolError
+from isa_lsp.utils import IsabelleToolError, MCPColumn, MCPLine
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -101,7 +101,7 @@ async def isabelle_hover(file_path: str, line: int, column: int) -> HoverInfo:
         line: Line number (1-indexed)
         column: Column number (1-indexed)
     """
-    return await hover_info(await _ensure_lsp_started(), file_path, line, column)
+    return await hover_info(await _ensure_lsp_started(), file_path, MCPLine(line), MCPColumn(column))
 
 
 @mcp.tool()
@@ -116,7 +116,7 @@ async def isabelle_completions(
         column: Column number (1-indexed)
         max_completions: Maximum number of completions to return
     """
-    return await completions(await _ensure_lsp_started(), file_path, line, column, max_completions)
+    return await completions(await _ensure_lsp_started(), file_path, MCPLine(line), MCPColumn(column), max_completions)
 
 
 @mcp.tool()
@@ -128,7 +128,7 @@ async def isabelle_definition(file_path: str, line: int, column: int) -> Declara
         line: Line number (1-indexed)
         column: Column number (1-indexed)
     """
-    return await declaration_location(await _ensure_lsp_started(), file_path, line, column)
+    return await declaration_location(await _ensure_lsp_started(), file_path, MCPLine(line), MCPColumn(column))
 
 
 @mcp.tool()
@@ -140,7 +140,7 @@ async def isabelle_highlights(file_path: str, line: int, column: int) -> Highlig
         line: Line number (1-indexed)
         column: Column number (1-indexed)
     """
-    return await document_highlights(await _ensure_lsp_started(), file_path, line, column)
+    return await document_highlights(await _ensure_lsp_started(), file_path, MCPLine(line), MCPColumn(column))
 
 
 @mcp.tool()
@@ -179,7 +179,11 @@ async def isabelle_goal(
         line: Line number (1-indexed)
         column: Column number (1-indexed), optional
     """
-    return await goal(await _ensure_lsp_started(), file_path, line, column)
+    lsp = await _ensure_lsp_started()
+    return await goal(
+        lsp, file_path, MCPLine(line),
+        MCPColumn(column) if column is not None else None,
+    )
 
 
 @mcp.tool()
@@ -190,7 +194,7 @@ async def isabelle_command_output(file_path: str, line: int) -> CommandOutputRes
         file_path: Absolute path to .thy file
         line: Line number (1-indexed)
     """
-    return await command_output(await _ensure_lsp_started(), file_path, line)
+    return await command_output(await _ensure_lsp_started(), file_path, MCPLine(line))
 
 
 @mcp.tool()
@@ -201,7 +205,10 @@ async def isabelle_preview(file_path: str, line: int | None = None) -> PreviewRe
         file_path: Absolute path to .thy file
         line: Line number for context (1-indexed), optional
     """
-    return await preview_document(await _ensure_lsp_started(), file_path, line)
+    return await preview_document(
+        await _ensure_lsp_started(), file_path,
+        MCPLine(line) if line is not None else None,
+    )
 
 
 @mcp.tool()

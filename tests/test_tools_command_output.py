@@ -3,20 +3,20 @@ from typing import Any, cast
 import pytest
 
 from isa_lsp.tools.command_output import command_output
-from isa_lsp.utils import IsabelleToolError
+from isa_lsp.utils import IsabelleToolError, MCPLine
 
 
 class TestCommandOutputTool:
     @pytest.mark.asyncio
     async def test_empty(self, mock_lsp_client, temp_theory_file):
-        result = await command_output(mock_lsp_client, temp_theory_file, 8)
+        result = await command_output(mock_lsp_client, temp_theory_file, MCPLine(8))
         assert result.messages == []
         assert result.line_context != ""
 
     @pytest.mark.asyncio
     async def test_with_output(self, mock_lsp_client, temp_theory_file):
         mock_lsp_client.dynamic_output_response = '<div class="writeln">Success</div>'
-        result = await command_output(mock_lsp_client, temp_theory_file, 8)
+        result = await command_output(mock_lsp_client, temp_theory_file, MCPLine(8))
         assert len(result.messages) == 1
         assert result.messages[0].kind == "writeln"
         assert result.messages[0].message == "Success"
@@ -29,6 +29,12 @@ class TestCommandOutputTool:
             def __init__(self):
                 self.calls: list[tuple[int, int]] = []
 
+            async def open_document(self, file_path: str, **kwargs: Any):
+                pass
+
+            async def set_caret(self, file_path: str, line: Any, character: Any = 0):
+                pass
+
             async def get_dynamic_output(
                 self, file_path: str, line: int, character: int = 0, timeout: float = 2.0,
             ):
@@ -36,7 +42,7 @@ class TestCommandOutputTool:
                 return '<span class="writeln_message">True</span>'
 
         client = Client()
-        result = await command_output(cast(Any, client), temp_theory_file, 9)
+        result = await command_output(cast(Any, client), temp_theory_file, MCPLine(9))
 
         assert result.messages[0].message == "True"
         assert client.calls == [(8, 2)]
@@ -58,6 +64,12 @@ class TestCommandOutputTool:
             def __init__(self):
                 self.calls: list[tuple[int, int]] = []
 
+            async def open_document(self, file_path: str, **kwargs: Any):
+                pass
+
+            async def set_caret(self, file_path: str, line: Any, character: Any = 0):
+                pass
+
             async def get_dynamic_output(
                 self, file_path: str, line: int, character: int = 0, timeout: float = 2.0,
             ):
@@ -73,7 +85,7 @@ class TestCommandOutputTool:
                 return '<pre class="source"/>'
 
         client = Client()
-        result = await command_output(cast(Any, client), str(theory_file), 4)
+        result = await command_output(cast(Any, client), str(theory_file), MCPLine(4))
 
         assert result.messages[0].kind == "writeln"
         assert result.messages[0].message == 'val it = "": string'
@@ -102,7 +114,7 @@ class TestCommandOutputTool:
             ):
                 raise AssertionError("empty lines should not query dynamic output")
 
-        result = await command_output(cast(Any, Client()), str(theory_file), 4)
+        result = await command_output(cast(Any, Client()), str(theory_file), MCPLine(4))
 
         assert result.line_context == ""
         assert result.messages == []
@@ -130,7 +142,7 @@ class TestCommandOutputTool:
             ):
                 raise AssertionError("comment-only lines should not query dynamic output")
 
-        result = await command_output(cast(Any, Client()), str(theory_file), 4)
+        result = await command_output(cast(Any, Client()), str(theory_file), MCPLine(4))
 
         assert result.line_context == "(* comment-only line *)"
         assert result.messages == []
@@ -138,4 +150,4 @@ class TestCommandOutputTool:
     @pytest.mark.asyncio
     async def test_invalid_line(self, mock_lsp_client, temp_theory_file):
         with pytest.raises(IsabelleToolError, match="line must be >= 1"):
-            await command_output(mock_lsp_client, temp_theory_file, 0)
+            await command_output(mock_lsp_client, temp_theory_file, MCPLine(0))

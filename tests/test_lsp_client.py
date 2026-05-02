@@ -4,12 +4,12 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from isa_lsp.lsp_client import DocumentState, IsabelleLSPClient
-from isa_lsp.utils import IsabelleToolError
+from isa_lsp.utils import IsabelleToolError, LSPCharacter, LSPLine
 
 
 class TestIsabelleLSPClient:
@@ -340,7 +340,7 @@ class TestIsabelleLSPClient:
         )
         client.request = AsyncMock(return_value=[{"label": "lemma"}])
 
-        result = await client.get_completions("/tmp/Test.thy", 0, 0)
+        result = await client.get_completions("/tmp/Test.thy", LSPLine(0), LSPCharacter(0))
 
         assert result == [{"label": "lemma"}]
 
@@ -399,18 +399,6 @@ class TestIsabelleLSPClient:
         assert await client._read_message() == {}
 
     @pytest.mark.asyncio
-    async def test_handle_state_output_resolves_waiter(self):
-        client = IsabelleLSPClient()
-        future = asyncio.get_running_loop().create_future()
-        client._state_output_waiters[7] = future
-
-        client._handle_state_output({"id": 7, "content": "<pre>1. P</pre>"})
-
-        assert future.done()
-        assert future.result() == "<pre>1. P</pre>"
-        assert 7 not in client._state_output_waiters
-
-    @pytest.mark.asyncio
     async def test_handle_state_output_resolves_init_waiter(self):
         client = IsabelleLSPClient()
         future = asyncio.get_running_loop().create_future()
@@ -420,6 +408,7 @@ class TestIsabelleLSPClient:
 
         assert future.done()
         assert future.result() == (42, "<pre>1. P</pre>")
+        assert client._state_init_waiters == []
 
     @pytest.mark.asyncio
     async def test_handle_dynamic_output(self):
@@ -458,7 +447,7 @@ class TestIsabelleLSPClient:
                 client._handle_state_output({"id": 99, "content": "<pre>1. P</pre>"})
 
         client.notify = AsyncMock(side_effect=fake_notify)
-        goals = await client.get_goals_at_position("/tmp/Test.thy", 7, 3)
+        goals = await client.get_goals_at_position("/tmp/Test.thy", LSPLine(7), 3)
 
         assert goals == ["P"]
         assert calls[0][0] == "PIDE/caret_update"
@@ -469,9 +458,13 @@ class TestIsabelleLSPClient:
     async def test_get_goals_timeout_cleans_init_waiter(self):
         client = IsabelleLSPClient()
         client.notify = AsyncMock()
+        client.STALL_TIMEOUT = 0.01
+        client.STATE_OUTPUT_GRACE = 0.01
+        client.PROGRESS_CHECK_INTERVAL = 0.01
+        client._last_server_activity = time.time() - 1.0
 
-        with pytest.raises(IsabelleToolError, match="Timed out waiting for PIDE proof state"):
-            await client.get_goals_at_position("/tmp/Test.thy", 7, 3, timeout=0.01)
+        with pytest.raises(IsabelleToolError):
+            await client.get_goals_at_position("/tmp/Test.thy", LSPLine(7), 3)
 
         assert client._state_init_waiters == []
 
@@ -479,9 +472,11 @@ class TestIsabelleLSPClient:
     async def test_dynamic_output_timeout_no_stale_data(self):
         client = IsabelleLSPClient()
         client.notify = AsyncMock()
+        client.PROGRESS_CHECK_INTERVAL = 0.01
+        client.diagnostic_cache.last_update["/tmp/Test.thy"] = time.time() - 10.0
         client._dynamic_output_cache_by_position[("/tmp/Other.thy", 1, 0)] = "old"
 
-        result = await client.get_dynamic_output("/tmp/Test.thy", 1, timeout=0.01)
+        result = await client.get_dynamic_output("/tmp/Test.thy", LSPLine(1))
         assert result == ""
 
     @pytest.mark.asyncio
@@ -493,39 +488,37 @@ class TestIsabelleLSPClient:
 
         async def fake_notify(method, params):
             calls.append((method, params))
-            if params["line"] == 1:
+            if params.get("line") == 1:
                 first_notify_entered.set()
                 await release_first.wait()
                 client._handle_dynamic_output({"content": "first"})
-            else:
+            elif params.get("line") == 2:
                 client._handle_dynamic_output({"content": "second"})
 
         client.notify = AsyncMock(side_effect=fake_notify)
 
-        first = asyncio.create_task(client.get_dynamic_output("/tmp/Test.thy", 1, timeout=1))
+        first = asyncio.create_task(client.get_dynamic_output("/tmp/Test.thy", LSPLine(1)))
         await asyncio.wait_for(first_notify_entered.wait(), timeout=1)
 
-        second = asyncio.create_task(client.get_dynamic_output("/tmp/Test.thy", 2, timeout=1))
+        second = asyncio.create_task(client.get_dynamic_output("/tmp/Test.thy", LSPLine(2)))
         await asyncio.sleep(0)
-        assert [call[1]["line"] for call in calls] == [1]
+        assert [call[1]["line"] for call in calls if "line" in call[1]] == [1]
 
         release_first.set()
         assert await first == "first"
         assert await second == "second"
-        assert [call[1]["line"] for call in calls] == [1, 2]
+        assert [call[1]["line"] for call in calls if "line" in call[1]] == [1, 2]
 
     def test_fail_pending_waiters_fails_and_clears_all_waiters(self):
         client = IsabelleLSPClient()
         loop = asyncio.get_event_loop()
         request_future = loop.create_future()
         state_init_future = loop.create_future()
-        state_output_future = loop.create_future()
         dynamic_future = loop.create_future()
         preview_future = loop.create_future()
 
         client.pending_requests[1] = request_future
         client._state_init_waiters.append(state_init_future)
-        client._state_output_waiters[7] = state_output_future
         client._dynamic_output_waiters.append((("/tmp/Test.thy", 1, 0), dynamic_future))
         client._dynamic_output_cache_by_position[("/tmp/Test.thy", 1, 0)] = "stale"
         client._preview_waiters[("file:///tmp/Test.thy", 0)] = preview_future
@@ -536,7 +529,6 @@ class TestIsabelleLSPClient:
         for future in (
             request_future,
             state_init_future,
-            state_output_future,
             dynamic_future,
             preview_future,
         ):
@@ -544,7 +536,6 @@ class TestIsabelleLSPClient:
             assert future.exception() is exc
         assert client.pending_requests == {}
         assert client._state_init_waiters == []
-        assert client._state_output_waiters == {}
         assert client._dynamic_output_waiters == []
         assert client._dynamic_output_cache_by_position == {}
         assert client._preview_waiters == {}
@@ -575,10 +566,10 @@ class TestIsabelleLSPClient:
 
         client.notify = AsyncMock(side_effect=fake_notify)
 
-        first = asyncio.create_task(client.request_preview("/tmp/Test.thy", column=0, timeout=1))
+        first = asyncio.create_task(client.request_preview("/tmp/Test.thy", column=0))
         await asyncio.wait_for(first_notify_entered.wait(), timeout=1)
 
-        second = asyncio.create_task(client.request_preview("/tmp/Test.thy", column=1, timeout=1))
+        second = asyncio.create_task(client.request_preview("/tmp/Test.thy", column=1))
         await asyncio.sleep(0)
         assert [call[1]["column"] for call in calls] == [0]
 
@@ -591,8 +582,11 @@ class TestIsabelleLSPClient:
     async def test_preview_timeout_cleans_waiter(self):
         client = IsabelleLSPClient()
         client.notify = AsyncMock()
+        client.STALL_TIMEOUT = 0.01
+        client.PROGRESS_CHECK_INTERVAL = 0.01
+        client._last_server_activity = time.time() - 1.0
 
-        with pytest.raises(IsabelleToolError, match="Timed out waiting for PIDE preview"):
-            await client.request_preview("/tmp/Test.thy", timeout=0.01)
+        with pytest.raises(IsabelleToolError, match="stalled"):
+            await client.request_preview("/tmp/Test.thy")
 
         assert client._preview_waiters == {}

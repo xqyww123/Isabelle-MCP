@@ -2,6 +2,10 @@ from isa_lsp.lsp_client import IsabelleLSPClient
 from isa_lsp.models import DiagnosticMessage, HoverInfo
 from isa_lsp.utils import (
     IsabelleToolError,
+    LSPCharacter,
+    LSPLine,
+    MCPColumn,
+    MCPLine,
     check_pide_response,
     extract_symbol_from_lsp_range,
     get_line_from_file,
@@ -13,12 +17,14 @@ from isa_lsp.utils import (
 
 
 async def hover_info(
-    client: IsabelleLSPClient, file_path: str, line: int, column: int,
+    client: IsabelleLSPClient, file_path: str, line: MCPLine, column: MCPColumn,
 ) -> HoverInfo:
     validate_position(line, column)
 
     await client.open_document(file_path)
-    await client.set_caret(file_path, line - 1)
+    lsp_line = line.to_lsp()
+    await client.set_caret(file_path, lsp_line)
+    await client.wait_for_processing(file_path, lsp_line)
 
     lsp_line, lsp_col = mcp_to_lsp_position(line, column)
 
@@ -54,11 +60,13 @@ async def hover_info(
         diag_start = diag_range.get("start", {})
         if diag_start.get("line", -1) == lsp_line:
             diag_mcp_line, diag_mcp_col = lsp_to_mcp_position(
-                diag_start.get("line", 0), diag_start.get("character", 0)
+                LSPLine(diag_start.get("line", 0)),
+                LSPCharacter(diag_start.get("character", 0)),
             )
             diag_end = diag_range.get("end", {})
             diag_end_line, diag_end_col = lsp_to_mcp_position(
-                diag_end.get("line", 0), diag_end.get("character", 0)
+                LSPLine(diag_end.get("line", 0)),
+                LSPCharacter(diag_end.get("character", 0)),
             )
             diagnostics_at_position.append(DiagnosticMessage(
                 severity=severity_int_to_string(diag.get("severity", 1)),

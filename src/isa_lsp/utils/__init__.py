@@ -1,5 +1,9 @@
 from isa_lsp.utils.core import (
     IsabelleToolError,
+    LSPCharacter,
+    LSPLine,
+    MCPColumn,
+    MCPLine,
     check_pide_response,
     file_path_to_uri,
     lsp_to_mcp_position,
@@ -19,6 +23,10 @@ from isa_lsp.utils.formatters import (
 
 __all__ = [
     "IsabelleToolError",
+    "LSPCharacter",
+    "LSPLine",
+    "MCPColumn",
+    "MCPLine",
     "check_pide_response",
     "file_path_to_uri",
     "lsp_to_mcp_position",

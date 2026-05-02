@@ -6,6 +6,10 @@ import pytest
 
 from isa_lsp.utils.core import (
     IsabelleToolError,
+    LSPCharacter,
+    LSPLine,
+    MCPColumn,
+    MCPLine,
     check_pide_response,
     file_path_to_uri,
     lsp_to_mcp_position,
@@ -84,20 +88,30 @@ class TestURIUtils:
 
 class TestPositions:
     def test_mcp_to_lsp(self):
-        assert mcp_to_lsp_position(1, 1) == (0, 0)
-        assert mcp_to_lsp_position(10, 5) == (9, 4)
+        assert mcp_to_lsp_position(MCPLine(1), MCPColumn(1)) == (0, 0)
+        assert mcp_to_lsp_position(MCPLine(10), MCPColumn(5)) == (9, 4)
 
     def test_lsp_to_mcp(self):
-        assert lsp_to_mcp_position(0, 0) == (1, 1)
-        assert lsp_to_mcp_position(9, 4) == (10, 5)
+        assert lsp_to_mcp_position(LSPLine(0), LSPCharacter(0)) == (1, 1)
+        assert lsp_to_mcp_position(LSPLine(9), LSPCharacter(4)) == (10, 5)
 
     def test_roundtrip(self):
         for line, col in [(1, 1), (10, 5), (100, 50), (1000, 500)]:
-            assert lsp_to_mcp_position(*mcp_to_lsp_position(line, col)) == (line, col)
+            assert lsp_to_mcp_position(
+                *mcp_to_lsp_position(MCPLine(line), MCPColumn(col))
+            ) == (line, col)
 
     def test_large_numbers(self):
-        assert mcp_to_lsp_position(10000, 5000) == (9999, 4999)
-        assert lsp_to_mcp_position(9999, 4999) == (10000, 5000)
+        assert mcp_to_lsp_position(MCPLine(10000), MCPColumn(5000)) == (9999, 4999)
+        assert lsp_to_mcp_position(LSPLine(9999), LSPCharacter(4999)) == (10000, 5000)
+
+    def test_type_safety_methods(self):
+        mcp_line = MCPLine(10)
+        lsp_line = mcp_line.to_lsp()
+        assert lsp_line == 9
+        assert isinstance(lsp_line, LSPLine)
+        assert lsp_line.to_mcp() == 10
+        assert isinstance(lsp_line.to_mcp(), MCPLine)
 
 
 class TestFormatters:
@@ -242,37 +256,37 @@ class TestGetLineFromFile:
     def test_basic(self, tmp_path):
         f = tmp_path / "test.thy"
         f.write_text("line 1\nline 2\nline 3\n")
-        assert get_line_from_file(str(f), 1) == "line 1"
-        assert get_line_from_file(str(f), 2) == "line 2"
-        assert get_line_from_file(str(f), 3) == "line 3"
+        assert get_line_from_file(str(f), MCPLine(1)) == "line 1"
+        assert get_line_from_file(str(f), MCPLine(2)) == "line 2"
+        assert get_line_from_file(str(f), MCPLine(3)) == "line 3"
 
     def test_out_of_range(self, tmp_path):
         f = tmp_path / "test.thy"
         f.write_text("line 1\n")
-        assert get_line_from_file(str(f), 10) == ""
+        assert get_line_from_file(str(f), MCPLine(10)) == ""
 
     def test_nonexistent_file(self):
-        assert get_line_from_file("/nonexistent/file.thy", 1) == ""
+        assert get_line_from_file("/nonexistent/file.thy", MCPLine(1)) == ""
 
     def test_unicode(self, tmp_path):
         f = tmp_path / "unicode.thy"
         f.write_text('lemma test: "∀x. P x ⟹ Q x"\n', encoding='utf-8')
-        line = get_line_from_file(str(f), 1)
+        line = get_line_from_file(str(f), MCPLine(1))
         assert "∀" in line
         assert "⟹" in line
 
     def test_empty_file(self, tmp_path):
         f = tmp_path / "empty.thy"
         f.write_text("")
-        assert get_line_from_file(str(f), 1) == ""
+        assert get_line_from_file(str(f), MCPLine(1)) == ""
 
     def test_single_line_no_newline(self, tmp_path):
         f = tmp_path / "test.thy"
         f.write_text("single line")
-        assert get_line_from_file(str(f), 1) == "single line"
+        assert get_line_from_file(str(f), MCPLine(1)) == "single line"
 
     def test_very_long_line(self, tmp_path):
         f = tmp_path / "long.thy"
         long_line = "x" * 10000
         f.write_text(f"{long_line}\n")
-        assert get_line_from_file(str(f), 1) == long_line
+        assert get_line_from_file(str(f), MCPLine(1)) == long_line

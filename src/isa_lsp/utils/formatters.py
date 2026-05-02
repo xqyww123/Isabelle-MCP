@@ -7,6 +7,8 @@ from typing import Any
 
 from bs4 import BeautifulSoup, NavigableString
 
+from isa_lsp.utils.core import LSPCharacter, LSPLine, MCPColumn, MCPLine
+
 
 def _pide_html_to_text(el: Any) -> str:
     """Convert a PIDE HTML element tree to plain text.
@@ -38,16 +40,34 @@ def parse_goals_from_html(html: str) -> list[str]:
         return []
     soup = BeautifulSoup(html, "html.parser")
     subgoals = soup.find_all("span", class_="subgoal")
-    if not subgoals:
-        if "no goals" in soup.get_text().lower():
-            return []
+    if subgoals:
+        goals: list[str] = []
+        for sg in subgoals:
+            text = _pide_html_to_text(sg).strip()
+            text = re.sub(r"^\d+\.\s*", "", text)
+            if text:
+                goals.append(text)
+        return goals
+
+    text = soup.get_text()
+    if "no goals" in text.lower():
         return []
+    return _parse_numbered_goals(text)
+
+
+def _parse_numbered_goals(text: str) -> list[str]:
     goals: list[str] = []
-    for sg in subgoals:
-        text = _pide_html_to_text(sg).strip()
-        text = re.sub(r"^\d+\.\s*", "", text)
-        if text:
-            goals.append(text)
+    current: list[str] = []
+    for line in text.splitlines():
+        m = re.match(r"\s*(\d+)\.\s+(.*)", line)
+        if m:
+            if current:
+                goals.append("\n".join(current))
+            current = [m.group(2)]
+        elif current and line.strip():
+            current.append(line.strip())
+    if current:
+        goals.append("\n".join(current))
     return goals
 
 
@@ -130,7 +150,7 @@ def parse_command_output_html(html: str) -> list[dict[str, str]]:
     return parser.messages
 
 
-def get_line_from_file(file_path: str, line: int) -> str:
+def get_line_from_file(file_path: str, line: MCPLine) -> str:
     try:
         with open(file_path, encoding='utf-8') as f:
             lines = f.readlines()
@@ -172,7 +192,7 @@ def extract_symbol_from_lsp_range(file_path: str, lsp_range: dict[str, Any]) -> 
         return ""
 
 
-def extract_symbol_at_position(file_path: str, line: int, column: int) -> str:
+def extract_symbol_at_position(file_path: str, line: MCPLine, column: MCPColumn) -> str:
     """Extract the identifier at a 1-indexed position in a file."""
     try:
         with open(file_path, encoding='utf-8') as f:

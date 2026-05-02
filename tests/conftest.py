@@ -3,6 +3,9 @@ from typing import Any
 
 import pytest
 
+from isa_lsp.lsp_client import DocumentState
+from isa_lsp.utils import LSPCharacter, LSPLine
+
 
 @pytest.fixture
 def temp_theory_file(tmp_path):
@@ -45,7 +48,7 @@ class MockLSPClient:
     def __init__(self):
         self.logic = "HOL"
         self.initialized = True
-        self.open_documents: dict[str, dict[str, Any]] = {}
+        self.open_documents: dict[str, DocumentState] = {}
         self.diagnostics_cache: dict[str, list[dict[str, Any]]] = {}
         self.processing_status: dict[str, bool] = {}
 
@@ -76,31 +79,44 @@ class MockLSPClient:
         if content is None:
             with open(file_path) as f:
                 content = f.read()
-        self.open_documents[file_path] = {
-            'uri': f"file://{file_path}", 'version': 1, 'content': content,
-        }
+        self.open_documents[file_path] = DocumentState(
+            file_path=file_path, uri=f"file://{file_path}", version=1, content=content,
+        )
         if file_path not in self.processing_status:
             self.processing_status[file_path] = False
+
+    async def set_caret(
+        self, file_path: str, line: LSPLine, character: LSPCharacter = LSPCharacter(0),
+    ) -> None:
+        pass
+
+    async def wait_for_processing(
+        self, file_path: str, start_line: LSPLine, end_line: LSPLine | None = None,
+    ) -> None:
+        pass
+
+    def file_all_processed(self, file_path: str) -> bool:
+        return self.processing_status.get(file_path, False)
 
     async def close_document(self, file_path: str):
         self.open_documents.pop(file_path, None)
 
-    async def get_hover(self, file_path: str, line: int, character: int):
+    async def get_hover(self, file_path: str, line: LSPLine, character: LSPCharacter) -> Any:
         return self.hover_response
 
-    async def get_completions(self, file_path: str, line: int, character: int):
+    async def get_completions(self, file_path: str, line: LSPLine, character: LSPCharacter) -> Any:
         return self.completion_response
 
-    async def get_definition(self, file_path: str, line: int, character: int):
+    async def get_definition(self, file_path: str, line: LSPLine, character: LSPCharacter) -> Any:
         return self.definition_response
 
-    async def get_highlights(self, file_path: str, line: int, character: int):
+    async def get_highlights(self, file_path: str, line: LSPLine, character: LSPCharacter) -> Any:
         return self.highlights_response
 
-    async def get_goals_at_position(self, file_path: str, line: int, character: int):
+    async def get_goals_at_position(self, file_path: str, line: LSPLine, character: int) -> list[str]:
         return self.goal_response
 
-    async def get_dynamic_output(self, file_path: str, line: int, character: int = 0, timeout: float = 2.0):
+    async def get_dynamic_output(self, file_path: str, line: LSPLine, character: int = 0) -> str:
         return self.dynamic_output_response
 
     async def request_preview(self, file_path: str, column: int = 0, timeout: float = 30.0):

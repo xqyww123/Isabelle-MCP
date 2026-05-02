@@ -1,6 +1,7 @@
 from isa_lsp.lsp_client import IsabelleLSPClient
 from isa_lsp.models import CommandOutputResult, OutputMessage
-from isa_lsp.utils import get_line_from_file, parse_command_output_html, validate_position
+from isa_lsp.utils import MCPLine, get_line_from_file, parse_command_output_html, validate_position
+from isa_lsp.utils.core import MCPColumn
 
 
 def _is_non_command_line(line_context: str) -> bool:
@@ -31,20 +32,20 @@ def _candidate_characters(line_context: str) -> list[int]:
 
 
 async def command_output(
-    client: IsabelleLSPClient, file_path: str, line: int,
+    client: IsabelleLSPClient, file_path: str, line: MCPLine,
 ) -> CommandOutputResult:
-    validate_position(line, 1)
+    validate_position(line, MCPColumn(1))
     line_context = get_line_from_file(file_path, line)
 
     if _is_non_command_line(line_context):
         return CommandOutputResult(line_context=line_context)
 
     await client.open_document(file_path)
-    await client.set_caret(file_path, line - 1)
+    await client.set_caret(file_path, line.to_lsp())
 
     messages: list[OutputMessage] = []
     for character in _candidate_characters(line_context):
-        html = await client.get_dynamic_output(file_path, line - 1, character)
+        html = await client.get_dynamic_output(file_path, line.to_lsp(), character)
         messages = [
             OutputMessage(kind=m.get("kind", "writeln"), message=m.get("text", ""))
             for m in parse_command_output_html(html)

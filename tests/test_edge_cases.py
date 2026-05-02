@@ -10,34 +10,34 @@ from isa_lsp.tools.completions import completions
 from isa_lsp.tools.diagnostics import diagnostic_messages
 from isa_lsp.tools.highlights import document_highlights
 from isa_lsp.tools.hover import hover_info
-from isa_lsp.utils import IsabelleToolError
+from isa_lsp.utils import IsabelleToolError, MCPColumn, MCPLine
 
 
 class TestInvalidInput:
     @pytest.mark.asyncio
     async def test_negative_line(self, mock_lsp_client, temp_theory_file):
         with pytest.raises(IsabelleToolError, match="line must be >= 1"):
-            await hover_info(mock_lsp_client, temp_theory_file, -1, 1)
+            await hover_info(mock_lsp_client, temp_theory_file, MCPLine(-1), MCPColumn(1))
 
     @pytest.mark.asyncio
     async def test_zero_line(self, mock_lsp_client, temp_theory_file):
         with pytest.raises(IsabelleToolError, match="line must be >= 1"):
-            await hover_info(mock_lsp_client, temp_theory_file, 0, 1)
+            await hover_info(mock_lsp_client, temp_theory_file, MCPLine(0), MCPColumn(1))
 
     @pytest.mark.asyncio
     async def test_negative_column(self, mock_lsp_client, temp_theory_file):
         with pytest.raises(IsabelleToolError, match="column must be >= 1"):
-            await hover_info(mock_lsp_client, temp_theory_file, 1, -1)
+            await hover_info(mock_lsp_client, temp_theory_file, MCPLine(1), MCPColumn(-1))
 
     @pytest.mark.asyncio
     async def test_nonexistent_file(self, mock_lsp_client):
         with pytest.raises(FileNotFoundError):
-            await hover_info(mock_lsp_client, "/nonexistent/file.thy", 1, 1)
+            await hover_info(mock_lsp_client, "/nonexistent/file.thy", MCPLine(1), MCPColumn(1))
 
     @pytest.mark.asyncio
     async def test_empty_file_path(self, mock_lsp_client):
         with pytest.raises((FileNotFoundError, IsabelleToolError)):
-            await hover_info(mock_lsp_client, "", 1, 1)
+            await hover_info(mock_lsp_client, "", MCPLine(1), MCPColumn(1))
 
 
 class TestModelValidation:
@@ -59,7 +59,7 @@ class TestConcurrency:
     async def test_concurrent_hover(self, mock_lsp_client, temp_theory_file):
         mock_lsp_client.hover_response = {"contents": "test"}
         results = await asyncio.gather(*[
-            hover_info(mock_lsp_client, temp_theory_file, i, 1) for i in range(1, 6)
+            hover_info(mock_lsp_client, temp_theory_file, MCPLine(i), MCPColumn(1)) for i in range(1, 6)
         ])
         assert len(results) == 5
         assert all(r.info == "test" for r in results)
@@ -70,9 +70,9 @@ class TestConcurrency:
         mock_lsp_client.completion_response = {"items": []}
         mock_lsp_client.diagnostics_cache[temp_theory_file] = []
         results = await asyncio.gather(
-            hover_info(mock_lsp_client, temp_theory_file, 5, 15),
-            completions(mock_lsp_client, temp_theory_file, 8, 1),
-            diagnostic_messages(mock_lsp_client, temp_theory_file),
+            hover_info(mock_lsp_client, temp_theory_file, MCPLine(5), MCPColumn(15)),
+            completions(mock_lsp_client, temp_theory_file, MCPLine(8), MCPColumn(1)),
+            diagnostic_messages(mock_lsp_client, temp_theory_file, 1, -1),
         )
         assert len(results) == 3
 
@@ -83,7 +83,7 @@ class TestUnicodeHandling:
         f = tmp_path / "unicode.thy"
         f.write_text('lemma "∀x. P x ⟹ Q x"\n', encoding='utf-8')
         mock_lsp_client.hover_response = {"contents": "Universal quantifier: ∀"}
-        result = await hover_info(mock_lsp_client, str(f), 1, 8)
+        result = await hover_info(mock_lsp_client, str(f), MCPLine(1), MCPColumn(8))
         assert isinstance(result.info, str)
 
     @pytest.mark.asyncio
@@ -94,7 +94,7 @@ class TestUnicodeHandling:
                 {"label": "∃", "kind": 1, "detail": "Existential"},
             ]
         }
-        result = await completions(mock_lsp_client, temp_theory_file, 8, 1)
+        result = await completions(mock_lsp_client, temp_theory_file, MCPLine(8), MCPColumn(1))
         assert len(result.items) == 2
 
 
@@ -102,7 +102,7 @@ class TestEmptyResponses:
     @pytest.mark.asyncio
     async def test_hover_empty_contents(self, mock_lsp_client, temp_theory_file):
         mock_lsp_client.hover_response = {"contents": ""}
-        result = await hover_info(mock_lsp_client, temp_theory_file, 5, 15)
+        result = await hover_info(mock_lsp_client, temp_theory_file, MCPLine(5), MCPColumn(15))
         assert result.info == ""
 
     @pytest.mark.asyncio
@@ -110,7 +110,7 @@ class TestEmptyResponses:
         mock_lsp_client.highlights_response = [
             {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}, "kind": 1}
         ]
-        result = await document_highlights(mock_lsp_client, temp_theory_file, 1, 1)
+        result = await document_highlights(mock_lsp_client, temp_theory_file, MCPLine(1), MCPColumn(1))
         assert len(result.highlights) == 1
 
 
@@ -120,7 +120,7 @@ class TestLargeData:
         mock_lsp_client.completion_response = {
             "items": [{"label": f"item_{i}", "kind": 1, "detail": "x" * 1000} for i in range(1000)]
         }
-        result = await completions(mock_lsp_client, temp_theory_file, 8, 1, max_completions=100)
+        result = await completions(mock_lsp_client, temp_theory_file, MCPLine(8), MCPColumn(1), max_completions=100)
         assert len(result.items) == 100
 
     @pytest.mark.asyncio
@@ -128,5 +128,5 @@ class TestLargeData:
         f = tmp_path / "long.thy"
         f.write_text("x" * 100000 + "\n")
         mock_lsp_client.hover_response = {"contents": "test"}
-        result = await hover_info(mock_lsp_client, str(f), 1, 50000)
+        result = await hover_info(mock_lsp_client, str(f), MCPLine(1), MCPColumn(50000))
         assert result.info == "test"

@@ -1,7 +1,7 @@
 import pytest
 
 from isa_lsp.tools.preview import preview_document
-from isa_lsp.utils import IsabelleToolError
+from isa_lsp.utils import IsabelleToolError, MCPLine
 
 
 class TestPreviewTool:
@@ -15,10 +15,10 @@ class TestPreviewTool:
     @pytest.mark.asyncio
     async def test_with_line(self, mock_lsp_client, temp_theory_file):
         mock_lsp_client.preview_response = {"content": "<html></html>"}
-        result = await preview_document(mock_lsp_client, temp_theory_file, line=5)
+        result = await preview_document(mock_lsp_client, temp_theory_file, line=MCPLine(5))
         assert result.line_context != ""
 
     @pytest.mark.asyncio
     async def test_invalid_line(self, mock_lsp_client, temp_theory_file):
         with pytest.raises(IsabelleToolError, match="line must be >= 1"):
-            await preview_document(mock_lsp_client, temp_theory_file, line=0)
+            await preview_document(mock_lsp_client, temp_theory_file, line=MCPLine(0))

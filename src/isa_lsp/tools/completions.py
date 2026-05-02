@@ -4,6 +4,8 @@ from isa_lsp.lsp_client import IsabelleLSPClient
 from isa_lsp.models import CompletionItem, CompletionsResult
 from isa_lsp.utils import (
     IsabelleToolError,
+    MCPColumn,
+    MCPLine,
     check_pide_response,
     get_line_from_file,
     mcp_to_lsp_position,
@@ -14,8 +16,8 @@ from isa_lsp.utils import (
 async def completions(
     client: IsabelleLSPClient,
     file_path: str,
-    line: int,
-    column: int,
+    line: MCPLine,
+    column: MCPColumn,
     max_completions: int = 32,
 ) -> CompletionsResult:
     validate_position(line, column)
@@ -23,7 +25,9 @@ async def completions(
         raise IsabelleToolError(f"max_completions must be >= 1, got {max_completions}")
 
     await client.open_document(file_path)
-    await client.set_caret(file_path, line - 1)
+    lsp_line = line.to_lsp()
+    await client.set_caret(file_path, lsp_line)
+    await client.wait_for_processing(file_path, lsp_line)
 
     lsp_line, lsp_col = mcp_to_lsp_position(line, column)
 
@@ -90,7 +94,7 @@ def _string_or_empty(value: object) -> str:
     return str(value)
 
 
-def _extract_prefix(line: str, column: int) -> str:
+def _extract_prefix(line: str, column: MCPColumn) -> str:
     text_before = line[:column - 1] if column <= len(line) + 1 else line
     words = re.split(r'[\s()\[\]{},:;.]+', text_before)
     return (words[-1] if words else "").lower()

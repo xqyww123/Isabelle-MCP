@@ -2,6 +2,10 @@ from isa_lsp.lsp_client import IsabelleLSPClient
 from isa_lsp.models import Highlight, HighlightsResult
 from isa_lsp.utils import (
     IsabelleToolError,
+    LSPCharacter,
+    LSPLine,
+    MCPColumn,
+    MCPLine,
     check_pide_response,
     extract_symbol_at_position,
     lsp_to_mcp_position,
@@ -13,12 +17,14 @@ _KIND_MAP = {1: "text", 2: "read", 3: "write"}
 
 
 async def document_highlights(
-    client: IsabelleLSPClient, file_path: str, line: int, column: int,
+    client: IsabelleLSPClient, file_path: str, line: MCPLine, column: MCPColumn,
 ) -> HighlightsResult:
     validate_position(line, column)
 
     await client.open_document(file_path)
-    await client.set_caret(file_path, line - 1)
+    lsp_line = line.to_lsp()
+    await client.set_caret(file_path, lsp_line)
+    await client.wait_for_processing(file_path, lsp_line)
 
     lsp_line, lsp_col = mcp_to_lsp_position(line, column)
 
@@ -50,9 +56,13 @@ def _parse_highlight(h: dict) -> Highlight | None:
         if not start or not end:
             return None
         start_line, start_col = lsp_to_mcp_position(
-            start.get("line", 0), start.get("character", 0)
+            LSPLine(start.get("line", 0)),
+            LSPCharacter(start.get("character", 0)),
         )
-        _, end_col = lsp_to_mcp_position(end.get("line", 0), end.get("character", 0))
+        _, end_col = lsp_to_mcp_position(
+            LSPLine(end.get("line", 0)),
+            LSPCharacter(end.get("character", 0)),
+        )
         kind = _KIND_MAP.get(h.get("kind", 1), "text")
         return Highlight(line=start_line, start_column=start_col, end_column=end_col, kind=kind)
     except Exception:

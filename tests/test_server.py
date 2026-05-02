@@ -58,7 +58,7 @@ class TestMCPServerTools:
         mock_lsp_client.diagnostics_cache[temp_theory_file] = []
         mock_lsp_client.processing_status[temp_theory_file] = True
         with _patch_ensure(mock_lsp_client):
-            result = await isabelle_diagnostics(temp_theory_file)
+            result = await isabelle_diagnostics(temp_theory_file, 1, -1)
         assert result.success is True
         assert result.items == []
 
@@ -155,7 +155,10 @@ class TestServerMain:
                 assert "version" in mock_print.call_args[0][0].lower()
 
     def test_run(self):
+        import sys
+
         from isa_lsp.server import main, mcp
-        with patch.object(mcp, 'run') as mock_run:
-            main()
-            mock_run.assert_called_once()
+        with patch.object(sys, 'argv', ['isa-lsp']):
+            with patch.object(mcp, 'run') as mock_run:
+                main()
+                mock_run.assert_called_once()

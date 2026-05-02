@@ -1,15 +1,49 @@
 """Position conversion, URI handling, and error types."""
 
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Any
 from urllib.parse import quote, unquote
+
+
+# MCP positions are 1-indexed; LSP positions are 0-indexed.
+# Subclassing int gives: Pyright type safety, zero-cost comparisons,
+# and OOP conversion methods.
+
+
+class MCPLine(int):
+    """1-indexed line number (MCP convention)."""
+
+    def to_lsp(self) -> LSPLine:
+        return LSPLine(self - 1)
+
+
+class MCPColumn(int):
+    """1-indexed column number (MCP convention)."""
+
+    def to_lsp(self) -> LSPCharacter:
+        return LSPCharacter(self - 1)
+
+
+class LSPLine(int):
+    """0-indexed line number (LSP convention)."""
+
+    def to_mcp(self) -> MCPLine:
+        return MCPLine(self + 1)
+
+
+class LSPCharacter(int):
+    """0-indexed character offset (LSP convention)."""
+
+    def to_mcp(self) -> MCPColumn:
+        return MCPColumn(self + 1)
 
 
 class IsabelleToolError(Exception):
     pass
 
 
-def check_pide_response(response: Any, operation: str, *, allow_none: bool = False) -> Any:
+def check_pide_response(response: object, operation: str, *, allow_none: bool = False) -> object:
     if response is None and not allow_none:
         raise IsabelleToolError(f"PIDE timeout during {operation}")
 
@@ -22,21 +56,23 @@ def check_pide_response(response: Any, operation: str, *, allow_none: bool = Fal
     return response
 
 
-def validate_position(line: int, column: int) -> None:
+def validate_position(line: MCPLine, column: MCPColumn) -> None:
     if line < 1:
         raise IsabelleToolError(f"line must be >= 1, got {line}")
     if column < 1:
         raise IsabelleToolError(f"column must be >= 1, got {column}")
 
 
-# MCP uses 1-indexed positions, LSP uses 0-indexed.
+def mcp_to_lsp_position(
+    line: MCPLine, column: MCPColumn,
+) -> tuple[LSPLine, LSPCharacter]:
+    return line.to_lsp(), column.to_lsp()
 
-def mcp_to_lsp_position(line: int, column: int) -> tuple[int, int]:
-    return (line - 1, column - 1)
 
-
-def lsp_to_mcp_position(line: int, character: int) -> tuple[int, int]:
-    return (line + 1, character + 1)
+def lsp_to_mcp_position(
+    line: LSPLine, character: LSPCharacter,
+) -> tuple[MCPLine, MCPColumn]:
+    return line.to_mcp(), character.to_mcp()
 
 
 def file_path_to_uri(file_path: str) -> str:

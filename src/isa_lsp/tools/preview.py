@@ -1,17 +1,17 @@
 from isa_lsp.lsp_client import IsabelleLSPClient
 from isa_lsp.models import PreviewResult
-from isa_lsp.utils import get_line_from_file, validate_position
+from isa_lsp.utils import MCPColumn, MCPLine, get_line_from_file, validate_position
 
 
 async def preview_document(
-    client: IsabelleLSPClient, file_path: str, line: int | None = None,
+    client: IsabelleLSPClient, file_path: str, line: MCPLine | None = None,
 ) -> PreviewResult:
     if line is not None:
-        validate_position(line, 1)
+        validate_position(line, MCPColumn(1))
 
     await client.open_document(file_path)
     if line is not None:
-        await client.set_caret(file_path, line - 1)
+        await client.set_caret(file_path, line.to_lsp())
 
     response = await client.request_preview(file_path)
     return PreviewResult(

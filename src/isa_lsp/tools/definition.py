@@ -2,6 +2,10 @@ from isa_lsp.lsp_client import IsabelleLSPClient
 from isa_lsp.models import DeclarationLocation, Location
 from isa_lsp.utils import (
     IsabelleToolError,
+    LSPCharacter,
+    LSPLine,
+    MCPColumn,
+    MCPLine,
     check_pide_response,
     extract_symbol_at_position,
     lsp_to_mcp_position,
@@ -12,12 +16,14 @@ from isa_lsp.utils import (
 
 
 async def declaration_location(
-    client: IsabelleLSPClient, file_path: str, line: int, column: int,
+    client: IsabelleLSPClient, file_path: str, line: MCPLine, column: MCPColumn,
 ) -> DeclarationLocation:
     validate_position(line, column)
 
     await client.open_document(file_path)
-    await client.set_caret(file_path, line - 1)
+    lsp_line = line.to_lsp()
+    await client.set_caret(file_path, lsp_line)
+    await client.wait_for_processing(file_path, lsp_line)
 
     lsp_line, lsp_col = mcp_to_lsp_position(line, column)
 
@@ -55,7 +61,8 @@ def _parse_location(loc: dict) -> Location | None:
         file_path = uri_to_file_path(uri)
         start = range_dict.get("start", {})
         mcp_line, mcp_col = lsp_to_mcp_position(
-            start.get("line", 0), start.get("character", 0)
+            LSPLine(start.get("line", 0)),
+            LSPCharacter(start.get("character", 0)),
         )
         return Location(file_path=file_path, line=mcp_line, column=mcp_col)
     except Exception:

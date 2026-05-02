@@ -1,13 +1,20 @@
 from isa_lsp.lsp_client import IsabelleLSPClient
 from isa_lsp.models import DiagnosticMessage, DiagnosticsResult
-from isa_lsp.utils import IsabelleToolError, lsp_to_mcp_position, severity_int_to_string
+from isa_lsp.utils import (
+    IsabelleToolError,
+    LSPCharacter,
+    LSPLine,
+    MCPLine,
+    lsp_to_mcp_position,
+    severity_int_to_string,
+)
 
 
-def _resolve_line(value: int, total_lines: int) -> int:
+def _resolve_line(value: int, total_lines: int) -> MCPLine:
     """Resolve negative line indices: -1 = last line, -i = last i-th line."""
     if value < 0:
-        return max(1, total_lines + 1 + value)
-    return value
+        return MCPLine(max(1, total_lines + 1 + value))
+    return MCPLine(value)
 
 
 async def diagnostic_messages(
@@ -21,33 +28,33 @@ async def diagnostic_messages(
     doc = client.open_documents.get(file_path)
     total_lines = (doc.content.count("\n") + 1) if doc else 1
 
-    start_line = _resolve_line(start_line, total_lines)
-    end_line = _resolve_line(end_line, total_lines)
+    mcp_start = _resolve_line(start_line, total_lines)
+    mcp_end = _resolve_line(end_line, total_lines)
 
-    if start_line < 1:
-        raise IsabelleToolError(f"start_line must be >= 1, got {start_line}")
-    if end_line < 1:
-        raise IsabelleToolError(f"end_line must be >= 1, got {end_line}")
-    if start_line > end_line:
+    if mcp_start < 1:
+        raise IsabelleToolError(f"start_line must be >= 1, got {mcp_start}")
+    if mcp_end < 1:
+        raise IsabelleToolError(f"end_line must be >= 1, got {mcp_end}")
+    if mcp_start > mcp_end:
         raise IsabelleToolError(
-            f"start_line must be <= end_line, got {start_line} > {end_line}"
+            f"start_line must be <= end_line, got {mcp_start} > {mcp_end}"
         )
 
     if doc is not None:
-        await client.set_caret(file_path, end_line - 1)
+        await client.set_caret(file_path, mcp_end.to_lsp())
+    await client.wait_for_processing(file_path, mcp_start.to_lsp(), mcp_end.to_lsp())
 
     items: list[DiagnosticMessage] = []
     for diag in client.get_cached_diagnostics(file_path):
-        diag_line, _ = lsp_to_mcp_position(
-            diag.get("range", {}).get("start", {}).get("line", 0), 0
-        )
-        if diag_line < start_line:
+        diag_lsp_line = diag.get("range", {}).get("start", {}).get("line", 0)
+        diag_mcp_line = LSPLine(diag_lsp_line).to_mcp()
+        if diag_mcp_line < mcp_start:
             continue
-        if diag_line > end_line:
+        if diag_mcp_line > mcp_end:
             continue
         items.append(_parse_diagnostic(diag))
 
-    processing_complete = client.diagnostics_settled(file_path)
+    processing_complete = client.file_all_processed(file_path)
 
     return DiagnosticsResult(
         success=processing_complete and all(it.severity != "error" for it in items),
@@ -60,8 +67,12 @@ async def diagnostic_messages(
 def _parse_diagnostic(diag: dict) -> DiagnosticMessage:
     start = diag.get("range", {}).get("start", {})
     end = diag.get("range", {}).get("end", {})
-    start_line, start_col = lsp_to_mcp_position(start.get("line", 0), start.get("character", 0))
-    end_line, end_col = lsp_to_mcp_position(end.get("line", 0), end.get("character", 0))
+    start_line, start_col = lsp_to_mcp_position(
+        LSPLine(start.get("line", 0)), LSPCharacter(start.get("character", 0)),
+    )
+    end_line, end_col = lsp_to_mcp_position(
+        LSPLine(end.get("line", 0)), LSPCharacter(end.get("character", 0)),
+    )
     return DiagnosticMessage(
         severity=severity_int_to_string(diag.get("severity", 1)),
         message=diag.get("message", ""),

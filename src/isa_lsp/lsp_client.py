@@ -8,8 +8,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
+from isa_lsp.processing import ProcessingTracker, parse_decoration_ranges
 from isa_lsp.utils import (
     IsabelleToolError,
+    LSPCharacter,
+    LSPLine,
     file_path_to_uri,
     parse_goals_from_html,
     uri_to_file_path,
@@ -74,7 +77,11 @@ class IsabelleLSPClient:
         self._dynamic_output_cache_by_position: dict[tuple[str, int, int], str] = {}
 
         # PIDE preview
+        self._preview_lock = asyncio.Lock()
         self._preview_waiters: dict[tuple[str, int], asyncio.Future[JsonDict]] = {}
+
+        # PIDE processing status (from PIDE/decoration)
+        self._processing_trackers: dict[str, ProcessingTracker] = {}
 
         # Server activity tracking for progress monitoring
         self._last_server_activity: float = 0.0
@@ -189,6 +196,7 @@ class IsabelleLSPClient:
         self._dynamic_output_waiters.clear()
         self._dynamic_output_cache_by_position.clear()
         self._preview_waiters.clear()
+        self._processing_trackers.clear()
 
     # ── JSON-RPC transport ──────────────────────────────────────────────
 
@@ -359,12 +367,33 @@ class IsabelleLSPClient:
             event = self._first_diagnostic_event.get(file_path)
             if event is not None and not event.is_set():
                 event.set()
+        elif method == "PIDE/decoration":
+            await self._handle_decoration(params)
         elif method == "PIDE/state_output":
             self._handle_state_output(params)
         elif method == "PIDE/dynamic_output":
             self._handle_dynamic_output(params)
         elif method == "PIDE/preview_response":
             self._handle_preview_response(params)
+
+    async def _handle_decoration(self, params: Any) -> None:
+        if not isinstance(params, dict):
+            return
+        uri = params.get("uri", "")
+        if not isinstance(uri, str) or not uri.startswith("file://"):
+            return
+        entries = params.get("entries")
+        if not isinstance(entries, list):
+            return
+        parsed = parse_decoration_ranges(entries)
+        if not parsed:
+            return
+        file_path = uri_to_file_path(uri)
+        tracker = self._processing_trackers.get(file_path)
+        if tracker is None:
+            tracker = ProcessingTracker()
+            self._processing_trackers[file_path] = tracker
+        await tracker.update(parsed)
 
     def _handle_state_output(self, params: Any) -> None:
         if not isinstance(params, dict):
@@ -492,11 +521,10 @@ class IsabelleLSPClient:
             return False
         return True
 
-    async def set_caret(self, file_path: str, line: int, character: int = 0) -> None:
-        """Send PIDE/caret_update to tell Isabelle which region to process.
-
-        Line and character are 0-indexed (LSP convention).
-        """
+    async def set_caret(
+        self, file_path: str, line: LSPLine, character: LSPCharacter = LSPCharacter(0),
+    ) -> None:
+        """Send PIDE/caret_update to tell Isabelle which region to process."""
         doc = self.open_documents.get(file_path)
         if doc is None:
             return
@@ -515,6 +543,41 @@ class IsabelleLSPClient:
         self.diagnostic_cache.diagnostics.pop(file_path, None)
         self.diagnostic_cache.last_update.pop(file_path, None)
         self._first_diagnostic_event.pop(file_path, None)
+        tracker = self._processing_trackers.pop(file_path, None)
+        if tracker is not None:
+            await tracker.reset()
+
+    # ── Processing status (PIDE/decoration) ────────────────────────────
+
+    async def wait_for_processing(
+        self,
+        file_path: str,
+        start_line: LSPLine,
+        end_line: LSPLine | None = None,
+    ) -> None:
+        """Wait until PIDE has processed [start_line, end_line] (0-indexed).
+
+        When *end_line* is None, waits for the single line *start_line*.
+        """
+        if end_line is None:
+            end_line = start_line
+        tracker = self._processing_trackers.get(file_path)
+        if tracker is None:
+            tracker = ProcessingTracker()
+            self._processing_trackers[file_path] = tracker
+        await tracker.wait_until_processed(
+            start_line,
+            end_line,
+            health_check=lambda: self._check_server_health(self.STALL_TIMEOUT),
+            check_interval=self.PROGRESS_CHECK_INTERVAL,
+        )
+
+    def file_all_processed(self, file_path: str) -> bool:
+        """True if the entire file has been processed (no unprocessed/running)."""
+        tracker = self._processing_trackers.get(file_path)
+        if tracker is None:
+            return False
+        return tracker.all_processed
 
     async def sync_dirty_files(self, dirty_paths: set[str]) -> None:
         """Re-sync open documents that are affected by dirty files.
@@ -559,7 +622,7 @@ class IsabelleLSPClient:
 
     # ── Standard LSP queries ────────────────────────────────────────────
 
-    async def get_hover(self, file_path: str, line: int, character: int) -> JsonDict | None:
+    async def get_hover(self, file_path: str, line: LSPLine, character: LSPCharacter) -> JsonDict | None:
         doc = self.open_documents.get(file_path)
         if not doc:
             raise IsabelleToolError(f"Document not open: {file_path}")
@@ -572,8 +635,8 @@ class IsabelleLSPClient:
     async def get_completions(
         self,
         file_path: str,
-        line: int,
-        character: int,
+        line: LSPLine,
+        character: LSPCharacter,
     ) -> JsonDict | list[JsonDict] | None:
         doc = self.open_documents.get(file_path)
         if not doc:
@@ -586,7 +649,7 @@ class IsabelleLSPClient:
             return [item for item in result if isinstance(item, dict)]
         return result if isinstance(result, dict) or result is None else None
 
-    async def get_definition(self, file_path: str, line: int, character: int) -> Any | None:
+    async def get_definition(self, file_path: str, line: LSPLine, character: LSPCharacter) -> Any | None:
         doc = self.open_documents.get(file_path)
         if not doc:
             raise IsabelleToolError(f"Document not open: {file_path}")
@@ -595,7 +658,7 @@ class IsabelleLSPClient:
             "position": {"line": line, "character": character},
         })
 
-    async def get_highlights(self, file_path: str, line: int, character: int) -> list[JsonDict] | None:
+    async def get_highlights(self, file_path: str, line: LSPLine, character: LSPCharacter) -> list[JsonDict] | None:
         doc = self.open_documents.get(file_path)
         if not doc:
             raise IsabelleToolError(f"Document not open: {file_path}")
@@ -620,7 +683,7 @@ class IsabelleLSPClient:
     # ── PIDE extension queries ──────────────────────────────────────────
 
     async def get_goals_at_position(
-        self, file_path: str, line: int, character: int,
+        self, file_path: str, line: LSPLine, character: int,
     ) -> list[str]:
         """Get proof goals at a position using PIDE state panels.
 
@@ -723,7 +786,7 @@ class IsabelleLSPClient:
         return IsabelleToolError("Timed out waiting for proof state.")
 
     async def get_dynamic_output(
-        self, file_path: str, line: int, character: int = 0,
+        self, file_path: str, line: LSPLine, character: int = 0,
     ) -> str:
         """Get dynamic output at position (progress-monitored).
 
@@ -737,10 +800,10 @@ class IsabelleLSPClient:
 
         future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         waiter = (key, future)
-        self._dynamic_output_waiters.append(waiter)
 
         try:
             async with self._caret_lock:
+                self._dynamic_output_waiters.append(waiter)
                 await self.notify("PIDE/caret_update", {
                     "uri": uri, "line": line, "character": character,
                 })
@@ -765,11 +828,12 @@ class IsabelleLSPClient:
         """Request document preview (progress-monitored, no fixed timeout)."""
         uri = file_path_to_uri(file_path)
         key = (uri, column)
-        future: asyncio.Future[JsonDict] = asyncio.get_running_loop().create_future()
-        self._preview_waiters[key] = future
+        async with self._preview_lock:
+            future: asyncio.Future[JsonDict] = asyncio.get_running_loop().create_future()
+            self._preview_waiters[key] = future
 
-        try:
-            await self.notify("PIDE/preview_request", {"uri": uri, "column": column})
-            return await self._wait_with_progress(future)
-        finally:
-            self._preview_waiters.pop(key, None)
+            try:
+                await self.notify("PIDE/preview_request", {"uri": uri, "column": column})
+                return await self._wait_with_progress(future)
+            finally:
+                self._preview_waiters.pop(key, None)
