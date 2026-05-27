@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from isa_lsp.utils.core import (
+from isabelle_mcp.utils.core import (
     IsabelleToolError,
     LSPCharacter,
     LSPLine,
@@ -16,7 +16,7 @@ from isa_lsp.utils.core import (
     mcp_to_lsp_position,
     uri_to_file_path,
 )
-from isa_lsp.utils.formatters import (
+from isabelle_mcp.utils.formatters import (
     get_line_from_file,
     parse_command_output_html,
     parse_goals_from_html,

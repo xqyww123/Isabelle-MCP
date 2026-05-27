@@ -8,8 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from isa_lsp.lsp_client import DocumentState, IsabelleLSPClient
-from isa_lsp.utils import IsabelleToolError, LSPCharacter, LSPLine
+from isabelle_mcp.lsp_client import DocumentState, IsabelleLSPClient
+from isabelle_mcp.utils import IsabelleToolError, LSPCharacter, LSPLine
 
 
 class TestIsabelleLSPClient:

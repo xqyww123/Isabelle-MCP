@@ -1,5 +1,5 @@
 """
-Example Python script demonstrating direct usage of isa-lsp tools.
+Example Python script demonstrating direct usage of isabelle-mcp tools.
 
 This shows how to use the MCP tools programmatically without an MCP client.
 """
@@ -7,9 +7,9 @@ This shows how to use the MCP tools programmatically without an MCP client.
 import asyncio
 from pathlib import Path
 
-from isa_lsp.evaluation import evaluate_to, evaluation_status
-from isa_lsp.lsp_client import IsabelleLSPClient
-from isa_lsp.tools import (
+from isabelle_mcp.evaluation import evaluate_to, evaluation_status
+from isabelle_mcp.lsp_client import IsabelleLSPClient
+from isabelle_mcp.tools import (
     declaration_location,
     diagnostic_messages,
     document_highlights,

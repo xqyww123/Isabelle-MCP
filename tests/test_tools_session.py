@@ -1,6 +1,6 @@
 import pytest
 
-from isa_lsp.tools.session import session_info
+from isabelle_mcp.tools.session import session_info
 
 
 class TestSessionTool:

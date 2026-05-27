@@ -3,14 +3,14 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "isa-lsp"
+name = "isabelle-mcp"
 version = "0.1.0"
 description = "Model Context Protocol server for Isabelle theorem prover"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
-    {name = "Isa-LSP Contributors"}
+    {name = "Isabelle-MCP Contributors"}
 ]
 keywords = ["isabelle", "theorem-prover", "mcp", "lsp", "ai-assistance"]
 classifiers = [
@@ -45,19 +45,19 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-org/isa-lsp"
-Documentation = "https://github.com/your-org/isa-lsp/tree/main/docs"
-Repository = "https://github.com/your-org/isa-lsp"
-Issues = "https://github.com/your-org/isa-lsp/issues"
+Homepage = "https://github.com/your-org/isabelle-mcp"
+Documentation = "https://github.com/your-org/isabelle-mcp/tree/main/docs"
+Repository = "https://github.com/your-org/isabelle-mcp"
+Issues = "https://github.com/your-org/isabelle-mcp/issues"
 
 [project.scripts]
-isa-lsp = "isa_lsp.server:main"
+isabelle-mcp = "isabelle_mcp.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-isa_lsp = ["py.typed"]
+isabelle_mcp = ["py.typed"]
 
 [tool.black]
 line-length = 100

@@ -1,4 +1,4 @@
-from isa_lsp.utils.core import (
+from isabelle_mcp.utils.core import (
     IsabelleToolError,
     LSPCharacter,
     LSPLine,
@@ -11,7 +11,7 @@ from isa_lsp.utils.core import (
     uri_to_file_path,
     validate_position,
 )
-from isa_lsp.utils.formatters import (
+from isabelle_mcp.utils.formatters import (
     extract_symbol_at_position,
     extract_symbol_from_lsp_range,
     get_line_from_file,
@@ -20,7 +20,7 @@ from isa_lsp.utils.formatters import (
     severity_int_to_string,
     strip_html_tags,
 )
-from isa_lsp.utils.isabelle_tokens import find_symbol_occurrences
+from isabelle_mcp.utils.isabelle_tokens import find_symbol_occurrences
 
 __all__ = [
     "IsabelleToolError",

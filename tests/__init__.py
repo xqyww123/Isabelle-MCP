@@ -1,3 +1,3 @@
 """
-Tests for Isa-LSP MCP server.
+Tests for Isabelle-MCP server.
 """

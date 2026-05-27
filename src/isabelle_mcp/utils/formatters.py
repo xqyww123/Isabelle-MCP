@@ -7,7 +7,7 @@ from typing import Any
 
 from bs4 import BeautifulSoup, NavigableString
 
-from isa_lsp.utils.core import LSPCharacter, LSPLine, MCPColumn, MCPLine
+from isabelle_mcp.utils.core import LSPCharacter, LSPLine, MCPColumn, MCPLine
 
 
 def _pide_html_to_text(el: Any) -> str:

@@ -1,5 +1,5 @@
-from isa_lsp.lsp_client import IsabelleLSPClient
-from isa_lsp.models import SessionInfo
+from isabelle_mcp.lsp_client import IsabelleLSPClient
+from isabelle_mcp.models import SessionInfo
 
 
 async def session_info(client: IsabelleLSPClient) -> SessionInfo:

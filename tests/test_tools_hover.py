@@ -1,7 +1,7 @@
 import pytest
 
-from isa_lsp.tools.hover import hover_info
-from isa_lsp.utils import IsabelleToolError, MCPLine
+from isabelle_mcp.tools.hover import hover_info
+from isabelle_mcp.utils import IsabelleToolError, MCPLine
 
 
 class TestHoverTool:
@@ -78,7 +78,7 @@ class TestHoverTool:
 
     @pytest.mark.asyncio
     async def test_symbol_not_found(self, mock_lsp_client, temp_theory_file):
-        from isa_lsp.utils import IsabelleToolError
+        from isabelle_mcp.utils import IsabelleToolError
         with pytest.raises(IsabelleToolError, match="not found on line"):
             await hover_info(mock_lsp_client, temp_theory_file, MCPLine(5), "nonexistent_sym")
 
@@ -143,7 +143,7 @@ class TestHoverTool:
         f = tmp_path / "Note.thy"
         f.write_text("hello world\n")
         mock_lsp_client.hover_response = {"contents": "test"}
-        with patch("isa_lsp.tools.hover.check_evaluation_guard", new_callable=AsyncMock) as mock_guard:
+        with patch("isabelle_mcp.tools.hover.check_evaluation_guard", new_callable=AsyncMock) as mock_guard:
             mock_guard.return_value = "This line is still being executed (forked proof). Output may be incomplete."
             result = await hover_info(mock_lsp_client, str(f), MCPLine(1), "hello")
         assert result.note is not None

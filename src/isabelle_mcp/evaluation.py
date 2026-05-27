@@ -18,14 +18,14 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
-from isa_lsp.lsp_client import IsabelleLSPClient
-from isa_lsp.models import (
+from isabelle_mcp.lsp_client import IsabelleLSPClient
+from isabelle_mcp.models import (
     DiagnosticMessage,
     EvaluationResult,
     RunningCommand,
     TheoryStatus,
 )
-from isa_lsp.utils import (
+from isabelle_mcp.utils import (
     IsabelleToolError,
     LSPCharacter,
     LSPLine,

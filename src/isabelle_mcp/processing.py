@@ -7,7 +7,7 @@ import logging
 import time as _time
 from collections.abc import Callable
 
-from isa_lsp.utils.core import LSPLine
+from isabelle_mcp.utils.core import LSPLine
 
 logger = logging.getLogger(__name__)
 

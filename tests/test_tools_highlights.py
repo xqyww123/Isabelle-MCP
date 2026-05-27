@@ -1,7 +1,7 @@
 import pytest
 
-from isa_lsp.tools.highlights import document_highlights
-from isa_lsp.utils import MCPColumn, MCPLine
+from isabelle_mcp.tools.highlights import document_highlights
+from isabelle_mcp.utils import MCPColumn, MCPLine
 
 
 class TestHighlightsTool:

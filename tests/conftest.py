@@ -3,8 +3,8 @@ from typing import Any
 
 import pytest
 
-from isa_lsp.lsp_client import DocumentState
-from isa_lsp.utils import LSPCharacter, LSPLine
+from isabelle_mcp.lsp_client import DocumentState
+from isabelle_mcp.utils import LSPCharacter, LSPLine
 
 
 @pytest.fixture
@@ -218,7 +218,7 @@ def mock_lsp_client():
 
 @pytest.fixture(autouse=True)
 def _reset_evaluation_state():
-    from isa_lsp.evaluation import evaluation_state
+    from isabelle_mcp.evaluation import evaluation_state
     evaluation_state.cancel()
     yield
     evaluation_state.cancel()

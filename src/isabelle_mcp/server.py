@@ -9,15 +9,15 @@ from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from isa_lsp.evaluation import (
+from isabelle_mcp.evaluation import (
     cancel_evaluation,
     evaluate_to,
     evaluation_status,
 )
-from isa_lsp.file_watcher import FileWatcher
-from isa_lsp.instructions import get_instructions
-from isa_lsp.lsp_client import IsabelleLSPClient
-from isa_lsp.models import (
+from isabelle_mcp.file_watcher import FileWatcher
+from isabelle_mcp.instructions import get_instructions
+from isabelle_mcp.lsp_client import IsabelleLSPClient
+from isabelle_mcp.models import (
     CommandOutputResult,
     DeclarationLocation,
     DiagnosticsResult,
@@ -27,7 +27,7 @@ from isa_lsp.models import (
     HoverInfo,
     SessionInfo,
 )
-from isa_lsp.tools import (
+from isabelle_mcp.tools import (
     command_output,
     declaration_location,
     diagnostic_messages,
@@ -36,7 +36,7 @@ from isa_lsp.tools import (
     hover_info,
     session_info,
 )
-from isa_lsp.utils import IsabelleToolError, MCPColumn, MCPLine  # MCPColumn still used by other tools
+from isabelle_mcp.utils import IsabelleToolError, MCPColumn, MCPLine  # MCPColumn still used by other tools
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -61,7 +61,7 @@ async def server_lifespan(_app: Any) -> AsyncGenerator[None]:
             await _lsp_client.shutdown()
 
 
-mcp = FastMCP("Isabelle LSP", lifespan=server_lifespan)
+mcp = FastMCP("Isabelle MCP", lifespan=server_lifespan)
 
 
 async def _ensure_lsp_started() -> IsabelleLSPClient:
@@ -249,12 +249,12 @@ def main() -> None:
     import sys
 
     if "--version" in sys.argv:
-        from isa_lsp import __version__
-        print(f"isa-lsp version {__version__}")
+        from isabelle_mcp import __version__
+        print(f"isabelle-mcp version {__version__}")
         return
 
     parser = argparse.ArgumentParser(
-        description="Isabelle LSP MCP Server",
+        description="Isabelle MCP Server",
         usage="%(prog)s -s SESSION [options] [-- ISABELLE_ARGS...]",
     )
     parser.add_argument(

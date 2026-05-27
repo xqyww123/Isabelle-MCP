@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from isa_lsp.server import (
+from isabelle_mcp.server import (
     isabelle_cancel_evaluation,
     isabelle_command_output,
     isabelle_definition,
@@ -19,7 +19,7 @@ from isa_lsp.server import (
 
 
 def _patch_ensure(mock_client):
-    return patch('isa_lsp.server._ensure_lsp_started', new_callable=AsyncMock, return_value=mock_client)
+    return patch('isabelle_mcp.server._ensure_lsp_started', new_callable=AsyncMock, return_value=mock_client)
 
 
 class TestMCPServerTools:
@@ -114,10 +114,10 @@ class TestMCPServerTools:
 class TestServerLifespan:
     @pytest.mark.asyncio
     async def test_creates_client(self):
-        import isa_lsp.server as server_mod
-        from isa_lsp.server import server_lifespan
+        import isabelle_mcp.server as server_mod
+        from isabelle_mcp.server import server_lifespan
 
-        with patch('isa_lsp.server.IsabelleLSPClient') as MockClient:
+        with patch('isabelle_mcp.server.IsabelleLSPClient') as MockClient:
             mock_instance = MagicMock()
             mock_instance.process = None
             MockClient.return_value = mock_instance
@@ -127,13 +127,13 @@ class TestServerLifespan:
 
     @pytest.mark.asyncio
     async def test_custom_session(self):
-        import isa_lsp.server as server_mod
-        from isa_lsp.server import server_lifespan
+        import isabelle_mcp.server as server_mod
+        from isabelle_mcp.server import server_lifespan
 
         server_mod._server_logic = "HOL-Analysis"
         server_mod._server_extra_args = ["-d", "/extra"]
         try:
-            with patch('isa_lsp.server.IsabelleLSPClient') as MockClient:
+            with patch('isabelle_mcp.server.IsabelleLSPClient') as MockClient:
                 mock_instance = MagicMock()
                 mock_instance.process = None
                 MockClient.return_value = mock_instance
@@ -150,8 +150,8 @@ class TestServerMain:
     def test_version(self):
         import sys
 
-        from isa_lsp.server import main
-        with patch.object(sys, 'argv', ['isa-lsp', '--version']):
+        from isabelle_mcp.server import main
+        with patch.object(sys, 'argv', ['isabelle-mcp', '--version']):
             with patch('builtins.print') as mock_print:
                 main()
                 assert "version" in mock_print.call_args[0][0].lower()
@@ -159,8 +159,8 @@ class TestServerMain:
     def test_run(self):
         import sys
 
-        from isa_lsp.server import main, mcp
-        with patch.object(sys, 'argv', ['isa-lsp', '-s', 'HOL']):
+        from isabelle_mcp.server import main, mcp
+        with patch.object(sys, 'argv', ['isabelle-mcp', '-s', 'HOL']):
             with patch.object(mcp, 'run') as mock_run:
                 main()
                 mock_run.assert_called_once()
@@ -168,17 +168,17 @@ class TestServerMain:
     def test_session_required(self):
         import sys
 
-        from isa_lsp.server import main
-        with patch.object(sys, 'argv', ['isa-lsp']):
+        from isabelle_mcp.server import main
+        with patch.object(sys, 'argv', ['isabelle-mcp']):
             with pytest.raises(SystemExit, match="2"):
                 main()
 
     def test_extra_args_passthrough(self):
         import sys
 
-        import isa_lsp.server as server_mod
-        from isa_lsp.server import main, mcp
-        with patch.object(sys, 'argv', ['isa-lsp', '-s', 'HOL-Analysis', '--', '-d', '/extra', '-o', 'threads=4']):
+        import isabelle_mcp.server as server_mod
+        from isabelle_mcp.server import main, mcp
+        with patch.object(sys, 'argv', ['isabelle-mcp', '-s', 'HOL-Analysis', '--', '-d', '/extra', '-o', 'threads=4']):
             with patch.object(mcp, 'run'):
                 main()
                 assert server_mod._server_logic == "HOL-Analysis"
@@ -187,7 +187,7 @@ class TestServerMain:
     def test_typo_rejected(self):
         import sys
 
-        from isa_lsp.server import main
-        with patch.object(sys, 'argv', ['isa-lsp', '-s', 'HOL', '--httpp']):
+        from isabelle_mcp.server import main
+        with patch.object(sys, 'argv', ['isabelle-mcp', '-s', 'HOL', '--httpp']):
             with pytest.raises(SystemExit, match="2"):
                 main()

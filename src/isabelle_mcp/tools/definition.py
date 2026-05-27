@@ -1,9 +1,9 @@
 import logging
 
-from isa_lsp.evaluation import check_evaluation_guard
-from isa_lsp.lsp_client import IsabelleLSPClient
-from isa_lsp.models import DeclarationLocation, EvaluationResult, Location
-from isa_lsp.utils import (
+from isabelle_mcp.evaluation import check_evaluation_guard
+from isabelle_mcp.lsp_client import IsabelleLSPClient
+from isabelle_mcp.models import DeclarationLocation, EvaluationResult, Location
+from isabelle_mcp.utils import (
     IsabelleToolError,
     LSPCharacter,
     LSPLine,

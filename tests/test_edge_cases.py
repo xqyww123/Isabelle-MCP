@@ -5,12 +5,12 @@ import asyncio
 import pytest
 from pydantic import ValidationError
 
-from isa_lsp.evaluation import evaluation_state
-from isa_lsp.models import HoverEntry, HoverInfo, Location
-from isa_lsp.tools.diagnostics import diagnostic_messages
-from isa_lsp.tools.highlights import document_highlights
-from isa_lsp.tools.hover import hover_info
-from isa_lsp.utils import IsabelleToolError, MCPColumn, MCPLine
+from isabelle_mcp.evaluation import evaluation_state
+from isabelle_mcp.models import HoverEntry, HoverInfo, Location
+from isabelle_mcp.tools.diagnostics import diagnostic_messages
+from isabelle_mcp.tools.highlights import document_highlights
+from isabelle_mcp.tools.hover import hover_info
+from isabelle_mcp.utils import IsabelleToolError, MCPColumn, MCPLine
 
 
 class TestInvalidInput:

@@ -1,14 +1,14 @@
-from isa_lsp.evaluation import check_evaluation_guard
-from isa_lsp.lsp_client import IsabelleLSPClient
-from isa_lsp.models import CommandOutputResult, EvaluationResult, OutputMessage
-from isa_lsp.utils import (
+from isabelle_mcp.evaluation import check_evaluation_guard
+from isabelle_mcp.lsp_client import IsabelleLSPClient
+from isabelle_mcp.models import CommandOutputResult, EvaluationResult, OutputMessage
+from isabelle_mcp.utils import (
     IsabelleToolError,
     MCPLine,
     get_line_from_file,
     parse_command_output_html,
     validate_position,
 )
-from isa_lsp.utils.core import MCPColumn
+from isabelle_mcp.utils.core import MCPColumn
 
 
 def _is_non_command_line(line_context: str) -> bool:

@@ -1,7 +1,7 @@
 import pytest
 
-from isa_lsp.tools.goal import goal
-from isa_lsp.utils import IsabelleToolError, MCPColumn, MCPLine
+from isabelle_mcp.tools.goal import goal
+from isabelle_mcp.utils import IsabelleToolError, MCPColumn, MCPLine
 
 
 class TestGoalTool:

@@ -1,12 +1,12 @@
 import pytest
 
-from isa_lsp.evaluation import (
+from isabelle_mcp.evaluation import (
     cancel_evaluation,
     evaluate_to,
     evaluation_state,
     evaluation_status,
 )
-from isa_lsp.utils import IsabelleToolError
+from isabelle_mcp.utils import IsabelleToolError
 
 
 class MockProcessingTracker:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PostToolUse hook: notify Isa-LSP MCP server about file changes."""
+"""PostToolUse hook: notify Isabelle-MCP server about file changes."""
 import json
 import sys
 import urllib.request

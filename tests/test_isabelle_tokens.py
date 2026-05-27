@@ -2,7 +2,7 @@
 
 import pytest
 
-from isa_lsp.utils.isabelle_tokens import find_symbol_occurrences, tokenize_isabelle_line
+from isabelle_mcp.utils.isabelle_tokens import find_symbol_occurrences, tokenize_isabelle_line
 
 
 class TestTokenize:

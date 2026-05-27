@@ -8,9 +8,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
-from isa_lsp.models import RunningCommand
-from isa_lsp.processing import ProcessingTracker, parse_decoration_ranges
-from isa_lsp.utils import (
+from isabelle_mcp.models import RunningCommand
+from isabelle_mcp.processing import ProcessingTracker, parse_decoration_ranges
+from isabelle_mcp.utils import (
     IsabelleToolError,
     LSPCharacter,
     LSPLine,

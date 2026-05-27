@@ -1,8 +1,8 @@
 import pytest
 
-from isa_lsp.evaluation import evaluation_state
-from isa_lsp.tools.definition import declaration_location
-from isa_lsp.utils import IsabelleToolError, MCPLine
+from isabelle_mcp.evaluation import evaluation_state
+from isabelle_mcp.tools.definition import declaration_location
+from isabelle_mcp.utils import IsabelleToolError, MCPLine
 
 
 class TestDefinitionTool:

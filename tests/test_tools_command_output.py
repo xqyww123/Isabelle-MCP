@@ -2,8 +2,8 @@ from typing import Any, cast
 
 import pytest
 
-from isa_lsp.tools.command_output import command_output
-from isa_lsp.utils import IsabelleToolError, MCPLine
+from isabelle_mcp.tools.command_output import command_output
+from isabelle_mcp.utils import IsabelleToolError, MCPLine
 
 
 class _MockTracker:
