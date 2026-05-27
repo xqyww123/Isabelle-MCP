@@ -20,6 +20,7 @@ from isa_lsp.utils.formatters import (
     severity_int_to_string,
     strip_html_tags,
 )
+from isa_lsp.utils.isabelle_tokens import find_symbol_occurrences
 
 __all__ = [
     "IsabelleToolError",
@@ -29,6 +30,7 @@ __all__ = [
     "MCPLine",
     "check_pide_response",
     "file_path_to_uri",
+    "find_symbol_occurrences",
     "lsp_to_mcp_position",
     "mcp_to_lsp_position",
     "uri_to_file_path",

@@ -1,3 +1,5 @@
+import logging
+
 from isa_lsp.evaluation import check_evaluation_guard
 from isa_lsp.lsp_client import IsabelleLSPClient
 from isa_lsp.models import DeclarationLocation, EvaluationResult, Location
@@ -5,21 +7,21 @@ from isa_lsp.utils import (
     IsabelleToolError,
     LSPCharacter,
     LSPLine,
-    MCPColumn,
     MCPLine,
     check_pide_response,
-    extract_symbol_at_position,
+    find_symbol_occurrences,
     lsp_to_mcp_position,
-    mcp_to_lsp_position,
     uri_to_file_path,
-    validate_position,
 )
+
+logger = logging.getLogger(__name__)
 
 
 async def declaration_location(
-    client: IsabelleLSPClient, file_path: str, line: MCPLine, column: MCPColumn,
+    client: IsabelleLSPClient, file_path: str, line: MCPLine, symbol: str,
 ) -> DeclarationLocation:
-    validate_position(line, column)
+    if line < 1:
+        raise IsabelleToolError(f"line must be >= 1, got {line}")
 
     await client.open_document(file_path)
 
@@ -28,24 +30,47 @@ async def declaration_location(
         raise IsabelleToolError(guard.message)
     note = guard if isinstance(guard, str) else None
 
-    lsp_line, lsp_col = mcp_to_lsp_position(line, column)
+    doc = client.open_documents.get(file_path)
+    if doc is None:
+        raise IsabelleToolError(f"Document not open: {file_path}")
 
-    try:
-        response = await client.get_definition(file_path, lsp_line, lsp_col)
-        check_pide_response(response, "get_definition", allow_none=True)
-    except Exception as exc:
-        raise IsabelleToolError(f"Failed to get definition: {exc}") from exc
+    lines = doc.content.split("\n")
+    lsp_line_idx = int(line.to_lsp())
+    if lsp_line_idx >= len(lines):
+        return DeclarationLocation(symbol=symbol, locations=[], note=note)
 
-    symbol = extract_symbol_at_position(file_path, line, column)
+    doc_line = lines[lsp_line_idx]
+    lsp_offsets = find_symbol_occurrences(doc_line, symbol)
+    if not lsp_offsets:
+        raise IsabelleToolError(f"Symbol '{symbol}' not found on line {line}")
 
+    seen: set[tuple[str, int, int]] = set()
     locations: list[Location] = []
-    if response is not None:
+    for lsp_char_offset in lsp_offsets:
+        try:
+            response = await client.get_definition(
+                file_path, LSPLine(lsp_line_idx), LSPCharacter(lsp_char_offset),
+            )
+            check_pide_response(response, "get_definition", allow_none=True)
+        except IsabelleToolError:
+            raise
+        except Exception:
+            logger.debug("Definition query failed at offset %d", lsp_char_offset, exc_info=True)
+            continue
+
+        if response is None:
+            continue
         loc_list = response if isinstance(response, list) else [response]
         for loc in loc_list:
-            if isinstance(loc, dict):
-                parsed = _parse_location(loc)
-                if parsed:
-                    locations.append(parsed)
+            if not isinstance(loc, dict):
+                continue
+            parsed = _parse_location(loc)
+            if parsed is None:
+                continue
+            key = (parsed.file_path, parsed.line, parsed.column)
+            if key not in seen:
+                seen.add(key)
+                locations.append(parsed)
 
     return DeclarationLocation(symbol=symbol, locations=locations, note=note)
 

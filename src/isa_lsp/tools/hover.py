@@ -1,26 +1,43 @@
+import logging
+
 from isa_lsp.evaluation import check_evaluation_guard
 from isa_lsp.lsp_client import IsabelleLSPClient
-from isa_lsp.models import DiagnosticMessage, EvaluationResult, HoverInfo
+from isa_lsp.models import DiagnosticMessage, EvaluationResult, HoverEntry, HoverInfo
 from isa_lsp.utils import (
     IsabelleToolError,
     LSPCharacter,
     LSPLine,
-    MCPColumn,
     MCPLine,
     check_pide_response,
-    extract_symbol_from_lsp_range,
-    get_line_from_file,
+    find_symbol_occurrences,
     lsp_to_mcp_position,
-    mcp_to_lsp_position,
     severity_int_to_string,
-    validate_position,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _extract_hover_text(response: dict | None) -> str:
+    if not response or not isinstance(response, dict):
+        return ""
+    contents = response.get("contents", {})
+    if isinstance(contents, dict):
+        return contents.get("value", "")
+    if isinstance(contents, str):
+        return contents
+    if isinstance(contents, list):
+        return "\n".join(
+            item.get("value", str(item)) if isinstance(item, dict) else str(item)
+            for item in contents
+        )
+    return ""
 
 
 async def hover_info(
-    client: IsabelleLSPClient, file_path: str, line: MCPLine, column: MCPColumn,
+    client: IsabelleLSPClient, file_path: str, line: MCPLine, symbol: str,
 ) -> HoverInfo:
-    validate_position(line, column)
+    if line < 1:
+        raise IsabelleToolError(f"line must be >= 1, got {line}")
 
     await client.open_document(file_path)
 
@@ -29,49 +46,60 @@ async def hover_info(
         raise IsabelleToolError(guard.message)
     note = guard if isinstance(guard, str) else None
 
-    lsp_line, lsp_col = mcp_to_lsp_position(line, column)
+    doc = client.open_documents.get(file_path)
+    if doc is None:
+        raise IsabelleToolError(f"Document not open: {file_path}")
 
-    try:
-        response = await client.get_hover(file_path, lsp_line, lsp_col)
-        check_pide_response(response, "get_hover", allow_none=True)
-    except Exception as exc:
-        raise IsabelleToolError(f"Failed to get hover info: {exc}") from exc
+    lines = doc.content.split("\n")
+    lsp_line_idx = int(line.to_lsp())
+    if lsp_line_idx >= len(lines):
+        return HoverInfo(symbol=symbol, results=[], line_context="", note=note)
 
-    symbol = ""
-    info_text = ""
+    doc_line = lines[lsp_line_idx]
+    lsp_offsets = find_symbol_occurrences(doc_line, symbol)
+    if not lsp_offsets:
+        raise IsabelleToolError(f"Symbol '{symbol}' not found on line {line}")
 
-    if response and isinstance(response, dict):
-        if "range" in response:
-            symbol = extract_symbol_from_lsp_range(file_path, response["range"])
-
-        contents = response.get("contents", {})
-        if isinstance(contents, dict):
-            info_text = contents.get("value", "")
-        elif isinstance(contents, str):
-            info_text = contents
-        elif isinstance(contents, list):
-            info_text = "\n".join(
-                item.get("value", str(item)) if isinstance(item, dict) else str(item)
-                for item in contents
+    info_map: dict[str, tuple[list[int], list[int]]] = {}
+    for occ_idx, lsp_char_offset in enumerate(lsp_offsets, 1):
+        try:
+            response = await client.get_hover(
+                file_path, LSPLine(lsp_line_idx), LSPCharacter(lsp_char_offset),
             )
+            check_pide_response(response, "get_hover", allow_none=True)
+        except IsabelleToolError:
+            raise
+        except Exception:
+            logger.debug("Hover query failed for occurrence %d: %s", occ_idx, exc_info=True)
+            continue
 
-    line_context = get_line_from_file(file_path, line)
+        info_text = _extract_hover_text(response)
+        mcp_col = int(LSPCharacter(lsp_char_offset).to_mcp())
+        if info_text not in info_map:
+            info_map[info_text] = ([], [])
+        info_map[info_text][0].append(occ_idx)
+        info_map[info_text][1].append(mcp_col)
 
-    diagnostics_at_position = []
+    results = [
+        HoverEntry(info=info_text, occurrences=occs, columns=cols)
+        for info_text, (occs, cols) in info_map.items()
+    ]
+
+    diagnostics_at_line: list[DiagnosticMessage] = []
     for diag in client.get_cached_diagnostics(file_path):
         diag_range = diag.get("range", {})
         diag_start = diag_range.get("start", {})
-        if diag_start.get("line", -1) == lsp_line:
+        if diag_start.get("line", -1) == lsp_line_idx:
+            diag_end = diag_range.get("end", {})
             diag_mcp_line, diag_mcp_col = lsp_to_mcp_position(
                 LSPLine(diag_start.get("line", 0)),
                 LSPCharacter(diag_start.get("character", 0)),
             )
-            diag_end = diag_range.get("end", {})
             diag_end_line, diag_end_col = lsp_to_mcp_position(
                 LSPLine(diag_end.get("line", 0)),
                 LSPCharacter(diag_end.get("character", 0)),
             )
-            diagnostics_at_position.append(DiagnosticMessage(
+            diagnostics_at_line.append(DiagnosticMessage(
                 severity=severity_int_to_string(diag.get("severity", 1)),
                 message=diag.get("message", ""),
                 line=diag_mcp_line, column=diag_mcp_col,
@@ -79,7 +107,7 @@ async def hover_info(
             ))
 
     return HoverInfo(
-        symbol=symbol, info=info_text,
-        line_context=line_context, diagnostics=diagnostics_at_position,
+        symbol=symbol, results=results,
+        line_context=doc_line, diagnostics=diagnostics_at_line,
         note=note,
     )

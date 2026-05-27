@@ -3,15 +3,27 @@
 All positions are 1-indexed (MCP convention).
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+
+class HoverEntry(BaseModel):
+    info: str = Field(description="Type signature and documentation")
+    occurrences: list[int] = Field(description="1-indexed occurrence indices on the line")
+    columns: list[int] = Field(description="1-indexed column positions of those occurrences")
+
+    @model_validator(mode="after")
+    def _check_parallel_lists(self) -> "HoverEntry":
+        if len(self.occurrences) != len(self.columns):
+            raise ValueError("occurrences and columns must have the same length")
+        return self
 
 
 class HoverInfo(BaseModel):
-    symbol: str = Field(description="Symbol text at position")
-    info: str = Field(description="Type signature and documentation")
+    symbol: str = Field(description="Queried symbol text")
+    results: list[HoverEntry] = Field(default_factory=list, description="Hover results grouped by content")
     line_context: str = Field(description="Full source line for reference")
     diagnostics: list["DiagnosticMessage"] = Field(
-        default_factory=list, description="Diagnostics at this position"
+        default_factory=list, description="Diagnostics on this line"
     )
     note: str | None = Field(default=None, description="Warning note (e.g. line still running)")
 
@@ -117,11 +129,11 @@ class EvaluationResult(BaseModel):
     )
     theories: list[TheoryStatus] = Field(
         default_factory=list,
-        description="Status of all loaded theories (from PIDE/theory_status)",
+        description="Status of all loaded theories",
     )
     running_commands: list[RunningCommand] = Field(
         default_factory=list,
-        description="Commands currently being executed (from opened files only)",
+        description="Commands currently being executed",
     )
     destination_line: int | None = Field(
         default=None, description="Target line for evaluation (1-indexed)",

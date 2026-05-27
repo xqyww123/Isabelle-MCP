@@ -27,17 +27,18 @@ class TestMCPServerTools:
     async def test_hover(self, temp_theory_file, mock_lsp_client):
         mock_lsp_client.hover_response = {"contents": "test"}
         with _patch_ensure(mock_lsp_client):
-            result = await isabelle_hover(temp_theory_file, 5, 15)
-        assert result.info == "test"
-        assert isinstance(result.symbol, str)
+            result = await isabelle_hover(temp_theory_file, 5, "my_const")
+        assert len(result.results) >= 1
+        assert result.results[0].info == "test"
+        assert result.symbol == "my_const"
 
     @pytest.mark.asyncio
     async def test_definition(self, temp_theory_file, mock_lsp_client):
         mock_lsp_client.definition_response = []
         with _patch_ensure(mock_lsp_client):
-            result = await isabelle_definition(temp_theory_file, 8, 20)
+            result = await isabelle_definition(temp_theory_file, 8, "my_const")
         assert result.locations == []
-        assert isinstance(result.symbol, str)
+        assert result.symbol == "my_const"
 
     @pytest.mark.asyncio
     async def test_highlights(self, temp_theory_file, mock_lsp_client):

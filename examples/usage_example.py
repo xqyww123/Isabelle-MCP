@@ -63,14 +63,16 @@ async def main():
 
         # Example 4: Hover info
         print("--- Example 4: Hover Information ---")
-        hover = await hover_info(client, str(theory_file), 11, 15)
+        hover = await hover_info(client, str(theory_file), 11, "my_const")
         print(f"Symbol: {hover.symbol}")
-        print(f"Info: {hover.info[:100]}..." if len(hover.info) > 100 else f"Info: {hover.info}")
+        for entry in hover.results:
+            info = entry.info
+            print(f"Info: {info[:100]}..." if len(info) > 100 else f"Info: {info}")
         print()
 
         # Example 5: Go to definition
         print("--- Example 5: Go to Definition ---")
-        defn = await declaration_location(client, str(theory_file), 18, 20)
+        defn = await declaration_location(client, str(theory_file), 18, "my_const")
         print(f"Symbol: {defn.symbol}")
         for loc in defn.locations:
             print(f"  {loc.file_path}:{loc.line}:{loc.column}")

@@ -29,6 +29,7 @@ from isa_lsp.utils import (
     IsabelleToolError,
     LSPCharacter,
     LSPLine,
+    MCPColumn,
     MCPLine,
     lsp_to_mcp_position,
     severity_int_to_string,
@@ -281,6 +282,7 @@ async def evaluate_to(
     client: IsabelleLSPClient,
     file_path: str,
     line: int,
+    column: int = 0,
 ) -> EvaluationResult:
     async with _evaluation_lock:
         if evaluation_state.active:
@@ -296,6 +298,14 @@ async def evaluate_to(
         mcp_line = _resolve_line(line, total_lines)
         if mcp_line < 1:
             raise IsabelleToolError(f"line must be >= 1, got {mcp_line}")
+        if column == -1:
+            lines = doc.content.split("\n") if doc else []
+            lsp_idx = int(mcp_line.to_lsp())
+            lsp_char = LSPCharacter(len(lines[lsp_idx]) if lsp_idx < len(lines) else 0)
+        elif column > 0:
+            lsp_char = MCPColumn(column).to_lsp()
+        else:
+            lsp_char = LSPCharacter(0)
 
         evaluation_state.start(file_path, mcp_line)
 
@@ -303,7 +313,7 @@ async def evaluate_to(
         tracker = client.get_processing_tracker(file_path)
         if tracker is not None:
             tracker.require_fresh_update()
-        await client.set_caret(file_path, mcp_line.to_lsp())
+        await client.set_caret(file_path, mcp_line.to_lsp(), lsp_char)
         status, theories, running_commands, errors = await _evaluation_wait_loop(
             client, file_path, mcp_line, evaluation_state, EVAL_POLL_INTERVAL,
         )

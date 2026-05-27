@@ -180,9 +180,13 @@ class MockLSPClient:
         self.open_documents.pop(file_path, None)
 
     async def get_hover(self, file_path: str, line: LSPLine, character: LSPCharacter) -> Any:
+        if callable(self.hover_response):
+            return self.hover_response(file_path, line, character)
         return self.hover_response
 
     async def get_definition(self, file_path: str, line: LSPLine, character: LSPCharacter) -> Any:
+        if callable(self.definition_response):
+            return self.definition_response(file_path, line, character)
         return self.definition_response
 
     async def get_highlights(self, file_path: str, line: LSPLine, character: LSPCharacter) -> Any:

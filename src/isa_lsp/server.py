@@ -36,7 +36,7 @@ from isa_lsp.tools import (
     hover_info,
     session_info,
 )
-from isa_lsp.utils import IsabelleToolError, MCPColumn, MCPLine
+from isa_lsp.utils import IsabelleToolError, MCPColumn, MCPLine  # MCPColumn still used by other tools
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -96,26 +96,24 @@ async def get_instructions_resource() -> str:
 
 
 @mcp.tool()
-async def isabelle_evaluate_to(file_path: str, line: int) -> EvaluationResult:
-    """Start evaluating a theory file up to a specific line.
+async def isabelle_evaluate_to(file_path: str, line: int, column: int = 0) -> EvaluationResult:
+    """Start evaluating a theory file up to a specific location.
 
-    Sets Isabelle to process the file through the target line.  Returns
-    within ~10 s with errors found so far and current progress.  Call
-    ``evaluation_status`` to poll until evaluation is complete.
+    The result may indicate evaluation is still in progress.
+    If so, call ``evaluation_status`` to poll until complete.
 
     Args:
         file_path: Absolute path to .thy file
         line: Target line number (1-indexed). Use -1 for last line.
+        column: Target column (1-indexed). 0 (default) means start of line. -1 means end of line.
     """
-    return await evaluate_to(await _ensure_lsp_started(), file_path, line)
+    return await evaluate_to(await _ensure_lsp_started(), file_path, line, column)
 
 
 @mcp.tool()
 async def isabelle_evaluation_status() -> EvaluationResult:
     """Check the progress of an ongoing evaluation.
-
-    Returns new errors (since the last check) and the current execution
-    position.  Call repeatedly until status is ``complete``.
+    Returns new errors (since the last check) and the current execution position.
     """
     return await evaluation_status(await _ensure_lsp_started())
 
@@ -134,31 +132,37 @@ async def isabelle_cancel_evaluation() -> EvaluationResult:
 
 
 @mcp.tool()
-async def isabelle_hover(file_path: str, line: int, column: int) -> HoverInfo:
-    """Get type and documentation for symbol at position.
+async def isabelle_hover(file_path: str, line: int, symbol: str) -> HoverInfo:
+    """Get type and documentation for a symbol on a line.
+
+    Finds all occurrences of the symbol on the line (up to 10), queries each,
+    and deduplicates results. Accepts both ASCII and Unicode symbol forms.
 
     Auto-starts evaluation if the line has not been evaluated yet.
 
     Args:
         file_path: Absolute path to .thy file
         line: Line number (1-indexed)
-        column: Column number (1-indexed)
+        symbol: Symbol text to look up (e.g. "Suc", "my_const", "⟹")
     """
-    return await hover_info(await _ensure_lsp_started(), file_path, MCPLine(line), MCPColumn(column))
+    return await hover_info(await _ensure_lsp_started(), file_path, MCPLine(line), symbol)
 
 
 @mcp.tool()
-async def isabelle_definition(file_path: str, line: int, column: int) -> DeclarationLocation:
+async def isabelle_definition(file_path: str, line: int, symbol: str) -> DeclarationLocation:
     """Find where a symbol is defined.
+
+    Finds all occurrences of the symbol on the line (up to 10), queries each,
+    and deduplicates locations. Accepts both ASCII and Unicode symbol forms.
 
     Auto-starts evaluation if the line has not been evaluated yet.
 
     Args:
         file_path: Absolute path to .thy file
         line: Line number (1-indexed)
-        column: Column number (1-indexed)
+        symbol: Symbol text to look up (e.g. "my_const", "List.map")
     """
-    return await declaration_location(await _ensure_lsp_started(), file_path, MCPLine(line), MCPColumn(column))
+    return await declaration_location(await _ensure_lsp_started(), file_path, MCPLine(line), symbol)
 
 
 @mcp.tool()
