@@ -1,5 +1,6 @@
+from isa_lsp.evaluation import check_evaluation_guard
 from isa_lsp.lsp_client import IsabelleLSPClient
-from isa_lsp.models import DeclarationLocation, Location
+from isa_lsp.models import DeclarationLocation, EvaluationResult, Location
 from isa_lsp.utils import (
     IsabelleToolError,
     LSPCharacter,
@@ -21,9 +22,11 @@ async def declaration_location(
     validate_position(line, column)
 
     await client.open_document(file_path)
-    lsp_line = line.to_lsp()
-    await client.set_caret(file_path, lsp_line)
-    await client.wait_for_processing(file_path, lsp_line)
+
+    guard = await check_evaluation_guard(client, file_path, line)
+    if isinstance(guard, EvaluationResult):
+        raise IsabelleToolError(guard.message)
+    note = guard if isinstance(guard, str) else None
 
     lsp_line, lsp_col = mcp_to_lsp_position(line, column)
 
@@ -44,7 +47,7 @@ async def declaration_location(
                 if parsed:
                     locations.append(parsed)
 
-    return DeclarationLocation(symbol=symbol, locations=locations)
+    return DeclarationLocation(symbol=symbol, locations=locations, note=note)
 
 
 def _parse_location(loc: dict) -> Location | None:

@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
+from isa_lsp.models import RunningCommand
 from isa_lsp.processing import ProcessingTracker, parse_decoration_ranges
 from isa_lsp.utils import (
     IsabelleToolError,
@@ -50,10 +51,12 @@ class IsabelleLSPClient:
         logic: str = "HOL",
         session_dirs: list[str] | None = None,
         verbose: bool = False,
+        extra_args: list[str] | None = None,
     ):
         self.logic = logic
         self.session_dirs = session_dirs or []
         self.verbose = verbose
+        self.extra_args = extra_args or []
 
         self.process: asyncio.subprocess.Process | None = None
         self.reader_task: asyncio.Task[None] | None = None
@@ -140,6 +143,7 @@ class IsabelleLSPClient:
             cmd.extend(["-d", d])
         if self.verbose:
             cmd.append("-v")
+        cmd.extend(self.extra_args)
 
         try:
             self.process = await asyncio.create_subprocess_exec(
@@ -279,16 +283,19 @@ class IsabelleLSPClient:
 
         raw_length = headers.get("content-length")
         if raw_length is None:
+            logger.warning("LSP message missing Content-Length header: %s", headers)
             return {}
         try:
             content_length = int(raw_length)
         except ValueError:
+            logger.warning("LSP message has non-integer Content-Length: %r", raw_length)
             return {}
 
         content = await self.process.stdout.readexactly(content_length)
         try:
             message = json.loads(content.decode("utf-8"))
         except json.JSONDecodeError:
+            logger.warning("LSP message has invalid JSON (length=%d): %s", content_length, content[:200])
             return {}
         return message if isinstance(message, dict) else {}
 
@@ -304,7 +311,7 @@ class IsabelleLSPClient:
         except asyncio.CancelledError:
             raise
         except Exception:
-            pass
+            logger.debug("stderr drain stopped", exc_info=True)
 
     async def _cancel_background_tasks(self) -> None:
         tasks = [
@@ -386,11 +393,11 @@ class IsabelleLSPClient:
         if not isinstance(entries, list):
             return
         parsed = parse_decoration_ranges(entries)
-        if not parsed:
-            return
         file_path = uri_to_file_path(uri)
         tracker = self._processing_trackers.get(file_path)
         if tracker is None:
+            if not parsed:
+                return
             tracker = ProcessingTracker()
             self._processing_trackers[file_path] = tracker
         await tracker.update(parsed)
@@ -430,16 +437,18 @@ class IsabelleLSPClient:
         if future and not future.done():
             future.set_result(params)
 
+    def _all_waiters(self) -> list[asyncio.Future]:
+        futures: list[asyncio.Future] = []
+        futures.extend(self.pending_requests.values())
+        futures.extend(self._state_init_waiters)
+        futures.extend(future for _, future in self._dynamic_output_waiters)
+        futures.extend(self._preview_waiters.values())
+        return futures
+
     def _fail_pending_waiters(self, exc: Exception) -> None:
-        for waiters in (
-            self.pending_requests.values(),
-            self._state_init_waiters,
-            (future for _, future in self._dynamic_output_waiters),
-            self._preview_waiters.values(),
-        ):
-            for future in list(waiters):
-                if not future.done():
-                    future.set_exception(exc)
+        for future in self._all_waiters():
+            if not future.done():
+                future.set_exception(exc)
         self.pending_requests.clear()
         self._state_init_waiters.clear()
         self._dynamic_output_waiters.clear()
@@ -572,12 +581,113 @@ class IsabelleLSPClient:
             check_interval=self.PROGRESS_CHECK_INTERVAL,
         )
 
+    async def wait_for_processing_bounded(
+        self,
+        file_path: str,
+        start_line: LSPLine,
+        end_line: LSPLine,
+        timeout: float,
+    ) -> bool:
+        """Wait until [start_line, end_line] is processed, or *timeout* expires.
+
+        Returns True if the range was fully processed, False on timeout.
+        """
+        tracker = self._processing_trackers.get(file_path)
+        if tracker is None:
+            tracker = ProcessingTracker()
+            self._processing_trackers[file_path] = tracker
+
+        return await tracker.wait_until_processed_bounded(
+            start_line,
+            end_line,
+            timeout=timeout,
+            health_check=lambda: self._check_server_health(self.STALL_TIMEOUT),
+            check_interval=self.PROGRESS_CHECK_INTERVAL,
+        )
+
+    async def request_theory_status(self) -> list[dict]:
+        """Send PIDE/theory_status and return raw theory list."""
+        result = await self.request("PIDE/theory_status", {})
+        return result.get("theories", []) if isinstance(result, dict) else []
+
+    async def cancel_execution(self) -> None:
+        """Send PIDE/cancel_execution to atomically stop all processing."""
+        await self.request("PIDE/cancel_execution", {})
+
+    def get_all_running_commands(self) -> list[RunningCommand]:
+        """Collect running commands from all tracked files with elapsed time and text."""
+        now = time.monotonic()
+        result: list[RunningCommand] = []
+        for file_path, tracker in self._processing_trackers.items():
+            doc = self.open_documents.get(file_path)
+            if doc is None:
+                continue
+            lines = doc.content.split("\n")
+            for sl, sc, el, ec, onset in tracker.get_running_ranges_with_onset():
+                el_clamped = min(el, len(lines) - 1)
+                if sl >= len(lines):
+                    continue
+                ec_clamped = min(ec, len(lines[el_clamped]))
+                if sl == el_clamped:
+                    text = lines[sl][sc:ec_clamped]
+                else:
+                    parts = [lines[sl][sc:]]
+                    for i in range(sl + 1, el_clamped):
+                        parts.append(lines[i])
+                    parts.append(lines[el_clamped][:ec_clamped])
+                    text = "\n".join(parts)
+                result.append(RunningCommand(
+                    file_path=file_path,
+                    start_line=sl + 1,
+                    end_line=el_clamped + 1,
+                    text=text,
+                    elapsed_seconds=round(now - onset, 1),
+                ))
+        return result
+
+    async def force_interrupt(self, file_path: str) -> None:
+        """Cancel all processing via PIDE/cancel_execution and restrict perspective.
+
+        Uses a three-step approach (verified 2026-05-27):
+        1. PIDE/cancel_execution — global stop + interrupt all running threads
+        2. Caret to line 0 — restrict perspective
+        3. Single edit — trigger Document.update with restricted perspective
+
+        The trailing space on line 0 is self-healing: the next open_document()
+        re-reads from disk and detects the content mismatch.
+        """
+        doc = self.open_documents.get(file_path)
+        if doc is None:
+            return
+        await self.cancel_execution()
+        await self.notify("PIDE/caret_update", {
+            "uri": doc.uri, "line": 0, "character": 0, "focus": True,
+        })
+        first_line = doc.content.split("\n", 1)[0]
+        doc.version += 1
+        await self.notify("textDocument/didChange", {
+            "textDocument": {"uri": doc.uri, "version": doc.version},
+            "contentChanges": [{
+                "range": {
+                    "start": {"line": 0, "character": len(first_line)},
+                    "end": {"line": 0, "character": len(first_line)},
+                },
+                "text": " ",
+            }],
+        })
+        parts = doc.content.split("\n", 1)
+        doc.content = parts[0] + " " + ("\n" + parts[1] if len(parts) > 1 else "")
+
     def file_all_processed(self, file_path: str) -> bool:
         """True if the entire file has been processed (no unprocessed/running)."""
         tracker = self._processing_trackers.get(file_path)
         if tracker is None:
             return False
         return tracker.all_processed
+
+    def get_processing_tracker(self, file_path: str) -> ProcessingTracker | None:
+        """Return the ProcessingTracker for *file_path*, or None."""
+        return self._processing_trackers.get(file_path)
 
     async def sync_dirty_files(self, dirty_paths: set[str]) -> None:
         """Re-sync open documents that are affected by dirty files.

@@ -13,19 +13,7 @@ class HoverInfo(BaseModel):
     diagnostics: list["DiagnosticMessage"] = Field(
         default_factory=list, description="Diagnostics at this position"
     )
-
-
-class CompletionItem(BaseModel):
-    label: str = Field(description="Completion text")
-    kind: str = Field(description="function | variable | keyword | constant | class | module")
-    detail: str = Field(default="", description="Additional info (e.g., type)")
-    documentation: str | None = Field(None, description="Description")
-    insert_text: str = Field(default="", description="Text to insert (may differ from label)")
-
-
-class CompletionsResult(BaseModel):
-    items: list[CompletionItem] = Field(default_factory=list)
-    line_context: str = Field(description="Source line for reference")
+    note: str | None = Field(default=None, description="Warning note (e.g. line still running)")
 
 
 class Location(BaseModel):
@@ -40,6 +28,7 @@ class DeclarationLocation(BaseModel):
         default_factory=list,
         description="Definition locations (may be multiple for overloaded symbols)",
     )
+    note: str | None = Field(default=None, description="Warning note (e.g. line still running)")
 
 
 class Highlight(BaseModel):
@@ -52,6 +41,7 @@ class Highlight(BaseModel):
 class HighlightsResult(BaseModel):
     symbol: str = Field(description="Symbol being highlighted")
     highlights: list[Highlight] = Field(default_factory=list)
+    note: str | None = Field(default=None, description="Warning note (e.g. line still running)")
 
 
 class DiagnosticMessage(BaseModel):
@@ -70,6 +60,7 @@ class DiagnosticsResult(BaseModel):
     failed_dependencies: list[str] = Field(
         default_factory=list, description="File paths of theories that failed to load"
     )
+    note: str | None = Field(default=None, description="Warning note (e.g. line still running)")
 
 
 class GoalState(BaseModel):
@@ -78,6 +69,7 @@ class GoalState(BaseModel):
     goals_before: list[str] | None = Field(default=None, description="Goals at line start (before tactic)")
     goals_after: list[str] | None = Field(default=None, description="Goals at line end (after tactic)")
     context: str | None = Field(default=None, description="Local proof context (assumptions, fixes)")
+    note: str | None = Field(default=None, description="Warning note (e.g. line still running)")
 
 
 class OutputMessage(BaseModel):
@@ -88,22 +80,59 @@ class OutputMessage(BaseModel):
 class CommandOutputResult(BaseModel):
     line_context: str = Field(description="Source line")
     messages: list[OutputMessage] = Field(default_factory=list)
+    note: str | None = Field(default=None, description="Warning note (e.g. line still running)")
 
 
-class PreviewResult(BaseModel):
-    html: str = Field(description="HTML preview of theory")
-    line_context: str | None = Field(None, description="Source line for context")
+class TheoryStatus(BaseModel):
+    node_name: str = Field(description="File path from PIDE/theory_status")
+    theory_name: str = Field(description="Qualified theory name (e.g. Test.A)")
+    external: bool = Field(description="True if auto-loaded (not explicitly opened)")
+    imports: list[str] = Field(default_factory=list, description="Imported theory names")
+    ok: bool = Field(description="True if no errors")
+    total: int = Field(description="Total number of commands")
+    unprocessed: int = Field(description="Commands not yet processed")
+    running: int = Field(description="Commands currently executing")
+    warned: int = Field(default=0, description="Commands with warnings")
+    failed: int = Field(default=0, description="Commands that failed")
+    finished: int = Field(default=0, description="Commands that finished")
+    canceled: bool = Field(default=False, description="True if execution was canceled")
+    consolidated: bool = Field(default=False, description="True if fully processed")
+    percentage: int = Field(default=0, description="Processing progress (0-100)")
+
+
+class RunningCommand(BaseModel):
+    file_path: str = Field(description="Absolute path to the file")
+    start_line: int = Field(description="Start line (1-indexed)", ge=1)
+    end_line: int = Field(description="End line (1-indexed)", ge=1)
+    text: str = Field(description="Command source text")
+    elapsed_seconds: float = Field(description="Seconds since command started running")
+
+
+class EvaluationResult(BaseModel):
+    status: str = Field(
+        description="complete | in_progress | no_evaluation | cancelled",
+    )
+    errors: list[DiagnosticMessage] = Field(
+        default_factory=list, description="New errors since last check",
+    )
+    theories: list[TheoryStatus] = Field(
+        default_factory=list,
+        description="Status of all loaded theories (from PIDE/theory_status)",
+    )
+    running_commands: list[RunningCommand] = Field(
+        default_factory=list,
+        description="Commands currently being executed (from opened files only)",
+    )
+    destination_line: int | None = Field(
+        default=None, description="Target line for evaluation (1-indexed)",
+    )
+    message: str = Field(default="", description="Human-readable status message")
 
 
 class SessionInfo(BaseModel):
     current_session: str = Field(description="Current logic/session name (e.g., HOL)")
 
 
-class BuildStatus(BaseModel):
-    success: bool = Field(description="Whether build succeeded")
-    messages: list[str] = Field(default_factory=list, description="Build output messages")
-    session: str = Field(description="Session name that was built")
-
-
-# Needed because HoverInfo references DiagnosticMessage via forward ref.
+# Needed because models reference DiagnosticMessage/TheoryStatus/RunningCommand via forward ref.
 HoverInfo.model_rebuild()
+EvaluationResult.model_rebuild()

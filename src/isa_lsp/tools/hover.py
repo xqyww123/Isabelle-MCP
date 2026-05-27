@@ -1,5 +1,6 @@
+from isa_lsp.evaluation import check_evaluation_guard
 from isa_lsp.lsp_client import IsabelleLSPClient
-from isa_lsp.models import DiagnosticMessage, HoverInfo
+from isa_lsp.models import DiagnosticMessage, EvaluationResult, HoverInfo
 from isa_lsp.utils import (
     IsabelleToolError,
     LSPCharacter,
@@ -22,9 +23,11 @@ async def hover_info(
     validate_position(line, column)
 
     await client.open_document(file_path)
-    lsp_line = line.to_lsp()
-    await client.set_caret(file_path, lsp_line)
-    await client.wait_for_processing(file_path, lsp_line)
+
+    guard = await check_evaluation_guard(client, file_path, line)
+    if isinstance(guard, EvaluationResult):
+        raise IsabelleToolError(guard.message)
+    note = guard if isinstance(guard, str) else None
 
     lsp_line, lsp_col = mcp_to_lsp_position(line, column)
 
@@ -78,4 +81,5 @@ async def hover_info(
     return HoverInfo(
         symbol=symbol, info=info_text,
         line_context=line_context, diagnostics=diagnostics_at_position,
+        note=note,
     )

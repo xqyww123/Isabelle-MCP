@@ -1,7 +1,6 @@
 """Isabelle LSP MCP Server — FastMCP entry point."""
 
 import logging
-import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -10,31 +9,31 @@ from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from isa_lsp.evaluation import (
+    cancel_evaluation,
+    evaluate_to,
+    evaluation_status,
+)
 from isa_lsp.file_watcher import FileWatcher
 from isa_lsp.instructions import get_instructions
 from isa_lsp.lsp_client import IsabelleLSPClient
 from isa_lsp.models import (
-    BuildStatus,
     CommandOutputResult,
-    CompletionsResult,
     DeclarationLocation,
     DiagnosticsResult,
+    EvaluationResult,
     GoalState,
     HighlightsResult,
     HoverInfo,
-    PreviewResult,
     SessionInfo,
 )
 from isa_lsp.tools import (
-    build_session,
     command_output,
-    completions,
     declaration_location,
     diagnostic_messages,
     document_highlights,
     goal,
     hover_info,
-    preview_document,
     session_info,
 )
 from isa_lsp.utils import IsabelleToolError, MCPColumn, MCPLine
@@ -44,13 +43,14 @@ logger = logging.getLogger(__name__)
 
 _lsp_client: IsabelleLSPClient | None = None
 _file_watcher: FileWatcher | None = None
+_server_logic: str = "HOL"
+_server_extra_args: list[str] = []
 
 
 @asynccontextmanager
 async def server_lifespan(_app: Any) -> AsyncGenerator[None]:
     global _lsp_client, _file_watcher
-    logic = os.environ.get("ISABELLE_SESSION", "Main")
-    _lsp_client = IsabelleLSPClient(logic=logic)
+    _lsp_client = IsabelleLSPClient(logic=_server_logic, extra_args=_server_extra_args)
     _file_watcher = FileWatcher()
     _file_watcher.start()
     try:
@@ -92,9 +92,52 @@ async def get_instructions_resource() -> str:
     return get_instructions()
 
 
+# ── Evaluation tools ──────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def isabelle_evaluate_to(file_path: str, line: int) -> EvaluationResult:
+    """Start evaluating a theory file up to a specific line.
+
+    Sets Isabelle to process the file through the target line.  Returns
+    within ~10 s with errors found so far and current progress.  Call
+    ``evaluation_status`` to poll until evaluation is complete.
+
+    Args:
+        file_path: Absolute path to .thy file
+        line: Target line number (1-indexed). Use -1 for last line.
+    """
+    return await evaluate_to(await _ensure_lsp_started(), file_path, line)
+
+
+@mcp.tool()
+async def isabelle_evaluation_status() -> EvaluationResult:
+    """Check the progress of an ongoing evaluation.
+
+    Returns new errors (since the last check) and the current execution
+    position.  Call repeatedly until status is ``complete``.
+    """
+    return await evaluation_status(await _ensure_lsp_started())
+
+
+@mcp.tool()
+async def isabelle_cancel_evaluation() -> EvaluationResult:
+    """Cancel an ongoing evaluation.
+
+    Stops Isabelle from processing further.  Already-processed results
+    remain valid for querying.
+    """
+    return await cancel_evaluation(await _ensure_lsp_started())
+
+
+# ── Query tools (require prior evaluation) ────────────────────────────
+
+
 @mcp.tool()
 async def isabelle_hover(file_path: str, line: int, column: int) -> HoverInfo:
     """Get type and documentation for symbol at position.
+
+    Auto-starts evaluation if the line has not been evaluated yet.
 
     Args:
         file_path: Absolute path to .thy file
@@ -105,23 +148,10 @@ async def isabelle_hover(file_path: str, line: int, column: int) -> HoverInfo:
 
 
 @mcp.tool()
-async def isabelle_completions(
-    file_path: str, line: int, column: int, max_completions: int = 50,
-) -> CompletionsResult:
-    """Get completion suggestions at position.
-
-    Args:
-        file_path: Absolute path to .thy file
-        line: Line number (1-indexed)
-        column: Column number (1-indexed)
-        max_completions: Maximum number of completions to return
-    """
-    return await completions(await _ensure_lsp_started(), file_path, MCPLine(line), MCPColumn(column), max_completions)
-
-
-@mcp.tool()
 async def isabelle_definition(file_path: str, line: int, column: int) -> DeclarationLocation:
     """Find where a symbol is defined.
+
+    Auto-starts evaluation if the line has not been evaluated yet.
 
     Args:
         file_path: Absolute path to .thy file
@@ -134,6 +164,8 @@ async def isabelle_definition(file_path: str, line: int, column: int) -> Declara
 @mcp.tool()
 async def isabelle_highlights(file_path: str, line: int, column: int) -> HighlightsResult:
     """Find all occurrences of symbol in document.
+
+    Auto-starts evaluation if the line has not been evaluated yet.
 
     Args:
         file_path: Absolute path to .thy file
@@ -151,13 +183,13 @@ async def isabelle_diagnostics(
 ) -> DiagnosticsResult:
     """Get compiler diagnostics (errors, warnings) for a line range.
 
-    Isabelle processes the file up to end_line (not beyond).
-    Use negative indices to count from the end: -1 = last line, -i = last i-th line.
+    Auto-starts evaluation if the range has not been evaluated yet.
+    Use negative indices to count from the end: -1 = last line.
 
     Args:
         file_path: Absolute path to .thy file
         start_line: Start line (1-indexed, or negative from end)
-        end_line: End line (1-indexed, or negative from end). Isabelle processes up to here.
+        end_line: End line (1-indexed, or negative from end)
     """
     return await diagnostic_messages(
         await _ensure_lsp_started(), file_path, start_line, end_line
@@ -169,6 +201,8 @@ async def isabelle_goal(
     file_path: str, line: int, column: int | None = None,
 ) -> GoalState:
     """Get proof goals at position. **MOST IMPORTANT tool — use often!**
+
+    Auto-starts evaluation if the line has not been evaluated yet.
 
     Omitting column shows how a tactic transforms the proof state:
     - goals_before: State at line start
@@ -190,6 +224,8 @@ async def isabelle_goal(
 async def isabelle_command_output(file_path: str, line: int) -> CommandOutputResult:
     """Get prover output messages for command at line.
 
+    Auto-starts evaluation if the line has not been evaluated yet.
+
     Args:
         file_path: Absolute path to .thy file
         line: Line number (1-indexed)
@@ -198,49 +234,43 @@ async def isabelle_command_output(file_path: str, line: int) -> CommandOutputRes
 
 
 @mcp.tool()
-async def isabelle_preview(file_path: str, line: int | None = None) -> PreviewResult:
-    """Generate HTML preview of theory content.
-
-    Args:
-        file_path: Absolute path to .thy file
-        line: Line number for context (1-indexed), optional
-    """
-    return await preview_document(
-        await _ensure_lsp_started(), file_path,
-        MCPLine(line) if line is not None else None,
-    )
-
-
-@mcp.tool()
 async def isabelle_session_info() -> SessionInfo:
     """Get information about current Isabelle session."""
     return await session_info(await _ensure_lsp_started())
 
 
-@mcp.tool()
-async def isabelle_build(session: str, clean: bool = False) -> BuildStatus:
-    """Build an Isabelle session to generate heap images.
-
-    Args:
-        session: Session name to build (e.g., 'HOL', 'Main')
-        clean: Clean build (remove old heap images)
-    """
-    return await build_session(await _ensure_lsp_started(), session, clean)
-
-
 def main() -> None:
+    global _server_logic, _server_extra_args
     import argparse
-    parser = argparse.ArgumentParser(description="Isabelle LSP MCP Server")
-    parser.add_argument("--version", action="store_true")
-    parser.add_argument("--http", action="store_true", help="Run as HTTP server (shared across clients)")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8371)
-    args = parser.parse_args()
+    import sys
 
-    if args.version:
+    if "--version" in sys.argv:
         from isa_lsp import __version__
         print(f"isa-lsp version {__version__}")
         return
+
+    parser = argparse.ArgumentParser(
+        description="Isabelle LSP MCP Server",
+        usage="%(prog)s -s SESSION [options] [-- ISABELLE_ARGS...]",
+    )
+    parser.add_argument(
+        "-s", "--session", required=True,
+        help="Isabelle session/logic name (e.g. HOL, HOL-Analysis)",
+    )
+    parser.add_argument("--http", action="store_true", help="Run as HTTP server (shared across clients)")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8371)
+
+    argv = sys.argv[1:]
+    if "--" in argv:
+        idx = argv.index("--")
+        own_argv, extra = argv[:idx], argv[idx + 1:]
+    else:
+        own_argv, extra = argv, []
+    args = parser.parse_args(own_argv)
+
+    _server_logic = args.session
+    _server_extra_args = extra
 
     if args.http:
         mcp.run(transport="streamable-http", host=args.host, port=args.port)

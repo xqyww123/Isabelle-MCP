@@ -1,6 +1,13 @@
+from isa_lsp.evaluation import check_evaluation_guard
 from isa_lsp.lsp_client import IsabelleLSPClient
-from isa_lsp.models import GoalState
-from isa_lsp.utils import MCPColumn, MCPLine, get_line_from_file, validate_position
+from isa_lsp.models import EvaluationResult, GoalState
+from isa_lsp.utils import (
+    IsabelleToolError,
+    MCPColumn,
+    MCPLine,
+    get_line_from_file,
+    validate_position,
+)
 
 
 async def goal(
@@ -12,7 +19,11 @@ async def goal(
     validate_position(line, column if column is not None else MCPColumn(1))
 
     await client.open_document(file_path)
-    await client.set_caret(file_path, line.to_lsp())
+
+    guard = await check_evaluation_guard(client, file_path, line)
+    if isinstance(guard, EvaluationResult):
+        raise IsabelleToolError(guard.message)
+    note = guard if isinstance(guard, str) else None
 
     line_context = get_line_from_file(file_path, line)
 
@@ -24,9 +35,10 @@ async def goal(
         return GoalState(
             line_context=line_context,
             goals_before=goals_before, goals_after=goals_after,
+            note=note,
         )
 
     goals = await client.get_goals_at_position(
         file_path, line.to_lsp(), column.to_lsp(),
     )
-    return GoalState(line_context=line_context, goals=goals)
+    return GoalState(line_context=line_context, goals=goals, note=note)

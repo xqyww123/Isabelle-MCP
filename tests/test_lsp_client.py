@@ -330,21 +330,6 @@ class TestIsabelleLSPClient:
             await client.request("test/method", {}, timeout=0.1)
 
     @pytest.mark.asyncio
-    async def test_get_completions_accepts_lsp_completion_item_list(self):
-        client = IsabelleLSPClient()
-        client.open_documents["/tmp/Test.thy"] = DocumentState(
-            file_path="/tmp/Test.thy",
-            uri="file:///tmp/Test.thy",
-            version=1,
-            content="",
-        )
-        client.request = AsyncMock(return_value=[{"label": "lemma"}])
-
-        result = await client.get_completions("/tmp/Test.thy", LSPLine(0), LSPCharacter(0))
-
-        assert result == [{"label": "lemma"}]
-
-    @pytest.mark.asyncio
     async def test_read_message_with_multiple_headers(self):
         client = IsabelleLSPClient()
         message = {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}}
@@ -422,19 +407,6 @@ class TestIsabelleLSPClient:
         assert future.done()
         assert future.result() == "<div class='writeln'>ok</div>"
         assert client._dynamic_output_cache_by_position[key] == "<div class='writeln'>ok</div>"
-
-    @pytest.mark.asyncio
-    async def test_handle_preview_response(self):
-        client = IsabelleLSPClient()
-        future = asyncio.get_running_loop().create_future()
-        client._preview_waiters[("file:///tmp/Test.thy", 0)] = future
-
-        client._handle_preview_response({
-            "uri": "file:///tmp/Test.thy", "column": 0, "content": "<html>Preview</html>",
-        })
-
-        assert future.done()
-        assert future.result()["content"] == "<html>Preview</html>"
 
     @pytest.mark.asyncio
     async def test_get_goals_uses_state_panel(self):
@@ -540,53 +512,3 @@ class TestIsabelleLSPClient:
         assert client._dynamic_output_cache_by_position == {}
         assert client._preview_waiters == {}
 
-    @pytest.mark.asyncio
-    async def test_preview_requests_are_serialized(self):
-        client = IsabelleLSPClient()
-        first_notify_entered = asyncio.Event()
-        release_first = asyncio.Event()
-        calls = []
-
-        async def fake_notify(method, params):
-            calls.append((method, params))
-            if params["column"] == 0:
-                first_notify_entered.set()
-                await release_first.wait()
-                client._handle_preview_response({
-                    "uri": "file:///tmp/Test.thy",
-                    "column": 0,
-                    "content": "first",
-                })
-            else:
-                client._handle_preview_response({
-                    "uri": "file:///tmp/Test.thy",
-                    "column": 1,
-                    "content": "second",
-                })
-
-        client.notify = AsyncMock(side_effect=fake_notify)
-
-        first = asyncio.create_task(client.request_preview("/tmp/Test.thy", column=0))
-        await asyncio.wait_for(first_notify_entered.wait(), timeout=1)
-
-        second = asyncio.create_task(client.request_preview("/tmp/Test.thy", column=1))
-        await asyncio.sleep(0)
-        assert [call[1]["column"] for call in calls] == [0]
-
-        release_first.set()
-        assert (await first)["content"] == "first"
-        assert (await second)["content"] == "second"
-        assert [call[1]["column"] for call in calls] == [0, 1]
-
-    @pytest.mark.asyncio
-    async def test_preview_timeout_cleans_waiter(self):
-        client = IsabelleLSPClient()
-        client.notify = AsyncMock()
-        client.STALL_TIMEOUT = 0.01
-        client.PROGRESS_CHECK_INTERVAL = 0.01
-        client._last_server_activity = time.time() - 1.0
-
-        with pytest.raises(IsabelleToolError, match="stalled"):
-            await client.request_preview("/tmp/Test.thy")
-
-        assert client._preview_waiters == {}

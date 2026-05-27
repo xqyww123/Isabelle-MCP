@@ -1,13 +1,13 @@
 # Isa-LSP Architecture Design
 
-**Version:** 0.1.0
-**Date:** 2026-03-07
-**Status:** Draft with current implementation notes
+**Version:** 0.2.0
+**Date:** 2026-05-25
+**Status:** Updated for async evaluation model
 
-> Documentation reliability note:
-> The current server exposes 10 MCP tools. Older architecture notes in this
-> document mention `isabelle_edit` and 11 tools as a design direction; that tool
-> is not registered in the current codebase.
+> The server exposes 10 MCP tools: 3 evaluation lifecycle tools and
+> 7 query tools.  The previous blocking model (where every tool waited
+> for Isabelle to process the file) has been replaced by an explicit
+> evaluate-then-query workflow.
 
 ## 1. Overview
 
@@ -39,15 +39,17 @@ Isa-LSP is a Python-based MCP (Model Context Protocol) server that acts as a bri
 │               │                                              │
 │  ┌────────────▼─────────────────────────────────────────┐   │
 │  │  MCP Tool Handlers (10 tools)                        │   │
+│  │  Evaluation:                                         │   │
+│  │  - isabelle_evaluate_to                              │   │
+│  │  - isabelle_evaluation_status                        │   │
+│  │  - isabelle_cancel_evaluation                        │   │
+│  │  Query (require prior evaluation):                   │   │
 │  │  - isabelle_hover                                    │   │
-│  │  - isabelle_completions                              │   │
 │  │  - isabelle_definition                               │   │
 │  │  - isabelle_highlights                               │   │
 │  │  - isabelle_diagnostics                              │   │
 │  │  - isabelle_goal                                     │   │
 │  │  - isabelle_command_output                           │   │
-│  │  - isabelle_preview                                  │   │
-│  │  - isabelle_build                                    │   │
 │  │  - isabelle_session_info                            │   │
 │  └────────────┬─────────────────────────────────────────┘   │
 │               │                                              │
@@ -512,66 +514,80 @@ class DiagnosticCache:
 
 ---
 
-## 3. Tool Implementation Pattern
+## 3. Async Evaluation Model
 
-Each MCP tool follows this pattern:
+### 3.1 Design
+
+The server separates **evaluation** (telling Isabelle what to process) from
+**querying** (reading results).  All blocking waits have been moved into
+three evaluation-lifecycle tools, while query tools return immediately if the
+target line has already been processed.
+
+### 3.2 Evaluation State Machine
+
+```
+         evaluate_to()
+  ┌──────────────────────────► ACTIVE
+  │                              │
+  │  evaluation_status()         │ destination reached
+  │  (poll loop)                 │
+  │                              ▼
+IDLE ◄────────────────────── COMPLETE
+  ▲                              │
+  │  cancel_evaluation()         │
+  │  (force interrupt +          │
+  │   move caret to line 0)      │
+  └──────────────────────────────┘
+```
+
+**EvaluationState** (module-level singleton in ``evaluation.py``):
+- ``active``, ``file_path``, ``destination_line``
+- ``reported_errors`` — set of ``(line, message)`` pairs already returned
+- Errors are reported incrementally; each call only returns new ones.
+
+### 3.3 Evaluation Tools
+
+| Tool | Behaviour |
+|------|-----------|
+| ``evaluate_to(file, line)`` | Set PIDE caret → wait ``EVAL_POLL_INTERVAL`` (default 10 s) → return errors + status |
+| ``evaluation_status()`` | Wait another interval → return new errors + status |
+| ``cancel_evaluation()`` | Move caret to line 0 → surgically delete+re-add running range text (forces ``discontinue_execution`` inside ``vscode_server``) → return |
+
+### 3.4 Query Tool Guard
+
+Each query tool calls ``check_evaluation_guard(client, file_path, line)``:
+
+1. If evaluation **active** → raise ``IsabelleToolError`` (call ``evaluation_status``).
+2. If target line **not processed** and no evaluation active → auto-start evaluation.
+3. If target line **processed** → return ``None`` (proceed to query).
+
+### 3.5 Cancel / Force-Interrupt Mechanism
+
+``cancel_evaluation`` cannot directly call ``Document.discontinue_execution``
+because ``vscode_server`` does not expose it as an LSP message.  Instead:
+
+1. Move caret to line 0 (shrinks perspective, prevents re-execution).
+2. Call ``IsabelleLSPClient.force_interrupt(file_path)`` which sends two
+   incremental ``textDocument/didChange`` messages — one deleting the
+   running range's text, one re-inserting it.  Each ``didChange`` triggers
+   ``discontinue_execution`` internally and creates a new execution context,
+   invalidating the old one.
+
+## 3a. Tool Implementation Pattern (Query Tools)
+
+Query tools follow this pattern:
 
 ```python
-@mcp.tool(
-    "isabelle_hover",
-    annotations=ToolAnnotations(
-        title="Hover Info",
-        readOnlyHint=True,
-        idempotentHint=True,
-    ),
-)
-async def hover_info(
-    ctx: Context,
-    file_path: Annotated[str, Field(description="Absolute path to .thy file")],
-    line: Annotated[int, Field(description="Line number (1-indexed)", ge=1)],
-    column: Annotated[int, Field(description="Column number (1-indexed)", ge=1)],
-) -> HoverInfo:
-    """Get type signature and documentation for symbol."""
+async def hover_info(client, file_path, line, column):
+    validate_position(line, column)
+    await client.open_document(file_path)
 
-    # 1. Get LSP client from context
-    client = ctx.request_context.lifespan_context.lsp_client
-    if not client:
-        raise IsabelleToolError("Session not initialized. Please call isabelle_build first.")
+    guard = await check_evaluation_guard(client, file_path, line)
+    if guard is not None:
+        raise IsabelleToolError(guard.message)
 
-    # 2. Ensure document is open
-    await ensure_document_open(client, file_path)
-
-    # 3. Convert to 0-indexed for LSP
-    lsp_line = line - 1
-    lsp_column = column - 1
-
-    # 4. Call LSP method
-    try:
-        response = await client.get_hover(file_path, lsp_line, lsp_column)
-        check_pide_response(response, "get_hover", allow_none=True)
-    except Exception as e:
-        raise IsabelleToolError(f"Failed to get hover info: {e}")
-
-    # 5. Parse response
-    symbol = extract_symbol_from_range(file_path, response.get("range"))
-    info_text = response.get("contents", {}).get("value", "")
-
-    # 6. Get line context
-    with open(file_path, 'r') as f:
-        lines = f.readlines()
-        line_context = lines[line - 1].rstrip() if line <= len(lines) else ""
-
-    # 7. Get diagnostics at position (optional)
-    all_diagnostics = await client.get_diagnostics(file_path)
-    position_diagnostics = filter_diagnostics_at_position(all_diagnostics, line, column)
-
-    # 8. Return structured result
-    return HoverInfo(
-        symbol=symbol,
-        info=info_text,
-        line_context=line_context,
-        diagnostics=position_diagnostics
-    )
+    # ... LSP query (fast, line already processed) ...
+    return HoverInfo(...)
 ```
 
 ---
@@ -581,13 +597,7 @@ async def hover_info(
 ### 4.1 Initialization Flow
 
 ```
-User calls isabelle_build(logic="HOL")
-         │
-         ├─→ Check if session heap exists
-         │   │
-         │   └─→ If not or clean=True:
-         │       ├─→ Run: isabelle build -b HOL
-         │       └─→ Wait for build completion (may take minutes)
+First tool call triggers _ensure_lsp_started()
          │
          ├─→ Spawn: isabelle vscode_server -l HOL [options]
          │   │

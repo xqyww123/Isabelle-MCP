@@ -5,15 +5,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from isa_lsp.server import (
-    isabelle_build,
+    isabelle_cancel_evaluation,
     isabelle_command_output,
-    isabelle_completions,
     isabelle_definition,
     isabelle_diagnostics,
+    isabelle_evaluate_to,
+    isabelle_evaluation_status,
     isabelle_goal,
     isabelle_highlights,
     isabelle_hover,
-    isabelle_preview,
     isabelle_session_info,
 )
 
@@ -30,13 +30,6 @@ class TestMCPServerTools:
             result = await isabelle_hover(temp_theory_file, 5, 15)
         assert result.info == "test"
         assert isinstance(result.symbol, str)
-
-    @pytest.mark.asyncio
-    async def test_completions(self, temp_theory_file, mock_lsp_client):
-        mock_lsp_client.completion_response = {"items": []}
-        with _patch_ensure(mock_lsp_client):
-            result = await isabelle_completions(temp_theory_file, 8, 1)
-        assert result.items == []
 
     @pytest.mark.asyncio
     async def test_definition(self, temp_theory_file, mock_lsp_client):
@@ -93,28 +86,28 @@ class TestMCPServerTools:
         assert isinstance(result.line_context, str)
 
     @pytest.mark.asyncio
-    async def test_preview(self, temp_theory_file, mock_lsp_client):
-        with _patch_ensure(mock_lsp_client):
-            result = await isabelle_preview(temp_theory_file)
-        assert isinstance(result.html, str)
-
-    @pytest.mark.asyncio
     async def test_session_info(self, mock_lsp_client):
         with _patch_ensure(mock_lsp_client):
             result = await isabelle_session_info()
         assert result.current_session == "HOL"
 
     @pytest.mark.asyncio
-    async def test_build(self, mock_lsp_client):
+    async def test_evaluate_to(self, temp_theory_file, mock_lsp_client):
         with _patch_ensure(mock_lsp_client):
-            with patch('asyncio.create_subprocess_exec') as mock_sub:
-                mock_proc = AsyncMock()
-                mock_proc.communicate = AsyncMock(return_value=(b"Success", b""))
-                mock_proc.returncode = 0
-                mock_sub.return_value = mock_proc
-                result = await isabelle_build("HOL")
-        assert result.success is True
-        assert result.session == "HOL"
+            result = await isabelle_evaluate_to(temp_theory_file, 5)
+        assert result.status == "complete"
+
+    @pytest.mark.asyncio
+    async def test_evaluation_status_no_eval(self, mock_lsp_client):
+        with _patch_ensure(mock_lsp_client):
+            result = await isabelle_evaluation_status()
+        assert result.status == "no_evaluation"
+
+    @pytest.mark.asyncio
+    async def test_cancel_evaluation_no_eval(self, mock_lsp_client):
+        with _patch_ensure(mock_lsp_client):
+            result = await isabelle_cancel_evaluation()
+        assert result.status == "no_evaluation"
 
 
 class TestServerLifespan:
@@ -133,15 +126,23 @@ class TestServerLifespan:
 
     @pytest.mark.asyncio
     async def test_custom_session(self):
+        import isa_lsp.server as server_mod
         from isa_lsp.server import server_lifespan
 
-        with patch.dict('os.environ', {'ISABELLE_SESSION': 'Main'}):
+        server_mod._server_logic = "HOL-Analysis"
+        server_mod._server_extra_args = ["-d", "/extra"]
+        try:
             with patch('isa_lsp.server.IsabelleLSPClient') as MockClient:
                 mock_instance = MagicMock()
                 mock_instance.process = None
                 MockClient.return_value = mock_instance
                 async with server_lifespan(MagicMock()):
-                    MockClient.assert_called_with(logic='Main')
+                    MockClient.assert_called_with(
+                        logic='HOL-Analysis', extra_args=["-d", "/extra"],
+                    )
+        finally:
+            server_mod._server_logic = "HOL"
+            server_mod._server_extra_args = []
 
 
 class TestServerMain:
@@ -158,7 +159,34 @@ class TestServerMain:
         import sys
 
         from isa_lsp.server import main, mcp
-        with patch.object(sys, 'argv', ['isa-lsp']):
+        with patch.object(sys, 'argv', ['isa-lsp', '-s', 'HOL']):
             with patch.object(mcp, 'run') as mock_run:
                 main()
                 mock_run.assert_called_once()
+
+    def test_session_required(self):
+        import sys
+
+        from isa_lsp.server import main
+        with patch.object(sys, 'argv', ['isa-lsp']):
+            with pytest.raises(SystemExit, match="2"):
+                main()
+
+    def test_extra_args_passthrough(self):
+        import sys
+
+        import isa_lsp.server as server_mod
+        from isa_lsp.server import main, mcp
+        with patch.object(sys, 'argv', ['isa-lsp', '-s', 'HOL-Analysis', '--', '-d', '/extra', '-o', 'threads=4']):
+            with patch.object(mcp, 'run'):
+                main()
+                assert server_mod._server_logic == "HOL-Analysis"
+                assert server_mod._server_extra_args == ["-d", "/extra", "-o", "threads=4"]
+
+    def test_typo_rejected(self):
+        import sys
+
+        from isa_lsp.server import main
+        with patch.object(sys, 'argv', ['isa-lsp', '-s', 'HOL', '--httpp']):
+            with pytest.raises(SystemExit, match="2"):
+                main()

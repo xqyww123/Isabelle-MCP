@@ -1,5 +1,6 @@
+from isa_lsp.evaluation import check_evaluation_guard
 from isa_lsp.lsp_client import IsabelleLSPClient
-from isa_lsp.models import DiagnosticMessage, DiagnosticsResult
+from isa_lsp.models import DiagnosticMessage, DiagnosticsResult, EvaluationResult
 from isa_lsp.utils import (
     IsabelleToolError,
     LSPCharacter,
@@ -40,9 +41,10 @@ async def diagnostic_messages(
             f"start_line must be <= end_line, got {mcp_start} > {mcp_end}"
         )
 
-    if doc is not None:
-        await client.set_caret(file_path, mcp_end.to_lsp())
-    await client.wait_for_processing(file_path, mcp_start.to_lsp(), mcp_end.to_lsp())
+    guard = await check_evaluation_guard(client, file_path, mcp_end)
+    if isinstance(guard, EvaluationResult):
+        raise IsabelleToolError(guard.message)
+    note = guard if isinstance(guard, str) else None
 
     items: list[DiagnosticMessage] = []
     for diag in client.get_cached_diagnostics(file_path):
@@ -61,6 +63,7 @@ async def diagnostic_messages(
         items=items,
         processing_complete=processing_complete,
         failed_dependencies=[],
+        note=note,
     )
 
 

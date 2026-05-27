@@ -1,44 +1,63 @@
 INSTRUCTIONS = """\
 # Isabelle LSP MCP Server
 
-## Tools
+## Evaluation model
 
-### Standard LSP (5 tools)
+Isabelle processes theory files incrementally.  Before querying results
+(hover, goals, diagnostics, etc.) you must **evaluate** the file up to
+the line of interest.
 
-1. **isabelle_hover** — type info and documentation for symbol at position
-2. **isabelle_completions** — completion suggestions, sorted by relevance
-3. **isabelle_definition** — jump to symbol definition
-4. **isabelle_highlights** — all occurrences of symbol in document
-5. **isabelle_diagnostics** — errors, warnings, processing status
+### Evaluation tools (3)
 
-### PIDE Extensions (3 tools)
+1. **isabelle_evaluate_to(file_path, line)** — start evaluating up to a
+   target line.  Returns within ~10 s with errors found so far.  If
+   evaluation is still running, call ``evaluation_status`` to poll.
+2. **isabelle_evaluation_status()** — check progress of an ongoing
+   evaluation.  Returns new errors since the last check and current
+   execution position.  Call repeatedly until status is ``complete``.
+3. **isabelle_cancel_evaluation()** — cancel an ongoing evaluation.
 
-6. **isabelle_goal** ⭐ — proof goals at position; omit column for before/after diff
-7. **isabelle_command_output** — prover messages for a command
-8. **isabelle_preview** — HTML preview of theory
+### Query tools (7)
 
-### Session Management (2 tools)
+Query tools return results instantly when the target line has been
+evaluated.  If the line has not been evaluated yet and no evaluation is
+running, they auto-start evaluation.  If an evaluation is already
+running, they fail with a message to call ``evaluation_status``.
 
-9.  **isabelle_session_info** — current session
-10. **isabelle_build** — build session heap images
+4. **isabelle_hover** — type info and documentation for symbol at position
+5. **isabelle_definition** — jump to symbol definition
+6. **isabelle_highlights** — all occurrences of symbol in document
+7. **isabelle_diagnostics** — errors, warnings for a line range
+8. **isabelle_goal** — proof goals at position; omit column for
+   before/after diff
+9. **isabelle_command_output** — prover messages for a command
+10. **isabelle_session_info** — current session name
 
 ## Key conventions
 
 - All positions are **1-indexed** (line 1, column 1 = first character).
 - Always use **absolute paths**.
-- Check `processing_complete` in diagnostics before relying on results.
-- PIDE tools (goal, command_output, preview) are best-effort; fall back to diagnostics on timeout.
+- ``evaluate_to`` supports negative line indices: ``-1`` = last line.
 
 ## Recommended workflow
 
-1. **isabelle_diagnostics** — always check code validity first.
-2. **isabelle_goal** — use extensively during proof development (omit column to see tactic effect).
-3. **isabelle_hover** + **isabelle_definition** — understand symbols.
-4. No `isabelle_edit` tool exists; modify files with your editor, then re-check with diagnostics/goals.
+1. **isabelle_evaluate_to** — evaluate the file to the region of interest.
+2. Poll **isabelle_evaluation_status** until ``status == "complete"``.
+3. **isabelle_goal** — use extensively during proof development (omit
+   column to see tactic effect).
+4. **isabelle_diagnostics** — check for errors in a range.
+5. **isabelle_hover** + **isabelle_definition** — understand symbols.
+6. Modify files with your editor, then re-evaluate with ``evaluate_to``.
 
 ## Session configuration
 
-Default session is **HOL**. Override via `ISABELLE_SESSION` env var before starting the MCP server.
+Default session is **HOL**.  Override via ``ISABELLE_SESSION`` env var
+before starting the MCP server.
+
+## Configuration
+
+- ``ISA_LSP_EVAL_POLL_INTERVAL`` env var controls the poll timeout in
+  seconds (default ``10``).
 """
 
 

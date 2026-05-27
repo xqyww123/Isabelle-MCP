@@ -42,6 +42,44 @@ def temp_theory_with_errors(tmp_path):
     return str(theory_file)
 
 
+class MockProcessingTracker:
+    """ProcessingTracker stub where everything is already processed."""
+
+    def __init__(self, *, all_processed: bool = True):
+        self._all_processed = all_processed
+
+    def range_processed(self, start_line: LSPLine, end_line: LSPLine) -> bool:
+        return self._all_processed
+
+    def line_reached(self, line: int) -> bool:
+        return self._all_processed
+
+    def line_running(self, line: int) -> bool:
+        return False
+
+    @property
+    def all_processed(self) -> bool:
+        return self._all_processed
+
+    def require_fresh_update(self) -> None:
+        pass
+
+    def get_running_ranges(self) -> list[tuple[int, int, int, int]]:
+        return []
+
+    def get_running_ranges_with_onset(self) -> list[tuple[int, int, int, int, float]]:
+        return []
+
+    def get_unprocessed_ranges(self) -> list[tuple[int, int, int, int]]:
+        return []
+
+    async def wait_until_processed_bounded(
+        self, start_line: LSPLine, end_line: LSPLine,
+        timeout: float = 5.0, health_check=None, check_interval: float = 5.0,
+    ) -> bool:
+        return self._all_processed
+
+
 class MockLSPClient:
     """Mock LSP client for unit testing."""
 
@@ -51,14 +89,13 @@ class MockLSPClient:
         self.open_documents: dict[str, DocumentState] = {}
         self.diagnostics_cache: dict[str, list[dict[str, Any]]] = {}
         self.processing_status: dict[str, bool] = {}
+        self._processing_trackers: dict[str, Any] = {}
 
         self.hover_response = None
-        self.completion_response = None
         self.definition_response = None
         self.highlights_response = None
         self.goal_response: list[str] = []
         self.dynamic_output_response = ""
-        self.preview_response: dict[str, Any] = {"content": ""}
 
     async def start(self):
         self.initialized = True
@@ -84,6 +121,8 @@ class MockLSPClient:
         )
         if file_path not in self.processing_status:
             self.processing_status[file_path] = False
+        if file_path not in self._processing_trackers:
+            self._processing_trackers[file_path] = MockProcessingTracker()
 
     async def set_caret(
         self, file_path: str, line: LSPLine, character: LSPCharacter = LSPCharacter(0),
@@ -95,17 +134,53 @@ class MockLSPClient:
     ) -> None:
         pass
 
+    async def wait_for_processing_bounded(
+        self, file_path: str, start_line: LSPLine, end_line: LSPLine, timeout: float,
+    ) -> bool:
+        return True
+
+    async def force_interrupt(self, file_path: str) -> None:
+        pass
+
+    async def request_theory_status(self) -> list[dict]:
+        theories = []
+        for path in self.open_documents:
+            name = Path(path).stem
+            theories.append({
+                "node_name": path,
+                "theory_name": name,
+                "external": False,
+                "imports": [],
+                "ok": True,
+                "total": 10,
+                "unprocessed": 0,
+                "running": 0,
+                "warned": 0,
+                "failed": 0,
+                "finished": 10,
+                "canceled": False,
+                "consolidated": True,
+                "percentage": 100,
+            })
+        return theories
+
+    async def cancel_execution(self) -> None:
+        pass
+
+    def get_all_running_commands(self) -> list:
+        return []
+
     def file_all_processed(self, file_path: str) -> bool:
         return self.processing_status.get(file_path, False)
+
+    def get_processing_tracker(self, file_path: str) -> Any:
+        return self._processing_trackers.get(file_path)
 
     async def close_document(self, file_path: str):
         self.open_documents.pop(file_path, None)
 
     async def get_hover(self, file_path: str, line: LSPLine, character: LSPCharacter) -> Any:
         return self.hover_response
-
-    async def get_completions(self, file_path: str, line: LSPLine, character: LSPCharacter) -> Any:
-        return self.completion_response
 
     async def get_definition(self, file_path: str, line: LSPLine, character: LSPCharacter) -> Any:
         return self.definition_response
@@ -118,9 +193,6 @@ class MockLSPClient:
 
     async def get_dynamic_output(self, file_path: str, line: LSPLine, character: int = 0) -> str:
         return self.dynamic_output_response
-
-    async def request_preview(self, file_path: str, column: int = 0, timeout: float = 30.0):
-        return self.preview_response
 
     def get_cached_diagnostics(self, file_path: str) -> list[dict[str, Any]]:
         return self.diagnostics_cache.get(file_path, [])
@@ -140,6 +212,14 @@ def mock_lsp_client():
     return MockLSPClient()
 
 
+@pytest.fixture(autouse=True)
+def _reset_evaluation_state():
+    from isa_lsp.evaluation import evaluation_state
+    evaluation_state.cancel()
+    yield
+    evaluation_state.cancel()
+
+
 @pytest.fixture
 def sample_hover_response():
     return {
@@ -148,18 +228,6 @@ def sample_hover_response():
             "start": {"line": 4, "character": 11},
             "end": {"line": 4, "character": 19},
         },
-    }
-
-
-@pytest.fixture
-def sample_completion_response():
-    return {
-        "isIncomplete": False,
-        "items": [
-            {"label": "lemma", "kind": 14, "detail": "Isabelle keyword"},
-            {"label": "theorem", "kind": 14, "detail": "Isabelle keyword"},
-            {"label": "apply", "kind": 14, "detail": "Proof method"},
-        ],
     }
 
 

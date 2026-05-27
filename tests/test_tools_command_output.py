@@ -6,6 +6,26 @@ from isa_lsp.tools.command_output import command_output
 from isa_lsp.utils import IsabelleToolError, MCPLine
 
 
+class _MockTracker:
+    def range_processed(self, start, end):
+        return True
+
+    def line_reached(self, line):
+        return True
+
+    def line_running(self, line):
+        return False
+
+
+def _add_tracker(client, file_path):
+    if not hasattr(client, '_processing_trackers'):
+        client._processing_trackers = {}
+    client._processing_trackers[file_path] = _MockTracker()
+
+    if not hasattr(client, 'get_processing_tracker'):
+        client.get_processing_tracker = lambda fp: client._processing_trackers.get(fp)
+
+
 class TestCommandOutputTool:
     @pytest.mark.asyncio
     async def test_empty(self, mock_lsp_client, temp_theory_file):
@@ -42,6 +62,7 @@ class TestCommandOutputTool:
                 return '<span class="writeln_message">True</span>'
 
         client = Client()
+        _add_tracker(client, temp_theory_file)
         result = await command_output(cast(Any, client), temp_theory_file, MCPLine(9))
 
         assert result.messages[0].message == "True"
@@ -85,6 +106,7 @@ class TestCommandOutputTool:
                 return '<pre class="source"/>'
 
         client = Client()
+        _add_tracker(client, str(theory_file))
         result = await command_output(cast(Any, client), str(theory_file), MCPLine(4))
 
         assert result.messages[0].kind == "writeln"

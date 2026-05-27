@@ -5,8 +5,8 @@ import asyncio
 import pytest
 from pydantic import ValidationError
 
+from isa_lsp.evaluation import evaluation_state
 from isa_lsp.models import HoverInfo, Location
-from isa_lsp.tools.completions import completions
 from isa_lsp.tools.diagnostics import diagnostic_messages
 from isa_lsp.tools.highlights import document_highlights
 from isa_lsp.tools.hover import hover_info
@@ -67,14 +67,20 @@ class TestConcurrency:
     @pytest.mark.asyncio
     async def test_concurrent_different_tools(self, mock_lsp_client, temp_theory_file):
         mock_lsp_client.hover_response = {"contents": "test"}
-        mock_lsp_client.completion_response = {"items": []}
         mock_lsp_client.diagnostics_cache[temp_theory_file] = []
         results = await asyncio.gather(
             hover_info(mock_lsp_client, temp_theory_file, MCPLine(5), MCPColumn(15)),
-            completions(mock_lsp_client, temp_theory_file, MCPLine(8), MCPColumn(1)),
             diagnostic_messages(mock_lsp_client, temp_theory_file, 1, -1),
         )
-        assert len(results) == 3
+        assert len(results) == 2
+
+
+class TestEvaluationGuard:
+    @pytest.mark.asyncio
+    async def test_query_during_evaluation_fails(self, mock_lsp_client, temp_theory_file):
+        evaluation_state.start(temp_theory_file, MCPLine(100))
+        with pytest.raises(IsabelleToolError, match="Evaluation in progress"):
+            await hover_info(mock_lsp_client, temp_theory_file, MCPLine(5), MCPColumn(1))
 
 
 class TestUnicodeHandling:
@@ -85,17 +91,6 @@ class TestUnicodeHandling:
         mock_lsp_client.hover_response = {"contents": "Universal quantifier: ∀"}
         result = await hover_info(mock_lsp_client, str(f), MCPLine(1), MCPColumn(8))
         assert isinstance(result.info, str)
-
-    @pytest.mark.asyncio
-    async def test_completion_unicode(self, mock_lsp_client, temp_theory_file):
-        mock_lsp_client.completion_response = {
-            "items": [
-                {"label": "∀", "kind": 1, "detail": "Universal"},
-                {"label": "∃", "kind": 1, "detail": "Existential"},
-            ]
-        }
-        result = await completions(mock_lsp_client, temp_theory_file, MCPLine(8), MCPColumn(1))
-        assert len(result.items) == 2
 
 
 class TestEmptyResponses:
@@ -115,14 +110,6 @@ class TestEmptyResponses:
 
 
 class TestLargeData:
-    @pytest.mark.asyncio
-    async def test_large_completion_list(self, mock_lsp_client, temp_theory_file):
-        mock_lsp_client.completion_response = {
-            "items": [{"label": f"item_{i}", "kind": 1, "detail": "x" * 1000} for i in range(1000)]
-        }
-        result = await completions(mock_lsp_client, temp_theory_file, MCPLine(8), MCPColumn(1), max_completions=100)
-        assert len(result.items) == 100
-
     @pytest.mark.asyncio
     async def test_very_long_line(self, tmp_path, mock_lsp_client):
         f = tmp_path / "long.thy"

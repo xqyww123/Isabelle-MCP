@@ -1,6 +1,13 @@
+from isa_lsp.evaluation import check_evaluation_guard
 from isa_lsp.lsp_client import IsabelleLSPClient
-from isa_lsp.models import CommandOutputResult, OutputMessage
-from isa_lsp.utils import MCPLine, get_line_from_file, parse_command_output_html, validate_position
+from isa_lsp.models import CommandOutputResult, EvaluationResult, OutputMessage
+from isa_lsp.utils import (
+    IsabelleToolError,
+    MCPLine,
+    get_line_from_file,
+    parse_command_output_html,
+    validate_position,
+)
 from isa_lsp.utils.core import MCPColumn
 
 
@@ -41,7 +48,11 @@ async def command_output(
         return CommandOutputResult(line_context=line_context)
 
     await client.open_document(file_path)
-    await client.set_caret(file_path, line.to_lsp())
+
+    guard = await check_evaluation_guard(client, file_path, line)
+    if isinstance(guard, EvaluationResult):
+        raise IsabelleToolError(guard.message)
+    note = guard if isinstance(guard, str) else None
 
     messages: list[OutputMessage] = []
     for character in _candidate_characters(line_context):
@@ -56,4 +67,5 @@ async def command_output(
     return CommandOutputResult(
         line_context=line_context,
         messages=messages,
+        note=note,
     )

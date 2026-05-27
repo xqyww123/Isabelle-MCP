@@ -1,5 +1,6 @@
+from isa_lsp.evaluation import check_evaluation_guard
 from isa_lsp.lsp_client import IsabelleLSPClient
-from isa_lsp.models import Highlight, HighlightsResult
+from isa_lsp.models import EvaluationResult, Highlight, HighlightsResult
 from isa_lsp.utils import (
     IsabelleToolError,
     LSPCharacter,
@@ -22,9 +23,11 @@ async def document_highlights(
     validate_position(line, column)
 
     await client.open_document(file_path)
-    lsp_line = line.to_lsp()
-    await client.set_caret(file_path, lsp_line)
-    await client.wait_for_processing(file_path, lsp_line)
+
+    guard = await check_evaluation_guard(client, file_path, line)
+    if isinstance(guard, EvaluationResult):
+        raise IsabelleToolError(guard.message)
+    note = guard if isinstance(guard, str) else None
 
     lsp_line, lsp_col = mcp_to_lsp_position(line, column)
 
@@ -44,7 +47,7 @@ async def document_highlights(
                 if parsed:
                     highlights.append(parsed)
 
-    return HighlightsResult(symbol=symbol, highlights=highlights)
+    return HighlightsResult(symbol=symbol, highlights=highlights, note=note)
 
 
 def _parse_highlight(h: dict) -> Highlight | None:
