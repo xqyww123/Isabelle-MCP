@@ -46,7 +46,7 @@ Isa-LSP is a Python-based MCP (Model Context Protocol) server that acts as a bri
 │  │  Query (require prior evaluation):                   │   │
 │  │  - isabelle_hover                                    │   │
 │  │  - isabelle_definition                               │   │
-│  │  - isabelle_highlights                               │   │
+│  │  - isabelle_local_occurrences                        │   │
 │  │  - isabelle_diagnostics                              │   │
 │  │  - isabelle_goal                                     │   │
 │  │  - isabelle_command_output                           │   │
@@ -578,8 +578,8 @@ because ``vscode_server`` does not expose it as an LSP message.  Instead:
 Query tools follow this pattern:
 
 ```python
-async def hover_info(client, file_path, line, column):
-    validate_position(line, column)
+async def hover_info(client, file_path, line, symbol):
+    validate_position(line, 1)
     await client.open_document(file_path)
 
     guard = await check_evaluation_guard(client, file_path, line)
@@ -611,7 +611,7 @@ First tool call triggers _ensure_lsp_started()
          │
          ├─→ Start background notification listener
          │
-         └─→ Return BuildResult with server capabilities
+         └─→ LSP client ready with server capabilities
 ```
 
 ### 4.2 Tool Call Flow
@@ -783,7 +783,7 @@ All `IsabelleToolError` exceptions are caught by FastMCP and returned as error r
 **Implementation:**
 - Store LSP client in lifespan context
 - Reuse same process for all tools in a session
-- Only restart on explicit `isabelle_build` call
+- The process lives for the server's lifetime; there is no in-band restart tool
 
 ### 7.2 Document Opening
 
@@ -996,11 +996,12 @@ known limitations.
 
 ```
 AI Agent
-   │ MCP: isabelle_hover(file, line=42, col=15)
+   │ MCP: isabelle_hover(file, line=42, symbol="Suc")
    │
    ▼
 MCP Server
    │ Validate inputs
+   │ Locate "Suc" on the line (col=15)
    │ Get LSP client from context
    │
    ▼
@@ -1038,7 +1039,7 @@ Tool Handler
    │ Get line context from file
    │ Get diagnostics at position
    │
-   │ Return: HoverInfo(symbol="Suc", info="nat => nat", ...)
+   │ Return: HoverInfo(symbol="Suc", results=[HoverEntry(info="nat => nat", ...)], ...)
    ▼
 AI Agent
 ```

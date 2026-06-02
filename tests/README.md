@@ -1,4 +1,4 @@
-# Isa-LSP Test Suite
+# Isabelle-MCP Test Suite
 
 Comprehensive test suite for the Isabelle LSP MCP server.
 
@@ -9,8 +9,7 @@ Comprehensive test suite for the Isabelle LSP MCP server.
 Unit tests mock external dependencies and test individual components:
 
 - **test_utils.py**: Core utility functions (errors, URI conversion, positions, formatters)
-- **test_utils_advanced.py**: Advanced edge cases for utilities
-- **test_models.py**: Pydantic model validation
+- **test_isabelle_tokens.py**: Symbol tokenizer and `find_symbol_occurrences`
 - **test_lsp_client.py**: LSP client functionality (mocked)
 - **test_tools_*.py**: Individual tool implementations
 - **test_server.py**: MCP server wrapper functions
@@ -27,26 +26,24 @@ Integration tests require a running Isabelle installation:
 ```
 tests/
 ├── conftest.py                      # Shared fixtures and configuration
-├── test_utils.py                    # Utility function tests (120+ tests)
-├── test_utils_advanced.py           # Advanced utility tests (40+ tests)
-├── test_models.py                   # Pydantic model tests (30+ tests)
-├── test_lsp_client.py              # LSP client tests (20+ tests)
-├── test_tools_hover.py             # Hover tool tests (15+ tests)
-├── test_tools_completions.py       # Completions tool tests (20+ tests)
-├── test_tools_definition.py        # Definition tool tests (15+ tests)
-├── test_tools_highlights.py        # Highlights tool tests (15+ tests)
-├── test_tools_diagnostics.py       # Diagnostics tool tests (20+ tests)
-├── test_tools_goal.py              # Goal tool tests (10+ tests)
-├── test_tools_command_output.py    # Command output tool tests (5+ tests)
-├── test_tools_preview.py           # Preview tool tests (5+ tests)
-├── test_tools_session.py           # Session management tests (10+ tests)
-├── test_server.py                  # Server wrapper tests (15+ tests)
-├── test_edge_cases.py              # Edge case tests (30+ tests)
-├── test_integration.py             # Integration tests (10+ tests)
+├── test_utils.py                    # Utility function tests (42 tests)
+├── test_isabelle_tokens.py          # Symbol tokenizer tests (39 tests)
+├── test_lsp_client.py               # LSP client tests (38 tests)
+├── test_tools_evaluate.py           # Evaluation tool tests (11 tests)
+├── test_tools_hover.py              # Hover tool tests (15 tests)
+├── test_tools_definition.py         # Definition tool tests (16 tests)
+├── test_tools_local_occurrences.py  # Local occurrences tool tests (7 tests)
+├── test_tools_diagnostics.py        # Diagnostics tool tests (8 tests)
+├── test_tools_goal.py               # Goal tool tests (5 tests)
+├── test_tools_command_output.py     # Command output tool tests (7 tests)
+├── test_tools_session.py            # Session info tool tests (1 test)
+├── test_server.py                   # Server wrapper tests (19 tests)
+├── test_edge_cases.py               # Edge case tests (17 tests)
+├── test_integration.py              # Integration tests (6 tests)
 └── README.md                        # This file
 ```
 
-**Total: 350+ tests**
+**Total: 231 tests**
 
 ## Running Tests
 
@@ -57,10 +54,7 @@ tests/
 pytest
 
 # Run with coverage
-pytest --cov=isa_lsp --cov-report=html
-
-# Run using the test script
-./run_tests.sh
+pytest --cov=isabelle_mcp --cov-report=html
 ```
 
 ### Selective Test Execution
@@ -101,17 +95,17 @@ pytest -n auto
 
 ```bash
 # Generate HTML coverage report
-pytest --cov=isa_lsp --cov-report=html
+pytest --cov=isabelle_mcp --cov-report=html
 
 # View in browser
 open htmlcov/index.html  # macOS
 xdg-open htmlcov/index.html  # Linux
 
 # Terminal coverage report
-pytest --cov=isa_lsp --cov-report=term-missing
+pytest --cov=isabelle_mcp --cov-report=term-missing
 
 # Coverage for specific module
-pytest --cov=isa_lsp.tools --cov-report=term
+pytest --cov=isabelle_mcp.tools --cov-report=term
 ```
 
 ## Test Categories
@@ -126,7 +120,7 @@ Tests are marked with pytest markers for selective execution:
 
 ### Test Coverage Areas
 
-#### 1. Utility Functions (160+ tests)
+#### 1. Utility Functions (42 tests) — `test_utils.py`
 - Error handling and exceptions
 - URI/file path conversion
 - Position conversion (MCP ↔ LSP)
@@ -134,13 +128,12 @@ Tests are marked with pytest markers for selective execution:
 - Symbol extraction
 - Edge cases and Unicode handling
 
-#### 2. Pydantic Models (30+ tests)
-- Model validation
-- Field constraints
-- Type checking
-- Invalid input handling
+#### 2. Symbol Tokenizer (39 tests) — `test_isabelle_tokens.py`
+- Isabelle line tokenization (identifiers, named symbols, sub/superscripts)
+- ASCII ↔ Unicode symbol matching
+- `find_symbol_occurrences` column resolution
 
-#### 3. LSP Client (20+ tests)
+#### 3. LSP Client (38 tests) — `test_lsp_client.py`
 - Client initialization
 - JSON-RPC message handling
 - Request/response management
@@ -148,23 +141,22 @@ Tests are marked with pytest markers for selective execution:
 - Diagnostics caching
 - Notification handling
 
-#### 4. MCP Tools (120+ tests)
+#### 4. MCP Tools (70 tests) — `test_tools_*.py`
+- Evaluation (evaluate_to / evaluation_status / cancel_evaluation)
 - Hover information retrieval
-- Code completion
 - Go to definition
-- Document highlights
+- Local occurrences (definition + uses)
 - Diagnostics
-- Proof goals (MVP)
-- Command output (MVP)
-- Preview generation (MVP)
-- Session management
+- Proof goals
+- Command output
+- Session info
 
-#### 5. Server Integration (15+ tests)
+#### 5. Server Integration (19 tests) — `test_server.py`
 - MCP wrapper functions
 - Server lifespan management
 - Tool dispatching
 
-#### 6. Edge Cases (30+ tests)
+#### 6. Edge Cases (17 tests) — `test_edge_cases.py`
 - File permissions
 - Concurrency
 - Memory handling
@@ -173,7 +165,7 @@ Tests are marked with pytest markers for selective execution:
 - Race conditions
 - Empty responses
 
-#### 7. Integration Tests (10+ tests)
+#### 7. Integration Tests (6 tests) — `test_integration.py`
 - Real Isabelle LSP interaction
 - Document processing
 - Error recovery
@@ -184,7 +176,7 @@ Tests are marked with pytest markers for selective execution:
 
 ```python
 import pytest
-from isa_lsp.tools.my_tool import my_tool
+from isabelle_mcp.tools.my_tool import my_tool
 
 class TestMyTool:
     """Test my_tool functionality."""
@@ -217,7 +209,6 @@ From `conftest.py`:
 - `temp_theory_with_errors`: Temporary theory file with errors
 - `mock_lsp_client`: Mock LSP client for unit tests
 - `sample_hover_response`: Sample LSP hover response
-- `sample_completion_response`: Sample LSP completion response
 - `sample_definition_response`: Sample LSP definition response
 - `sample_highlights_response`: Sample LSP highlights response
 - `sample_diagnostics`: Sample diagnostic messages
@@ -281,7 +272,7 @@ For CI/CD pipelines:
 - name: Run tests
   run: |
     pip install -e ".[dev]"
-    pytest -v --cov=isa_lsp --cov-report=xml
+    pytest -v --cov=isabelle_mcp --cov-report=xml
 
 - name: Upload coverage
   uses: codecov/codecov-action@v3
@@ -332,7 +323,7 @@ pytest --benchmark-only
 
 ### Common Issues
 
-**Issue**: `ImportError: No module named 'isa_lsp'`
+**Issue**: `ImportError: No module named 'isabelle_mcp'`
 **Solution**: Install package in editable mode: `pip install -e .`
 
 **Issue**: `pytest: command not found`

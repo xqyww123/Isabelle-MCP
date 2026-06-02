@@ -12,9 +12,9 @@ from isabelle_mcp.lsp_client import IsabelleLSPClient
 from isabelle_mcp.tools import (
     declaration_location,
     diagnostic_messages,
-    document_highlights,
     goal,
     hover_info,
+    local_occurrences,
     session_info,
 )
 
@@ -78,12 +78,12 @@ async def main():
             print(f"  {loc.file_path}:{loc.line}:{loc.column}")
         print()
 
-        # Example 6: Document highlights
-        print("--- Example 6: Document Highlights ---")
-        highlights = await document_highlights(client, str(theory_file), 11, 15)
-        print(f"Symbol: {highlights.symbol}")
-        for h in highlights.highlights[:5]:
-            print(f"  Line {h.line}, cols {h.start_column}-{h.end_column} ({h.kind})")
+        # Example 6: Local occurrences (definition + uses of a local entity)
+        print("--- Example 6: Local Occurrences ---")
+        occ = await local_occurrences(client, str(theory_file), 18, "my_const")
+        print(f"Symbol: {occ.symbol}")
+        for o in occ.occurrences[:5]:
+            print(f"  Line {o.line}, cols {o.start_column}-{o.end_column}")
         print()
 
         # Example 7: Proof goals

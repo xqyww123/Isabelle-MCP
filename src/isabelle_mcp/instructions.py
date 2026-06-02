@@ -26,7 +26,8 @@ running, they fail with a message to call ``evaluation_status``.
 
 4. **isabelle_hover** — type info and documentation for symbol at position
 5. **isabelle_definition** — jump to symbol definition
-6. **isabelle_highlights** — all occurrences of symbol in document
+6. **isabelle_local_occurrences** — all in-file occurrences (definition +
+   uses) of a locally-defined entity; current file only
 7. **isabelle_diagnostics** — errors, warnings for a line range
 8. **isabelle_goal** — proof goals at position; omit column for
    before/after diff

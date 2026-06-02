@@ -7,8 +7,10 @@
 ## 1. Overview
 
 This document provides API design and implementation guidance for Isa-LSP. The
-current server exposes 10 MCP tools. Document editing (`isabelle_edit`) is a
-design target discussed below, not a tool currently registered by the server.
+current server exposes 10 MCP tools. Document editing (`isabelle_edit`),
+completion (`isabelle_completions`), and preview (`isabelle_preview`) are design
+targets discussed below, not tools currently registered by the server — though
+the LSP-client layer already implements completion and preview support.
 For high-level specifications, see SPECIFICATION.md. For architecture, see
 ARCHITECTURE.md.
 
@@ -21,9 +23,9 @@ ARCHITECTURE.md.
 | MCP Tool | LSP Method | Request Params | Response Fields |
 |----------|------------|----------------|-----------------|
 | `isabelle_hover` | `textDocument/hover` | `TextDocumentPositionParams` | `Hover` with `contents` and `range` |
-| `isabelle_completions` | `textDocument/completion` | `CompletionParams` | `CompletionList` with `items[]` |
+| `isabelle_completions` _(design target)_ | `textDocument/completion` | `CompletionParams` | `CompletionList` with `items[]` — not exposed as a tool |
 | `isabelle_definition` | `textDocument/definition` | `DefinitionParams` | `Location[]` or `LocationLink[]` |
-| `isabelle_highlights` | `textDocument/documentHighlight` | `DocumentHighlightParams` | `DocumentHighlight[]` |
+| `isabelle_local_occurrences` | `textDocument/documentHighlight` | `DocumentHighlightParams` | `DocumentHighlight[]` |
 | `isabelle_diagnostics` | (notifications) | - | Cached from `publishDiagnostics` |
 
 ### 2.2 Document Editing Methods
@@ -38,13 +40,12 @@ ARCHITECTURE.md.
 |----------|--------------|------|
 | `isabelle_goal` | `PIDE/caret_update`, `PIDE/state_init`, `PIDE/state_output`, `PIDE/state_exit` | Multi-step async; state id assigned by server |
 | `isabelle_command_output` | `PIDE/dynamic_output` | Notification-based |
-| `isabelle_preview` | `PIDE/preview_request`, `PIDE/preview_response` | Request-response |
+| `isabelle_preview` _(design target)_ | `PIDE/preview_request`, `PIDE/preview_response` | Request-response; not exposed as a tool |
 
 ### 2.4 Session Management
 
 | MCP Tool | Implementation | External Commands |
 |----------|----------------|-------------------|
-| `isabelle_build` | Spawn `isabelle build` + `vscode_server` | `isabelle build -b <session>` |
 | `isabelle_session_info` | Query LSP client state | - |
 
 ---
@@ -98,50 +99,56 @@ ARCHITECTURE.md.
 6. Optional: filter diagnostics at same position
 
 **Edge Cases:**
-- No hover info available → return empty `info` field
-- Position out of bounds → LSP returns null, tool raises error
-- Symbol spans multiple tokens → use range to extract exact text
+- Symbol not found on the line → return empty `results` list
+- No hover info for an occurrence → skip that occurrence
+- Identical hover content for several occurrences → grouped into one `HoverEntry`
 
 **Code Snippet:**
 ```python
-async def hover_info(ctx, file_path, line, column):
+async def hover_info(ctx, file_path, line, symbol):
     client = get_lsp_client(ctx)
     await ensure_document_open(client, file_path)
 
-    # Convert to 0-indexed
-    lsp_line, lsp_col = line - 1, column - 1
+    # Locate each occurrence of `symbol` on the line (1-indexed columns)
+    line_text = get_line(file_path, line)
+    columns = find_symbol_columns(line_text, symbol)  # 1-indexed
 
-    # Call LSP
-    response = await client.request("textDocument/hover", {
-        "textDocument": {"uri": file_path_to_uri(file_path)},
-        "position": {"line": lsp_line, "character": lsp_col}
-    })
+    if not columns:
+        return HoverInfo(symbol=symbol, results=[], line_context=line_text)
 
-    check_pide_response(response, "hover", allow_none=True)
-
-    # Parse response
-    if not response or "contents" not in response:
-        return HoverInfo(symbol="", info="", line_context=get_line(file_path, line))
-
-    contents = response["contents"]
-    info_text = contents.get("value", "") if isinstance(contents, dict) else str(contents)
-
-    # Extract symbol from range
-    symbol = ""
-    if "range" in response:
-        symbol = extract_text_from_range(file_path, response["range"])
+    # Query hover for each occurrence, grouping by identical content
+    by_info: dict[str, HoverEntry] = {}
+    for occ, col in enumerate(columns, start=1):
+        response = await client.request("textDocument/hover", {
+            "textDocument": {"uri": file_path_to_uri(file_path)},
+            "position": {"line": line - 1, "character": col - 1}  # LSP is 0-indexed
+        })
+        check_pide_response(response, "hover", allow_none=True)
+        if not response or "contents" not in response:
+            continue
+        contents = response["contents"]
+        info_text = contents.get("value", "") if isinstance(contents, dict) else str(contents)
+        entry = by_info.get(info_text)
+        if entry is None:
+            entry = HoverEntry(info=info_text, occurrences=[], columns=[])
+            by_info[info_text] = entry
+        entry.occurrences.append(occ)
+        entry.columns.append(col)
 
     return HoverInfo(
         symbol=symbol,
-        info=info_text,
-        line_context=get_line(file_path, line),
+        results=list(by_info.values()),
+        line_context=line_text,
         diagnostics=[]
     )
 ```
 
 ---
 
-### 3.2 `isabelle_completions`
+### 3.2 `isabelle_completions` (Design Target)
+
+> Not exposed as an MCP tool. The LSP-client layer implements `get_completions`;
+> the design below is the intended tool surface.
 
 **LSP Request:**
 ```json
@@ -272,11 +279,12 @@ def sort_completions(items: List[CompletionItem], cursor_prefix: str) -> List[Co
 ```
 
 **Implementation Notes:**
-1. LSP can return single `Location` or `Location[]`
-2. Normalize to always return list
-3. Convert URIs back to file paths
-4. Convert positions to 1-indexed
-5. Extract symbol name from original position
+1. The MCP tool takes a `symbol` (text on the line), not a column; locate its
+   occurrence on the line and issue the LSP request at that column
+2. LSP can return single `Location` or `Location[]`
+3. Normalize to always return list
+4. Convert URIs back to file paths
+5. Convert positions to 1-indexed
 
 **Edge Cases:**
 - No definition found → return `locations=[]`
@@ -294,19 +302,20 @@ def normalize_definition_response(response):
     else:
         return [response]
 
-async def declaration_location(ctx, file_path, line, column):
+async def declaration_location(ctx, file_path, line, symbol):
     client = get_lsp_client(ctx)
     await ensure_document_open(client, file_path)
 
+    # Locate the symbol's first occurrence on the line (1-indexed column)
+    line_text = get_line(file_path, line)
+    col = find_symbol_columns(line_text, symbol)[0]  # 1-indexed
+
     response = await client.request("textDocument/definition", {
         "textDocument": {"uri": file_path_to_uri(file_path)},
-        "position": {"line": line - 1, "character": column - 1}
+        "position": {"line": line - 1, "character": col - 1}
     })
 
     locations = normalize_definition_response(response)
-
-    # Extract symbol at query position
-    symbol = extract_symbol_at_position(file_path, line, column)
 
     return DeclarationLocation(
         symbol=symbol,
@@ -323,7 +332,10 @@ async def declaration_location(ctx, file_path, line, column):
 
 ---
 
-### 3.4 `isabelle_highlights`
+### 3.4 `isabelle_local_occurrences`
+
+The MCP tool takes a `symbol` (text on the line), not a column; the server locates
+the symbol's occurrence(s) on the line and issues the LSP request below at each.
 
 **LSP Request:**
 ```json
@@ -356,27 +368,29 @@ async def declaration_location(ctx, file_path, line, column):
         "start": {"line": 20, "character": 5},
         "end": {"line": 20, "character": 9}
       },
-      "kind": 2
+      "kind": 1
     }
   ]
 }
 ```
 
-**DocumentHighlightKind (LSP Enum):**
-- 1: Text (default)
-- 2: Read (variable read)
-- 3: Write (variable write)
+**DocumentHighlightKind (LSP Enum):** The LSP spec defines 1=Text, 2=Read,
+3=Write, but Isabelle's `vscode_server` hardcodes every result to **kind=1
+(Text)** — the `read`/`write` constructors exist in its source but are never
+called. The underlying def/ref distinction is therefore unavailable, so the MCP
+tool **omits the `kind` field** entirely.
 
 **Implementation Notes:**
-1. Isabelle primarily returns kind=1 (text highlighting)
-2. Convert ranges to 1-indexed positions
-3. Map kind enum to string
-4. Extract symbol text from first highlight range
+1. Convert ranges to 1-indexed positions; merge/dedup occurrences from each query
+2. Semantics are entity-occurrence based: a position highlights only when the
+   entity's **definition** is present in the current file's markup. References to
+   global constants from imported theories, and plain free/bound variables,
+   resolve to nothing.
 
 **Edge Cases:**
-- No highlights found → return `highlights=[]`
-- Symbol only occurs once → return single-item list
-- Partial highlights (e.g., in comments) → LSP filters appropriately
+- Symbol not found on the line → error
+- No occurrences (global/free-var) → return `occurrences=[]`
+- Entity occurs once → single-item list
 
 ---
 
@@ -842,7 +856,10 @@ def parse_dynamic_output(html: str) -> List[OutputMessage]:
 
 ---
 
-### 3.9 `isabelle_preview`
+### 3.9 `isabelle_preview` (Design Target)
+
+> Not exposed as an MCP tool. The LSP-client layer implements `request_preview`;
+> the design below is the intended tool surface.
 
 **PIDE Request:**
 ```json
@@ -923,130 +940,7 @@ class PreviewManager:
 
 ---
 
-### 3.10 `isabelle_build`
-
-**Implementation Steps:**
-
-1. **Check if build needed:**
-   ```bash
-   isabelle build -n -b <logic>  # -n = no build, just check
-   # Exit code 0 = up to date, non-zero = build needed
-   ```
-
-2. **Run build if needed or clean=True:**
-   ```bash
-   isabelle build -b <logic> [-c] [-d <dir>] [-v]
-   # -b = build heap
-   # -c = clean build
-   # -d = session directory
-   # -v = verbose
-   ```
-
-3. **Spawn LSP server:**
-   ```bash
-   isabelle vscode_server -l <logic> [-d <dir>] [-o <option>=<value>]
-   ```
-
-4. **Send LSP initialize:**
-   ```json
-   {
-     "jsonrpc": "2.0",
-     "id": 1,
-     "method": "initialize",
-     "params": {
-       "processId": null,
-       "rootUri": null,
-       "capabilities": {}
-     }
-   }
-   ```
-
-5. **Wait for initialize response and send initialized notification**
-
-**Implementation Notes:**
-- Build can take 1-10 minutes for large sessions
-- Stream build output to user (via build_log field)
-- Handle build failures gracefully
-- Store server info and capabilities in context
-
-**Code Snippet:**
-```python
-async def build_session(
-    logic: str = "HOL",
-    session_dirs: List[str] = [],
-    clean: bool = False,
-    verbose: bool = False
-) -> BuildResult:
-    """Build session and start LSP server"""
-    build_log = []
-
-    # Check if build needed
-    check_cmd = ["isabelle", "build", "-n", "-b", logic]
-    for d in session_dirs:
-        check_cmd.extend(["-d", d])
-
-    check_result = await asyncio.create_subprocess_exec(
-        *check_cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    await check_result.wait()
-
-    # Build if needed or clean requested
-    if check_result.returncode != 0 or clean:
-        build_cmd = ["isabelle", "build", "-b", logic]
-        if clean:
-            build_cmd.append("-c")
-        for d in session_dirs:
-            build_cmd.extend(["-d", d])
-        if verbose:
-            build_cmd.append("-v")
-
-        build_process = await asyncio.create_subprocess_exec(
-            *build_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT
-        )
-
-        # Stream output
-        while True:
-            line = await build_process.stdout.readline()
-            if not line:
-                break
-            line_str = line.decode('utf-8').rstrip()
-            build_log.append(line_str)
-
-        await build_process.wait()
-
-        if build_process.returncode != 0:
-            return BuildResult(
-                success=False,
-                build_log="\n".join(build_log),
-                session_name=logic,
-                server_info=None
-            )
-
-    # Start LSP server
-    client = IsabelleLSPClient(logic=logic, session_dirs=session_dirs)
-    await client.start()
-
-    # Get server info
-    server_info = {
-        "name": "isabelle vscode_server",
-        "version": await get_isabelle_version()
-    }
-
-    return BuildResult(
-        success=True,
-        build_log="\n".join(build_log),
-        session_name=logic,
-        server_info=server_info
-    )
-```
-
----
-
-### 3.11 `isabelle_session_info`
+### 3.10 `isabelle_session_info`
 
 **Implementation Notes:**
 - Query the current LSP client session name
@@ -1252,10 +1146,10 @@ async def test_hover_info():
         "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}
     }
 
-    result = await hover_info_impl(client, "/path/to/file.thy", 1, 1)
+    result = await hover_info_impl(client, "/path/to/file.thy", 1, "Suc")
 
     assert result.symbol == "Suc"
-    assert "nat => nat" in result.info
+    assert "nat => nat" in result.results[0].info
     assert len(client.requests) == 1
     assert client.requests[0][0] == "textDocument/hover"
 ```

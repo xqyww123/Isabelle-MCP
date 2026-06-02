@@ -23,17 +23,17 @@ from isabelle_mcp.models import (
     DiagnosticsResult,
     EvaluationResult,
     GoalState,
-    HighlightsResult,
     HoverInfo,
+    LocalOccurrencesResult,
     SessionInfo,
 )
 from isabelle_mcp.tools import (
     command_output,
     declaration_location,
     diagnostic_messages,
-    document_highlights,
     goal,
     hover_info,
+    local_occurrences,
     session_info,
 )
 from isabelle_mcp.utils import IsabelleToolError, MCPColumn, MCPLine  # MCPColumn still used by other tools
@@ -86,9 +86,9 @@ async def notify_file_change(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
-@mcp.resource("instructions://isabelle-lsp")
+@mcp.resource("instructions://isabelle-mcp")
 async def get_instructions_resource() -> str:
-    """Get user-facing instructions for using the Isabelle LSP MCP server."""
+    """Get user-facing instructions for using the Isabelle MCP server."""
     return get_instructions()
 
 
@@ -100,7 +100,7 @@ async def isabelle_evaluate_to(file_path: str, line: int, column: int = 0) -> Ev
     """Start evaluating a theory file up to a specific location.
 
     The result may indicate evaluation is still in progress.
-    If so, call ``evaluation_status`` to poll until complete.
+    If so, call ``evaluation_status`` to update the progress.
 
     Args:
         file_path: Absolute path to .thy file
@@ -166,17 +166,25 @@ async def isabelle_definition(file_path: str, line: int, symbol: str) -> Declara
 
 
 @mcp.tool()
-async def isabelle_highlights(file_path: str, line: int, column: int) -> HighlightsResult:
-    """Find all occurrences of symbol in document.
+async def isabelle_local_occurrences(file_path: str, line: int, symbol: str) -> LocalOccurrencesResult:
+    """Find every occurrence of a *locally-defined* entity within this file.
+
+    Given a symbol on a line, resolves the entity there and returns all places it
+    appears in the SAME file — its definition site and its uses. Useful to see
+    where a constant, abbreviation, or lemma defined in this theory is used.
+
+    Scope is the current file only, and only entities defined in this file resolve:
+    references to global constants from imported theories, and plain free/bound
+    variables, return no occurrences.
 
     Auto-starts evaluation if the line has not been evaluated yet.
 
     Args:
         file_path: Absolute path to .thy file
         line: Line number (1-indexed)
-        column: Column number (1-indexed)
+        symbol: Symbol text to look up (e.g. "my_const", "add_one"), ASCII or Unicode.
     """
-    return await document_highlights(await _ensure_lsp_started(), file_path, MCPLine(line), MCPColumn(column))
+    return await local_occurrences(await _ensure_lsp_started(), file_path, MCPLine(line), symbol)
 
 
 @mcp.tool()

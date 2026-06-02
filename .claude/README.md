@@ -6,14 +6,14 @@ This directory contains configuration for using the Isabelle LSP MCP server with
 
 The `mcp.json` file configures Claude Code to use the Isabelle LSP MCP server, which provides:
 
+- **Evaluation**: Run the prover up to a line and track progress
 - **Hover information**: Type signatures and documentation
-- **Code completion**: Context-aware suggestions for Isabelle/Isar
 - **Go to definition**: Navigate to theorem/constant definitions
-- **Document highlights**: Find all references to a symbol
+- **Local occurrences**: Find a local entity's definition and in-file uses
 - **Diagnostics**: Type errors and warnings
 - **Proof state**: View current goals and proof context
-- **Command output**: Execute Isabelle commands
-- **Session management**: Build and manage Isabelle sessions
+- **Command output**: Prover output messages
+- **Session info**: Query the current session
 
 ## Setup
 
@@ -69,16 +69,20 @@ Once configured, Claude Code will automatically start the Isabelle LSP server wh
 
 #### Available Tools
 
-1. **isabelle_hover** - Get type information for symbols
-2. **isabelle_completions** - Get code completion suggestions
-3. **isabelle_definition** - Navigate to definitions
-4. **isabelle_highlights** - Find all symbol references
-5. **isabelle_diagnostics** - Get type errors and warnings
-6. **isabelle_goal** - View current proof goals
-7. **isabelle_command_output** - Execute Isabelle commands
-8. **isabelle_preview** - Preview document (MVP limited)
-9. **isabelle_session_info** - Get session information
-10. **isabelle_build** - Build Isabelle sessions
+1. **isabelle_evaluate_to** - Run the prover up to a line (auto-starts evaluation)
+2. **isabelle_evaluation_status** - Check evaluation progress
+3. **isabelle_cancel_evaluation** - Cancel a running evaluation
+4. **isabelle_hover** - Get type information for symbols
+5. **isabelle_definition** - Navigate to definitions
+6. **isabelle_local_occurrences** - Find a local entity's definition and in-file uses
+7. **isabelle_diagnostics** - Get type errors and warnings
+8. **isabelle_goal** - View current proof goals
+9. **isabelle_command_output** - Prover output messages
+10. **isabelle_session_info** - Get session information
+
+> Design targets — not yet exposed as MCP tools: `isabelle_completions` and
+> `isabelle_preview` (the LSP-client layer already supports both), plus
+> `isabelle_edit`.
 
 ## Troubleshooting
 
@@ -111,11 +115,8 @@ If not available, install Isabelle from: https://isabelle.in.tum.de/
 If session builds fail, try:
 
 ```bash
-# Build session manually
+# Build the session manually
 isabelle build -b HOL
-
-# Or use the MCP tool
-isabelle_build(session="HOL", clean=True)
 ```
 
 ## Advanced Configuration

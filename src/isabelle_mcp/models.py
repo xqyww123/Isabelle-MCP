@@ -43,16 +43,15 @@ class DeclarationLocation(BaseModel):
     note: str | None = Field(default=None, description="Warning note (e.g. line still running)")
 
 
-class Highlight(BaseModel):
+class Occurrence(BaseModel):
     line: int = Field(description="Line number (1-indexed)", ge=1)
     start_column: int = Field(description="Start column (1-indexed)", ge=1)
     end_column: int = Field(description="End column (1-indexed)", ge=1)
-    kind: str = Field(description="text | read | write")
 
 
-class HighlightsResult(BaseModel):
-    symbol: str = Field(description="Symbol being highlighted")
-    highlights: list[Highlight] = Field(default_factory=list)
+class LocalOccurrencesResult(BaseModel):
+    symbol: str = Field(description="Symbol being looked up")
+    occurrences: list[Occurrence] = Field(default_factory=list)
     note: str | None = Field(default=None, description="Warning note (e.g. line still running)")
 
 

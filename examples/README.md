@@ -61,15 +61,6 @@ state = isabelle_goal(
 )
 print("Goals before:", state.goals_before)
 print("Goals after:", state.goals_after)
-
-# 3. Get completion suggestions
-completions = isabelle_completions(
-    file_path="/path/to/Theory.thy",
-    line=50,
-    column=10
-)
-for item in completions.items[:5]:
-    print(f"  {item.label}: {item.detail}")
 ```
 
 ## Testing Examples
@@ -114,15 +105,16 @@ diags = isabelle_diagnostics(file_path=path, start_line=10, end_line=20)
 # For each error, get context
 for error in diags.items:
     if error.severity == "error":
-        # Get hover info at error location
+        # Get hover info for a symbol on the error line
         info = isabelle_hover(
             file_path=path,
             line=error.line,
-            column=error.column
+            symbol="Suc"
         )
         print(f"Error: {error.message}")
         print(f"Symbol: {info.symbol}")
-        print(f"Info: {info.info}")
+        for entry in info.results:
+            print(f"Info: {entry.info}")
 ```
 
 ### 2. Developing Proofs
@@ -144,40 +136,30 @@ for i, goal in enumerate(state.goals_after, 1):
 
 ### 3. Code Navigation
 
-Use definition and highlights together:
+Use definition and local occurrences together:
 
 ```python
 # Find where a symbol is defined
-defn = isabelle_definition(file_path=path, line=10, column=5)
+defn = isabelle_definition(file_path=path, line=10, symbol="my_const")
 print(f"Symbol: {defn.symbol}")
 for loc in defn.locations:
     print(f"  Defined at {loc.file_path}:{loc.line}")
 
-# Find all uses of the symbol
-highlights = isabelle_highlights(file_path=path, line=10, column=5)
-print(f"\nAll occurrences of '{highlights.symbol}':")
-for h in highlights.highlights:
-    print(f"  Line {h.line}, columns {h.start_column}-{h.end_column} ({h.kind})")
+# Find all in-file occurrences (definition + uses) of the symbol
+occ = isabelle_local_occurrences(file_path=path, line=10, symbol="my_const")
+print(f"\nAll occurrences of '{occ.symbol}':")
+for o in occ.occurrences:
+    print(f"  Line {o.line}, columns {o.start_column}-{o.end_column}")
 ```
 
-### 4. Building Sessions
+### 4. Checking the Session
 
-Build required sessions before use:
+Inspect the current session before use:
 
 ```python
 # Check current session
 info = isabelle_session_info()
 print(f"Current session: {info.current_session}")
-print(f"Available: {info.available_sessions}")
-
-# Build a session if needed
-status = isabelle_build(session="HOL-Analysis", clean=False)
-if status.success:
-    print("Build successful!")
-else:
-    print("Build failed:")
-    for msg in status.messages:
-        print(f"  {msg}")
 ```
 
 ## Troubleshooting
@@ -198,7 +180,6 @@ else:
 
 - Use the same LSP client instance for multiple queries (client is cached)
 - Filter diagnostics by line range to reduce processing
-- Limit completion results with `max_completions` parameter
 
 ## Additional Resources
 

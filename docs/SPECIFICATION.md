@@ -6,10 +6,14 @@
 
 > Documentation reliability note:
 > This document contains both current behavior and design targets. The current
-> server exposes 10 MCP tools: 5 standard LSP tools, 3 PIDE notification tools,
-> and 2 session tools. It does not currently expose `isabelle_edit`. Sections
-> that discuss document editing or "11 tools" are retained as design notes until
-> that feature is implemented.
+> server exposes these MCP tools: hover, definition, local occurrences,
+> diagnostics, goal, command output, session info, and the evaluation tools
+> (`isabelle_evaluate_to`, `isabelle_evaluation_status`, `isabelle_cancel_evaluation`).
+> It does **not** currently expose `isabelle_completions`, `isabelle_preview`, or
+> `isabelle_edit` as MCP tools — though the LSP-client layer already implements
+> completion and preview support, it is simply not surfaced as a tool yet.
+> Sections that present these three as live tools are retained as design notes
+> until they are exposed.
 
 ## 1. Executive Summary
 
@@ -30,12 +34,12 @@ Isa-LSP is a Model Context Protocol (MCP) server that provides AI agents (like C
 ### 1.3 Scope
 
 **In Scope (MVP - LSP/PIDE Native Support Only):**
-- 5 standard LSP-based MCP tools (hover, completion, definition, highlights, diagnostics)
-- 3 PIDE-specific MCP tools (proof state, command output, preview)
-- 2 session management tools (build, session info)
+- Standard LSP-based MCP tools (hover, definition, local occurrences, diagnostics; completion is a design target)
+- PIDE-specific MCP tools (proof state, command output; preview is a design target)
+- 1 session management tool (session info)
 - Document open/close state management (`didOpen`, `didClose`)
 - Async notification handling (diagnostics and selected PIDE notifications)
-- Session lifecycle management with optional build support
+- Session lifecycle management
 
 **Out of Scope:**
 - Document editing (`isabelle_edit`) for the current release
@@ -112,8 +116,9 @@ Based on `isabelle vscode_server` analysis - **only LSP-native features**:
 **Priority**: High (Core feature)
 **Pattern**: Like `lean_hover_info`
 
-#### Tool 2: `isabelle_completions`
+#### Tool 2: `isabelle_completions` (Design Target)
 **Purpose**: Get code completion suggestions (syntax, semantic, paths, spelling)
+**Current Status**: Not exposed as an MCP tool (the LSP-client layer supports it via `get_completions`)
 **LSP Mapping**: `textDocument/completion` ✅
 **Priority**: High (Core feature)
 **Pattern**: Like `lean_completions`
@@ -124,8 +129,8 @@ Based on `isabelle vscode_server` analysis - **only LSP-native features**:
 **Priority**: High (Navigation)
 **Pattern**: Like `lean_declaration_file`
 
-#### Tool 4: `isabelle_highlights`
-**Purpose**: Find all occurrences of symbol in document
+#### Tool 4: `isabelle_local_occurrences`
+**Purpose**: Find in-file occurrences (definition + uses) of a locally-defined entity
 **LSP Mapping**: `textDocument/documentHighlight` ✅
 **Priority**: Medium (Navigation)
 **Pattern**: New (no Lean equivalent)
@@ -152,8 +157,9 @@ Isabelle-specific features - **only PIDE-native methods**:
 **Priority**: Medium (Debugging)
 **Pattern**: New (Isabelle-specific)
 
-#### Tool 8: `isabelle_preview`
+#### Tool 8: `isabelle_preview` (Design Target)
 **Purpose**: Generate HTML preview/documentation
+**Current Status**: Not exposed as an MCP tool (the LSP-client layer supports it via `request_preview`)
 **PIDE Mapping**: `PIDE/preview_request` → `PIDE/preview_response` ✅
 **Priority**: Low (Documentation generation)
 **Pattern**: New (Isabelle-specific)
@@ -167,16 +173,9 @@ Isabelle-specific features - **only PIDE-native methods**:
 **Priority**: **HIGH** if implemented (enables interactive theorem proving workflow)
 **Pattern**: New (no Lean equivalent — enables the edit-check-fix loop)
 
-### 3.4 Session Management Tools (2 tools)
+### 3.4 Session Management Tools (1 tool)
 
-#### Tool 10: `isabelle_build`
-**Purpose**: Rebuild session and restart LSP server
-**LSP Mapping**: Spawns new `isabelle vscode_server` process ✅
-**Priority**: Critical (Session initialization)
-**Pattern**: Like `lean_build`
-**Destructive**: Yes (restarts session)
-
-#### Tool 11: `isabelle_session_info`
+#### Tool 10: `isabelle_session_info`
 **Purpose**: Get the current session name
 **LSP Mapping**: In-memory client state ✅
 **Priority**: Low (Introspection)
@@ -190,7 +189,7 @@ Isabelle-specific features - **only PIDE-native methods**:
 
 #### 4.1.1 `isabelle_hover`
 
-**Description**: Get type signature, documentation, and tooltips for the symbol at a position. Use column at the START of the identifier.
+**Description**: Get type signature, documentation, and tooltips for a symbol on a line. Looks up every occurrence of the given symbol text on the line.
 
 **Tool Annotations**:
 ```python
@@ -205,26 +204,38 @@ ToolAnnotations(
 ```python
 file_path: Annotated[str, Field(description="Absolute path to .thy file")]
 line: Annotated[int, Field(description="Line number (1-indexed)", ge=1)]
-column: Annotated[int, Field(description="Column number (1-indexed)", ge=1)]
+symbol: Annotated[str, Field(description="Symbol text to look up, ASCII or Unicode")]
 ```
 
 **Output Model**:
 ```python
-class HoverInfo(BaseModel):
-    symbol: str = Field(description="Symbol text at position")
+class HoverEntry(BaseModel):
     info: str = Field(description="Type signature and documentation")
-    line_context: str = Field(description="Full source line for reference")
-    diagnostics: List[DiagnosticMessage] = Field(
+    occurrences: List[int] = Field(description="1-indexed occurrence indices on the line")
+    columns: List[int] = Field(description="1-indexed column positions of those occurrences")
+
+class HoverInfo(BaseModel):
+    symbol: str = Field(description="Queried symbol text")
+    results: List[HoverEntry] = Field(
         default_factory=list,
-        description="Diagnostics at this position"
+        description="Hover results grouped by content"
     )
+    line_context: str = Field(description="Full source line for reference")
+    diagnostics: List[DiagnosticMessage] = Field(default_factory=list)
+    note: Optional[str] = Field(default=None)
 ```
 
 **Example Response**:
 ```json
 {
   "symbol": "Suc",
-  "info": "Suc :: nat ⇒ nat\n\nThe successor function for natural numbers.",
+  "results": [
+    {
+      "info": "Suc :: nat ⇒ nat\n\nThe successor function for natural numbers.",
+      "occurrences": [1],
+      "columns": [7]
+    }
+  ],
   "line_context": "lemma \"Suc n = n + 1\"",
   "diagnostics": []
 }
@@ -232,7 +243,9 @@ class HoverInfo(BaseModel):
 
 ---
 
-#### 4.1.2 `isabelle_completions`
+#### 4.1.2 `isabelle_completions` (Design Target)
+
+**Current Status**: Not exposed as an MCP tool. The LSP-client layer supports it (`get_completions`); the spec below is the intended tool surface.
 
 **Description**: Get code completion suggestions at a position.
 
@@ -288,7 +301,7 @@ ToolAnnotations(
 ```python
 file_path: Annotated[str, Field(description="Absolute path to .thy file")]
 line: Annotated[int, Field(description="Line number (1-indexed)", ge=1)]
-column: Annotated[int, Field(description="Column number (1-indexed)", ge=1)]
+symbol: Annotated[str, Field(description="Symbol text to look up, ASCII or Unicode")]
 ```
 
 **Output Model**:
@@ -308,14 +321,14 @@ class DeclarationLocation(BaseModel):
 
 ---
 
-#### 4.1.4 `isabelle_highlights`
+#### 4.1.4 `isabelle_local_occurrences`
 
-**Description**: Find all occurrences of the symbol at the given position within the current document.
+**Description**: Find every in-file occurrence (definition + uses) of a locally-defined entity, given a symbol on a line. Only entities whose definition is in the current file resolve; global constants and free/bound variables return nothing.
 
 **Tool Annotations**:
 ```python
 ToolAnnotations(
-    title="Document Highlights",
+    title="Local Occurrences",
     readOnlyHint=True,
     idempotentHint=True,
 )
@@ -325,20 +338,19 @@ ToolAnnotations(
 ```python
 file_path: Annotated[str, Field(description="Absolute path to .thy file")]
 line: Annotated[int, Field(description="Line number (1-indexed)", ge=1)]
-column: Annotated[int, Field(description="Column number (1-indexed)", ge=1)]
+symbol: Annotated[str, Field(description="Symbol text to look up, ASCII or Unicode")]
 ```
 
 **Output Model**:
 ```python
-class Highlight(BaseModel):
+class Occurrence(BaseModel):
     line: int = Field(description="Line number (1-indexed)", ge=1)
     start_column: int = Field(description="Start column (1-indexed)", ge=1)
     end_column: int = Field(description="End column (1-indexed)", ge=1)
-    kind: str = Field(description="text | read | write")
 
-class HighlightsResult(BaseModel):
-    symbol: str = Field(description="Symbol being highlighted")
-    highlights: List[Highlight] = Field(default_factory=list)
+class LocalOccurrencesResult(BaseModel):
+    symbol: str = Field(description="Symbol being looked up")
+    occurrences: List[Occurrence] = Field(default_factory=list)
 ```
 
 ---
@@ -515,7 +527,9 @@ class CommandOutputResult(BaseModel):
 
 ---
 
-#### 4.2.3 `isabelle_preview`
+#### 4.2.3 `isabelle_preview` (Design Target)
+
+**Current Status**: Not exposed as an MCP tool. The LSP-client layer supports it (`request_preview`); the spec below is the intended tool surface.
 
 **Description**: Generate HTML preview/documentation rendering of a theory file.
 
@@ -682,41 +696,7 @@ For protocol details and implementation guidance, see API_DESIGN.md Section 3.6.
 
 ### 4.4 Session Management Tools
 
-#### 4.4.1 `isabelle_build` 🔨 Destructive
-
-**Description**: Rebuild the session and restart the LSP server. **WARNING: This is destructive and will restart the entire session.**
-
-**Tool Annotations**:
-```python
-ToolAnnotations(
-    title="Build Session",
-    readOnlyHint=False,
-    idempotentHint=False,
-)
-```
-
-**Input Parameters**:
-```python
-logic: Annotated[str, Field(description="Session name (e.g., 'HOL', 'HOL-Analysis')")] = "HOL"
-session_dirs: Annotated[List[str], Field(
-    description="Additional session directories"
-)] = []
-clean: Annotated[bool, Field(description="Clean build (rebuild everything)")] = False
-verbose: Annotated[bool, Field(description="Verbose build output")] = False
-```
-
-**Output Model**:
-```python
-class BuildResult(BaseModel):
-    success: bool = Field(description="True if build succeeded")
-    build_log: str = Field(description="Build output")
-    session_name: str = Field(description="Session that was built")
-    server_info: Optional[Dict[str, Any]] = Field(None, description="LSP server info after restart")
-```
-
----
-
-#### 4.4.2 `isabelle_session_info`
+#### 4.4.1 `isabelle_session_info`
 
 **Description**: Get the name of the current Isabelle session.
 
@@ -767,7 +747,6 @@ def check_pide_response(response: Any, operation: str, *, allow_none: bool = Fal
 - `"Invalid theory file path: '{path}' not found in any Isabelle session"`
 - `"PIDE timeout during get_hover"`
 - `"Document not open. Please call isabelle_open_document first."`
-- `"Session not initialized. Please call isabelle_build first."`
 
 ---
 
@@ -783,13 +762,13 @@ INSTRUCTIONS = """## General Rules
 ## Key Tools
 - **isabelle_goal**: Proof state at position. Omit `column` for before/after. MOST IMPORTANT!
 - **isabelle_diagnostics**: Compiler errors/warnings. Use after every change.
-- **isabelle_hover**: Type signature + docs. Column at START of identifier.
+- **isabelle_hover**: Type signature + docs. Look up by symbol text on a line.
 - **isabelle_completions**: Code completion suggestions.
 
 ## Position Conventions
 - Line/column are 1-indexed (first line = 1, first character = 1)
 - For goals, omit column to see how a tactic transforms the state
-- For hover, use column at the START of the identifier
+- For hover and definition, pass the symbol text to look up on the line
 
 ## Workflow
 1. Open a theory file (automatic on first tool call)
@@ -812,25 +791,26 @@ Empty list = `{"items": []}`.
 
 ### 7.1 Functional Status
 
-1. Current server registers 10 MCP tools, not 11.
-2. Standard LSP features (hover, completion, definition, highlights,
-   diagnostics) are implemented and covered by tests.
+1. Current server registers 10 MCP tools.
+2. Standard LSP features (hover, definition, local occurrences, diagnostics) are
+   implemented and covered by tests. Completion is supported at the LSP-client
+   layer (`get_completions`) but not yet exposed as an MCP tool.
 3. PIDE tools use Isabelle2024 native notifications:
    - `isabelle_goal` uses `PIDE/caret_update`, `PIDE/state_init`,
      `PIDE/state_output`, and `PIDE/state_exit`.
    - `isabelle_command_output` uses `PIDE/dynamic_output`.
-   - `isabelle_preview` uses `PIDE/preview_request` and
-     `PIDE/preview_response`.
 4. PIDE tools are best-effort: they may timeout if Isabelle emits no matching
    notification for the requested position/file.
-5. `isabelle_edit` is not implemented in the current server.
+5. `isabelle_completions`, `isabelle_preview`, and `isabelle_edit` are not
+   exposed as MCP tools in the current server (completion and preview have
+   LSP-client support; the design specs are retained above).
 
 ### 7.2 Interface Consistency
 
-1. Current tool names are `isabelle_hover`, `isabelle_completions`,
-   `isabelle_definition`, `isabelle_highlights`, `isabelle_diagnostics`,
-   `isabelle_goal`, `isabelle_command_output`, `isabelle_preview`,
-   `isabelle_build`, and `isabelle_session_info`.
+1. Current tool names are `isabelle_evaluate_to`, `isabelle_evaluation_status`,
+   `isabelle_cancel_evaluation`, `isabelle_hover`, `isabelle_definition`,
+   `isabelle_local_occurrences`, `isabelle_diagnostics`, `isabelle_goal`,
+   `isabelle_command_output`, and `isabelle_session_info`.
 2. All public tool positions are 1-indexed.
 3. Tools return Pydantic models rather than bare lists.
 4. Error handling uses `IsabelleToolError` for expected tool failures.

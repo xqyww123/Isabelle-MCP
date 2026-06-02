@@ -12,8 +12,8 @@ from isabelle_mcp.server import (
     isabelle_evaluate_to,
     isabelle_evaluation_status,
     isabelle_goal,
-    isabelle_highlights,
     isabelle_hover,
+    isabelle_local_occurrences,
     isabelle_session_info,
 )
 
@@ -41,11 +41,11 @@ class TestMCPServerTools:
         assert result.symbol == "my_const"
 
     @pytest.mark.asyncio
-    async def test_highlights(self, temp_theory_file, mock_lsp_client):
+    async def test_local_occurrences(self, temp_theory_file, mock_lsp_client):
         mock_lsp_client.highlights_response = []
         with _patch_ensure(mock_lsp_client):
-            result = await isabelle_highlights(temp_theory_file, 5, 15)
-        assert result.highlights == []
+            result = await isabelle_local_occurrences(temp_theory_file, 8, "my_const")
+        assert result.occurrences == []
 
     @pytest.mark.asyncio
     async def test_diagnostics(self, temp_theory_file, mock_lsp_client):
