@@ -136,7 +136,7 @@ Based on `isabelle vscode_server` analysis - **only LSP-native features**:
 **Pattern**: New (no Lean equivalent)
 
 #### Tool 5: `isabelle_diagnostics`
-**Purpose**: Get compiler diagnostics (errors, warnings, info)
+**Purpose**: Get prover diagnostics (errors, warnings, info)
 **LSP Mapping**: Cached `textDocument/publishDiagnostics` notifications ✅
 **Priority**: High (Essential)
 **Pattern**: Like `lean_diagnostic_messages`
@@ -357,7 +357,7 @@ class LocalOccurrencesResult(BaseModel):
 
 #### 4.1.5 `isabelle_diagnostics`
 
-**Description**: Get compiler diagnostics (errors, warnings, information) for a theory file. **This is essential for checking if your changes are correct.**
+**Description**: Get prover diagnostics (errors, warnings, information) for a theory file. **This is essential for checking if your changes are correct.**
 
 **Tool Annotations**:
 ```python
@@ -761,7 +761,7 @@ INSTRUCTIONS = """## General Rules
 
 ## Key Tools
 - **isabelle_goal**: Proof state at position. Omit `column` for before/after. MOST IMPORTANT!
-- **isabelle_diagnostics**: Compiler errors/warnings. Use after every change.
+- **isabelle_diagnostics**: Prover errors/warnings. Use after every change.
 - **isabelle_hover**: Type signature + docs. Look up by symbol text on a line.
 - **isabelle_completions**: Code completion suggestions.
 

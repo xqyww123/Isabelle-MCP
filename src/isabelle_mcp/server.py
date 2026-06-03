@@ -193,7 +193,7 @@ async def isabelle_diagnostics(
     start_line: int,
     end_line: int,
 ) -> DiagnosticsResult:
-    """Get compiler diagnostics (errors, warnings) for a line range.
+    """Get prover diagnostics (errors, warnings) for a line range.
 
     Auto-starts evaluation if the range has not been evaluated yet.
     Use negative indices to count from the end: -1 = last line.
@@ -212,7 +212,7 @@ async def isabelle_diagnostics(
 async def isabelle_goal(
     file_path: str, line: int, column: int | None = None,
 ) -> GoalState:
-    """Get proof goals at position. **MOST IMPORTANT tool — use often!**
+    """Get proof goals at position.
 
     Auto-starts evaluation if the line has not been evaluated yet.
 
