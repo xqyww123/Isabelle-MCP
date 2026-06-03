@@ -97,6 +97,7 @@ class MockLSPClient:
         self.goal_response: list[str] = []
         self.dynamic_output_response = ""
         self.command_at_position_response: tuple[str, dict[str, Any]] | None = None
+        self.output_at_position_response: tuple[str, dict[str, Any], str] | None = None
 
     async def start(self):
         self.initialized = True
@@ -203,6 +204,11 @@ class MockLSPClient:
 
     async def get_dynamic_output(self, file_path: str, line: LSPLine, character: int = 0) -> str:
         return self.dynamic_output_response
+
+    async def get_output_at_position(
+        self, file_path: str, line: LSPLine, character: LSPCharacter,
+    ) -> tuple[str, dict[str, Any], str] | None:
+        return self.output_at_position_response
 
     def get_cached_diagnostics(self, file_path: str) -> list[dict[str, Any]]:
         return self.diagnostics_cache.get(file_path, [])

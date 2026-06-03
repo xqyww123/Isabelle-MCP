@@ -81,6 +81,21 @@ class CommandSpan(BaseModel):
     end_line: int = Field(ge=1, description="Command end line (1-indexed)")
     end_column: int = Field(ge=1, description="Command end column (1-indexed, just past the last character)")
 
+    @classmethod
+    def from_lsp(cls, result: "tuple[str, dict] | None") -> "CommandSpan | None":
+        """Build from a PIDE/command_at_position result (source, 0-indexed LSP range)."""
+        if result is None:
+            return None
+        source, rng = result
+        start, end = rng.get("start", {}), rng.get("end", {})
+        return cls(
+            text=source,
+            start_line=int(start.get("line", 0)) + 1,
+            start_column=int(start.get("character", 0)) + 1,
+            end_line=int(end.get("line", 0)) + 1,
+            end_column=int(end.get("character", 0)) + 1,
+        )
+
 
 class GoalState(BaseModel):
     command: CommandSpan | None = Field(
@@ -101,12 +116,18 @@ class GoalState(BaseModel):
 
 
 class OutputMessage(BaseModel):
-    kind: str = Field(description="writeln | warning | error | information")
+    kind: str = Field(description="normal | tracing | warning | error | information | state")
     message: str = Field(description="Message content")
 
 
 class CommandOutputResult(BaseModel):
-    line_context: str = Field(description="Source line")
+    command: CommandSpan | None = Field(
+        default=None,
+        description=(
+            "The Isar command enclosing the queried position — its full source text "
+            "and range. None if there is no command at the position."
+        ),
+    )
     messages: list[OutputMessage] = Field(default_factory=list)
     note: str | None = Field(default=None, description="Warning note (e.g. line still running)")
 

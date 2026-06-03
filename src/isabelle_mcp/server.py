@@ -6,6 +6,8 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastmcp import FastMCP
+from fastmcp.tools.tool import ToolResult
+from mcp.types import TextContent
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -18,7 +20,6 @@ from isabelle_mcp.file_watcher import FileWatcher
 from isabelle_mcp.instructions import get_instructions
 from isabelle_mcp.lsp_client import IsabelleLSPClient
 from isabelle_mcp.models import (
-    CommandOutputResult,
     DeclarationLocation,
     DiagnosticsResult,
     EvaluationResult,
@@ -31,6 +32,7 @@ from isabelle_mcp.tools import (
     command_output,
     declaration_location,
     diagnostic_messages,
+    format_command_output,
     goal,
     hover_info,
     local_occurrences,
@@ -228,17 +230,29 @@ async def isabelle_goal(
     return await goal(lsp, file_path, MCPLine(line), after_text)
 
 
-@mcp.tool()
-async def isabelle_command_output(file_path: str, line: int) -> CommandOutputResult:
-    """Get prover output messages for command at line.
+@mcp.tool(output_schema=None)
+async def isabelle_command_output(
+    file_path: str, line: int, after_text: str | None = None,
+) -> ToolResult:
+    """Get the Isar command at a position and the prover messages it produced.
 
-    Auto-starts evaluation if the line has not been evaluated yet.
+    Returns the command enclosing the position — its full source text and range —
+    together with the prover output it emitted (normal/tracing/warning/error/
+    information/state messages). Auto-starts evaluation if the line has not been
+    evaluated yet.
 
     Args:
         file_path: Absolute path to .thy file
         line: Line number (1-indexed)
+        after_text: Optional text on the line; the command right after it is used.
+            Without it, the command at the end of the line is used.
     """
-    return await command_output(await _ensure_lsp_started(), file_path, MCPLine(line))
+    result = await command_output(
+        await _ensure_lsp_started(), file_path, MCPLine(line), after_text,
+    )
+    return ToolResult(
+        content=[TextContent(type="text", text=format_command_output(result, line))],
+    )
 
 
 @mcp.tool()

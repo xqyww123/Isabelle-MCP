@@ -72,17 +72,17 @@ def _parse_numbered_goals(text: str) -> list[str]:
 
 
 _COMMAND_OUTPUT_KIND_BY_CSS_CLASS = {
-    'writeln': 'writeln',
-    'writeln_message': 'writeln',
+    'writeln': 'normal',
+    'writeln_message': 'normal',
+    'tracing': 'tracing',
+    'tracing_message': 'tracing',
     'warning': 'warning',
     'warning_message': 'warning',
     'error': 'error',
     'error_message': 'error',
     'information': 'information',
     'information_message': 'information',
-    'state_message': 'information',
-    'tracing': 'writeln',
-    'tracing_message': 'writeln',
+    'state_message': 'state',
 }
 
 

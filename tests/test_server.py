@@ -90,8 +90,8 @@ class TestMCPServerTools:
     async def test_command_output(self, temp_theory_file, mock_lsp_client):
         with _patch_ensure(mock_lsp_client):
             result = await isabelle_command_output(temp_theory_file, 8)
-        assert result.messages == []
-        assert isinstance(result.line_context, str)
+        # Returns a ToolResult carrying the formatted plain-text block.
+        assert result.content[0].text == "No command at line 8."
 
     @pytest.mark.asyncio
     async def test_session_info(self, mock_lsp_client):

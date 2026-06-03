@@ -4,6 +4,8 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
+import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
@@ -22,6 +24,34 @@ from isabelle_mcp.utils import (
 logger = logging.getLogger(__name__)
 
 JsonDict = dict[str, Any]
+
+_unicode_option_cache: str | None = None
+
+
+def unicode_symbols_option() -> str:
+    """Return the version-correct vscode_server option for unicode symbol output.
+
+    Isabelle2025 renamed ``vscode_unicode_symbols`` to ``vscode_unicode_symbols_output``
+    (passing the old name aborts the 2025 server at startup). Detect the version via
+    ``ISABELLE_IDENTIFIER`` (e.g. "Isabelle2024", "Isabelle2025-2"); fall back to the
+    pre-2025 name if detection fails. Cached for the process.
+    """
+    global _unicode_option_cache
+    if _unicode_option_cache is not None:
+        return _unicode_option_cache
+    name = "vscode_unicode_symbols"
+    try:
+        out = subprocess.run(
+            ["isabelle", "getenv", "-b", "ISABELLE_IDENTIFIER"],
+            capture_output=True, text=True, timeout=30, check=False,
+        ).stdout.strip()
+        match = re.search(r"Isabelle(\d{4})", out)
+        if match and int(match.group(1)) >= 2025:
+            name = "vscode_unicode_symbols_output"
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("Could not detect Isabelle version (%s); using %s", exc, name)
+    _unicode_option_cache = name
+    return name
 
 
 @dataclass
@@ -136,8 +166,12 @@ class IsabelleLSPClient:
         cmd = [
             "isabelle", "vscode_server", "-l", self.logic,
             "-o", "vscode_pide_extensions",
-            "-o", "vscode_unicode_symbols",
+            "-o", unicode_symbols_option(),
             "-o", "vscode_caret_perspective=1",
+            # Keep the proof state OUT of command output by default — it is the job of
+            # isabelle_goal (the state panel works regardless of this option). Override
+            # with a later "-o editor_output_state=true" in extra_args to include it.
+            "-o", "editor_output_state=false",
         ]
         for d in self.session_dirs:
             cmd.extend(["-d", d])
@@ -764,6 +798,35 @@ class IsabelleLSPClient:
         if not isinstance(source, str) or not isinstance(rng, dict):
             return None
         return (source, rng)
+
+    async def get_output_at_position(
+        self, file_path: str, line: LSPLine, character: LSPCharacter,
+    ) -> tuple[str, JsonDict, str] | None:
+        """Return (source, range, output_html) of the command enclosing the position.
+
+        Uses the patched PIDE/output_at_position request: a position-explicit query
+        that renders the enclosing command's prover output without moving the caret
+        (unlike dynamic_output, which only pushes on caret movement). range is the
+        LSP range dict; output_html is the Output-panel HTML for the whole command.
+        Returns None when no command is found at the position.
+        """
+        doc = self.open_documents.get(file_path)
+        if not doc:
+            raise IsabelleToolError(f"Document not open: {file_path}")
+        result = await self.request("PIDE/output_at_position", {
+            "textDocument": {"uri": doc.uri},
+            "position": {"line": line, "character": character},
+        })
+        if not isinstance(result, dict):
+            return None
+        source, rng, content = (
+            result.get("source"), result.get("range"), result.get("content"),
+        )
+        if not isinstance(source, str) or not isinstance(rng, dict):
+            return None
+        if not isinstance(content, str):
+            content = ""
+        return (source, rng, content)
 
     async def get_completions(
         self,

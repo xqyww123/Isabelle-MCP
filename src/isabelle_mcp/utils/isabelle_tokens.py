@@ -10,6 +10,8 @@ import logging
 from Isabelle_RPC_Host.position import symbol_explode
 from Isabelle_RPC_Host.unicode import ascii_of_unicode
 
+from isabelle_mcp.utils.core import IsabelleToolError
+
 logger = logging.getLogger(__name__)
 
 # Explicit enumeration from symbol.ML lines 246-386.
@@ -245,3 +247,28 @@ def find_after_text_caret(
             return (line_idx + k, end_off - line_starts[k])
 
     return None
+
+
+def resolve_caret(
+    lines: list[str], lsp_line_idx: int, after_text: str | None, line_label: object,
+) -> tuple[int, int]:
+    """Resolve the caret position whose enclosing command a query reports.
+
+    Without after_text, anchor on the last non-blank character of the line so the
+    caret falls INSIDE the command (the exact end of the line sits on the command
+    boundary and would resolve to the following command). With after_text, return
+    the position just past that token run (see find_after_text_caret).
+
+    Returns an (lsp_line, lsp_character) pair (both 0-indexed). ``line_label`` is
+    the 1-indexed line as the user supplied it, used only in error messages.
+    """
+    if lsp_line_idx >= len(lines):
+        raise IsabelleToolError(f"line {line_label} is beyond the end of the file")
+    line_text = lines[lsp_line_idx]
+    if after_text is None:
+        stripped = len(line_text.rstrip())
+        return (lsp_line_idx, stripped - 1 if stripped > 0 else 0)
+    caret = find_after_text_caret(lines, lsp_line_idx, after_text)
+    if caret is None:
+        raise IsabelleToolError(f"Text '{after_text}' not found on line {line_label}")
+    return caret

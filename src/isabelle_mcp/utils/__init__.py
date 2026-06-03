@@ -23,6 +23,7 @@ from isabelle_mcp.utils.formatters import (
 from isabelle_mcp.utils.isabelle_tokens import (
     find_after_text_caret,
     find_symbol_occurrences,
+    resolve_caret,
 )
 
 __all__ = [
@@ -35,6 +36,7 @@ __all__ = [
     "file_path_to_uri",
     "find_after_text_caret",
     "find_symbol_occurrences",
+    "resolve_caret",
     "lsp_to_mcp_position",
     "mcp_to_lsp_position",
     "uri_to_file_path",

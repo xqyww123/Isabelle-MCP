@@ -159,7 +159,7 @@ class TestFormatters:
         html = '<div class="writeln">Output</div><div class="warning">Warn</div>'
         msgs = parse_command_output_html(html)
         assert len(msgs) == 2
-        assert msgs[0] == {'kind': 'writeln', 'text': 'Output'}
+        assert msgs[0] == {'kind': 'normal', 'text': 'Output'}
         assert msgs[1] == {'kind': 'warning', 'text': 'Warn'}
 
     def test_parse_command_output_multiple_css_classes(self):
@@ -179,7 +179,7 @@ class TestFormatters:
             '<span class="block">int</span></span></pre>'
         )
         assert parse_command_output_html(html) == [
-            {'kind': 'writeln', 'text': 'val it = 64: int'}
+            {'kind': 'normal', 'text': 'val it = 64: int'}
         ]
 
     def test_parse_command_output_isabelle2024_error_message(self):
@@ -201,7 +201,7 @@ class TestFormatters:
             '</span></pre>'
         )
         assert parse_command_output_html(html) == [
-            {'kind': 'information', 'text': 'proof (prove) goal (1 subgoal): 1. P ⟹ Q'}
+            {'kind': 'state', 'text': 'proof (prove) goal (1 subgoal): 1. P ⟹ Q'}
         ]
 
     @pytest.mark.parametrize(
@@ -218,7 +218,7 @@ class TestFormatters:
                 '<span class="block"><span class="block"><a '
                 'href="file:/home/qiyuan/Current/MLML/contrib/Isabelle2024/src/HOL/HOL.thy#100">'
                 '<span class="block">True</span></a></span></span></span></span></pre>',
-                [{'kind': 'writeln', 'text': 'True'}],
+                [{'kind': 'normal', 'text': 'True'}],
             ),
             (
                 '<pre class="source"><span class="error_message">Bad context for command '
@@ -232,7 +232,7 @@ class TestFormatters:
                 '<span class="break"> </span>=</span><span class="break"> </span>'
                 '&quot;&quot;:<span class="break"> </span><span class="block">string</span>'
                 '</span></span></pre>',
-                [{'kind': 'writeln', 'text': 'val it = "": string'}],
+                [{'kind': 'normal', 'text': 'val it = "": string'}],
             ),
             (
                 '<pre class="source"><span class="writeln_message"><span class="block">'
@@ -240,7 +240,7 @@ class TestFormatters:
                 '<span class="break"> </span>=</span><span class="break"> </span>'
                 '64:<span class="break"> </span><span class="block">int</span>'
                 '</span></span></pre>',
-                [{'kind': 'writeln', 'text': 'val it = 64: int'}],
+                [{'kind': 'normal', 'text': 'val it = 64: int'}],
             ),
             ('<pre class="source"/>', []),
         ],
