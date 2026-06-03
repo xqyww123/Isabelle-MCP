@@ -74,12 +74,29 @@ class DiagnosticsResult(BaseModel):
     note: str | None = Field(default=None, description="Warning note (e.g. line still running)")
 
 
+class CommandSpan(BaseModel):
+    text: str = Field(description="Full source text of the Isar command (may span multiple lines)")
+    start_line: int = Field(ge=1, description="Command start line (1-indexed)")
+    start_column: int = Field(ge=1, description="Command start column (1-indexed)")
+    end_line: int = Field(ge=1, description="Command end line (1-indexed)")
+    end_column: int = Field(ge=1, description="Command end column (1-indexed, just past the last character)")
+
+
 class GoalState(BaseModel):
-    line_context: str = Field(description="Source line where goals were queried")
-    goals: list[str] | None = Field(default=None, description="Goals at specific column")
-    goals_before: list[str] | None = Field(default=None, description="Goals at line start (before tactic)")
-    goals_after: list[str] | None = Field(default=None, description="Goals at line end (after tactic)")
-    context: str | None = Field(default=None, description="Local proof context (assumptions, fixes)")
+    command: CommandSpan | None = Field(
+        default=None,
+        description=(
+            "The Isar command enclosing the queried position — its full source text "
+            "and range. None if there is no command at the position."
+        ),
+    )
+    subgoals: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Open subgoals of the proof state after the command runs — one string "
+            "per subgoal; empty list means no subgoals remain (proof finished here)."
+        ),
+    )
     note: str | None = Field(default=None, description="Warning note (e.g. line still running)")
 
 

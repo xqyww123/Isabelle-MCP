@@ -59,8 +59,8 @@ state = isabelle_goal(
     file_path="/path/to/Theory.thy",
     line=42  # Line with proof tactic
 )
-print("Goals before:", state.goals_before)
-print("Goals after:", state.goals_after)
+print("Command:", state.command.text if state.command else None)
+print("Subgoals after the command:", state.subgoals)
 ```
 
 ## Testing Examples
@@ -119,19 +119,20 @@ for error in diags.items:
 
 ### 2. Developing Proofs
 
-Use `isabelle_goal` to understand proof state changes:
+Use `isabelle_goal` to inspect the proof state after a command:
 
 ```python
-# Check proof state transformation by a tactic
+# Proof state after the command at this line
 state = isabelle_goal(file_path=path, line=tactic_line)
 
-print(f"Before applying '{state.line_context}':")
-for i, goal in enumerate(state.goals_before, 1):
-    print(f"  Goal {i}: {goal}")
+if state.command:
+    print(f"Command: {state.command.text!r}")
+print("Subgoals after it run:")
+for i, sg in enumerate(state.subgoals, 1):
+    print(f"  {i}. {sg}")
 
-print(f"\nAfter:")
-for i, goal in enumerate(state.goals_after, 1):
-    print(f"  Goal {i}: {goal}")
+# To target a specific command, pass after_text (matched as Isabelle tokens):
+state = isabelle_goal(file_path=path, line=tactic_line, after_text="apply (induct n)")
 ```
 
 ### 3. Code Navigation

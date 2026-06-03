@@ -742,6 +742,29 @@ class IsabelleLSPClient:
         })
         return result if isinstance(result, dict) or result is None else None
 
+    async def get_command_at_position(
+        self, file_path: str, line: LSPLine, character: LSPCharacter,
+    ) -> tuple[str, JsonDict] | None:
+        """Return (source, range) of the Isar command enclosing the position.
+
+        Uses the patched PIDE/command_at_position request. range is the LSP range
+        dict {start:{line,character}, end:{line,character}}. Returns None when no
+        command is found at the position.
+        """
+        doc = self.open_documents.get(file_path)
+        if not doc:
+            raise IsabelleToolError(f"Document not open: {file_path}")
+        result = await self.request("PIDE/command_at_position", {
+            "textDocument": {"uri": doc.uri},
+            "position": {"line": line, "character": character},
+        })
+        if not isinstance(result, dict):
+            return None
+        source, rng = result.get("source"), result.get("range")
+        if not isinstance(source, str) or not isinstance(rng, dict):
+            return None
+        return (source, rng)
+
     async def get_completions(
         self,
         file_path: str,

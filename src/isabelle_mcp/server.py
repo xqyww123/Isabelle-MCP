@@ -36,7 +36,7 @@ from isabelle_mcp.tools import (
     local_occurrences,
     session_info,
 )
-from isabelle_mcp.utils import IsabelleToolError, MCPColumn, MCPLine  # MCPColumn still used by other tools
+from isabelle_mcp.utils import IsabelleToolError, MCPLine
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -210,26 +210,22 @@ async def isabelle_diagnostics(
 
 @mcp.tool()
 async def isabelle_goal(
-    file_path: str, line: int, column: int | None = None,
+    file_path: str, line: int, after_text: str | None = None,
 ) -> GoalState:
-    """Get proof goals at position.
+    """Get the Isar command at a position and the proof state after it executes.
 
-    Auto-starts evaluation if the line has not been evaluated yet.
-
-    Omitting column shows how a tactic transforms the proof state:
-    - goals_before: State at line start
-    - goals_after: State at line end
+    Returns the command enclosing the position — its full source text and range —
+    together with the subgoals remaining after that command runs. Auto-starts
+    evaluation if the line has not been evaluated yet.
 
     Args:
         file_path: Absolute path to .thy file
         line: Line number (1-indexed)
-        column: Column number (1-indexed), optional
+        after_text: Optional text on the line; the command right after it is used.
+            Without it, the command at the end of the line is used.
     """
     lsp = await _ensure_lsp_started()
-    return await goal(
-        lsp, file_path, MCPLine(line),
-        MCPColumn(column) if column is not None else None,
-    )
+    return await goal(lsp, file_path, MCPLine(line), after_text)
 
 
 @mcp.tool()

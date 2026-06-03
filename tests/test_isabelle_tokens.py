@@ -2,7 +2,11 @@
 
 import pytest
 
-from isabelle_mcp.utils.isabelle_tokens import find_symbol_occurrences, tokenize_isabelle_line
+from isabelle_mcp.utils.isabelle_tokens import (
+    find_after_text_caret,
+    find_symbol_occurrences,
+    tokenize_isabelle_line,
+)
 
 
 class TestTokenize:
@@ -178,3 +182,44 @@ class TestFindSymbolOccurrences:
     def test_type_var_search(self):
         offsets = find_symbol_occurrences("'a list", "'a")
         assert offsets == [0]
+
+
+class TestFindAfterTextCaret:
+    def test_single_line_simple(self):
+        lines = ["  by (simp add: foo)"]
+        assert find_after_text_caret(lines, 0, "by") == (0, 4)
+
+    def test_single_line_whole_tactic(self):
+        lines = ["  by (simp add: foo)"]
+        assert find_after_text_caret(lines, 0, "(simp add: foo)") == (0, len(lines[0]))
+
+    def test_not_found(self):
+        lines = ["  by (simp add: foo)"]
+        assert find_after_text_caret(lines, 0, "no_such_text") is None
+
+    def test_match_must_start_on_line(self):
+        lines = ["lemma foo:", "  by auto"]
+        # "by" lives on line 1, so anchoring at line 0 must NOT find it
+        assert find_after_text_caret(lines, 0, "by") is None
+        assert find_after_text_caret(lines, 1, "by") == (1, 4)
+
+    def test_cross_line_command(self):
+        lines = ["apply (rule someThm", "  [where x = y])"]
+        # match begins on line 0 ("apply") and runs onto line 1
+        result = find_after_text_caret(lines, 0, "apply (rule someThm [where x = y])")
+        assert result == (1, len(lines[1]))
+
+    def test_first_occurrence(self):
+        lines = ["foo bar foo bar"]
+        assert find_after_text_caret(lines, 0, "foo") == (0, 3)
+
+    def test_unicode_matched_by_ascii(self):
+        lines = ['lemma: "P ⟹ Q"']
+        # the ASCII form of the arrow matches the Unicode glyph on the line
+        result = find_after_text_caret(lines, 0, "P \\<Longrightarrow>")
+        assert result is not None
+        assert result[0] == 0
+
+    def test_line_out_of_range(self):
+        lines = ["  by auto"]
+        assert find_after_text_caret(lines, 5, "by") is None

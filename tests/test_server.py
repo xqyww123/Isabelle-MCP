@@ -65,19 +65,26 @@ class TestMCPServerTools:
         assert result.items == []
 
     @pytest.mark.asyncio
-    async def test_goal_without_column(self, temp_theory_file, mock_lsp_client):
+    async def test_goal_without_after_text(self, temp_theory_file, mock_lsp_client):
+        mock_lsp_client.command_at_position_response = (
+            "by simp", {"start": {"line": 8, "character": 2}, "end": {"line": 8, "character": 9}},
+        )
         with _patch_ensure(mock_lsp_client):
-            result = await isabelle_goal(temp_theory_file, 8)
-        assert result.goals_before == []
-        assert result.goals_after == []
-        assert result.goals is None
+            result = await isabelle_goal(temp_theory_file, 9)
+        assert result.subgoals == []
+        assert result.command is not None
+        assert result.command.text == "by simp"
 
     @pytest.mark.asyncio
-    async def test_goal_with_column(self, temp_theory_file, mock_lsp_client):
+    async def test_goal_with_after_text(self, temp_theory_file, mock_lsp_client):
+        # Line 9 is "  by (simp add: my_const_def)"
+        mock_lsp_client.command_at_position_response = (
+            "by simp", {"start": {"line": 8, "character": 2}, "end": {"line": 8, "character": 9}},
+        )
         with _patch_ensure(mock_lsp_client):
-            result = await isabelle_goal(temp_theory_file, 8, column=10)
-        assert result.goals == []
-        assert result.goals_before is None
+            result = await isabelle_goal(temp_theory_file, 9, after_text="by")
+        assert result.subgoals == []
+        assert result.command is not None
 
     @pytest.mark.asyncio
     async def test_command_output(self, temp_theory_file, mock_lsp_client):

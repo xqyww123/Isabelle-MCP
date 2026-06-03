@@ -89,9 +89,9 @@ async def main():
         # Example 7: Proof goals
         print("--- Example 7: Proof Goals ---")
         state = await goal(client, str(theory_file), 28)
-        print(f"Line context: {state.line_context}")
-        print(f"Goals before: {state.goals_before}")
-        print(f"Goals after: {state.goals_after}")
+        if state.command:
+            print(f"Command: {state.command.text!r}")
+        print(f"Subgoals after the command: {state.subgoals}")
         print()
 
         print("=== All examples completed successfully! ===")

@@ -4,6 +4,7 @@ Implements a simplified Isabelle lexer based on symbol_pos.ML and lexicon.ML,
 operating in ASCII space via Isabelle_RPC_Host.
 """
 
+import bisect
 import logging
 
 from Isabelle_RPC_Host.position import symbol_explode
@@ -181,3 +182,66 @@ def find_symbol_occurrences(doc_line: str, symbol: str) -> list[int]:
                 break
 
     return results
+
+
+def find_after_text_caret(
+    lines: list[str], line_idx: int, after_text: str,
+) -> tuple[int, int] | None:
+    """Locate after_text and return the caret position immediately AFTER it.
+
+    after_text is matched as a sequence of Isabelle tokens (like
+    find_symbol_occurrences), so ASCII and Unicode forms are equivalent and the
+    match lands on token boundaries. The match must BEGIN on line ``line_idx``
+    (0-indexed) but may extend onto following lines — newlines are ordinary token
+    separators, so a command split across several lines still matches.
+
+    Returns the (line, character) position (both 0-indexed, LSP coordinates) just
+    past the last matched token, or None if after_text does not occur as such a
+    token run starting on ``line_idx``. When it occurs more than once, the first
+    occurrence is used.
+    """
+    if line_idx < 0 or line_idx >= len(lines):
+        return None
+
+    sub_lines = lines[line_idx:]
+    sub_text = "\n".join(sub_lines)
+    ascii_sub = ascii_of_unicode(sub_text)
+    ascii_target = ascii_of_unicode(after_text)
+
+    sub_tokens = tokenize_isabelle_line(ascii_sub)
+    target_tokens = tokenize_isabelle_line(ascii_target)
+    if not target_tokens or not sub_tokens:
+        return None
+
+    # Char offset of each symbol within sub_text (original, non-ASCII coordinates).
+    sub_symbols = symbol_explode(sub_text)
+    sub_offsets: list[int] = []
+    off = 0
+    for sym in sub_symbols:
+        sub_offsets.append(off)
+        off += len(sym)
+    total_len = off
+
+    # Char offset at which each line begins within sub_text.
+    line_starts: list[int] = [0]
+    for ln in sub_lines:
+        line_starts.append(line_starts[-1] + len(ln) + 1)  # +1 for the '\n'
+    first_line_len = len(sub_lines[0])
+
+    target_texts = [t[0] for t in target_tokens]
+    target_len = len(target_texts)
+
+    for i in range(len(sub_tokens) - target_len + 1):
+        start_off = sub_offsets[sub_tokens[i][2]]
+        # Token starts are monotonically increasing: once we pass the first line,
+        # no later match can begin on line_idx.
+        if start_off >= first_line_len:
+            break
+        if all(sub_tokens[i + j][0] == target_texts[j] for j in range(target_len)):
+            last_token = sub_tokens[i + target_len - 1]
+            end_sym_idx = last_token[2] + len(symbol_explode(last_token[0]))
+            end_off = sub_offsets[end_sym_idx] if end_sym_idx < len(sub_offsets) else total_len
+            k = bisect.bisect_right(line_starts, end_off) - 1
+            return (line_idx + k, end_off - line_starts[k])
+
+    return None
