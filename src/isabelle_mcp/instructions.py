@@ -9,9 +9,10 @@ the line of interest.
 
 ### Evaluation tools (3)
 
-1. **isabelle_evaluate_to(file_path, line)** — start evaluating up to a
-   target line.  Returns within ~10 s with errors found so far.  If
-   evaluation is still running, call ``evaluation_status`` to poll.
+1. **isabelle_evaluate_to(file_path, line, after_text=None)** — start
+   evaluating up to a target line, or up to ``after_text`` on that line.
+   Returns within ~10 s with errors found so far.  If evaluation is still
+   running, call ``evaluation_status`` to poll.
 2. **isabelle_evaluation_status()** — check progress of an ongoing
    evaluation.  Returns new errors since the last check and current
    execution position.  Call repeatedly until status is ``complete``.
@@ -29,7 +30,7 @@ running, they fail with a message to call ``evaluation_status``.
 6. **isabelle_local_occurrences** — all in-file occurrences (definition +
    uses) of a locally-defined entity; current file only
 7. **isabelle_diagnostics** — errors, warnings for a line range
-8. **isabelle_goal** — proof goals at position; omit column for
+8. **isabelle_goal** — proof goals at position; omit after_text for
    before/after diff
 9. **isabelle_command_output** — prover messages for a command
 10. **isabelle_session_info** — current session name
@@ -45,7 +46,7 @@ running, they fail with a message to call ``evaluation_status``.
 1. **isabelle_evaluate_to** — evaluate the file to the region of interest.
 2. Poll **isabelle_evaluation_status** until ``status == "complete"``.
 3. **isabelle_goal** — use extensively during proof development (omit
-   column to see tactic effect).
+   after_text to see tactic effect).
 4. **isabelle_diagnostics** — check for errors in a range.
 5. **isabelle_hover** + **isabelle_definition** — understand symbols.
 6. Modify files with your editor, then re-evaluate with ``evaluate_to``.

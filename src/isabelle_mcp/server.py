@@ -98,8 +98,10 @@ async def get_instructions_resource() -> str:
 
 
 @mcp.tool()
-async def isabelle_evaluate_to(file_path: str, line: int, column: int = 0) -> EvaluationResult:
-    """Start evaluating a theory file up to a specific location.
+async def isabelle_evaluate_to(
+    file_path: str, line: int, after_text: str | None = None,
+) -> EvaluationResult:
+    """Start evaluating a theory file up to a location on a line.
 
     The result may indicate evaluation is still in progress.
     If so, call ``evaluation_status`` to update the progress.
@@ -107,9 +109,14 @@ async def isabelle_evaluate_to(file_path: str, line: int, column: int = 0) -> Ev
     Args:
         file_path: Absolute path to .thy file
         line: Target line number (1-indexed). Use -1 for last line.
-        column: Target column (1-indexed). 0 (default) means start of line. -1 means end of line.
+        after_text: Optional text snippet to stop at. Evaluation proceeds through
+            the command ending at this snippet. The snippet is matched on token
+            boundaries (ASCII and Unicode forms are equivalent), must BEGIN on
+            ``line``, and may span onto following lines; its first occurrence is
+            used. Without it (default), evaluation proceeds through the command on
+            ``line``.
     """
-    return await evaluate_to(await _ensure_lsp_started(), file_path, line, column)
+    return await evaluate_to(await _ensure_lsp_started(), file_path, line, after_text)
 
 
 @mcp.tool()
@@ -234,7 +241,7 @@ async def isabelle_goal(
 async def isabelle_command_output(
     file_path: str, line: int, after_text: str | None = None,
 ) -> ToolResult:
-    """Get the Isar command at a position and the prover messages it produced.
+    """Get the Isar command at a position and the output messages it produced.
 
     Returns the command enclosing the position — its full source text and range —
     together with the prover output it emitted (normal/tracing/warning/error/

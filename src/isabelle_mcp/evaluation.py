@@ -29,9 +29,9 @@ from isabelle_mcp.utils import (
     IsabelleToolError,
     LSPCharacter,
     LSPLine,
-    MCPColumn,
     MCPLine,
     lsp_to_mcp_position,
+    resolve_caret,
     severity_int_to_string,
 )
 
@@ -282,7 +282,7 @@ async def evaluate_to(
     client: IsabelleLSPClient,
     file_path: str,
     line: int,
-    column: int = 0,
+    after_text: str | None = None,
 ) -> EvaluationResult:
     async with _evaluation_lock:
         if evaluation_state.active:
@@ -295,34 +295,35 @@ async def evaluate_to(
         await client.open_document(file_path)
         doc = client.open_documents.get(file_path)
         total_lines = (doc.content.count("\n") + 1) if doc else 1
-        mcp_line = _resolve_line(line, total_lines)
-        if mcp_line < 1:
-            raise IsabelleToolError(f"line must be >= 1, got {mcp_line}")
-        if column == -1:
-            lines = doc.content.split("\n") if doc else []
-            lsp_idx = int(mcp_line.to_lsp())
-            lsp_char = LSPCharacter(len(lines[lsp_idx]) if lsp_idx < len(lines) else 0)
-        elif column > 0:
-            lsp_char = MCPColumn(column).to_lsp()
-        else:
-            lsp_char = LSPCharacter(0)
+        anchor_line = _resolve_line(line, total_lines)
+        if anchor_line < 1:
+            raise IsabelleToolError(f"line must be >= 1, got {anchor_line}")
+        lines = doc.content.split("\n") if doc else []
+        # resolve_caret anchors the caret INSIDE the command at the line (or just
+        # past after_text). With a multi-line after_text the caret may land on a
+        # later line, which then becomes the real evaluation destination.
+        caret_line, caret_char = resolve_caret(
+            lines, int(anchor_line.to_lsp()), after_text, line,
+        )
+        dest_line = LSPLine(caret_line).to_mcp()
+        lsp_char = LSPCharacter(caret_char)
 
-        evaluation_state.start(file_path, mcp_line)
+        evaluation_state.start(file_path, dest_line)
 
     try:
         tracker = client.get_processing_tracker(file_path)
         if tracker is not None:
             tracker.require_fresh_update()
-        await client.set_caret(file_path, mcp_line.to_lsp(), lsp_char)
+        await client.set_caret(file_path, dest_line.to_lsp(), lsp_char)
         status, theories, running_commands, errors = await _evaluation_wait_loop(
-            client, file_path, mcp_line, evaluation_state, EVAL_POLL_INTERVAL,
+            client, file_path, dest_line, evaluation_state, EVAL_POLL_INTERVAL,
         )
     except Exception:
         await _cleanup_auto_opened(client, evaluation_state)
         evaluation_state.cancel()
         raise
 
-    dest = int(mcp_line)
+    dest = int(dest_line)
     if status == "complete":
         await _cleanup_auto_opened(client, evaluation_state)
         evaluation_state.complete()

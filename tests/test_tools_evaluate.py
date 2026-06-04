@@ -102,6 +102,32 @@ class TestEvaluateTo:
         assert result.destination_line is not None
         assert result.destination_line >= 11
 
+    @pytest.mark.asyncio
+    async def test_after_text_same_line(self, temp_theory_file, mock_lsp_client):
+        # after_text resolves on its own line; destination stays on that line.
+        result = await evaluate_to(
+            mock_lsp_client, temp_theory_file, 5, after_text="my_const",
+        )
+        assert result.status == "complete"
+        assert result.destination_line == 5
+
+    @pytest.mark.asyncio
+    async def test_after_text_spans_to_later_line(self, temp_theory_file, mock_lsp_client):
+        # Snippet begins on line 8 ("... = 42\"") and ends with `by` on line 9, so
+        # the resolved caret — and the destination — land on line 9.
+        result = await evaluate_to(
+            mock_lsp_client, temp_theory_file, 8, after_text='= 42" by',
+        )
+        assert result.status == "complete"
+        assert result.destination_line == 9
+
+    @pytest.mark.asyncio
+    async def test_after_text_not_found(self, temp_theory_file, mock_lsp_client):
+        with pytest.raises(IsabelleToolError, match="not found on line 5"):
+            await evaluate_to(
+                mock_lsp_client, temp_theory_file, 5, after_text="no_such_token_zzz",
+            )
+
 
 class TestEvaluationStatus:
     @pytest.mark.asyncio
