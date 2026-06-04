@@ -63,7 +63,11 @@ async def server_lifespan(_app: Any) -> AsyncGenerator[None]:
             await _lsp_client.shutdown()
 
 
-mcp = FastMCP("Isabelle MCP", lifespan=server_lifespan)
+mcp = FastMCP(
+    "Isabelle MCP",
+    instructions=get_instructions(),
+    lifespan=server_lifespan,
+)
 
 
 async def _ensure_lsp_started() -> IsabelleLSPClient:
@@ -86,12 +90,6 @@ async def notify_file_change(request: Request) -> JSONResponse:
         _file_watcher.notify_file_changed(file_path)
         logger.info("Hook notified file change: %s", file_path)
     return JSONResponse({"ok": True})
-
-
-@mcp.resource("instructions://isabelle-mcp")
-async def get_instructions_resource() -> str:
-    """Get user-facing instructions for using the Isabelle MCP server."""
-    return get_instructions()
 
 
 # ── Evaluation tools ──────────────────────────────────────────────────

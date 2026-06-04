@@ -13,12 +13,37 @@ pip install -e ".[dev]"
 {
   "mcpServers": {
     "isabelle": {
-      "command": "isa-lsp",
-      "env": { "ISABELLE_SESSION": "HOL" }
+      "command": "isabelle-mcp",
+      "args": ["-s", "HOL"]
     }
   }
 }
 ```
+
+## Running the server
+
+```bash
+isabelle-mcp -s HOL                              # stdio transport (default)
+isabelle-mcp -s HOL-Analysis --http --port 8371  # shared HTTP server
+isabelle-mcp -s HOL -- -o editor_output_state=true  # args after `--` go to Isabelle
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-s`, `--session` | *(required)* | Isabelle session/logic, e.g. `HOL`, `HOL-Analysis` |
+| `--http` | off (stdio) | Run as a shared HTTP server instead of stdio |
+| `--host` | `127.0.0.1` | HTTP bind host |
+| `--port` | `8371` | HTTP bind port |
+| `-- ...` | — | Everything after `--` is forwarded to `isabelle vscode_server` |
+
+### Environment variables
+
+These are read once at process startup; a connected agent cannot change them.
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `ISA_LSP_EVAL_POLL_INTERVAL` | `10` | Seconds an evaluate/poll call waits before returning `in_progress` |
+| `ISA_LSP_DUMP` | unset | If set to a path, append a JSON wire-log of all LSP traffic (debugging) |
 
 ## Tools
 
@@ -31,7 +56,7 @@ pip install -e ".[dev]"
 | `isabelle_definition` | Jump to symbol definition |
 | `isabelle_local_occurrences` | In-file occurrences (definition + uses) of a local entity |
 | `isabelle_diagnostics` | Errors, warnings, processing status |
-| `isabelle_goal` | **Proof goals** — omit column for before/after diff |
+| `isabelle_goal` | **Proof goals** — omit after_text for before/after diff |
 | `isabelle_command_output` | Prover output messages |
 | `isabelle_session_info` | Current session info |
 

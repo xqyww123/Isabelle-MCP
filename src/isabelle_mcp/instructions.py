@@ -50,16 +50,6 @@ running, they fail with a message to call ``evaluation_status``.
 4. **isabelle_diagnostics** — check for errors in a range.
 5. **isabelle_hover** + **isabelle_definition** — understand symbols.
 6. Modify files with your editor, then re-evaluate with ``evaluate_to``.
-
-## Session configuration
-
-Default session is **HOL**.  Override via ``ISABELLE_SESSION`` env var
-before starting the MCP server.
-
-## Configuration
-
-- ``ISA_LSP_EVAL_POLL_INTERVAL`` env var controls the poll timeout in
-  seconds (default ``10``).
 """
 
 
