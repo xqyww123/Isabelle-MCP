@@ -4,7 +4,20 @@ from typing import Any
 import pytest
 
 from isabelle_mcp.lsp_client import DocumentState
-from isabelle_mcp.utils import LSPCharacter, LSPLine
+from isabelle_mcp.utils import LSPCharacter, LSPLine, set_symbols_text
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _seed_symbol_table():
+    """Seed the symbol table from the bundled fixture.
+
+    At runtime the table is seeded over PIDE/symbols; in tests there is no
+    server, so we seed from a checked-in copy of Isabelle's etc/symbols. This
+    keeps the ASCII/Unicode conversion (and the token tests that rely on it)
+    hermetic — independent of whether 'isabelle' is on PATH.
+    """
+    symbols_file = Path(__file__).parent / "data" / "symbols"
+    set_symbols_text(symbols_file.read_text(encoding="utf-8"))
 
 
 @pytest.fixture

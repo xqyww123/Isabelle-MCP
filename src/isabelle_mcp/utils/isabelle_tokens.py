@@ -1,16 +1,14 @@
 """Isabelle tokenizer and symbol occurrence finder.
 
 Implements a simplified Isabelle lexer based on symbol_pos.ML and lexicon.ML,
-operating in ASCII space via Isabelle_RPC_Host.
+operating in ASCII space via the vendored isabelle_symbols module.
 """
 
 import bisect
 import logging
 
-from Isabelle_RPC_Host.position import symbol_explode
-from Isabelle_RPC_Host.unicode import ascii_of_unicode
-
 from isabelle_mcp.utils.core import IsabelleToolError
+from isabelle_mcp.utils.isabelle_symbols import ascii_of_unicode, symbol_explode
 
 logger = logging.getLogger(__name__)
 

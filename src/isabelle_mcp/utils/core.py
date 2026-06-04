@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from urllib.parse import quote, unquote
 
+from fastmcp.exceptions import ToolError
+
 
 # MCP positions are 1-indexed; LSP positions are 0-indexed.
 # Subclassing int gives: Pyright type safety, zero-cost comparisons,
@@ -39,8 +41,13 @@ class LSPCharacter(int):
         return MCPColumn(self + 1)
 
 
-class IsabelleToolError(Exception):
-    pass
+class IsabelleToolError(ToolError):
+    """An expected, actionable error meant for the calling agent.
+
+    Inherits :class:`fastmcp.exceptions.ToolError` so its message is always
+    delivered to the LLM (unaffected by ``mask_error_details``) and is kept
+    semantically distinct from unexpected internal bugs.
+    """
 
 
 def check_pide_response(response: object, operation: str, *, allow_none: bool = False) -> object:

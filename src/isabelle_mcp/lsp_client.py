@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import re
 import subprocess
 import time
@@ -18,6 +19,7 @@ from isabelle_mcp.utils import (
     LSPLine,
     file_path_to_uri,
     parse_goals_from_html,
+    set_symbols_text,
     uri_to_file_path,
 )
 
@@ -26,6 +28,22 @@ logger = logging.getLogger(__name__)
 JsonDict = dict[str, Any]
 
 _unicode_option_cache: str | None = None
+
+# Raw wire dump: when ISA_LSP_DUMP names a file, every JSON-RPC frame in/out of
+# the vscode_server is appended there as one JSON line per frame. Default off so
+# the shared/live server is unaffected.
+_DUMP_PATH: str | None = os.environ.get("ISA_LSP_DUMP") or None
+
+
+def _wire_dump(direction: str, message: JsonDict) -> None:
+    if _DUMP_PATH is None:
+        return
+    try:
+        with open(_DUMP_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"t": time.time(), "dir": direction, "msg": message},
+                                ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
 
 def unicode_symbols_option() -> str:
@@ -196,6 +214,7 @@ class IsabelleLSPClient:
         self.reader_task = asyncio.create_task(self._read_loop())
         self.stderr_task = asyncio.create_task(self._drain_stderr())
         await self.initialize()
+        await self._seed_symbols()
 
     async def initialize(self) -> dict[str, Any]:
         response = await self.request("initialize", {
@@ -209,6 +228,35 @@ class IsabelleLSPClient:
             self.isabelle_version = result.get("serverInfo", {}).get("version", "unknown")
         await self.notify("initialized", {})
         return result
+
+    async def _seed_symbols(self) -> None:
+        """Fetch the Isabelle symbol table and seed the local converter.
+
+        Best-effort: the patched server answers PIDE/symbols with the text of its
+        etc/symbols files, which feeds ascii_of_unicode without any subprocess.
+        On a stock/unpatched server this fails silently and the converter falls
+        back to 'isabelle getenv' on first use.
+        """
+        try:
+            text = await self.get_symbols()
+        except (IsabelleToolError, asyncio.TimeoutError) as exc:
+            logger.info("PIDE/symbols unavailable (%s); converter will use fallback.", exc)
+            return
+        if text:
+            set_symbols_text(text)
+
+    async def get_symbols(self) -> str:
+        """Return the concatenated text of the server's etc/symbols files.
+
+        Uses the patched PIDE/symbols request. Returns "" if the server replies
+        without content.
+        """
+        result = await self.request("PIDE/symbols", {})
+        if isinstance(result, dict):
+            content = result.get("content")
+            if isinstance(content, str):
+                return content
+        return ""
 
     async def shutdown(self) -> None:
         if self.process and self.process.returncode is None:
@@ -274,6 +322,7 @@ class IsabelleLSPClient:
     async def _send(self, message: JsonDict) -> None:
         if not self.process or not self.process.stdin:
             raise IsabelleToolError("LSP process not running")
+        _wire_dump("out", message)
         content = json.dumps(message).encode('utf-8')
         header = f"Content-Length: {len(content)}\r\n\r\n".encode('ascii')
         async with self._write_lock:
@@ -331,7 +380,10 @@ class IsabelleLSPClient:
         except json.JSONDecodeError:
             logger.warning("LSP message has invalid JSON (length=%d): %s", content_length, content[:200])
             return {}
-        return message if isinstance(message, dict) else {}
+        if isinstance(message, dict):
+            _wire_dump("in", message)
+            return message
+        return {}
 
     async def _drain_stderr(self) -> None:
         if not self.process or not self.process.stderr:
