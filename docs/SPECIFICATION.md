@@ -1,7 +1,7 @@
 # Isa-LSP Functional Specification
 
 **Version:** 0.1.0
-**Date:** 2026-03-07
+**Date:** 2026-06-04
 **Status:** Draft with current implementation notes
 
 > Documentation reliability note:
@@ -72,7 +72,11 @@ Isa-LSP is a Model Context Protocol (MCP) server that provides AI agents (like C
 1. **Structured Outputs**: All tools return Pydantic models, never bare primitives or lists
 2. **Consistent Naming**: `isabelle_{category}_{action}` pattern
 3. **1-Indexed Positions**: All line/column numbers are 1-indexed (explicit in docs)
-4. **Optional Column Pattern**: Omitting column gives before/after view (for proof states)
+4. **Symbol- and Snippet-Based Targeting**: Agents are unreliable at counting columns,
+   so position-sensitive tools take a *text snippet* instead. `isabelle_hover`,
+   `isabelle_definition`, and `isabelle_local_occurrences` take a `symbol` (the token
+   text to find on the line); `isabelle_goal` and `isabelle_command_output` take an
+   optional `after_text` (the command right after that snippet is used)
 5. **Custom Exceptions**: `IsabelleToolError` for tool failures
 6. **Tool Annotations**: Mark readonly, idempotent, and destructive operations
 7. **Concise Documentation**: Instruction card + docstrings
@@ -86,27 +90,53 @@ Isa-LSP is a Model Context Protocol (MCP) server that provides AI agents (like C
 def tool() -> List[str]: ...
 
 # GOOD: Wrapped in result model
-class DiagnosticsResult(BaseModel):
-    success: bool = Field(True, description="True if no errors")
-    items: List[DiagnosticMessage] = Field(default_factory=list)
+class LocalOccurrencesResult(BaseModel):
+    symbol: str = Field(description="Symbol being looked up")
+    occurrences: List[Occurrence] = Field(default_factory=list)
 
-def tool() -> DiagnosticsResult: ...
+def tool() -> LocalOccurrencesResult: ...
 ```
 
 ### 2.3 Parameter Conventions
 
 - `file_path: str` - Absolute path to theory file
-- `line: int` - 1-indexed line number (Field ge=1)
-- `column: Optional[int]` - 1-indexed column (omit for ranges/before-after)
-- `max_*: int` - Limits (max_completions, max_results)
-- `interactive: bool` - Verbose output flag
-- `theorem_name: str` - Fully qualified identifier
+- `line: int` - 1-indexed line number; evaluation tools also accept
+  negative indices counting from the end (`-1` = last line)
+- `symbol: str` - Token text to locate on the line (hover, definition,
+  local occurrences); matched on token boundaries, ASCII and Unicode forms equivalent
+- `after_text: str | None` - Optional snippet on the line; the command right after
+  it is used (goal, command output). Without it, the command at the end of the line
+  is used. `isabelle_evaluate_to` uses it as a stop point and the snippet may span
+  onto following lines
 
 ---
 
 ## 3. Feature Catalog
 
-### 3.1 Standard LSP Tools (5 tools)
+The current server registers **9 MCP tools**: three evaluation tools and six
+query tools. (`isabelle_completions`, `isabelle_preview`, and `isabelle_edit`
+below are design targets, not registered tools.)
+
+### 3.0 Evaluation Tools (3 tools)
+
+Evaluation drives Isabelle's processing; the query tools below read its results.
+
+#### Tool: `isabelle_evaluate_to`
+**Purpose**: Start checking a theory file up to a target line (auto-starts the prover)
+**Returns**: Plain-text per-file snapshot (errors / warnings / running lines) — may
+report `in_progress`; poll with `isabelle_evaluation_status`
+**Priority**: High (entry point for all checking)
+
+#### Tool: `isabelle_evaluation_status`
+**Purpose**: Check progress of an ongoing evaluation (per-file errors/warnings/running
+line spans, completion)
+**Returns**: Plain-text per-file snapshot
+
+#### Tool: `isabelle_cancel_evaluation`
+**Purpose**: Cancel an ongoing evaluation; already-checked results stay valid
+**Returns**: Plain-text status message
+
+### 3.1 Standard LSP Tools (4 tools)
 
 Based on `isabelle vscode_server` analysis - **only LSP-native features**:
 
@@ -135,29 +165,24 @@ Based on `isabelle vscode_server` analysis - **only LSP-native features**:
 **Priority**: Medium (Navigation)
 **Pattern**: New (no Lean equivalent)
 
-#### Tool 5: `isabelle_diagnostics`
-**Purpose**: Get prover diagnostics (errors, warnings, info)
-**LSP Mapping**: Cached `textDocument/publishDiagnostics` notifications ✅
-**Priority**: High (Essential)
-**Pattern**: Like `lean_diagnostic_messages`
-
 ### 3.2 PIDE Extension Tools (3 tools)
 
 Isabelle-specific features - **only PIDE-native methods**:
 
-#### Tool 6: `isabelle_goal`
-**Purpose**: Get proof state (goals, assumptions) at position
+#### Tool 5: `isabelle_goal`
+**Purpose**: Get the Isar command at a position and the proof state (subgoals) after it runs
 **PIDE Mapping**: `PIDE/state_*` sequence ✅
 **Priority**: **CRITICAL** (Most important tool for theorem proving)
-**Pattern**: Like `lean_goal` with optional column for before/after
+**Pattern**: Like `lean_goal`; targeting is by optional `after_text`, not a column
 
-#### Tool 7: `isabelle_command_output`
-**Purpose**: Get prover messages for command (writeln, warnings, errors)
+#### Tool 6: `isabelle_command_output`
+**Purpose**: Get the Isar command at a position and the prover messages it produced
+(including the full error/warning message text — this is where error detail is read)
 **PIDE Mapping**: `PIDE/dynamic_output` notifications ✅
 **Priority**: Medium (Debugging)
-**Pattern**: New (Isabelle-specific)
+**Pattern**: New (Isabelle-specific); targeting is by optional `after_text`
 
-#### Tool 8: `isabelle_preview` (Design Target)
+#### Tool 7: `isabelle_preview` (Design Target)
 **Purpose**: Generate HTML preview/documentation
 **Current Status**: Not exposed as an MCP tool (the LSP-client layer supports it via `request_preview`)
 **PIDE Mapping**: `PIDE/preview_request` → `PIDE/preview_response` ✅
@@ -166,7 +191,7 @@ Isabelle-specific features - **only PIDE-native methods**:
 
 ### 3.3 Document Editing Tool (Design Target)
 
-#### Tool 9: `isabelle_edit`
+#### Tool 8: `isabelle_edit`
 **Purpose**: Edit theory file content and trigger PIDE reprocessing (like editing in VS Code)
 **Current Status**: Not implemented in the current server
 **LSP Mapping**: `textDocument/didChange` (Full sync)
@@ -175,7 +200,7 @@ Isabelle-specific features - **only PIDE-native methods**:
 
 ### 3.4 Session Management Tools (1 tool)
 
-#### Tool 10: `isabelle_session_info`
+#### Tool 9: `isabelle_session_info`
 **Purpose**: Get the current session name
 **LSP Mapping**: In-memory client state ✅
 **Priority**: Low (Introspection)
@@ -317,6 +342,7 @@ class DeclarationLocation(BaseModel):
         default_factory=list,
         description="Definition locations (may be multiple for overloaded symbols)"
     )
+    note: Optional[str] = Field(default=None, description="Warning note (e.g. line still running)")
 ```
 
 ---
@@ -351,75 +377,7 @@ class Occurrence(BaseModel):
 class LocalOccurrencesResult(BaseModel):
     symbol: str = Field(description="Symbol being looked up")
     occurrences: List[Occurrence] = Field(default_factory=list)
-```
-
----
-
-#### 4.1.5 `isabelle_diagnostics`
-
-**Description**: Get prover diagnostics (errors, warnings, information) for a theory file. **This is essential for checking if your changes are correct.**
-
-**Tool Annotations**:
-```python
-ToolAnnotations(
-    title="Diagnostics",
-    readOnlyHint=True,
-    idempotentHint=True,
-)
-```
-
-**Input Parameters**:
-```python
-file_path: Annotated[str, Field(description="Absolute path to .thy file")]
-start_line: Annotated[Optional[int], Field(
-    description="Filter diagnostics from this line (1-indexed)", ge=1
-)] = None
-end_line: Annotated[Optional[int], Field(
-    description="Filter diagnostics to this line (1-indexed)", ge=1
-)] = None
-interactive: Annotated[bool, Field(
-    description="Returns verbose nested markup with embedded PIDE information. "
-                "Only use when plain text is insufficient."
-)] = False
-```
-
-**Output Model**:
-```python
-class DiagnosticMessage(BaseModel):
-    severity: str = Field(description="error | warning | information | hint")
-    message: str = Field(description="Diagnostic message text")
-    line: int = Field(description="Line number (1-indexed)", ge=1)
-    column: int = Field(description="Column number (1-indexed)", ge=1)
-    end_line: int = Field(description="End line (1-indexed)", ge=1)
-    end_column: int = Field(description="End column (1-indexed)", ge=1)
-
-class DiagnosticsResult(BaseModel):
-    success: bool = Field(True, description="True if the queried file/range has no errors")
-    items: List[DiagnosticMessage] = Field(default_factory=list)
-    processing_complete: bool = Field(description="Whether PIDE finished processing")
-    failed_dependencies: List[str] = Field(
-        default_factory=list,
-        description="File paths of theories that failed to load"
-    )
-```
-
-**Example Response**:
-```json
-{
-  "success": false,
-  "items": [
-    {
-      "severity": "error",
-      "message": "Undefined constant \"foo\"",
-      "line": 42,
-      "column": 10,
-      "end_line": 42,
-      "end_column": 13
-    }
-  ],
-  "processing_complete": true,
-  "failed_dependencies": []
-}
+    note: Optional[str] = Field(default=None, description="Warning note (e.g. line still running)")
 ```
 
 ---
@@ -428,9 +386,15 @@ class DiagnosticsResult(BaseModel):
 
 #### 4.2.1 `isabelle_goal` ⭐ MOST IMPORTANT TOOL
 
-**Description**: Get proof goals at a position. **MOST IMPORTANT tool for theorem proving - use often!**
+**Description**: Get the Isar command enclosing a position and the proof state
+(remaining subgoals) **after** that command runs. **MOST IMPORTANT tool for theorem
+proving — use often!** An empty `subgoals` list means the proof is finished at that
+command. Auto-starts evaluation if the line has not been evaluated yet.
 
-Omit `column` to see `goals_before` (at line start) and `goals_after` (at line end), showing how the tactic transforms the proof state. "no goals" means the proof is complete.
+Without `after_text`, the command at the end of the line is used. Pass `after_text`
+to target the command right after that snippet on the line. To see a tactic's
+before/after effect, query it twice: once at the line *before* the tactic and once
+at the tactic's own line.
 
 **Tool Annotations**:
 ```python
@@ -445,51 +409,46 @@ ToolAnnotations(
 ```python
 file_path: Annotated[str, Field(description="Absolute path to .thy file")]
 line: Annotated[int, Field(description="Line number (1-indexed)", ge=1)]
-column: Annotated[Optional[int], Field(
-    description="Column number (1-indexed). Omit to see before/after tactic transformation.", ge=1
+after_text: Annotated[Optional[str], Field(
+    description="Optional text on the line; the command right after it is used. "
+                "Without it, the command at the end of the line is used."
 )] = None
 ```
 
 **Output Model**:
 ```python
+class CommandSpan(BaseModel):
+    text: str = Field(description="Full source text of the Isar command (may span multiple lines)")
+    start_line: int = Field(ge=1, description="Command start line (1-indexed)")
+    start_column: int = Field(ge=1, description="Command start column (1-indexed)")
+    end_line: int = Field(ge=1, description="Command end line (1-indexed)")
+    end_column: int = Field(ge=1, description="Command end column (1-indexed, just past the last character)")
+
 class GoalState(BaseModel):
-    line_context: str = Field(description="Source line where goals were queried")
-
-    # If column is provided:
-    goals: Optional[List[str]] = Field(None, description="Goals at specific column")
-
-    # If column is omitted:
-    goals_before: Optional[List[str]] = Field(None, description="Goals at line start (before tactic)")
-    goals_after: Optional[List[str]] = Field(None, description="Goals at line end (after tactic)")
-
-    # Additional context:
-    context: Optional[str] = Field(None, description="Local proof context (assumptions, fixes)")
+    command: Optional[CommandSpan] = Field(
+        default=None,
+        description="The Isar command enclosing the queried position — its full source "
+                    "text and range. None if there is no command at the position."
+    )
+    subgoals: List[str] = Field(
+        default_factory=list,
+        description="Open subgoals of the proof state after the command runs — one "
+                    "string per subgoal; empty list means no subgoals remain."
+    )
+    note: Optional[str] = Field(default=None, description="Warning note (e.g. line still running)")
 ```
 
-**Example Response (column omitted)**:
+**Example Response**:
 ```json
 {
-  "line_context": "  by (auto simp: lemma1)",
-  "goals_before": [
-    "⋀x. P x ⟹ Q x",
-    "R y"
-  ],
-  "goals_after": [],
-  "context": "fix x y\nassume \"A x\" \"B y\""
-}
-```
-
-**Example Response (column provided)**:
-```json
-{
-  "line_context": "  apply (induction n)",
-  "goals": [
-    "case 0\nthen show ?thesis",
-    "case (Suc n)\nthen show ?thesis"
-  ],
-  "goals_before": null,
-  "goals_after": null,
-  "context": "fix n :: nat"
+  "command": {
+    "text": "by (auto simp: lemma1)",
+    "start_line": 12,
+    "start_column": 3,
+    "end_line": 12,
+    "end_column": 25
+  },
+  "subgoals": []
 }
 ```
 
@@ -497,7 +456,9 @@ class GoalState(BaseModel):
 
 #### 4.2.2 `isabelle_command_output`
 
-**Description**: Get prover output messages (writeln, warnings, errors) for the command at a position.
+**Description**: Get the Isar command enclosing a position and the prover output it
+produced. Auto-starts evaluation if the line has not been evaluated yet. Targeting
+follows the same `after_text` rule as `isabelle_goal`.
 
 **Tool Annotations**:
 ```python
@@ -512,17 +473,31 @@ ToolAnnotations(
 ```python
 file_path: Annotated[str, Field(description="Absolute path to .thy file")]
 line: Annotated[int, Field(description="Line number (1-indexed)", ge=1)]
+after_text: Annotated[Optional[str], Field(
+    description="Optional text on the line; the command right after it is used. "
+                "Without it, the command at the end of the line is used."
+)] = None
 ```
 
-**Output Model**:
+**Output**: This tool is registered with `output_schema=None` and returns a
+**formatted plain-text** `ToolResult`, not a JSON model. The underlying
+`CommandOutputResult` (below) is rendered by `format_command_output` into a
+location header (`[line N]` or `[line N-M]`), the command source text, and one
+`[kind] message` line per output message (or `(no output)`).
+
 ```python
 class OutputMessage(BaseModel):
-    kind: str = Field(description="writeln | warning | error | information")
-    text: str = Field(description="Message content")
+    kind: str = Field(description="normal | tracing | warning | error | information | state")
+    message: str = Field(description="Message content")
 
 class CommandOutputResult(BaseModel):
-    line_context: str = Field(description="Source line")
+    command: Optional[CommandSpan] = Field(
+        default=None,
+        description="The Isar command enclosing the queried position — its full source "
+                    "text and range. None if there is no command at the position."
+    )
     messages: List[OutputMessage] = Field(default_factory=list)
+    note: Optional[str] = Field(default=None, description="Warning note (e.g. line still running)")
 ```
 
 ---
@@ -719,6 +694,128 @@ class SessionInfo(BaseModel):
 
 ---
 
+### 4.5 Evaluation Tools
+
+These three tools drive Isabelle's processing. All return a **plain-text per-file
+snapshot** (a `ToolResult` with `output_schema=None`, i.e. no structured output
+schema), not a Pydantic model. Because checking runs asynchronously, an
+`isabelle_evaluate_to` call may return before processing reaches the target — it
+then reports that evaluation is still in progress, and the agent polls
+`isabelle_evaluation_status` until it completes (or cancels a stuck run). Errors do
+**not** halt checking: every command up to the target is checked even if an earlier
+one fails.
+
+The snapshot lists each relevant file with up to three columns — **errors** /
+**warnings** / **running** — as 1-indexed line spans. `errors` is the line-deduped
+union of the `text_overview_error` and `background_bad` decorations, so a `sorry`, a
+failed proof, and a killed command all show up as errors (there is no separate
+"sorry" category). `warnings` is `text_overview_warning`; `running` is
+`background_running1` (still-executing forked proofs). Classification is
+decoration-only — no diagnostics channel is read for the snapshot. For a file with
+no decoration (e.g. an unopened dependency) the snapshot falls back to
+`theory_status` **counts** (failed→errors, warned→warnings, no line numbers) and
+uses `unprocessed`/`consolidated` to show "in progress" vs "clean". Full
+error/warning message *text* is fetched separately via `isabelle_command_output`.
+
+#### 4.5.1 `isabelle_evaluate_to`
+
+**Description**: Start evaluating a theory file up to a location on a line.
+Auto-starts the prover. The result may indicate evaluation is still in progress.
+
+**Input Parameters**:
+```python
+file_path: Annotated[str, Field(description="Absolute path to .thy file")]
+line: Annotated[int, Field(description="Target line number (1-indexed). Use -1 for last line.")]
+after_text: Annotated[Optional[str], Field(
+    description="Optional snippet to stop at. Evaluation proceeds through the command "
+                "ending at this snippet, matched on token boundaries (ASCII/Unicode "
+                "equivalent); it must BEGIN on `line` and may span onto following lines."
+)] = None
+```
+
+#### 4.5.2 `isabelle_evaluation_status`
+
+**Description**: Check the progress of an ongoing evaluation. Returns the current
+per-file snapshot (errors / warnings / running line spans) and whether it finished.
+**Input Parameters**: None. Reports "No evaluation in progress." when idle.
+
+#### 4.5.3 `isabelle_cancel_evaluation`
+
+**Description**: Cancel an ongoing evaluation. Stops Isabelle from processing
+further; already-processed results remain valid for querying. **Input Parameters**:
+None.
+
+**Output** (shared by all three): a **plain-text string** (no `output_schema`).
+Internally these tools return an `EvaluationView` dataclass (see
+`src/isabelle_mcp/models.py`) which is rendered to the agent-facing text by
+`format_evaluation_result` in `src/isabelle_mcp/evaluation.py`. The internal shapes
+are:
+
+```python
+@dataclass
+class FileSnapshot:
+    file_path: str
+    lined: bool   # True = decoration spans; False = theory_status-count fallback
+    state: str    # "clean" | "in_progress" | "problems"
+    errors: list[tuple[int, int]] = field(default_factory=list)    # (start, end) line spans
+    warnings: list[tuple[int, int]] = field(default_factory=list)
+    running: list[tuple[int, int]] = field(default_factory=list)
+    error_count: int = 0
+    warning_count: int = 0
+    running_count: int = 0
+
+@dataclass
+class EvaluationView:
+    status: str   # complete | in_progress | no_evaluation | cancelled
+    destination_line: int | None = None
+    message: str = ""
+    files: list[FileSnapshot] = field(default_factory=list)
+    running_commands: list[RunningCommand] = field(default_factory=list)
+```
+
+The rendered text leads with the status message and then one block per file, e.g.:
+
+```
+Evaluation complete, arrived at line 42.
+
+Scratch.thy:
+  errors: 37, 40-41
+  warnings: 12
+  running: 55
+```
+
+A file with no problems renders as `Scratch.thy: clean`; an unopened dependency with
+only theory_status counts renders as `Imported.thy: 1 error (no line info)` or
+`Imported.thy: in progress`. A `RunningCommand` whose `elapsed_seconds` keeps
+climbing while it stays in the `running` column is the signature of a stuck
+evaluation; cancel it, fix the command, and re-evaluate.
+
+---
+
+### 4.6 File Synchronization
+
+There is no `isabelle_edit` tool (it remains a design target, §4.3). Instead, the
+agent edits `.thy`/`.ML` files on disk with ordinary tools, and the server pushes
+those edits to Isabelle automatically:
+
+- **Editor-opened `.thy` (the MCP's job).** A `FileWatcher` watches the parent
+  directories of open files and, on any change, **immediately** pushes that file to
+  Isabelle as a `textDocument/didChange` (event-driven — no dirty-set, no polling, no
+  HTTP hook). Its four handlers include `moved`, so atomic-rename saves (Claude
+  Edit/Write, jEdit, sed) are caught. A tool-call backstop re-stats every open file at
+  the start of each MCP call and pushes any the watcher missed (content comparison is
+  the final gate).
+- **Dependency files (the server's job).** `.ML` blobs and imported `.thy` are synced
+  by Isabelle's own vscode_server File_Watcher. Because that watcher debounces by
+  `vscode_load_delay` (default `0.5` s), the backstop also stats the `theory_status`
+  dependency set and waits out the debounce when a dependency was just edited.
+- Pushing an edit *during* an in-progress evaluation is intentional and supported:
+  PIDE re-checks incrementally and the processing tracker adopts the new version —
+  exactly as editing in jEdit/VS Code while checking runs. The locked sync paths do not
+  skip while an evaluation is active.
+
+---
+
 ## 5. Error Handling
 
 ### 5.1 Custom Exception
@@ -752,38 +849,15 @@ def check_pide_response(response: Any, operation: str, *, allow_none: bool = Fal
 
 ## 6. Instructions Card
 
-```python
-INSTRUCTIONS = """## General Rules
-- All line and column numbers are 1-indexed.
-- Modify theory files with normal filesystem/editor tools, then use diagnostics
-  and goal queries to verify them. `isabelle_edit` is a design target, not a
-  current tool.
+The server-level instructions string delivered to the agent on connect is the
+`INSTRUCTIONS` literal in `src/isabelle_mcp/instructions.py` (returned by
+`get_instructions()` and passed as `FastMCP(..., instructions=...)`). That file is
+the single source of truth; it is **not** reproduced here, to avoid drift.
 
-## Key Tools
-- **isabelle_goal**: Proof state at position. Omit `column` for before/after. MOST IMPORTANT!
-- **isabelle_diagnostics**: Prover errors/warnings. Use after every change.
-- **isabelle_hover**: Type signature + docs. Look up by symbol text on a line.
-- **isabelle_completions**: Code completion suggestions.
-
-## Position Conventions
-- Line/column are 1-indexed (first line = 1, first character = 1)
-- For goals, omit column to see how a tactic transforms the state
-- For hover and definition, pass the symbol text to look up on the line
-
-## Workflow
-1. Open a theory file (automatic on first tool call)
-2. Use isabelle_diagnostics to check for errors
-3. Use isabelle_goal to see proof state
-4. Modify tactics or add lemmas with normal file editing tools
-5. Check isabelle_diagnostics again to verify changes
-6. Use isabelle_hover to understand symbols
-7. Use isabelle_completions for code assistance
-
-## Return Formats
-All tools return JSON objects (Pydantic models). Lists are wrapped in `items` field.
-Empty list = `{"items": []}`.
-"""
-```
+Its key points: positions are 1-indexed and file paths absolute; you edit `.thy`
+files on disk and the server syncs them to Isabelle automatically (§4.6);
+evaluation is asynchronous, so poll `isabelle_evaluation_status` and cancel a stuck
+run rather than waiting for `complete`; and errors do not halt checking.
 
 ---
 
@@ -791,8 +865,8 @@ Empty list = `{"items": []}`.
 
 ### 7.1 Functional Status
 
-1. Current server registers 10 MCP tools.
-2. Standard LSP features (hover, definition, local occurrences, diagnostics) are
+1. Current server registers 9 MCP tools.
+2. Standard LSP features (hover, definition, local occurrences) are
    implemented and covered by tests. Completion is supported at the LSP-client
    layer (`get_completions`) but not yet exposed as an MCP tool.
 3. PIDE tools use Isabelle2024 native notifications:
@@ -809,10 +883,11 @@ Empty list = `{"items": []}`.
 
 1. Current tool names are `isabelle_evaluate_to`, `isabelle_evaluation_status`,
    `isabelle_cancel_evaluation`, `isabelle_hover`, `isabelle_definition`,
-   `isabelle_local_occurrences`, `isabelle_diagnostics`, `isabelle_goal`,
-   `isabelle_command_output`, and `isabelle_session_info`.
+   `isabelle_local_occurrences`, `isabelle_goal`, `isabelle_command_output`, and
+   `isabelle_session_info`.
 2. All public tool positions are 1-indexed.
-3. Tools return Pydantic models rather than bare lists.
+3. Query tools return Pydantic models rather than bare lists; the three evaluation
+   tools return a plain-text snapshot (no structured output schema).
 4. Error handling uses `IsabelleToolError` for expected tool failures.
 
 ### 7.3 Quality Status
@@ -837,8 +912,8 @@ Documentation must not mark future/design-target behavior as implemented.
 | Output models | Pydantic | Pydantic | ✅ Consistent |
 | List wrapper | `items` field | `items` field | ✅ Consistent |
 | Goal query | `lean_goal` | `isabelle_goal` | ✅ Same pattern |
-| Optional column | Yes (before/after) | Yes (before/after) | ✅ Same pattern |
-| Diagnostics | `lean_diagnostic_messages` | `isabelle_diagnostics` | ✅ Same pattern |
+| Position targeting | Optional column | `symbol` / `after_text` snippet | Snippet-based (agents miscount columns) |
+| Diagnostics | `lean_diagnostic_messages` | evaluation snapshot + `isabelle_command_output` | Snapshot lists error/warning lines; message text via `command_output` |
 | Edit | ❌ (external tool) | Not implemented | Design target only |
 | File outline | `lean_file_outline` | ❌ Not in MVP | LSP doesn't support |
 | Code actions | `lean_code_actions` | ❌ Not in MVP | LSP doesn't support |

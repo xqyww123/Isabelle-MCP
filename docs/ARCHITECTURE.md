@@ -1,11 +1,11 @@
 # Isa-LSP Architecture Design
 
 **Version:** 0.2.0
-**Date:** 2026-05-25
-**Status:** Updated for async evaluation model
+**Date:** 2026-06-04
+**Status:** Updated for async evaluation model + file-sync (FileWatcher) model
 
-> The server exposes 10 MCP tools: 3 evaluation lifecycle tools and
-> 7 query tools.  The previous blocking model (where every tool waited
+> The server exposes 9 MCP tools: 3 evaluation lifecycle tools and
+> 6 query tools.  The previous blocking model (where every tool waited
 > for Isabelle to process the file) has been replaced by an explicit
 > evaluate-then-query workflow.
 
@@ -38,8 +38,8 @@ Isa-LSP is a Python-based MCP (Model Context Protocol) server that acts as a bri
 │  └────────────┬─────────────────────────────────────────┘   │
 │               │                                              │
 │  ┌────────────▼─────────────────────────────────────────┐   │
-│  │  MCP Tool Handlers (10 tools)                        │   │
-│  │  Evaluation:                                         │   │
+│  │  MCP Tool Handlers (9 tools)                         │   │
+│  │  Evaluation (plain-text snapshot):                   │   │
 │  │  - isabelle_evaluate_to                              │   │
 │  │  - isabelle_evaluation_status                        │   │
 │  │  - isabelle_cancel_evaluation                        │   │
@@ -47,7 +47,6 @@ Isa-LSP is a Python-based MCP (Model Context Protocol) server that acts as a bri
 │  │  - isabelle_hover                                    │   │
 │  │  - isabelle_definition                               │   │
 │  │  - isabelle_local_occurrences                        │   │
-│  │  - isabelle_diagnostics                              │   │
 │  │  - isabelle_goal                                     │   │
 │  │  - isabelle_command_output                           │   │
 │  │  - isabelle_session_info                            │   │
@@ -96,6 +95,17 @@ Isa-LSP is a Python-based MCP (Model Context Protocol) server that acts as a bri
 │  - Session heap (HOL, Main, etc.)                            │
 └──────────────────────────────────────────────────────────────┘
 ```
+
+**Not shown in the boxes above (file synchronization, §2.5):** a `FileWatcher`
+watches the parent directories of editor-opened `.thy` files (added/removed at
+`open_document`/`close_document`) and, on any change, **immediately** pushes that
+file to Isabelle as a `didChange` — event-driven, no dirty-set and no background
+loop. A tool-call backstop (`resync_and_check_freshness`) re-stats the open files
+at the start of every tool call to catch anything the watcher missed. Dependency
+files (`.ML` blobs, imported `.thy`) are synced by Isabelle's *own* vscode_server
+File_Watcher, not the MCP. The LSP Client Wrapper also owns a per-file
+`ProcessingTracker` (fed by `PIDE/decoration`) used to decide whether a line has
+been processed.
 
 ---
 
@@ -148,7 +158,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
 
 **Responsibility:** Manage communication with `isabelle vscode_server`
 
-**File:** `src/isa_lsp/lsp_client.py`
+**File:** `src/isabelle_mcp/lsp_client.py`
 
 **Key Features:**
 - Subprocess lifecycle management
@@ -157,6 +167,8 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
 - Background notification listener
 - Document state tracking
 - PIDE state panel management
+- Per-file `ProcessingTracker` (PIDE/decoration line-status)
+- Dirty-file sync to Isabelle (`sync_dirty_files` → `didChange`)
 
 **Architecture:**
 ```python
@@ -187,8 +199,11 @@ class IsabelleLSPClient:
     async def open_document(self, file_path: str, content: str = None):
         """Open document in LSP session"""
 
-    async def change_document(self, file_path: str, new_content: str):
-        """Send textDocument/didChange with full content (triggers PIDE reprocessing)"""
+    async def sync_dirty_files(self, dirty_paths: set[str]):
+        """Re-read the open editor docs among dirty_paths; didChange if content changed"""
+
+    async def resync_changed_open_documents(self):
+        """Layer 2 backstop: re-stat all open docs; sync the ones whose stat-sig changed"""
 
     async def close_document(self, file_path: str):
         """Close document in LSP session"""
@@ -383,41 +398,40 @@ class StatePanelManager:
 
 ### 2.5 Document Synchronization
 
-**Challenge:** Keep LSP server's document state in sync with queries
+**Challenge:** Keep the LSP server's document state in sync with the files the agent
+edits on disk, without an explicit edit tool.
 
-**Solution:** Automatic document opening with caching
+**Solution:** Open-on-demand + a FileWatcher-driven dirty/flush model. (There is no
+`DocumentManager` class and no fixed `sleep(2.0)`; processing is awaited dynamically
+via the `ProcessingTracker`.)
 
-```python
-class DocumentManager:
-    def __init__(self, client: IsabelleLSPClient):
-        self.client = client
-        self.open_documents: Set[str] = set()
-
-    async def ensure_open(self, file_path: str):
-        """Ensure document is open in LSP session"""
-        if file_path in self.open_documents:
-            return
-
-        # Read file content
-        with open(file_path, 'r') as f:
-            content = f.read()
-
-        # Send didOpen
-        uri = file_path_to_uri(file_path)
-        await self.client.notify("textDocument/didOpen", {
-            "textDocument": {
-                "uri": uri,
-                "languageId": "isabelle",
-                "version": 1,
-                "text": content
-            }
-        })
-
-        self.open_documents.add(file_path)
-
-        # Wait for initial processing (heuristic: 2 seconds)
-        await asyncio.sleep(2.0)
-```
+- **Open on demand (ensure-open only):** `client.open_document(file_path)` reads the
+  file, sends `textDocument/didOpen`, records a `DocumentState` (version + cached
+  content + on-disk `stat_sig`), and registers the file's parent directory with the
+  `FileWatcher`. For an already-open document it returns immediately — it does **not**
+  re-read disk or send `didChange`; all content syncing is owned by the locked sync
+  paths below. Paths are canonicalized with `os.path.realpath`.
+- **Editor-opened `.thy` — event-driven push (Layer 1):** the `FileWatcher`
+  (`file_watcher.py`) watches the parent directories of open files via inotify (four
+  handlers: modified / created / moved / deleted — `moved` is what catches atomic-rename
+  saves like Claude's Edit/Write). On any change it **immediately** schedules
+  `sync_file_locked(client, path)` onto the event loop (`run_coroutine_threadsafe`),
+  which sends `textDocument/didChange` if the content actually changed. No dirty-set, no
+  polling, no HTTP hook.
+- **Tool-call backstop (Layer 2):** `_ensure_lsp_started` calls
+  `resync_and_check_freshness`, which re-stats every open doc (`stat_sig` compared with
+  `!=`, content the final gate) and pushes the changed ones — catching anything the
+  watcher missed (inotify overflow, NFS, a disabled watcher). Stat'ing runs off the
+  event loop via `asyncio.to_thread`.
+- **Dependency files (Layer 3):** `.ML` blobs and imported `.thy` are synced by
+  Isabelle's *own* vscode_server File_Watcher, not the MCP. Because that watcher has a
+  `vscode_load_delay` debounce (default 0.5 s, read at startup), the tool-call backstop
+  also stats the `theory_status` dependency set; if a dep changed within that window it
+  waits the delay so the server has certainly noticed it before querying.
+- **Mid-evaluation edits are intentional:** the locked sync paths take
+  `_evaluation_state_lock` but do not skip while an evaluation is active; PIDE re-checks
+  incrementally and the `ProcessingTracker` adopts the new version. A long evaluation
+  also re-stats open docs from its wait loop, rate-limited to ≤ once per 3 s.
 
 ---
 
@@ -433,9 +447,11 @@ Isabelle's `vscode_server` reports `textDocumentSync = 2` (Incremental per LSP s
 3. **Incremental reprocessing**: PIDE reprocesses only affected commands in the document
 4. **Output debounce** (500ms `vscode_output_delay`): updated diagnostics pushed via `textDocument/publishDiagnostics`
 
-**Current status:** Not implemented in the current server. The following design
-describes a future `change_document` / `wait_for_processing` layer and an
-`isabelle_edit` MCP tool. For design details, see API_DESIGN.md Section 3.6.
+**Current status:** The *file synchronization* layer described in §2.5 (FileWatcher +
+`sync_dirty_files` + background flush) IS implemented and is how edits reach Isabelle
+today. What is NOT implemented is an explicit `isabelle_edit` MCP tool; the
+`change_document` / per-tool `wait_for_processing` design below is a future layer on
+top of the existing sync. For design details, see API_DESIGN.md Section 3.6.
 
 **Component Interactions:**
 
@@ -467,31 +483,34 @@ future isabelle_edit MCP tool
 
 ---
 
-### 2.7 Diagnostic Caching
+### 2.7 Diagnostic Caching (internal — feeds hover)
 
-**Challenge:** Diagnostics are sent via async notifications, but tools need synchronous access
+**Challenge:** Diagnostics are sent via async notifications, but consumers need
+synchronous access.
 
-**Solution:** Cache diagnostics from `publishDiagnostics` notifications
+**Solution:** Cache diagnostics from `publishDiagnostics` notifications. There is no
+longer an `isabelle_diagnostics` tool that exposes this cache; the only consumer is
+`isabelle_hover`, which attaches the queried line's `DiagnosticMessage`s to its
+result. Error/warning *locations* for the evaluation snapshot come from the
+`PIDE/decoration` channels instead, and *message text* comes from
+`isabelle_command_output` — neither path reads this cache.
 
 ```python
 class DiagnosticCache:
     def __init__(self):
         self.diagnostics: Dict[str, List[Dict]] = {}
-        self.processing_status: Dict[str, bool] = {}
 
     def handle_publish_diagnostics(self, uri: str, diagnostics: List[Dict]):
         """Handle textDocument/publishDiagnostics notification"""
         file_path = uri_to_file_path(uri)
         self.diagnostics[file_path] = diagnostics
 
-        # Heuristic: if no "running" decorations, processing is complete
-        # (In reality, would need to track PIDE decorations)
-        self.processing_status[file_path] = True
-
-    def get_diagnostics(self, file_path: str) -> DiagnosticsResult:
-        """Get cached diagnostics for file"""
+    def diagnostics_on_line(self, file_path: str, line: int) -> List[DiagnosticMessage]:
+        """Diagnostics on a 1-indexed line (used by isabelle_hover)"""
         items = []
         for diag in self.diagnostics.get(file_path, []):
+            if diag["range"]["start"]["line"] + 1 != line:
+                continue
             items.append(DiagnosticMessage(
                 severity=severity_to_string(diag["severity"]),
                 message=diag["message"],
@@ -500,17 +519,12 @@ class DiagnosticCache:
                 end_line=diag["range"]["end"]["line"] + 1,
                 end_column=diag["range"]["end"]["character"] + 1,
             ))
-
-        success = all(item.severity != "error" for item in items)
-        processing_complete = self.processing_status.get(file_path, False)
-
-        return DiagnosticsResult(
-            success=success,
-            items=items,
-            processing_complete=processing_complete,
-            failed_dependencies=[]
-        )
+        return items
 ```
+
+> Illustrative only. Processing/completion status is **not** derived from this cache;
+> it comes from the per-file `ProcessingTracker`, which consumes `PIDE/decoration`
+> `background_running1`/`background_unprocessed1` ranges directly.
 
 ---
 
@@ -551,7 +565,7 @@ IDLE ◄────────────────────── COMPL
 |------|-----------|
 | ``evaluate_to(file, line)`` | Set PIDE caret → wait ``EVAL_POLL_INTERVAL`` (default 10 s) → return errors + status |
 | ``evaluation_status()`` | Wait another interval → return new errors + status |
-| ``cancel_evaluation()`` | Move caret to line 0 → surgically delete+re-add running range text (forces ``discontinue_execution`` inside ``vscode_server``) → return |
+| ``cancel_evaluation()`` | ``force_interrupt``: ``PIDE/cancel_execution`` (global stop) → caret to line 0 → one ``didChange`` appending a space → return (see §3.5) |
 
 ### 3.4 Query Tool Guard
 
@@ -563,15 +577,21 @@ Each query tool calls ``check_evaluation_guard(client, file_path, line)``:
 
 ### 3.5 Cancel / Force-Interrupt Mechanism
 
-``cancel_evaluation`` cannot directly call ``Document.discontinue_execution``
-because ``vscode_server`` does not expose it as an LSP message.  Instead:
+``cancel_evaluation`` calls ``IsabelleLSPClient.force_interrupt(file_path)``,
+which uses the patched ``PIDE/cancel_execution`` request (verified 2026-05-27):
 
-1. Move caret to line 0 (shrinks perspective, prevents re-execution).
-2. Call ``IsabelleLSPClient.force_interrupt(file_path)`` which sends two
-   incremental ``textDocument/didChange`` messages — one deleting the
-   running range's text, one re-inserting it.  Each ``didChange`` triggers
-   ``discontinue_execution`` internally and creates a new execution context,
-   invalidating the old one.
+1. ``PIDE/cancel_execution`` — atomically stops ALL processing globally (target
+   file and dependency theories) and interrupts running worker threads.
+2. ``PIDE/caret_update`` to line 0 — restricts the perspective so processing does
+   not immediately resume.
+3. A single ``textDocument/didChange`` (append a space on line 0) — triggers
+   ``Document.update`` with the restricted perspective; only the header re-processes.
+   The trailing space is self-healing: ``force_interrupt`` drops the document's
+   ``stat_sig`` so the next tool-call stat backstop re-reads disk and pushes the real
+   content (``open_document`` no longer re-reads an already-open doc — see §2.5).
+
+``PIDE/cancel_execution`` replaced earlier approaches that did not reliably stop
+forked proofs (caret-move-only, edit-only, insert+delete pairs).
 
 ## 3a. Tool Implementation Pattern (Query Tools)
 
@@ -623,22 +643,22 @@ AI Agent calls isabelle_goal(file, line)
          │
          ├─→ Get LSP client from context
          │
-         ├─→ Ensure document is open
+         ├─→ Ensure document is open + check_evaluation_guard
          │   │
-         │   └─→ If not: send textDocument/didOpen
+         │   └─→ If not open: send textDocument/didOpen
          │
-         ├─→ Create state panel
+         ├─→ resolve_caret(after_text or end-of-line) → (caret_line, caret_char)
+         ├─→ get_command_at_position → CommandSpan
+         │
+         ├─→ Create state panel (single query at the resolved caret)
          │   │
-         │   ├─→ Send PIDE/state_init
-         │   ├─→ Send PIDE/caret_update (line start)
-         │   ├─→ Wait for PIDE/state_output → goals_before
-         │   ├─→ Send PIDE/caret_update (line end)
-         │   ├─→ Wait for PIDE/state_output → goals_after
+         │   ├─→ Send PIDE/caret_update + PIDE/state_init
+         │   ├─→ Wait for PIDE/state_output → subgoals
          │   └─→ Send PIDE/state_exit
          │
-         ├─→ Parse goals from HTML
+         ├─→ Parse subgoals from HTML
          │
-         └─→ Return GoalState model
+         └─→ Return GoalState(command, subgoals, note)
 ```
 
 ### 4.3 Edit Tool Call Flow (Future Design)
@@ -789,11 +809,12 @@ All `IsabelleToolError` exceptions are caught by FastMCP and returned as error r
 
 **Problem:** PIDE needs time to process documents (1-5s depending on size)
 
-**Solution:** Wait heuristics and caching
+**Solution:** Open-once caching + dynamic processing waits
 
 **Implementation:**
-- Cache list of open documents
-- Add 2-second delay after opening before first query
+- Cache open documents in `DocumentState` (open once, reuse)
+- Wait for the target region dynamically via the `ProcessingTracker`
+  (`wait_for_processing` / `wait_for_processing_bounded`), not a fixed delay
 - Return `processing_complete` flag in diagnostics
 
 ### 7.3 State Panel Management
@@ -904,7 +925,7 @@ pip install -e .
   "mcpServers": {
     "isabelle-lsp": {
       "command": "python",
-      "args": ["-m", "isa_lsp.server"],
+      "args": ["-m", "isabelle_mcp.server"],
       "env": {
         "ISABELLE_SESSION_PATH": "/path/to/isabelle/session"
       }
@@ -1048,16 +1069,18 @@ AI Agent
 
 ```
 AI Agent
-   │ MCP: isabelle_goal(file, line=42, column=None)
+   │ MCP: isabelle_goal(file, line=42, after_text=None)
    │
    ▼
 MCP Server
    │ Route to goal tool handler
+   │ resolve_caret(after_text or end-of-line) → (caret_line, caret_char)
+   │ get_command_at_position → CommandSpan (enclosing command source+range)
    │
    ▼
 State Panel Manager
    │ PIDE: {"method": "PIDE/caret_update",
-   │        "params": {"line": 41, "character": 0}}
+   │        "params": {"line": 41, "character": <caret_char>}}
    │ PIDE: {"method": "PIDE/state_init"}
    │
    ▼
@@ -1071,36 +1094,18 @@ isabelle vscode_server
    ▼
 State Panel Manager
    │ Receive state_output and learn panel id = 1
-   │ Store as goals_before
    │ PIDE: {"method": "PIDE/state_exit", "params": {"id": "<panel_id>"}}
    │
-   │ Repeat the same temporary-panel sequence at line end:
-   │ PIDE: {"method": "PIDE/caret_update",
-   │        "params": {"line": 41, "character": <end>}}
-   │ PIDE: {"method": "PIDE/state_init"}
+   │ Parse subgoals from HTML (one entry per open subgoal; "no goals" → [])
    │
-   ▼
-isabelle vscode_server
-   │ Update caret to line end
-   │ Create state panel with server-assigned id
-   │ Query PIDE for proof state
-   │
-   │ PIDE: {"method": "PIDE/state_output",
-   │        "params": {"id": 1, "content": "<html>no goals</html>"}}
-   ▼
-State Panel Manager
-   │ Receive state_output and learn panel id
-   │ Store as goals_after
-   │
-   │ PIDE: {"method": "PIDE/state_exit", "params": {"id": "<panel_id>"}}
-   │
-   │ Parse goals from HTML
-   │ Extract goal text, strip formatting
-   │
-   │ Return: GoalState(goals_before=["P x"], goals_after=[], ...)
+   │ Return: GoalState(command=CommandSpan(...), subgoals=["P x"], note=None)
    ▼
 AI Agent
 ```
+
+(Single query at the resolved caret — there is no before/after double panel and no
+`column` parameter. To compare a tactic's before/after, query the prior line and the
+tactic's own line separately.)
 
 ### A.3 Document Edit + Reprocessing (Future Design)
 
@@ -1155,6 +1160,33 @@ Edit Tool Handler
    ▼
 AI Agent
 ```
+
+### A.4 File Sync (Current — how edits actually reach Isabelle)
+
+```
+Agent edits file.thy on disk (ordinary file tools)
+   │
+   ├─ Editor-opened .thy (in open_documents) — the MCP's job:
+   │   Layer 1 (event-driven): FileWatcher inotify event on the parent dir
+   │       (modified/created/MOVED/deleted; MOVED catches atomic-rename saves)
+   │       └─→ run_coroutine_threadsafe → sync_file_locked(client, path)
+   │   Layer 2 (backstop): next MCP tool call → _ensure_lsp_started
+   │       └─→ resync_and_check_freshness → client.resync_changed_open_documents()
+   │           (re-stat open docs; stat_sig != → sync the changed ones)
+   │   both run under _evaluation_state_lock → client.sync_dirty_files({path})
+   │       │ if disk content != cached: bump version, send textDocument/didChange
+   │       ▼
+   │   isabelle vscode_server → PIDE incremental re-check → PIDE/decoration
+   │       ▼
+   │   ProcessingTracker.update()  (adopts new version's ranges; wakes waiters)
+   │
+   └─ Dependency files (.ML blobs, imported .thy) — the SERVER's job:
+       Isabelle's own vscode_server File_Watcher disk-watches them (0.5 s debounce).
+       Layer 3: the tool-call backstop stats the theory_status dep set and, if a dep
+       changed within the debounce window, waits vscode_load_delay before querying.
+```
+
+(Pushing mid-evaluation is intentional — PIDE re-checks incrementally.)
 
 ---
 

@@ -1,9 +1,11 @@
-from isabelle_mcp.evaluation import check_evaluation_guard
+import io
+
+from isabelle_mcp.evaluation import check_evaluation_guard, format_evaluation_result
 from isabelle_mcp.lsp_client import IsabelleLSPClient
 from isabelle_mcp.models import (
     CommandOutputResult,
     CommandSpan,
-    EvaluationResult,
+    EvaluationView,
     OutputMessage,
 )
 from isabelle_mcp.utils import (
@@ -28,8 +30,8 @@ async def command_output(
     await client.open_document(file_path)
 
     guard = await check_evaluation_guard(client, file_path, line)
-    if isinstance(guard, EvaluationResult):
-        raise IsabelleToolError(guard.message)
+    if isinstance(guard, EvaluationView):
+        raise IsabelleToolError(format_evaluation_result(guard, client.project_root))
     note = guard if isinstance(guard, str) else None
 
     doc = client.open_documents.get(file_path)
@@ -61,13 +63,22 @@ async def command_output(
 
 def format_command_output(result: CommandOutputResult, line: int) -> str:
     """Render a CommandOutputResult as the agent-facing plain-text block."""
-    blocks: list[str] = []
+    buf = io.StringIO()
+    first = True
+
+    def section(text: str) -> None:
+        nonlocal first
+        if not first:
+            buf.write("\n\n")
+        buf.write(text)
+        first = False
+
     if result.note:
-        blocks.append(f"[note] {result.note}")
+        section(f"[note] {result.note}")
 
     if result.command is None:
-        blocks.append(f"No command at line {line}.")
-        return "\n\n".join(blocks)
+        section(f"No command at line {line}.")
+        return buf.getvalue()
 
     cmd = result.command
     loc = (
@@ -79,5 +90,5 @@ def format_command_output(result: CommandOutputResult, line: int) -> str:
         body = "\n".join(f"[{m.kind}] {m.message}" for m in result.messages)
     else:
         body = "(no output)"
-    blocks.append(f"{loc}\n{cmd.text}\n\n{body}")
-    return "\n\n".join(blocks)
+    section(f"{loc}\n{cmd.text}\n\n{body}")
+    return buf.getvalue()

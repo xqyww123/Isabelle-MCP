@@ -64,13 +64,6 @@ class TestToolsIntegration:
         assert isinstance(result.line_context, str)
 
     @pytest.mark.asyncio
-    async def test_diagnostics(self, lsp_client, theory_file):
-        from isabelle_mcp.tools import diagnostic_messages
-        await lsp_client.open_document(theory_file)
-        result = await diagnostic_messages(lsp_client, theory_file, 1, -1)
-        assert isinstance(result.items, list)
-
-    @pytest.mark.asyncio
     async def test_definition(self, lsp_client, theory_file):
         from isabelle_mcp.tools import declaration_location
         await lsp_client.open_document(theory_file)

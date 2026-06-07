@@ -512,3 +512,125 @@ class TestIsabelleLSPClient:
         assert client._dynamic_output_cache_by_position == {}
         assert client._preview_waiters == {}
 
+
+def _mock_process_client() -> IsabelleLSPClient:
+    client = IsabelleLSPClient()
+    client.process = MagicMock()
+    client.process.stdin = MagicMock()
+    client.process.stdin.write = MagicMock()
+    client.process.stdin.drain = AsyncMock()
+    return client
+
+
+class TestStatSigAndResync:
+    @pytest.mark.asyncio
+    async def test_open_records_stat_sig(self, tmp_path):
+        from isabelle_mcp.lsp_client import _stat_sig
+        client = _mock_process_client()
+        f = tmp_path / "Foo.thy"
+        f.write_text("theory Foo begin end")
+        await client.open_document(str(f), wait_for_diagnostics=False)
+        doc = client.open_documents[str(f)]
+        assert doc.stat_sig is not None
+        assert doc.stat_sig == _stat_sig(str(f))
+
+    @pytest.mark.asyncio
+    async def test_open_already_open_is_ensure_only(self, tmp_path):
+        """Re-opening an open doc must NOT re-read disk or send didChange."""
+        client = _mock_process_client()
+        f = tmp_path / "Foo.thy"
+        f.write_text("theory Foo begin end")
+        await client.open_document(str(f), wait_for_diagnostics=False)
+        v1 = client.open_documents[str(f)].version
+        f.write_text("theory Foo begin (*changed on disk*) end")
+        client.notify = AsyncMock()
+        await client.open_document(str(f), wait_for_diagnostics=False)
+        # No didChange, version unchanged, cached content still the OLD content.
+        client.notify.assert_not_called()
+        assert client.open_documents[str(f)].version == v1
+        assert "changed on disk" not in client.open_documents[str(f)].content
+
+    @pytest.mark.asyncio
+    async def test_resync_detects_and_pushes_change(self, tmp_path):
+        client = _mock_process_client()
+        f = tmp_path / "Foo.thy"
+        f.write_text("theory Foo begin end")
+        await client.open_document(str(f), wait_for_diagnostics=False)
+        v1 = client.open_documents[str(f)].version
+        f.write_text("theory Foo begin (*v2*) end")
+        client.notify = AsyncMock()
+        await client.resync_changed_open_documents()
+        client.notify.assert_called_once()
+        method, params = client.notify.call_args[0]
+        assert method == "textDocument/didChange"
+        assert "v2" in params["contentChanges"][0]["text"]
+        assert client.open_documents[str(f)].version == v1 + 1
+
+    @pytest.mark.asyncio
+    async def test_resync_uses_inequality_not_greater(self, tmp_path):
+        """A backdated mtime with different content is still detected (!= not >)."""
+        import os
+        client = _mock_process_client()
+        f = tmp_path / "Foo.thy"
+        f.write_text("theory Foo begin end")
+        await client.open_document(str(f), wait_for_diagnostics=False)
+        f.write_text("theory Foo begin (*older-but-different*) end")
+        os.utime(str(f), (1_000_000.0, 1_000_000.0))  # mtime far in the PAST
+        client.notify = AsyncMock()
+        await client.resync_changed_open_documents()
+        client.notify.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_resync_identical_content_sends_nothing(self, tmp_path):
+        """A bare metadata touch (same bytes) refreshes stat_sig but sends no didChange."""
+        import os
+        from isabelle_mcp.lsp_client import _stat_sig
+        client = _mock_process_client()
+        f = tmp_path / "Foo.thy"
+        f.write_text("theory Foo begin end")
+        await client.open_document(str(f), wait_for_diagnostics=False)
+        os.utime(str(f), None)  # touch: new mtime, identical content
+        client.notify = AsyncMock()
+        await client.resync_changed_open_documents()
+        client.notify.assert_not_called()
+        assert client.open_documents[str(f)].stat_sig == _stat_sig(str(f))
+
+    @pytest.mark.asyncio
+    async def test_resync_handles_deletion(self, tmp_path):
+        client = _mock_process_client()
+        f = tmp_path / "Foo.thy"
+        f.write_text("theory Foo begin end")
+        await client.open_document(str(f), wait_for_diagnostics=False)
+        f.unlink()
+        client.notify = AsyncMock()
+        await client.resync_changed_open_documents()  # must not raise
+        client.notify.assert_not_called()
+        assert client.open_documents[str(f)].stat_sig is None
+
+    @pytest.mark.asyncio
+    async def test_dirty_ml_does_not_force_resync_open_thy(self, tmp_path):
+        """The removed '.ML changed → re-sync all open .thy' behavior must be gone."""
+        client = _mock_process_client()
+        thy = tmp_path / "Foo.thy"
+        thy.write_text("theory Foo begin end")
+        await client.open_document(str(thy), wait_for_diagnostics=False)
+        ml = tmp_path / "Helper.ML"          # a dependency, NOT in open_documents
+        ml.write_text("val x = 1;")
+        client.notify = AsyncMock()
+        await client.sync_dirty_files({str(ml)})
+        client.notify.assert_not_called()    # open .thy is NOT force-resynced
+
+    @pytest.mark.asyncio
+    async def test_open_document_realpath_keying(self, tmp_path):
+        """open_documents is keyed by realpath; a symlinked path resolves to it."""
+        import os
+        client = _mock_process_client()
+        real = tmp_path / "Foo.thy"
+        real.write_text("theory Foo begin end")
+        link = tmp_path / "Link.thy"
+        os.symlink(real, link)
+        await client.open_document(str(link), wait_for_diagnostics=False)
+        assert os.path.realpath(str(link)) in client.open_documents
+        # set_caret via the symlink path resolves to the same DocumentState (no error).
+        await client.set_caret(str(link), LSPLine(0))
+

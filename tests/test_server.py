@@ -8,7 +8,6 @@ from isabelle_mcp.server import (
     isabelle_cancel_evaluation,
     isabelle_command_output,
     isabelle_definition,
-    isabelle_diagnostics,
     isabelle_evaluate_to,
     isabelle_evaluation_status,
     isabelle_goal,
@@ -46,23 +45,6 @@ class TestMCPServerTools:
         with _patch_ensure(mock_lsp_client):
             result = await isabelle_local_occurrences(temp_theory_file, 8, "my_const")
         assert result.occurrences == []
-
-    @pytest.mark.asyncio
-    async def test_diagnostics(self, temp_theory_file, mock_lsp_client):
-        mock_lsp_client.diagnostics_cache[temp_theory_file] = []
-        mock_lsp_client.processing_status[temp_theory_file] = True
-        with _patch_ensure(mock_lsp_client):
-            result = await isabelle_diagnostics(temp_theory_file, 1, -1)
-        assert result.success is True
-        assert result.items == []
-
-    @pytest.mark.asyncio
-    async def test_diagnostics_with_line_filter(self, temp_theory_file, mock_lsp_client):
-        mock_lsp_client.diagnostics_cache[temp_theory_file] = []
-        mock_lsp_client.processing_status[temp_theory_file] = True
-        with _patch_ensure(mock_lsp_client):
-            result = await isabelle_diagnostics(temp_theory_file, start_line=5, end_line=10)
-        assert result.items == []
 
     @pytest.mark.asyncio
     async def test_goal_without_after_text(self, temp_theory_file, mock_lsp_client):
@@ -103,19 +85,19 @@ class TestMCPServerTools:
     async def test_evaluate_to(self, temp_theory_file, mock_lsp_client):
         with _patch_ensure(mock_lsp_client):
             result = await isabelle_evaluate_to(temp_theory_file, 5)
-        assert result.status == "complete"
+        assert "complete" in result.content[0].text.lower()
 
     @pytest.mark.asyncio
     async def test_evaluation_status_no_eval(self, mock_lsp_client):
         with _patch_ensure(mock_lsp_client):
             result = await isabelle_evaluation_status()
-        assert result.status == "no_evaluation"
+        assert result.content[0].text == "No evaluation in progress."
 
     @pytest.mark.asyncio
     async def test_cancel_evaluation_no_eval(self, mock_lsp_client):
         with _patch_ensure(mock_lsp_client):
             result = await isabelle_cancel_evaluation()
-        assert result.status == "no_evaluation"
+        assert result.content[0].text == "No evaluation in progress."
 
 
 class TestServerLifespan:
@@ -147,10 +129,28 @@ class TestServerLifespan:
                 async with server_lifespan(MagicMock()):
                     MockClient.assert_called_with(
                         logic='HOL-Analysis', extra_args=["-d", "/extra"],
+                        project_root=None,
                     )
         finally:
             server_mod._server_logic = "HOL"
             server_mod._server_extra_args = []
+
+
+class TestHookRetirement:
+    def test_notify_file_change_route_removed(self):
+        import isabelle_mcp.server as server_mod
+        assert not hasattr(server_mod, "notify_file_change")
+
+    def test_no_periodic_sync_loop(self):
+        import isabelle_mcp.server as server_mod
+        assert not hasattr(server_mod, "_periodic_sync_loop")
+        assert not hasattr(server_mod, "SYNC_INTERVAL")
+        assert not hasattr(server_mod, "_sync_task")
+
+    def test_lifespan_wires_watcher_sink(self):
+        import isabelle_mcp.server as server_mod
+        # The event-driven sink the FileWatcher schedules on every relevant edit.
+        assert callable(server_mod._file_change_sink)
 
 
 class TestServerMain:

@@ -12,16 +12,17 @@ PIDE/cancel_execution for global cancellation.
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
 
-from isabelle_mcp.lsp_client import IsabelleLSPClient
+from isabelle_mcp.lsp_client import IsabelleLSPClient, _stat_sig, _stat_sigs
 from isabelle_mcp.models import (
-    DiagnosticMessage,
-    EvaluationResult,
+    EvaluationView,
+    FileSnapshot,
     RunningCommand,
     TheoryStatus,
 )
@@ -30,9 +31,7 @@ from isabelle_mcp.utils import (
     LSPCharacter,
     LSPLine,
     MCPLine,
-    lsp_to_mcp_position,
     resolve_caret,
-    severity_int_to_string,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,6 +39,10 @@ logger = logging.getLogger(__name__)
 EVAL_POLL_INTERVAL: float = float(
     os.environ.get("ISA_LSP_EVAL_POLL_INTERVAL", "10"),
 )
+
+# During a long evaluation, re-stat open docs at most this often (seconds) so an
+# edit landing mid-evaluation is still pushed, without stat'ing on every wakeup.
+_LONG_EVAL_RESTAT_INTERVAL: float = 3.0
 
 
 # ---------------------------------------------------------------------------
@@ -50,23 +53,6 @@ def _resolve_line(value: int, total_lines: int) -> MCPLine:
     if value < 0:
         return MCPLine(max(1, total_lines + 1 + value))
     return MCPLine(value)
-
-
-def _parse_diagnostic(diag: dict) -> DiagnosticMessage:
-    start = diag.get("range", {}).get("start", {})
-    end = diag.get("range", {}).get("end", {})
-    start_line, start_col = lsp_to_mcp_position(
-        LSPLine(start.get("line", 0)), LSPCharacter(start.get("character", 0)),
-    )
-    end_line, end_col = lsp_to_mcp_position(
-        LSPLine(end.get("line", 0)), LSPCharacter(end.get("character", 0)),
-    )
-    return DiagnosticMessage(
-        severity=severity_int_to_string(diag.get("severity", 1)),
-        message=diag.get("message", ""),
-        line=start_line, column=start_col,
-        end_line=end_line, end_column=end_col,
-    )
 
 
 def _parse_theory_status(raw: dict) -> TheoryStatus:
@@ -169,14 +155,12 @@ class EvaluationState:
     active: bool = False
     file_path: str = ""
     destination_line: MCPLine = MCPLine(1)
-    reported_errors: set[tuple[str, int, str]] = field(default_factory=set)
     auto_opened_files: set[str] = field(default_factory=set)
 
     def start(self, file_path: str, destination_line: MCPLine) -> None:
         self.active = True
         self.file_path = file_path
         self.destination_line = destination_line
-        self.reported_errors = set()
         self.auto_opened_files = set()
 
     def complete(self) -> None:
@@ -187,7 +171,15 @@ class EvaluationState:
 
 
 evaluation_state = EvaluationState()
-_evaluation_lock = asyncio.Lock()
+# Serializes the short evaluation-state transitions (evaluate_to start /
+# cancel / guard) and the document content/version mutations and caret-target
+# resolution that must stay atomic with them. Held only for those transitions —
+# NOT for the whole evaluation. The event-driven file-sync push and the tool-call
+# stat backstop also take it so a concurrent sync cannot interleave with a start/stop.
+_evaluation_state_lock = asyncio.Lock()
+
+# Sentinel for "dependency never stat'd before" (its recorded value may be None).
+_UNSEEN: object = object()
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +189,14 @@ _evaluation_lock = asyncio.Lock()
 async def _build_status_snapshot(
     client: IsabelleLSPClient,
     evaluation_state: EvaluationState,
-) -> tuple[list[TheoryStatus], list[RunningCommand], list[DiagnosticMessage]]:
+) -> tuple[list[TheoryStatus], list[RunningCommand]]:
+    """Pull theory_status, auto-open failed theories, collect running commands.
+
+    Auto-opening a not-ok theory (load-bearing side effect) gives it a decoration
+    tracker so the snapshot can report its problems with line numbers. No diagnostics
+    are read — the snapshot is built from decoration + theory_status (see
+    :func:`_build_file_snapshot`).
+    """
     raw_theories = await client.request_theory_status()
     theories = [_parse_theory_status(t) for t in raw_theories]
 
@@ -211,22 +210,122 @@ async def _build_status_snapshot(
                     pass
 
     running_commands = client.get_all_running_commands()
+    return theories, running_commands
 
-    new_errors: list[DiagnosticMessage] = []
+
+# ---------------------------------------------------------------------------
+# Per-file snapshot (decoration primary, theory_status fallback)
+# ---------------------------------------------------------------------------
+
+def _line_spans(ranges: list[tuple[int, int, int, int]]) -> list[tuple[int, int]]:
+    """0-indexed decoration tuples → sorted 1-indexed (start_line, end_line) spans."""
+    spans = [
+        (int(LSPLine(r[0]).to_mcp()), int(LSPLine(r[2]).to_mcp())) for r in ranges
+    ]
+    return sorted(spans)
+
+
+def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge line spans that share a line into one (dedupes the two error channels)."""
+    if not spans:
+        return []
+    spans = sorted(spans)
+    merged = [spans[0]]
+    for s, e in spans[1:]:
+        ls, le = merged[-1]
+        if s <= le:  # overlap (inclusive) → same problem from both channels
+            merged[-1] = (ls, max(le, e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def _build_file_snapshot(
+    client: IsabelleLSPClient,
+    file_path: str,
+    ts_map: dict[str, TheoryStatus],
+) -> FileSnapshot:
+    """One file's problem snapshot. Decoration if current, else theory_status counts.
+
+    Built fully synchronously (no await between getter reads) so the union/merge sees
+    one consistent tracker state.
+    """
+    ts = ts_map.get(file_path)
+    tracker = client.get_processing_tracker(file_path)
+
+    if tracker is not None:
+        bad = tracker.get_bad_ranges()
+        oerr = tracker.get_overview_error_ranges()
+        owarn = tracker.get_overview_warning_ranges()
+        running = tracker.get_running_ranges()
+        unproc = tracker.get_unprocessed_ranges()
+        deco_has_content = bool(bad or oerr or owarn or running or unproc)
+        # theory_status reports a problem/activity the decoration should reflect.
+        ts_active_or_problem = ts is not None and (
+            ts.unprocessed > 0 or ts.running > 0 or ts.failed or ts.warned
+        )
+        # Trust decoration when it carries content, or when theory_status agrees
+        # there is nothing to show. Only fall back when theory_status reports a
+        # problem/activity that the (stale) decoration does NOT reflect — e.g. a
+        # dependency re-invalidated by an edit, whose decoration lags.
+        if deco_has_content or not ts_active_or_problem:
+            errors = _merge_spans(_line_spans(oerr) + _line_spans(bad))
+            warnings = _line_spans(owarn)
+            running_spans = _line_spans(running)
+            state = "problems" if (errors or warnings) else "clean"
+            return FileSnapshot(
+                file_path=file_path, lined=True, state=state,
+                errors=errors, warnings=warnings, running=running_spans,
+                error_count=len(errors), warning_count=len(warnings),
+                running_count=len(running_spans),
+            )
+
+    # theory_status fallback (counts only, no line numbers)
+    if ts is None:
+        return FileSnapshot(file_path=file_path, lined=False, state="in_progress")
+    if ts.unprocessed > 0 or ts.running > 0 or not ts.consolidated:
+        state = "in_progress"
+    elif ts.failed or ts.warned:
+        state = "problems"
+    else:
+        state = "clean"
+    return FileSnapshot(
+        file_path=file_path, lined=False, state=state,
+        error_count=ts.failed, warning_count=ts.warned, running_count=ts.running,
+    )
+
+
+def _relevant_files(
+    client: IsabelleLSPClient, target: str, auto_opened: set[str],
+) -> list[str]:
+    """Target ∪ auto-opened deps ∪ open docs with any problem/running marker."""
+    files: list[str] = [target]
+    for f in auto_opened:
+        if f not in files:
+            files.append(f)
     for path in list(client.open_documents):
-        for diag in client.get_cached_diagnostics(path):
-            sev = diag.get("severity", 4)
-            if sev > 2:
-                continue
-            msg = diag.get("message", "")
-            line = diag.get("range", {}).get("start", {}).get("line", 0)
-            key = (path, line, msg)
-            if key in evaluation_state.reported_errors:
-                continue
-            evaluation_state.reported_errors.add(key)
-            new_errors.append(_parse_diagnostic(diag))
+        if path in files:
+            continue
+        tr = client.get_processing_tracker(path)
+        if tr is not None and (
+            tr.get_bad_ranges() or tr.get_overview_error_ranges()
+            or tr.get_overview_warning_ranges() or tr.get_running_ranges()
+        ):
+            files.append(path)
+    return files
 
-    return theories, running_commands, new_errors
+
+def _snapshot_files(
+    client: IsabelleLSPClient,
+    target: str,
+    theories: list[TheoryStatus],
+    auto_opened: set[str],
+) -> list[FileSnapshot]:
+    ts_map = {t.node_name: t for t in theories}
+    return [
+        _build_file_snapshot(client, f, ts_map)
+        for f in _relevant_files(client, target, auto_opened)
+    ]
 
 
 async def _cleanup_auto_opened(
@@ -250,19 +349,23 @@ async def _evaluation_wait_loop(
     dest_line: MCPLine,
     state: EvaluationState,
     timeout: float,
-) -> tuple[str, list[TheoryStatus], list[RunningCommand], list[DiagnosticMessage]]:
+) -> tuple[str, list[TheoryStatus], list[RunningCommand]]:
     deadline = time.monotonic() + timeout
-    all_errors: list[DiagnosticMessage] = []
+    last_restat = time.monotonic()
     while True:
         if not state.active:
-            return "cancelled", [], [], all_errors
-        theories, running_commands, new_errors = await _build_status_snapshot(client, state)
-        all_errors.extend(new_errors)
+            return "cancelled", [], []
+        now = time.monotonic()
+        if now - last_restat >= _LONG_EVAL_RESTAT_INTERVAL:
+            last_restat = now
+            # Push any edit that landed mid-evaluation; PIDE re-checks incrementally.
+            await resync_changed_open_documents_locked(client)
+        theories, running_commands = await _build_status_snapshot(client, state)
         if _is_evaluation_complete(file_path, dest_line, client, theories):
-            return "complete", theories, running_commands, all_errors
+            return "complete", theories, running_commands
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return "in_progress", theories, running_commands, all_errors
+            return "in_progress", theories, running_commands
         tracker = client.get_processing_tracker(file_path)
         if tracker:
             await tracker.wait_until_processed_bounded(
@@ -283,8 +386,8 @@ async def evaluate_to(
     file_path: str,
     line: int,
     after_text: str | None = None,
-) -> EvaluationResult:
-    async with _evaluation_lock:
+) -> EvaluationView:
+    async with _evaluation_state_lock:
         if evaluation_state.active:
             raise IsabelleToolError(
                 "An evaluation is already in progress. "
@@ -315,7 +418,7 @@ async def evaluate_to(
         if tracker is not None:
             tracker.require_fresh_update()
         await client.set_caret(file_path, dest_line.to_lsp(), lsp_char)
-        status, theories, running_commands, errors = await _evaluation_wait_loop(
+        status, theories, running_commands = await _evaluation_wait_loop(
             client, file_path, dest_line, evaluation_state, EVAL_POLL_INTERVAL,
         )
     except Exception:
@@ -324,74 +427,148 @@ async def evaluate_to(
         raise
 
     dest = int(dest_line)
+    auto_opened = set(evaluation_state.auto_opened_files)
+    # Build the snapshot BEFORE cleanup closes the auto-opened deps (which would
+    # drop their decoration trackers).
+    files = _snapshot_files(client, file_path, theories, auto_opened)
+    message = (
+        f"Evaluation complete, arrived at line {dest}."
+        if status == "complete"
+        else _in_progress_message(running_commands)
+    )
     if status == "complete":
         await _cleanup_auto_opened(client, evaluation_state)
         evaluation_state.complete()
-        return EvaluationResult(
-            status="complete",
-            errors=errors,
-            theories=theories,
-            running_commands=running_commands,
-            destination_line=dest,
-            message=f"Evaluation complete, arrived at line {dest}.",
-        )
-
-    return EvaluationResult(
+    return EvaluationView(
         status=status,
-        errors=errors,
-        theories=theories,
-        running_commands=running_commands,
         destination_line=dest,
-        message=_in_progress_message(running_commands),
+        message=message,
+        files=files,
+        running_commands=running_commands,
     )
 
 
 async def evaluation_status(
     client: IsabelleLSPClient,
-) -> EvaluationResult:
+) -> EvaluationView:
     if not evaluation_state.active:
-        return EvaluationResult(
+        return EvaluationView(
             status="no_evaluation",
             message="No evaluation in progress.",
         )
 
-    theories, running_commands, errors = await _build_status_snapshot(
+    theories, running_commands = await _build_status_snapshot(
         client, evaluation_state,
     )
     dest = int(evaluation_state.destination_line)
+    target = evaluation_state.file_path
+    auto_opened = set(evaluation_state.auto_opened_files)
 
-    if _is_evaluation_complete(
-        evaluation_state.file_path,
-        evaluation_state.destination_line,
-        client, theories,
-    ):
+    complete = _is_evaluation_complete(
+        target, evaluation_state.destination_line, client, theories,
+    )
+    files = _snapshot_files(client, target, theories, auto_opened)
+    if complete:
         await _cleanup_auto_opened(client, evaluation_state)
         evaluation_state.complete()
-        return EvaluationResult(
+        return EvaluationView(
             status="complete",
-            errors=errors,
-            theories=theories,
-            running_commands=running_commands,
             destination_line=dest,
             message=f"Evaluation complete, arrived at line {dest}.",
+            files=files,
+            running_commands=running_commands,
         )
 
-    return EvaluationResult(
+    return EvaluationView(
         status="in_progress",
-        errors=errors,
-        theories=theories,
-        running_commands=running_commands,
         destination_line=dest,
         message=_in_progress_message(running_commands),
+        files=files,
+        running_commands=running_commands,
     )
+
+
+async def sync_file_locked(client: IsabelleLSPClient, path: str) -> None:
+    """Push one editor-opened file's on-disk content to Isabelle (event-driven).
+
+    The sink the FileWatcher schedules on every relevant change. Holds
+    ``_evaluation_state_lock`` so the push cannot interleave with an evaluate_to /
+    cancel start/stop transition. A no-op if *path* is not an open editor document
+    (e.g. a dependency file — those are the server File_Watcher's job). Pushing while
+    an evaluation is active is intentional: PIDE re-checks incrementally.
+    """
+    async with _evaluation_state_lock:
+        await client.sync_dirty_files({path})
+
+
+async def resync_changed_open_documents_locked(client: IsabelleLSPClient) -> None:
+    """Layer 2 under the lock: re-stat all open docs and didChange the changed ones."""
+    async with _evaluation_state_lock:
+        await client.resync_changed_open_documents()
+
+
+async def _dependency_freshness_wait(client: IsabelleLSPClient) -> float:
+    """Layer 3 detection: how long to wait for the server to notice a fresh dep edit.
+
+    Dependency files (external imports + ``.ML`` blobs, identified by ``external`` in
+    ``theory_status`` and not themselves editor-opened) are synced by Isabelle's own
+    File_Watcher, which has a ``vscode_load_delay`` debounce. If such a dep changed
+    since our last check **and** its mtime is within that debounce window, return the
+    delay so the caller waits before querying; otherwise return ``0``. Stat'ing runs
+    off the event loop. The dep set is bounded to the document model's non-heap nodes.
+    """
+    raw = await client.request_theory_status()
+    dep_nodes = [
+        t.get("node_name", "")
+        for t in raw
+        if t.get("external") and t.get("node_name")
+        and t.get("node_name") not in client.open_documents
+    ]
+    if not dep_nodes:
+        client._dep_stat_sigs.clear()
+        return 0.0
+
+    sigs = await asyncio.to_thread(_stat_sigs, dep_nodes)
+    delay = client.vscode_load_delay
+    now = time.time()
+    need_wait = False
+    for node, sig in sigs.items():
+        prev = client._dep_stat_sigs.get(node, _UNSEEN)
+        if prev is not _UNSEEN and sig is not None and sig != prev:
+            # sig = (ino, size, mtime_ns, ctime_ns); recent edit ⇒ within the debounce.
+            if (now - sig[2] / 1e9) < delay:
+                need_wait = True
+        client._dep_stat_sigs[node] = sig
+    for gone in set(client._dep_stat_sigs) - set(sigs):
+        del client._dep_stat_sigs[gone]
+    return delay if need_wait else 0.0
+
+
+async def resync_and_check_freshness(client: IsabelleLSPClient) -> None:
+    """Tool-call entry backstop: Layer 2 (open docs) + Layer 3 (dependency) freshness.
+
+    Runs at the start of every tool call (see ``_ensure_lsp_started``). Only Layer 2
+    holds ``_evaluation_state_lock`` — it mutates document content/version. Layer 3
+    runs **lock-free**: it only issues a read-only ``theory_status`` request and
+    maintains its own ``_dep_stat_sigs``, touching no lock-protected state, so it must
+    not block (or be blocked by) the event-driven push path.
+    """
+    await resync_changed_open_documents_locked(client)   # Layer 2 (locked)
+    wait = await _dependency_freshness_wait(client)        # Layer 3 (lock-free)
+    if wait > 0:
+        logger.info(
+            "Dependency changed <%.2fs ago; waiting %.2fs for the server to notice it",
+            wait, wait,
+        )
+        await asyncio.sleep(wait)
 
 
 async def cancel_evaluation(
     client: IsabelleLSPClient,
-) -> EvaluationResult:
-    async with _evaluation_lock:
+) -> EvaluationView:
+    async with _evaluation_state_lock:
         if not evaluation_state.active:
-            return EvaluationResult(
+            return EvaluationView(
                 status="no_evaluation",
                 message="No evaluation in progress.",
             )
@@ -399,19 +576,10 @@ async def cancel_evaluation(
         fp = evaluation_state.file_path
         dest = int(evaluation_state.destination_line)
         await client.force_interrupt(fp)
-
-        errors: list[DiagnosticMessage] = []
-        for diag in client.get_cached_diagnostics(fp):
-            sev = diag.get("severity", 4)
-            if sev > 2:
-                continue
-            errors.append(_parse_diagnostic(diag))
-
         await _cleanup_auto_opened(client, evaluation_state)
         evaluation_state.cancel()
-        return EvaluationResult(
+        return EvaluationView(
             status="cancelled",
-            errors=errors,
             destination_line=dest,
             message="Evaluation cancelled.",
         )
@@ -421,17 +589,18 @@ async def check_evaluation_guard(
     client: IsabelleLSPClient,
     file_path: str,
     line: MCPLine,
-) -> EvaluationResult | str | None:
+) -> "EvaluationView | str | None":
     """Ensure *line* has been evaluated; raise, warn, or auto-start.
 
     Returns:
       - ``None``: line is fully processed, caller can proceed.
       - ``str``: line is running (forked proof), caller can proceed but
         should set ``result.note`` to this warning string.
-      - ``EvaluationResult``: auto-evaluation started but didn't complete.
+      - ``EvaluationView``: auto-evaluation started but didn't complete; the caller
+        renders it (``format_evaluation_result``) and raises it.
     Raises :class:`IsabelleToolError` if another evaluation is running.
     """
-    async with _evaluation_lock:
+    async with _evaluation_state_lock:
         if evaluation_state.active:
             raise IsabelleToolError(
                 "Evaluation in progress. "
@@ -448,3 +617,66 @@ async def check_evaluation_guard(
     if result.status == "complete":
         return None
     return result
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+def _relativize(path: str, root: str | None) -> str:
+    real = os.path.realpath(path)
+    if root is None:
+        return real
+    try:
+        return os.path.relpath(real, root)
+    except ValueError:
+        return real
+
+
+def _fmt_spans(spans: list[tuple[int, int]]) -> str:
+    return ", ".join(f"{s}" if s == e else f"{s}-{e}" for s, e in spans)
+
+
+def _count_bits(fs: FileSnapshot) -> str:
+    parts = []
+    if fs.error_count:
+        parts.append(f"{fs.error_count} error" + ("s" if fs.error_count != 1 else ""))
+    if fs.warning_count:
+        parts.append(f"{fs.warning_count} warning" + ("s" if fs.warning_count != 1 else ""))
+    if fs.running_count:
+        parts.append(f"{fs.running_count} running")
+    return ", ".join(parts)
+
+
+def _format_file_snapshot(fs: FileSnapshot, root: str | None) -> str:
+    name = _relativize(fs.file_path, root)
+    if fs.lined:
+        rows = []
+        if fs.errors:
+            rows.append(f"  errors: {_fmt_spans(fs.errors)}")
+        if fs.warnings:
+            rows.append(f"  warnings: {_fmt_spans(fs.warnings)}")
+        if fs.running:
+            rows.append(f"  running: {_fmt_spans(fs.running)}")
+        if not rows:
+            return f"{name}: clean"
+        return f"{name}:\n" + "\n".join(rows)
+    # theory_status fallback (counts only)
+    if fs.state == "in_progress":
+        bits = _count_bits(fs)
+        return f"{name}: in progress" + (f" ({bits} so far)" if bits else "")
+    if fs.state == "clean":
+        return f"{name}: clean"
+    return f"{name}: {_count_bits(fs)} (no line info)"
+
+
+def format_evaluation_result(view: EvaluationView, root: str | None = None) -> str:
+    """Render an EvaluationView as the agent-facing plain-text snapshot."""
+    if view.status == "no_evaluation":
+        return view.message or "No evaluation in progress."
+    buf = io.StringIO()
+    buf.write(view.message.rstrip("\n") if view.message else view.status)
+    for fs in view.files:
+        buf.write("\n\n")
+        buf.write(_format_file_snapshot(fs, root))
+    return buf.getvalue()

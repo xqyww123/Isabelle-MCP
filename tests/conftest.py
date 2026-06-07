@@ -86,6 +86,15 @@ class MockProcessingTracker:
     def get_unprocessed_ranges(self) -> list[tuple[int, int, int, int]]:
         return []
 
+    def get_bad_ranges(self) -> list[tuple[int, int, int, int]]:
+        return []
+
+    def get_overview_error_ranges(self) -> list[tuple[int, int, int, int]]:
+        return []
+
+    def get_overview_warning_ranges(self) -> list[tuple[int, int, int, int]]:
+        return []
+
     async def wait_until_processed_bounded(
         self, start_line: LSPLine, end_line: LSPLine,
         timeout: float = 5.0, health_check=None, check_interval: float = 5.0,
@@ -99,6 +108,7 @@ class MockLSPClient:
     def __init__(self):
         self.logic = "HOL"
         self.initialized = True
+        self.project_root = None
         self.open_documents: dict[str, DocumentState] = {}
         self.diagnostics_cache: dict[str, list[dict[str, Any]]] = {}
         self.processing_status: dict[str, bool] = {}

@@ -7,7 +7,6 @@ from pydantic import ValidationError
 
 from isabelle_mcp.evaluation import evaluation_state
 from isabelle_mcp.models import HoverEntry, HoverInfo, Location
-from isabelle_mcp.tools.diagnostics import diagnostic_messages
 from isabelle_mcp.tools.hover import hover_info
 from isabelle_mcp.tools.local_occurrences import local_occurrences
 from isabelle_mcp.utils import IsabelleToolError, MCPLine
@@ -72,10 +71,10 @@ class TestConcurrency:
     @pytest.mark.asyncio
     async def test_concurrent_different_tools(self, mock_lsp_client, temp_theory_file):
         mock_lsp_client.hover_response = {"contents": "test"}
-        mock_lsp_client.diagnostics_cache[temp_theory_file] = []
+        mock_lsp_client.highlights_response = []
         results = await asyncio.gather(
             hover_info(mock_lsp_client, temp_theory_file, MCPLine(5), "my_const"),
-            diagnostic_messages(mock_lsp_client, temp_theory_file, 1, -1),
+            local_occurrences(mock_lsp_client, temp_theory_file, MCPLine(8), "my_const"),
         )
         assert len(results) == 2
 

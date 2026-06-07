@@ -29,11 +29,10 @@ tests/
 ├── test_utils.py                    # Utility function tests (42 tests)
 ├── test_isabelle_tokens.py          # Symbol tokenizer tests (39 tests)
 ├── test_lsp_client.py               # LSP client tests (38 tests)
-├── test_tools_evaluate.py           # Evaluation tool tests (11 tests)
+├── test_tools_evaluate.py           # Evaluation tool + snapshot/render tests
 ├── test_tools_hover.py              # Hover tool tests (15 tests)
 ├── test_tools_definition.py         # Definition tool tests (16 tests)
 ├── test_tools_local_occurrences.py  # Local occurrences tool tests (7 tests)
-├── test_tools_diagnostics.py        # Diagnostics tool tests (8 tests)
 ├── test_tools_goal.py               # Goal tool tests (5 tests)
 ├── test_tools_command_output.py     # Command output tool tests (7 tests)
 ├── test_tools_session.py            # Session info tool tests (1 test)

@@ -11,7 +11,10 @@ from isabelle_mcp.utils.core import LSPLine
 
 logger = logging.getLogger(__name__)
 
-_TRACKED_TYPES = frozenset({"background_unprocessed1", "background_running1"})
+_TRACKED_TYPES = frozenset({
+    "background_unprocessed1", "background_running1",
+    "background_bad", "text_overview_error", "text_overview_warning",
+})
 
 
 def parse_decoration_ranges(entries: list[dict]) -> dict[str, list[tuple[int, int, int, int]]]:
@@ -56,6 +59,13 @@ class ProcessingTracker:
         self._unprocessed: list[tuple[int, int, int, int]] = []
         self._running: list[tuple[int, int, int, int]] = []
         self._running_onset: dict[tuple[int, int, int, int], float] = {}
+        # Problem decorations (full-replace per type, same as _unprocessed):
+        #   _bad           — background_bad      (failed/killed commands AND sorry)
+        #   _overview_error — text_overview_error (errors on the overview ruler)
+        #   _overview_warning — text_overview_warning (warnings on the ruler)
+        self._bad: list[tuple[int, int, int, int]] = []
+        self._overview_error: list[tuple[int, int, int, int]] = []
+        self._overview_warning: list[tuple[int, int, int, int]] = []
         self._initialized: bool = False
         self._update_count: int = 0
         self._min_required_updates: int = 0
@@ -74,6 +84,16 @@ class ProcessingTracker:
                     updated_onset[r] = self._running_onset.get(r, now)
                 self._running = new_running
                 self._running_onset = updated_onset
+            # Separate per-type branches (do NOT fold into a loop that also
+            # touches _unprocessed/_running). An emptied type arrives as
+            # ``content:[]`` → key present with empty list → cleared. This
+            # full-replace is how a fixed error/warning/sorry disappears.
+            if "background_bad" in parsed:
+                self._bad = parsed["background_bad"]
+            if "text_overview_error" in parsed:
+                self._overview_error = parsed["text_overview_error"]
+            if "text_overview_warning" in parsed:
+                self._overview_warning = parsed["text_overview_warning"]
             self._initialized = True
             self._update_count += 1
             self._condition.notify_all()
@@ -187,12 +207,27 @@ class ProcessingTracker:
         """Return a snapshot of unprocessed ranges (0-indexed)."""
         return list(self._unprocessed)
 
+    def get_bad_ranges(self) -> list[tuple[int, int, int, int]]:
+        """Return a snapshot of background_bad ranges (failed/killed/sorry), 0-indexed."""
+        return list(self._bad)
+
+    def get_overview_error_ranges(self) -> list[tuple[int, int, int, int]]:
+        """Return a snapshot of text_overview_error ranges (0-indexed)."""
+        return list(self._overview_error)
+
+    def get_overview_warning_ranges(self) -> list[tuple[int, int, int, int]]:
+        """Return a snapshot of text_overview_warning ranges (0-indexed)."""
+        return list(self._overview_warning)
+
     async def reset(self) -> None:
         """Clear all state (e.g. when the document is closed)."""
         async with self._condition:
             self._unprocessed.clear()
             self._running.clear()
             self._running_onset.clear()
+            self._bad.clear()
+            self._overview_error.clear()
+            self._overview_warning.clear()
             self._initialized = False
             self._update_count = 0
             self._min_required_updates = 0

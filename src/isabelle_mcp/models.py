@@ -3,6 +3,8 @@
 All positions are 1-indexed (MCP convention).
 """
 
+from dataclasses import dataclass, field
+
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -62,16 +64,6 @@ class DiagnosticMessage(BaseModel):
     column: int = Field(description="Column number (1-indexed)", ge=1)
     end_line: int | None = Field(None, description="End line (1-indexed)", ge=1)
     end_column: int | None = Field(None, description="End column (1-indexed)", ge=1)
-
-
-class DiagnosticsResult(BaseModel):
-    success: bool = Field(True, description="True if the queried file/range has no errors")
-    items: list[DiagnosticMessage] = Field(default_factory=list)
-    processing_complete: bool = Field(description="Whether PIDE finished processing")
-    failed_dependencies: list[str] = Field(
-        default_factory=list, description="File paths of theories that failed to load"
-    )
-    note: str | None = Field(default=None, description="Warning note (e.g. line still running)")
 
 
 class CommandSpan(BaseModel):
@@ -157,31 +149,47 @@ class RunningCommand(BaseModel):
     elapsed_seconds: float = Field(description="Seconds since command started running")
 
 
-class EvaluationResult(BaseModel):
-    status: str = Field(
-        description="complete | in_progress | no_evaluation | cancelled",
-    )
-    errors: list[DiagnosticMessage] = Field(
-        default_factory=list, description="New errors since last check",
-    )
-    theories: list[TheoryStatus] = Field(
-        default_factory=list,
-        description="Status of all loaded theories",
-    )
-    running_commands: list[RunningCommand] = Field(
-        default_factory=list,
-        description="Commands currently being executed",
-    )
-    destination_line: int | None = Field(
-        default=None, description="Target line for evaluation (1-indexed)",
-    )
-    message: str = Field(default="", description="Human-readable status message")
+@dataclass
+class FileSnapshot:
+    """Per-file problem snapshot for an evaluation result.
+
+    Two flavours:
+      - decoration source (``lined=True``): ``errors``/``warnings``/``running`` hold
+        1-indexed ``(start_line, end_line)`` spans (errors = line-deduped union of
+        text_overview_error and background_bad).
+      - theory_status fallback (``lined=False``): spans are empty; the ``*_count``
+        fields hold theory_status counts; ``state`` is "clean" / "in_progress".
+    """
+
+    file_path: str
+    lined: bool
+    state: str  # "clean" | "in_progress" | "problems"
+    errors: list[tuple[int, int]] = field(default_factory=list)
+    warnings: list[tuple[int, int]] = field(default_factory=list)
+    running: list[tuple[int, int]] = field(default_factory=list)
+    error_count: int = 0
+    warning_count: int = 0
+    running_count: int = 0
+
+
+@dataclass
+class EvaluationView:
+    """Internal structured evaluation result.
+
+    Rendered to the agent-facing string by ``format_evaluation_result``; the core
+    evaluation functions return this so unit tests can assert on structured fields.
+    """
+
+    status: str  # complete | in_progress | no_evaluation | cancelled
+    destination_line: int | None = None
+    message: str = ""
+    files: list[FileSnapshot] = field(default_factory=list)
+    running_commands: list[RunningCommand] = field(default_factory=list)
 
 
 class SessionInfo(BaseModel):
     current_session: str = Field(description="Current logic/session name (e.g., HOL)")
 
 
-# Needed because models reference DiagnosticMessage/TheoryStatus/RunningCommand via forward ref.
+# Needed because models reference DiagnosticMessage via forward ref.
 HoverInfo.model_rebuild()
-EvaluationResult.model_rebuild()

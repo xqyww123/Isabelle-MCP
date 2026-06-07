@@ -46,6 +46,37 @@ def _wire_dump(direction: str, message: JsonDict) -> None:
         pass
 
 
+def _canon(file_path: str) -> str:
+    """Canonical absolute path (resolves symlinks and ``..``) for stable keying.
+
+    All ``open_documents`` keys, URIs, watch directories, and stat comparisons use
+    this form so a symlinked/relative path and its real path never desync.
+    """
+    return os.path.realpath(file_path)
+
+
+StatSig = tuple[int, int, int, int]
+
+
+def _stat_sig(file_path: str) -> StatSig | None:
+    """Change-signature of a file: ``(st_ino, st_size, st_mtime_ns, st_ctime_ns)``.
+
+    Compared with ``!=`` (never ``>``): mtime is non-monotonic and tamperable, so
+    any differing field means "possibly changed" — content comparison is the final
+    gate. Returns ``None`` when the file cannot be stat'd (e.g. it was deleted).
+    """
+    try:
+        st = os.stat(file_path)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def _stat_sigs(paths: list[str]) -> dict[str, StatSig | None]:
+    """Batch :func:`_stat_sig` — runnable off the event loop via ``to_thread``."""
+    return {p: _stat_sig(p) for p in paths}
+
+
 def unicode_symbols_option() -> str:
     """Return the version-correct vscode_server option for unicode symbol output.
 
@@ -72,6 +103,24 @@ def unicode_symbols_option() -> str:
     return name
 
 
+def read_vscode_load_delay(default: float = 0.5) -> float:
+    """Return the server's ``vscode_load_delay`` (its File_Watcher debounce, seconds).
+
+    Read via ``isabelle options -g vscode_load_delay`` so the dependency-freshness
+    wait (Layer 3) tracks any ``-o vscode_load_delay=…`` override instead of a
+    hardcoded constant. Falls back to *default* if the option cannot be read.
+    """
+    try:
+        out = subprocess.run(
+            ["isabelle", "options", "-g", "vscode_load_delay"],
+            capture_output=True, text=True, timeout=30, check=False,
+        ).stdout.strip()
+        return float(out)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        logger.warning("Could not read vscode_load_delay (%s); using %.2f", exc, default)
+        return default
+
+
 @dataclass
 class DocumentState:
     file_path: str
@@ -79,6 +128,9 @@ class DocumentState:
     version: int
     content: str
     language_id: str = "isabelle"
+    # Last on-disk signature we synced to the server. ``None`` forces a re-read on
+    # the next stat backstop (used after force_interrupt mutates the model only).
+    stat_sig: StatSig | None = None
 
 
 @dataclass
@@ -100,11 +152,16 @@ class IsabelleLSPClient:
         session_dirs: list[str] | None = None,
         verbose: bool = False,
         extra_args: list[str] | None = None,
+        project_root: str | None = None,
     ):
         self.logic = logic
         self.session_dirs = session_dirs or []
         self.verbose = verbose
         self.extra_args = extra_args or []
+        # Base directory for relativizing displayed paths. ``None`` (the current
+        # placeholder) → renderers show absolute paths. A real per-agent root will
+        # be set with the stdio-per-agent refactor.
+        self.project_root = project_root
 
         self.process: asyncio.subprocess.Process | None = None
         self.reader_task: asyncio.Task[None] | None = None
@@ -117,6 +174,16 @@ class IsabelleLSPClient:
         self.open_documents: dict[str, DocumentState] = {}
         self.diagnostic_cache = DiagnosticCache()
         self._first_diagnostic_event: dict[str, asyncio.Event] = {}
+
+        # Optional FileWatcher (set by the server). open_document/close_document
+        # register/deregister the file's parent directory for event-driven sync.
+        self.file_watcher: Any = None
+
+        # Dependency-freshness (Layer 3): last-seen stat signatures of server-owned
+        # dependency files (external imports + .ML blobs), keyed by node_name.
+        self._dep_stat_sigs: dict[str, StatSig | None] = {}
+        # The server File_Watcher's debounce; refreshed from options at start().
+        self.vscode_load_delay: float = 0.5
 
         # Caret lock: serializes the entire goal/dynamic_output query cycle.
         # The Isabelle caret is global — see docs/ARCHITECTURE.md §7.3.
@@ -211,6 +278,7 @@ class IsabelleLSPClient:
 
         self.start_time = time.time()
         self._last_server_activity = self.start_time
+        self.vscode_load_delay = read_vscode_load_delay()
         self.reader_task = asyncio.create_task(self._read_loop())
         self.stderr_task = asyncio.create_task(self._drain_stderr())
         await self.initialize()
@@ -274,6 +342,7 @@ class IsabelleLSPClient:
                 await self.process.wait()
 
         self.open_documents.clear()
+        self._dep_stat_sigs.clear()
         self.pending_requests.clear()
         self.diagnostic_cache.diagnostics.clear()
         self.diagnostic_cache.last_update.clear()
@@ -543,6 +612,21 @@ class IsabelleLSPClient:
 
     # ── High-level document methods ─────────────────────────────────────
 
+    def _add_file_watch(self, file_path: str) -> None:
+        """Register the file's parent dir with the watcher (event-driven sync)."""
+        fw = self.file_watcher
+        if fw is not None:
+            fw.add_watch(os.path.dirname(file_path))
+
+    def _remove_file_watch(self, file_path: str) -> None:
+        """Deregister the file's parent dir — only if no other open doc lives there."""
+        fw = self.file_watcher
+        if fw is None:
+            return
+        directory = os.path.dirname(file_path)
+        if not any(os.path.dirname(p) == directory for p in self.open_documents):
+            fw.remove_watch(directory)
+
     async def open_document(
         self,
         file_path: str,
@@ -551,23 +635,23 @@ class IsabelleLSPClient:
         wait_for_diagnostics: bool = True,
         diagnostic_timeout: float = 2.0,
     ) -> None:
+        """Ensure *file_path* is open (didOpen once); never re-sync content here.
+
+        For an already-open document this returns immediately — it does NOT re-read
+        disk, bump the version, or send didChange. All content syncing is owned by
+        the locked sync paths (:meth:`resync_changed_open_documents` /
+        :meth:`sync_dirty_files`), which run via the tool-call backstop before any
+        ``open_document`` in a tool body. This removes the only unlocked didChange
+        path and the version race it caused.
+        """
+        file_path = _canon(file_path)
+
+        if file_path in self.open_documents:
+            return
+
         if content is None:
             with open(file_path, encoding='utf-8') as f:
                 content = f.read()
-
-        existing = self.open_documents.get(file_path)
-        if existing is not None:
-            if existing.content == content:
-                logger.info("Document unchanged: %s", file_path)
-                return
-            existing.version += 1
-            existing.content = content
-            logger.info("Sending didChange v%d for %s", existing.version, file_path)
-            await self.notify("textDocument/didChange", {
-                "textDocument": {"uri": existing.uri, "version": existing.version},
-                "contentChanges": [{"text": content}],
-            })
-            return
 
         uri = file_path_to_uri(file_path)
 
@@ -584,7 +668,9 @@ class IsabelleLSPClient:
         })
         self.open_documents[file_path] = DocumentState(
             file_path=file_path, uri=uri, version=1, content=content,
+            stat_sig=_stat_sig(file_path),
         )
+        self._add_file_watch(file_path)
 
         if wait_for_diagnostics:
             received = await self.wait_for_first_diagnostics(
@@ -620,7 +706,7 @@ class IsabelleLSPClient:
         self, file_path: str, line: LSPLine, character: LSPCharacter = LSPCharacter(0),
     ) -> None:
         """Send PIDE/caret_update to tell Isabelle which region to process."""
-        doc = self.open_documents.get(file_path)
+        doc = self.open_documents.get(_canon(file_path))
         if doc is None:
             return
         await self.notify("PIDE/caret_update", {
@@ -631,6 +717,7 @@ class IsabelleLSPClient:
         })
 
     async def close_document(self, file_path: str) -> None:
+        file_path = _canon(file_path)
         doc = self.open_documents.pop(file_path, None)
         if doc is None:
             return
@@ -641,6 +728,7 @@ class IsabelleLSPClient:
         tracker = self._processing_trackers.pop(file_path, None)
         if tracker is not None:
             await tracker.reset()
+        self._remove_file_watch(file_path)
 
     # ── Processing status (PIDE/decoration) ────────────────────────────
 
@@ -739,10 +827,11 @@ class IsabelleLSPClient:
         2. Caret to line 0 — restrict perspective
         3. Single edit — trigger Document.update with restricted perspective
 
-        The trailing space on line 0 is self-healing: the next open_document()
-        re-reads from disk and detects the content mismatch.
+        The trailing space on line 0 is self-healing: we drop ``stat_sig`` so the
+        next tool-call stat backstop (resync_changed_open_documents) re-reads from
+        disk, sees the content mismatch, and didChanges back to the real file.
         """
-        doc = self.open_documents.get(file_path)
+        doc = self.open_documents.get(_canon(file_path))
         if doc is None:
             return
         await self.cancel_execution()
@@ -763,6 +852,9 @@ class IsabelleLSPClient:
         })
         parts = doc.content.split("\n", 1)
         doc.content = parts[0] + " " + ("\n" + parts[1] if len(parts) > 1 else "")
+        # The model now diverges from disk (synthetic space, never written out).
+        # Drop the signature so the next stat backstop re-reads disk and heals it.
+        doc.stat_sig = None
 
     def file_all_processed(self, file_path: str) -> bool:
         """True if the entire file has been processed (no unprocessed/running)."""
@@ -775,23 +867,37 @@ class IsabelleLSPClient:
         """Return the ProcessingTracker for *file_path*, or None."""
         return self._processing_trackers.get(file_path)
 
-    async def sync_dirty_files(self, dirty_paths: set[str]) -> None:
-        """Re-sync open documents that are affected by dirty files.
+    async def resync_changed_open_documents(self) -> None:
+        """Tool-call backstop (Layer 2): re-stat every open doc; sync changed ones.
 
-        .thy files: re-read and didChange if content differs.
-        .ML files: force re-sync all open .thy files (unknown dependency graph).
+        Catches edits the event sources silently missed (inotify overflow, a
+        non-hooked external editor, NFS, symlink/hardlink). The stat batch runs off
+        the event loop so a slow/NFS mount cannot block it. Content comparison in
+        :meth:`sync_dirty_files` is the final gate, so a bare metadata touch with no
+        content change sends nothing.
         """
-        has_dirty_ml = any(p.endswith(".ML") for p in dirty_paths)
-        thy_to_resync: set[str] = set()
+        paths = list(self.open_documents)
+        if not paths:
+            return
+        sigs = await asyncio.to_thread(_stat_sigs, paths)
+        changed: set[str] = set()
+        for path, sig in sigs.items():
+            doc = self.open_documents.get(path)
+            if doc is not None and sig != doc.stat_sig:
+                changed.add(path)
+        if changed:
+            await self.sync_dirty_files(changed)
 
-        for path in dirty_paths:
-            if path in self.open_documents:
-                thy_to_resync.add(path)
+    async def sync_dirty_files(self, dirty_paths: set[str]) -> None:
+        """Re-sync the open editor documents among *dirty_paths* (didChange on change).
 
-        if has_dirty_ml:
-            thy_to_resync.update(self.open_documents.keys())
-
-        for path in thy_to_resync:
+        Only editor-opened ``.thy`` documents (``open_documents``) are pushed here.
+        Dependency files (``.ML`` blobs + imported ``.thy``) are the vscode_server's
+        own File_Watcher's job, so a dirty dependency is simply ignored. Each synced
+        path's ``stat_sig`` is refreshed so the Layer-2 backstop won't re-flag it.
+        """
+        for raw in dirty_paths:
+            path = _canon(raw)
             doc = self.open_documents.get(path)
             if doc is None:
                 continue
@@ -799,6 +905,8 @@ class IsabelleLSPClient:
                 with open(path, encoding="utf-8") as f:
                     content = f.read()
             except OSError:
+                # Deleted/unreadable: drop the signature so a later recreate re-syncs.
+                doc.stat_sig = None
                 continue
             if content != doc.content:
                 doc.version += 1
@@ -808,13 +916,7 @@ class IsabelleLSPClient:
                     "textDocument": {"uri": doc.uri, "version": doc.version},
                     "contentChanges": [{"text": content}],
                 })
-            elif has_dirty_ml:
-                doc.version += 1
-                logger.info("Forcing re-sync (ML changed): %s v%d", path, doc.version)
-                await self.notify("textDocument/didChange", {
-                    "textDocument": {"uri": doc.uri, "version": doc.version},
-                    "contentChanges": [{"text": doc.content}],
-                })
+            doc.stat_sig = _stat_sig(path)
 
     # ── Standard LSP queries ────────────────────────────────────────────
 

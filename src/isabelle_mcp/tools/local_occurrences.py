@@ -1,8 +1,8 @@
 import logging
 
-from isabelle_mcp.evaluation import check_evaluation_guard
+from isabelle_mcp.evaluation import check_evaluation_guard, format_evaluation_result
 from isabelle_mcp.lsp_client import IsabelleLSPClient
-from isabelle_mcp.models import EvaluationResult, LocalOccurrencesResult, Occurrence
+from isabelle_mcp.models import EvaluationView, LocalOccurrencesResult, Occurrence
 from isabelle_mcp.utils import (
     IsabelleToolError,
     LSPCharacter,
@@ -25,8 +25,8 @@ async def local_occurrences(
     await client.open_document(file_path)
 
     guard = await check_evaluation_guard(client, file_path, line)
-    if isinstance(guard, EvaluationResult):
-        raise IsabelleToolError(guard.message)
+    if isinstance(guard, EvaluationView):
+        raise IsabelleToolError(format_evaluation_result(guard, client.project_root))
     note = guard if isinstance(guard, str) else None
 
     doc = client.open_documents.get(file_path)

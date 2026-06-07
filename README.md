@@ -4,6 +4,14 @@ MCP server bridging AI agents with Isabelle's theorem prover via its LSP impleme
 
 **Python ≥ 3.10 | v0.1.0 (MVP)**
 
+> ⚠️ **One agent per server instance.** This server holds a single shared
+> Isabelle session with global mutable state — one set of open documents, one
+> caret/perspective, and one evaluation in flight at a time. It is
+> **single-threaded and not concurrency-safe**: pointing multiple agents at
+> one instance, or interleaving concurrent requests (including via the shared
+> `--http` mode), corrupts the shared evaluation/caret/document state with
+> catastrophic, hard-to-debug results. Run one dedicated server per agent.
+
 ## Quick Start
 
 ```bash
@@ -43,19 +51,19 @@ These are read once at process startup; a connected agent cannot change them.
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `ISA_LSP_EVAL_POLL_INTERVAL` | `10` | Seconds an evaluate/poll call waits before returning `in_progress` |
+| `ISA_LSP_SYNC_INTERVAL` | `1` | Seconds between background pushes of file-system edits to Isabelle |
 | `ISA_LSP_DUMP` | unset | If set to a path, append a JSON wire-log of all LSP traffic (debugging) |
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| `isabelle_evaluate_to` | Evaluate the theory up to a line (auto-starts the prover) |
-| `isabelle_evaluation_status` | Poll progress of a running evaluation |
+| `isabelle_evaluate_to` | Evaluate the theory up to a line (auto-starts the prover); returns a per-file snapshot of errors / warnings / running command lines |
+| `isabelle_evaluation_status` | Poll progress of a running evaluation (same snapshot) |
 | `isabelle_cancel_evaluation` | Cancel a running evaluation |
 | `isabelle_hover` | Type info and documentation at position |
 | `isabelle_definition` | Jump to symbol definition |
 | `isabelle_local_occurrences` | In-file occurrences (definition + uses) of a local entity |
-| `isabelle_diagnostics` | Errors, warnings, processing status |
 | `isabelle_goal` | **Proof goals** — omit after_text for before/after diff |
 | `isabelle_command_output` | Prover output messages |
 | `isabelle_session_info` | Current session info |

@@ -1,13 +1,21 @@
 # Isa-LSP API Design Document
 
 **Version:** 0.1.0
-**Date:** 2026-03-07
+**Date:** 2026-06-04
 **Status:** Draft with current implementation notes
+
+> Note: this is a design/protocol document; several code blocks are illustrative
+> pseudocode, not verbatim current source. Where a section describes *current*
+> behavior it has been reconciled with the implementation; design-target tools
+> (`isabelle_edit`, `isabelle_completions`, `isabelle_preview`) are marked as such.
+> File edits now reach Isabelle via a FileWatcher + sync model (§3.6), not an
+> `isabelle_edit` tool. Position-sensitive tools target by `symbol`/`after_text`
+> snippet, never a column.
 
 ## 1. Overview
 
 This document provides API design and implementation guidance for Isa-LSP. The
-current server exposes 10 MCP tools. Document editing (`isabelle_edit`),
+current server exposes 9 MCP tools. Document editing (`isabelle_edit`),
 completion (`isabelle_completions`), and preview (`isabelle_preview`) are design
 targets discussed below, not tools currently registered by the server — though
 the LSP-client layer already implements completion and preview support.
@@ -26,7 +34,12 @@ ARCHITECTURE.md.
 | `isabelle_completions` _(design target)_ | `textDocument/completion` | `CompletionParams` | `CompletionList` with `items[]` — not exposed as a tool |
 | `isabelle_definition` | `textDocument/definition` | `DefinitionParams` | `Location[]` or `LocationLink[]` |
 | `isabelle_local_occurrences` | `textDocument/documentHighlight` | `DocumentHighlightParams` | `DocumentHighlight[]` |
-| `isabelle_diagnostics` | (notifications) | - | Cached from `publishDiagnostics` |
+
+> The `publishDiagnostics` notification is still cached internally (consumed by
+> `isabelle_hover` to attach line diagnostics), but there is no longer a dedicated
+> `isabelle_diagnostics` tool. Error/warning *message text* is obtained via
+> `isabelle_command_output`; error/warning *line locations* come from the evaluation
+> snapshot (decoration channels). See §3.5.
 
 ### 2.2 Document Editing Methods
 
@@ -39,7 +52,7 @@ ARCHITECTURE.md.
 | MCP Tool | PIDE Methods | Flow |
 |----------|--------------|------|
 | `isabelle_goal` | `PIDE/caret_update`, `PIDE/state_init`, `PIDE/state_output`, `PIDE/state_exit` | Multi-step async; state id assigned by server |
-| `isabelle_command_output` | `PIDE/dynamic_output` | Notification-based |
+| `isabelle_command_output` | `PIDE/output_at_position` (patched, position-explicit) | Request-response; returns the enclosing command's source+range and rendered output in one shot |
 | `isabelle_preview` _(design target)_ | `PIDE/preview_request`, `PIDE/preview_response` | Request-response; not exposed as a tool |
 
 ### 2.4 Session Management
@@ -394,9 +407,20 @@ tool **omits the `kind` field** entirely.
 
 ---
 
-### 3.5 `isabelle_diagnostics`
+### 3.5 Diagnostic cache (internal — no longer a tool)
 
-**LSP Notification (Server → Client):**
+There is no `isabelle_diagnostics` MCP tool. The `publishDiagnostics` notification
+handler and the diagnostic cache (`DiagnosticMessage` model) still exist, but are
+**internal only**: `isabelle_hover` reads them to attach the line's diagnostics to a
+hover result. The two agent-facing paths to error/warning information are:
+
+- **Where** (line locations) → the evaluation snapshot (§4.5 in `SPECIFICATION.md`),
+  built from the `PIDE/decoration` channels (`text_overview_error` +
+  `background_bad` for errors, `text_overview_warning` for warnings) — not from the
+  diagnostics channel.
+- **What** (full message text) → `isabelle_command_output` at the offending line.
+
+**LSP Notification (Server → Client), consumed internally:**
 ```json
 {
   "jsonrpc": "2.0",
@@ -418,88 +442,14 @@ tool **omits the `kind` field** entirely.
 }
 ```
 
-**Diagnostic Severity (LSP Enum):**
-- 1: Error
-- 2: Warning
-- 3: Information
-- 4: Hint
+**Diagnostic Severity (LSP Enum):** 1 = Error, 2 = Warning, 3 = Information, 4 = Hint.
 
 **Implementation Notes:**
-1. **Caching Required**: Diagnostics arrive via async notifications
-2. Store diagnostics by file URI in cache
-3. Tool reads from cache synchronously
-4. Filter by line range if `start_line`/`end_line` provided
-5. Compute `success` flag: true if no errors in range
-
-**Processing Status Heuristic:**
-- PIDE sends diagnostics incrementally as processing progresses
-- Heuristic: if last diagnostic was received > 500ms ago, consider complete
-- Better: track `PIDE/decoration` with `background_running` type
-
-**Code Snippet:**
-```python
-class DiagnosticCache:
-    def __init__(self):
-        self.diagnostics: Dict[str, List[Dict]] = {}
-        self.last_update: Dict[str, float] = {}
-
-    def handle_publish_diagnostics(self, uri: str, diagnostics: List[Dict]):
-        """Handle LSP publishDiagnostics notification"""
-        file_path = uri_to_file_path(uri)
-        self.diagnostics[file_path] = diagnostics
-        self.last_update[file_path] = time.time()
-
-    def get_diagnostics(
-        self,
-        file_path: str,
-        start_line: Optional[int] = None,
-        end_line: Optional[int] = None
-    ) -> DiagnosticsResult:
-        """Get cached diagnostics, optionally filtered by line range"""
-        all_diags = self.diagnostics.get(file_path, [])
-
-        # Filter by line range
-        filtered = []
-        for diag in all_diags:
-            diag_line = diag["range"]["start"]["line"] + 1  # Convert to 1-indexed
-            if start_line and diag_line < start_line:
-                continue
-            if end_line and diag_line > end_line:
-                continue
-            filtered.append(diag)
-
-        # Convert to DiagnosticMessage models
-        items = [
-            DiagnosticMessage(
-                severity=severity_to_string(diag["severity"]),
-                message=diag["message"],
-                line=diag["range"]["start"]["line"] + 1,
-                column=diag["range"]["start"]["character"] + 1,
-                end_line=diag["range"]["end"]["line"] + 1,
-                end_column=diag["range"]["end"]["character"] + 1
-            )
-            for diag in filtered
-        ]
-
-        # Compute success flag
-        success = all(item.severity != "error" for item in items)
-
-        # Check processing status (heuristic)
-        last_update = self.last_update.get(file_path, 0)
-        processing_complete = (time.time() - last_update) > 0.5
-
-        return DiagnosticsResult(
-            success=success,
-            items=items,
-            processing_complete=processing_complete,
-            failed_dependencies=[]
-        )
-```
-
-**Edge Cases:**
-- File not yet opened → return empty diagnostics with warning
-- PIDE still processing → return `processing_complete=false`
-- Build failures → extract failed dependency paths from special diagnostics
+1. Diagnostics arrive via async notifications and are cached by file URI.
+2. The handler stores them; `isabelle_hover` reads the cache synchronously to attach
+   the queried line's diagnostics (`DiagnosticMessage`) to its result.
+3. The cache is no longer exposed through a standalone tool, so there is no
+   `start_line`/`end_line` filter, `success` flag, or `DiagnosticsResult` model.
 
 ---
 
@@ -507,6 +457,20 @@ class DiagnosticCache:
 
 This section describes a future mutating tool. It is not registered in the
 current server.
+
+> **Current behavior (no `isabelle_edit` tool):** Today the agent edits `.thy`/`.ML`
+> files on disk with ordinary tools, and the server pushes those edits to Isabelle
+> automatically. For editor-opened `.thy`, a `FileWatcher` (`file_watcher.py`) watches
+> their parent directories and, on any change, immediately pushes the file as
+> `textDocument/didChange` (event-driven; the `moved` handler catches atomic-rename
+> saves). A tool-call backstop (`_ensure_lsp_started` → `resync_and_check_freshness`)
+> re-stats every open doc at the start of each MCP call and syncs the changed ones
+> (only if content changed, via `client.sync_dirty_files`). Dependency files (`.ML`
+> blobs, imported `.thy`) are synced by Isabelle's own vscode_server File_Watcher; the
+> backstop waits out its `vscode_load_delay` debounce when a dependency was just edited.
+> Pushing edits during an active evaluation is intentional. The `isabelle_edit` design
+> below would add an explicit in-session edit tool on top of this; the line-splice and
+> `wait_for_processing` details are design notes, not current code.
 
 **LSP Notification (Client → Server):**
 ```json
@@ -567,7 +531,10 @@ current server.
    - Consider complete when no new `publishDiagnostics` received for 500ms+
    - Timeout after 10 seconds (configurable)
 
-   **Known limitation**: This heuristic can produce false positives (PIDE takes >500ms between diagnostic batches → falsely reports completion) and false negatives (file has zero diagnostics → waits until timeout). A more robust approach would track `PIDE/decoration` notifications with `background_running` status, but this is not implemented.
+   **Note**: The diagnostics-quiet heuristic described here is superseded in the
+   current code by the `ProcessingTracker`, which tracks `PIDE/decoration`
+   `background_running1`/`background_unprocessed1` ranges directly — the
+   "robust approach" mentioned here as unimplemented is now the implementation.
 
 5. **Disk sync**: When `sync_to_disk=True`, write the new content to the file on disk after the LSP change is sent. This keeps the file system consistent for `git`, other editors, and external tools.
 
@@ -577,7 +544,7 @@ current server.
 
 7. **Cache invalidation**: After an edit, previously cached results from other tools (`isabelle_goal`, `isabelle_hover`, etc.) are stale for the edited document. The tool does not automatically invalidate them — callers must re-query after editing.
 
-8. **Concurrency**: Line-range edits splice against `DocumentState.content`. If two `isabelle_edit` calls to the same document overlap, both will compute their splice against the same base content, and the second `change_document` will silently overwrite the first. Callers must serialize edits to the same document.
+8. **Concurrency**: Line-range edits splice against `DocumentState.content`. If two `isabelle_edit` calls to the same document overlap, both will compute their splice against the same base content, and the second push would silently overwrite the first. Callers must serialize edits to the same document. (In the current code the corresponding client method is `sync_dirty_files`, which re-reads from disk and sends `didChange`; there is no `change_document` method.)
 
 **Code Snippet:**
 ```python
@@ -677,21 +644,13 @@ async def edit_document(
 ```
 
 The current implementation opens one temporary state panel per queried position.
-For before/after mode, it performs the sequence twice: once at line start and
-once at line end.
-
-```
-1. Send: PIDE/caret_update
-   {"uri": "file:///...", "line": 41, "character": <end_of_line>}
-
-2. Send: PIDE/state_init
-
-3. Receive: PIDE/state_output
-   {"id": <panel_id>, "content": "<html>...goals...</html>"}
-
-4. Send: PIDE/state_exit
-   {"id": <panel_id>}
-```
+It performs the sequence **once**, at a single caret resolved from the optional
+`after_text` snippet (or the end of the line when `after_text` is omitted) via
+`resolve_caret`. There is no "before/after mode" and no `column` parameter. The
+tool calls `get_command_at_position` (for the enclosing command's source+range) and
+`get_goals_at_position` (for the subgoals after that command), and returns a
+`GoalState(command=CommandSpan|None, subgoals=list[str], note=str|None)`. To compare
+a tactic's before/after effect, query the line before it and the tactic's own line.
 
 **HTML Output Format (Example):**
 ```html
@@ -741,7 +700,8 @@ def parse_goals_from_html(html: str) -> List[str]:
    for `PIDE/state_exit`.
 2. **Async Coordination**: Use `asyncio.Future` for waiting on `state_output`
 3. **Timeout**: 5-10 seconds max wait for state output
-4. **Before/After Pattern**: If column is None, query twice (line start and end)
+4. **Single query**: The caret is resolved once from `after_text` (or end of line);
+   there is no before/after double query and no `column` parameter.
 5. **Context Extraction**: Parse `<div class="context">` if available
 6. **Concurrency**: Serialize state queries because `PIDE/state_init` responses
    are matched by the next state output notification.
@@ -798,25 +758,32 @@ class StatePanelManager:
 
 ### 3.8 `isabelle_command_output`
 
-**PIDE Notification (Server → Client):**
+**Current mechanism — `PIDE/output_at_position` (patched, position-explicit).**
+The caret is resolved once from the optional `after_text` snippet (or end of line)
+via `resolve_caret`, then a single `PIDE/output_at_position` request returns the
+enclosing command's **source + range AND its rendered output** in one shot. Unlike
+the older push-based `dynamic_output`, it does not move the caret, so it is immune to
+the "same caret → no push" hang and renders the whole command's results regardless of
+the offset within the command. The tool returns
+`CommandOutputResult(command=CommandSpan|None, messages=list[OutputMessage], note=str|None)`,
+which the MCP layer renders to a plain-text `ToolResult` (`format_command_output`).
+
+**Request/response shape:**
 ```json
-{
-  "jsonrpc": "2.0",
-  "method": "PIDE/dynamic_output",
-  "params": {
-    "content": "<pre class=\"source\"><span class=\"writeln_message\">val it = 64: int</span></pre>"
-  }
-}
+// Request
+{"jsonrpc": "2.0", "id": 7, "method": "PIDE/output_at_position",
+ "params": {"uri": "file:///...", "line": 40, "character": 2}}
+// Response result: the command source, its 1-indexed range, and rendered output HTML,
+// e.g. "<pre class=\"source\"><span class=\"writeln_message\">val it = 64: int</span></pre>"
 ```
 
 **Implementation Notes:**
-1. **Notification Based**: `dynamic_output` is sent after caret movement, but
-   the notification payload contains only `content`.
-2. The current client serializes dynamic-output queries so a notification can
-   be associated with the currently requested position.
-3. The client does not reuse output from a different file/line/column. If
-   Isabelle emits no fresh notification and no same-position cache exists, the
-   command output result contains an empty message list.
+1. **Request-response, position-explicit**: one request per resolved position;
+   no notification matching, no caret movement.
+2. **No command at the position** (blank line, comment, or past the last command)
+   → `command=None`, empty `messages`.
+3. The legacy `PIDE/dynamic_output` push path still exists in the client
+   (`get_dynamic_output`) but is not used by this tool.
 4. `isabelle_command_output` probes a small set of caret columns on the line:
    first non-space character, end of the command token, the following
    character, then column 0. This matches Isabelle output that appears only
@@ -1030,7 +997,17 @@ async def ensure_document_open(client: IsabelleLSPClient, file_path: str):
     await asyncio.sleep(2.0)
 ```
 
+> The fixed `asyncio.sleep(2.0)` above is illustrative only. The current
+> `open_document` does not hardcode a delay; processing is awaited dynamically via
+> the `ProcessingTracker` (`wait_for_processing` / `wait_for_processing_bounded`).
+
 ### 4.4 Document Change Management
+
+> **Current code:** there is no `change_document` method. On-disk edits are pushed
+> by `sync_dirty_files` (re-read from disk → `didChange` if content changed),
+> driven by the FileWatcher + per-tool-call/background-loop flush (§3.6). The
+> `change_document` pseudocode below illustrates the underlying full-replacement
+> `didChange` it performs.
 
 **Protocol context**: Isabelle's `vscode_server` reports `textDocumentSync = 2` (Incremental per LSP spec). However, the LSP spec guarantees that a client can always send full content replacement (omitting `range` in `contentChanges`) regardless of the announced sync kind. We use this full-replacement approach for simplicity.
 
@@ -1078,8 +1055,9 @@ async def wait_for_processing(self, file_path: str, timeout: float = 10.0) -> bo
           before the second batch arrives.
         - False negative: if the file has zero diagnostics after the edit,
           no publishDiagnostics is sent at all, so we wait until timeout.
-        - A more robust approach would track PIDE/decoration notifications
-          with background_running status, but this is not yet implemented.
+        - NOTE: the current `wait_for_processing` no longer relies on this
+          diagnostics-quiet heuristic — it waits on the `ProcessingTracker`, which
+          tracks PIDE/decoration background_running/unprocessed ranges directly.
     """
     deadline = time.time() + timeout
     while time.time() < deadline:

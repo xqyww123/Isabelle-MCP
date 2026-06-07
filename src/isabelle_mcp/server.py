@@ -1,6 +1,8 @@
 """Isabelle LSP MCP Server — FastMCP entry point."""
 
+import asyncio
 import logging
+import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -8,21 +10,20 @@ from typing import Any
 from fastmcp import FastMCP
 from fastmcp.tools.tool import ToolResult
 from mcp.types import TextContent
-from starlette.requests import Request
-from starlette.responses import JSONResponse
 
 from isabelle_mcp.evaluation import (
     cancel_evaluation,
     evaluate_to,
     evaluation_status,
+    format_evaluation_result,
+    resync_and_check_freshness,
+    sync_file_locked,
 )
 from isabelle_mcp.file_watcher import FileWatcher
 from isabelle_mcp.instructions import get_instructions
 from isabelle_mcp.lsp_client import IsabelleLSPClient
 from isabelle_mcp.models import (
     DeclarationLocation,
-    DiagnosticsResult,
-    EvaluationResult,
     GoalState,
     HoverInfo,
     LocalOccurrencesResult,
@@ -31,7 +32,6 @@ from isabelle_mcp.models import (
 from isabelle_mcp.tools import (
     command_output,
     declaration_location,
-    diagnostic_messages,
     format_command_output,
     goal,
     hover_info,
@@ -49,12 +49,37 @@ _server_logic: str = "HOL"
 _server_extra_args: list[str] = []
 
 
+async def _file_change_sink(path: str) -> None:
+    """Event-driven sync sink: the FileWatcher schedules this on every relevant edit.
+
+    A no-op until the Isabelle process has been started by a tool call — the prover
+    never auto-starts. ``sync_file_locked`` ignores paths that are not editor-opened
+    documents (e.g. dependency files, which the server's own File_Watcher syncs).
+    """
+    client = _lsp_client
+    if client is None or client.process is None:
+        return
+    try:
+        await sync_file_locked(client, path)
+    except Exception:
+        logger.exception("Event-driven file sync failed for %s", path)
+
+
 @asynccontextmanager
 async def server_lifespan(_app: Any) -> AsyncGenerator[None]:
     global _lsp_client, _file_watcher
-    _lsp_client = IsabelleLSPClient(logic=_server_logic, extra_args=_server_extra_args)
+    # project_root stays None for now (shared HTTP server has no meaningful root) →
+    # evaluation snapshots render absolute paths. Set a real per-agent root here with
+    # the stdio-per-agent refactor.
+    _lsp_client = IsabelleLSPClient(
+        logic=_server_logic, extra_args=_server_extra_args, project_root=None,
+    )
     _file_watcher = FileWatcher()
     _file_watcher.start()
+    # Wire event-driven sync: the watcher (observer thread) schedules _file_change_sink
+    # onto this event loop; open_document/close_document add/remove its directory watches.
+    _file_watcher.set_sink(asyncio.get_running_loop(), _file_change_sink)
+    _lsp_client.file_watcher = _file_watcher
     try:
         yield
     finally:
@@ -75,34 +100,25 @@ async def _ensure_lsp_started() -> IsabelleLSPClient:
         raise IsabelleToolError("LSP client not initialized")
     if _lsp_client.process is None:
         await _lsp_client.start()
-    if _file_watcher is not None:
-        dirty = _file_watcher.pop_dirty_files()
-        if dirty:
-            await _lsp_client.sync_dirty_files(dirty)
+    # Backstop sync at every tool-call start: Layer 2 (re-stat open docs and push the
+    # changed ones) + Layer 3 (wait out the server's debounce if a dependency just
+    # changed). Catches anything the event-driven watcher missed.
+    await resync_and_check_freshness(_lsp_client)
     return _lsp_client
-
-
-@mcp.custom_route("/notify-file-change", methods=["POST"])
-async def notify_file_change(request: Request) -> JSONResponse:
-    data = await request.json()
-    file_path = data.get("file_path", "")
-    if file_path and _file_watcher is not None:
-        _file_watcher.notify_file_changed(file_path)
-        logger.info("Hook notified file change: %s", file_path)
-    return JSONResponse({"ok": True})
 
 
 # ── Evaluation tools ──────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(output_schema=None)
 async def isabelle_evaluate_to(
     file_path: str, line: int, after_text: str | None = None,
-) -> EvaluationResult:
+) -> ToolResult:
     """Start evaluating a theory file up to a location on a line.
 
-    The result may indicate evaluation is still in progress.
-    If so, call ``evaluation_status`` to update the progress.
+    Returns a per-file snapshot — errors / warnings / running command lines. The
+    result may indicate evaluation is still in progress; if so, call
+    ``evaluation_status`` to update the progress.
 
     Args:
         file_path: Absolute path to .thy file
@@ -114,25 +130,40 @@ async def isabelle_evaluate_to(
             used. Without it (default), evaluation proceeds through the command on
             ``line``.
     """
-    return await evaluate_to(await _ensure_lsp_started(), file_path, line, after_text)
+    file_path = os.path.realpath(file_path)
+    client = await _ensure_lsp_started()
+    view = await evaluate_to(client, file_path, line, after_text)
+    return ToolResult(content=[TextContent(
+        type="text", text=format_evaluation_result(view, client.project_root),
+    )])
 
 
-@mcp.tool()
-async def isabelle_evaluation_status() -> EvaluationResult:
+@mcp.tool(output_schema=None)
+async def isabelle_evaluation_status() -> ToolResult:
     """Check the progress of an ongoing evaluation.
-    Returns new errors (since the last check) and the current execution position.
+
+    Returns the current per-file snapshot (errors / warnings / running) and execution
+    position.
     """
-    return await evaluation_status(await _ensure_lsp_started())
+    client = await _ensure_lsp_started()
+    view = await evaluation_status(client)
+    return ToolResult(content=[TextContent(
+        type="text", text=format_evaluation_result(view, client.project_root),
+    )])
 
 
-@mcp.tool()
-async def isabelle_cancel_evaluation() -> EvaluationResult:
+@mcp.tool(output_schema=None)
+async def isabelle_cancel_evaluation() -> ToolResult:
     """Cancel an ongoing evaluation.
 
     Stops Isabelle from processing further.  Already-processed results
     remain valid for querying.
     """
-    return await cancel_evaluation(await _ensure_lsp_started())
+    client = await _ensure_lsp_started()
+    view = await cancel_evaluation(client)
+    return ToolResult(content=[TextContent(
+        type="text", text=format_evaluation_result(view, client.project_root),
+    )])
 
 
 # ── Query tools (require prior evaluation) ────────────────────────────
@@ -152,7 +183,9 @@ async def isabelle_hover(file_path: str, line: int, symbol: str) -> HoverInfo:
         line: Line number (1-indexed)
         symbol: Symbol text to look up (e.g. "Suc", "my_const", "⟹")
     """
-    return await hover_info(await _ensure_lsp_started(), file_path, MCPLine(line), symbol)
+    return await hover_info(
+        await _ensure_lsp_started(), os.path.realpath(file_path), MCPLine(line), symbol,
+    )
 
 
 @mcp.tool()
@@ -169,7 +202,9 @@ async def isabelle_definition(file_path: str, line: int, symbol: str) -> Declara
         line: Line number (1-indexed)
         symbol: Symbol text to look up (e.g. "my_const", "List.map")
     """
-    return await declaration_location(await _ensure_lsp_started(), file_path, MCPLine(line), symbol)
+    return await declaration_location(
+        await _ensure_lsp_started(), os.path.realpath(file_path), MCPLine(line), symbol,
+    )
 
 
 @mcp.tool()
@@ -191,27 +226,8 @@ async def isabelle_local_occurrences(file_path: str, line: int, symbol: str) -> 
         line: Line number (1-indexed)
         symbol: Symbol text to look up (e.g. "my_const", "add_one"), ASCII or Unicode.
     """
-    return await local_occurrences(await _ensure_lsp_started(), file_path, MCPLine(line), symbol)
-
-
-@mcp.tool()
-async def isabelle_diagnostics(
-    file_path: str,
-    start_line: int,
-    end_line: int,
-) -> DiagnosticsResult:
-    """Get prover diagnostics (errors, warnings) for a line range.
-
-    Auto-starts evaluation if the range has not been evaluated yet.
-    Use negative indices to count from the end: -1 = last line.
-
-    Args:
-        file_path: Absolute path to .thy file
-        start_line: Start line (1-indexed, or negative from end)
-        end_line: End line (1-indexed, or negative from end)
-    """
-    return await diagnostic_messages(
-        await _ensure_lsp_started(), file_path, start_line, end_line
+    return await local_occurrences(
+        await _ensure_lsp_started(), os.path.realpath(file_path), MCPLine(line), symbol,
     )
 
 
@@ -231,6 +247,7 @@ async def isabelle_goal(
         after_text: Optional text on the line; the command right after it is used.
             Without it, the command at the end of the line is used.
     """
+    file_path = os.path.realpath(file_path)
     lsp = await _ensure_lsp_started()
     return await goal(lsp, file_path, MCPLine(line), after_text)
 
@@ -253,7 +270,7 @@ async def isabelle_command_output(
             Without it, the command at the end of the line is used.
     """
     result = await command_output(
-        await _ensure_lsp_started(), file_path, MCPLine(line), after_text,
+        await _ensure_lsp_started(), os.path.realpath(file_path), MCPLine(line), after_text,
     )
     return ToolResult(
         content=[TextContent(type="text", text=format_command_output(result, line))],
