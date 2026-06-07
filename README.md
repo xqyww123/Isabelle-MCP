@@ -72,8 +72,6 @@ All positions are **1-indexed**. File paths must be **absolute**.
 
 PIDE tools (goal, command_output) are best-effort wrappers around async PIDE notifications and may time out.
 
-_Design targets (not yet exposed as MCP tools): `isabelle_completions` and `isabelle_preview` — both already supported at the LSP-client layer — plus `isabelle_edit`._
-
 ## Development
 
 ```bash

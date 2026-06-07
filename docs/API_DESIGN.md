@@ -6,19 +6,14 @@
 
 > Note: this is a design/protocol document; several code blocks are illustrative
 > pseudocode, not verbatim current source. Where a section describes *current*
-> behavior it has been reconciled with the implementation; design-target tools
-> (`isabelle_edit`, `isabelle_completions`, `isabelle_preview`) are marked as such.
-> File edits now reach Isabelle via a FileWatcher + sync model (§3.6), not an
-> `isabelle_edit` tool. Position-sensitive tools target by `symbol`/`after_text`
+> behavior it has been reconciled with the implementation.
+> Position-sensitive tools target by `symbol`/`after_text`
 > snippet, never a column.
 
 ## 1. Overview
 
 This document provides API design and implementation guidance for Isa-LSP. The
-current server exposes 9 MCP tools. Document editing (`isabelle_edit`),
-completion (`isabelle_completions`), and preview (`isabelle_preview`) are design
-targets discussed below, not tools currently registered by the server — though
-the LSP-client layer already implements completion and preview support.
+current server exposes 9 MCP tools.
 For high-level specifications, see SPECIFICATION.md. For architecture, see
 ARCHITECTURE.md.
 
@@ -31,7 +26,6 @@ ARCHITECTURE.md.
 | MCP Tool | LSP Method | Request Params | Response Fields |
 |----------|------------|----------------|-----------------|
 | `isabelle_hover` | `textDocument/hover` | `TextDocumentPositionParams` | `Hover` with `contents` and `range` |
-| `isabelle_completions` _(design target)_ | `textDocument/completion` | `CompletionParams` | `CompletionList` with `items[]` — not exposed as a tool |
 | `isabelle_definition` | `textDocument/definition` | `DefinitionParams` | `Location[]` or `LocationLink[]` |
 | `isabelle_local_occurrences` | `textDocument/documentHighlight` | `DocumentHighlightParams` | `DocumentHighlight[]` |
 
@@ -39,23 +33,16 @@ ARCHITECTURE.md.
 > `isabelle_hover` to attach line diagnostics), but there is no longer a dedicated
 > `isabelle_diagnostics` tool. Error/warning *message text* is obtained via
 > `isabelle_command_output`; error/warning *line locations* come from the evaluation
-> snapshot (decoration channels). See §3.5.
+> snapshot (decoration channels). See §3.4.
 
-### 2.2 Document Editing Methods
-
-| MCP Tool | LSP Method | Flow |
-|----------|------------|------|
-| `isabelle_edit` | `textDocument/didChange` (Full sync) | Design target only; not implemented in current server |
-
-### 2.3 PIDE Extension Methods
+### 2.2 PIDE Extension Methods
 
 | MCP Tool | PIDE Methods | Flow |
 |----------|--------------|------|
 | `isabelle_goal` | `PIDE/caret_update`, `PIDE/state_init`, `PIDE/state_output`, `PIDE/state_exit` | Multi-step async; state id assigned by server |
 | `isabelle_command_output` | `PIDE/output_at_position` (patched, position-explicit) | Request-response; returns the enclosing command's source+range and rendered output in one shot |
-| `isabelle_preview` _(design target)_ | `PIDE/preview_request`, `PIDE/preview_response` | Request-response; not exposed as a tool |
 
-### 2.4 Session Management
+### 2.3 Session Management
 
 | MCP Tool | Implementation | External Commands |
 |----------|----------------|-------------------|
@@ -158,98 +145,7 @@ async def hover_info(ctx, file_path, line, symbol):
 
 ---
 
-### 3.2 `isabelle_completions` (Design Target)
-
-> Not exposed as an MCP tool. The LSP-client layer implements `get_completions`;
-> the design below is the intended tool surface.
-
-**LSP Request:**
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 2,
-  "method": "textDocument/completion",
-  "params": {
-    "textDocument": {"uri": "file:///path/to/file.thy"},
-    "position": {"line": 10, "character": 5}
-  }
-}
-```
-
-**LSP Response:**
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 2,
-  "result": {
-    "isIncomplete": false,
-    "items": [
-      {
-        "label": "Suc",
-        "kind": 3,
-        "detail": "nat ⇒ nat",
-        "documentation": "Successor function",
-        "insertText": "Suc",
-        "textEdit": {
-          "range": {
-            "start": {"line": 10, "character": 4},
-            "end": {"line": 10, "character": 5}
-          },
-          "newText": "Suc"
-        }
-      }
-    ]
-  }
-}
-```
-
-**Completion Kinds (LSP Enum):**
-- 1: Text
-- 2: Method
-- 3: Function
-- 4: Constructor
-- 5: Field
-- 6: Variable
-- 7: Class
-- 9: Module
-- 14: Keyword
-- 15: File
-- 21: Constant
-
-**Implementation Notes:**
-1. Isabelle returns MANY completions (50-200), filter to `max_completions`
-2. Sort by relevance: prefix match > contains > alphabetical
-3. Map LSP `kind` enum to string: `{3: "function", 6: "variable", ...}`
-4. Extract `insertText` from `textEdit.newText` if present
-5. Handle symbol abbreviations (Isabelle-specific trigger characters)
-
-**Sorting Algorithm:**
-```python
-def sort_completions(items: List[CompletionItem], cursor_prefix: str) -> List[CompletionItem]:
-    """Sort completions by relevance to cursor prefix"""
-    prefix_lower = cursor_prefix.lower()
-
-    def sort_key(item):
-        label_lower = item.label.lower()
-        if label_lower.startswith(prefix_lower):
-            return (0, label_lower)  # Prefix match (highest priority)
-        elif prefix_lower in label_lower:
-            return (1, label_lower)  # Contains (medium priority)
-        else:
-            return (2, label_lower)  # Alphabetical (low priority)
-
-    items.sort(key=sort_key)
-    return items[:max_completions]
-```
-
-**Edge Cases:**
-- Empty completions → return `items=[]`
-- Trigger character (e.g., `\`) → Isabelle handles symbol completions
-- Mid-word position → LSP adjusts range automatically
-
----
-
-### 3.3 `isabelle_definition`
+### 3.2 `isabelle_definition`
 
 **LSP Request:**
 ```json
@@ -345,7 +241,7 @@ async def declaration_location(ctx, file_path, line, symbol):
 
 ---
 
-### 3.4 `isabelle_local_occurrences`
+### 3.3 `isabelle_local_occurrences`
 
 The MCP tool takes a `symbol` (text on the line), not a column; the server locates
 the symbol's occurrence(s) on the line and issues the LSP request below at each.
@@ -407,14 +303,14 @@ tool **omits the `kind` field** entirely.
 
 ---
 
-### 3.5 Diagnostic cache (internal — no longer a tool)
+### 3.4 Diagnostic cache (internal — no longer a tool)
 
 There is no `isabelle_diagnostics` MCP tool. The `publishDiagnostics` notification
 handler and the diagnostic cache (`DiagnosticMessage` model) still exist, but are
 **internal only**: `isabelle_hover` reads them to attach the line's diagnostics to a
 hover result. The two agent-facing paths to error/warning information are:
 
-- **Where** (line locations) → the evaluation snapshot (§4.5 in `SPECIFICATION.md`),
+- **Where** (line locations) → the evaluation snapshot (§4.4 in `SPECIFICATION.md`),
   built from the `PIDE/decoration` channels (`text_overview_error` +
   `background_bad` for errors, `text_overview_warning` for warnings) — not from the
   diagnostics channel.
@@ -453,178 +349,7 @@ hover result. The two agent-facing paths to error/warning information are:
 
 ---
 
-### 3.6 `isabelle_edit` (Design Target)
-
-This section describes a future mutating tool. It is not registered in the
-current server.
-
-> **Current behavior (no `isabelle_edit` tool):** Today the agent edits `.thy`/`.ML`
-> files on disk with ordinary tools, and the server pushes those edits to Isabelle
-> automatically. For editor-opened `.thy`, a `FileWatcher` (`file_watcher.py`) watches
-> their parent directories and, on any change, immediately pushes the file as
-> `textDocument/didChange` (event-driven; the `moved` handler catches atomic-rename
-> saves). A tool-call backstop (`_ensure_lsp_started` → `resync_and_check_freshness`)
-> re-stats every open doc at the start of each MCP call and syncs the changed ones
-> (only if content changed, via `client.sync_dirty_files`). Dependency files (`.ML`
-> blobs, imported `.thy`) are synced by Isabelle's own vscode_server File_Watcher; the
-> backstop waits out its `vscode_load_delay` debounce when a dependency was just edited.
-> Pushing edits during an active evaluation is intentional. The `isabelle_edit` design
-> below would add an explicit in-session edit tool on top of this; the line-splice and
-> `wait_for_processing` details are design notes, not current code.
-
-**LSP Notification (Client → Server):**
-```json
-{
-  "jsonrpc": "2.0",
-  "method": "textDocument/didChange",
-  "params": {
-    "textDocument": {
-      "uri": "file:///path/to/file.thy",
-      "version": 3
-    },
-    "contentChanges": [
-      {
-        "text": "<full new content of the file>"
-      }
-    ]
-  }
-}
-```
-
-**Server Behavior After didChange:**
-
-| Phase | Delay | Description |
-|-------|-------|-------------|
-| Input debounce | 100ms (`vscode_input_delay`) | Batches rapid consecutive changes |
-| Flush to PIDE | immediate after debounce | Converts pending edits → `Document.Edit_Text` |
-| PIDE processing | variable (depends on file size) | Incremental type-checking and proof processing |
-| Output debounce | 500ms (`vscode_output_delay`) | Batches diagnostic updates |
-| Diagnostics push | after output debounce | `textDocument/publishDiagnostics` notification |
-
-**Implementation Notes:**
-
-1. **Sync Kind**: Isabelle reports `textDocumentSync = 2` (Incremental per LSP spec). However, a client can always send full content replacement (omitting the `range` field in `contentChanges`) even when the server announces Incremental — the LSP spec guarantees this fallback. We use full replacement for simplicity and correctness. The server internally computes diffs via `doc.change()`.
-
-2. **Version Management**: Each `didChange` must increment the version. The tool tracks versions per-document in `DocumentState.version`.
-
-3. **Line-range to full content**: When the user provides `start_line`/`end_line`/`new_text`, the tool computes the full new content from the cached `DocumentState.content`:
-   ```python
-   def apply_line_edit(content: str, start_line: int, end_line: int, new_text: str) -> str:
-       lines = content.splitlines(keepends=True)
-       # Ensure last line has newline for consistent splicing
-       if lines and not lines[-1].endswith('\n'):
-           lines[-1] += '\n'
-
-       # Convert to 0-indexed; end_line is 1-indexed inclusive → exclusive
-       start_idx = min(start_line - 1, len(lines))
-       end_idx = min(end_line, len(lines))
-
-       # When end_idx < start_idx, this is a pure insert (no lines removed)
-       new_lines = new_text.splitlines(keepends=True) if new_text else []
-
-       result_lines = lines[:start_idx] + new_lines + lines[end_idx:]
-       return ''.join(result_lines)
-   ```
-
-4. **Processing detection**: After sending `didChange`, the tool waits for PIDE to finish by monitoring the diagnostics cache:
-   - Poll every 300ms
-   - Consider complete when no new `publishDiagnostics` received for 500ms+
-   - Timeout after 10 seconds (configurable)
-
-   **Note**: The diagnostics-quiet heuristic described here is superseded in the
-   current code by the `ProcessingTracker`, which tracks `PIDE/decoration`
-   `background_running1`/`background_unprocessed1` ranges directly — the
-   "robust approach" mentioned here as unimplemented is now the implementation.
-
-5. **Disk sync**: When `sync_to_disk=True`, write the new content to the file on disk after the LSP change is sent. This keeps the file system consistent for `git`, other editors, and external tools.
-
-   **Warning**: When `sync_to_disk=False`, the LSP buffer diverges from the file on disk. A subsequent `open_document` call (which reads from disk) would overwrite the in-buffer changes. Only use `sync_to_disk=False` when performing a sequence of edits followed by a single explicit disk write, or when the edit is transient (e.g., command injection for sledgehammer).
-
-6. **Auto-open**: If the file is not yet open in the LSP session, automatically open it via `didOpen` before applying the change.
-
-7. **Cache invalidation**: After an edit, previously cached results from other tools (`isabelle_goal`, `isabelle_hover`, etc.) are stale for the edited document. The tool does not automatically invalidate them — callers must re-query after editing.
-
-8. **Concurrency**: Line-range edits splice against `DocumentState.content`. If two `isabelle_edit` calls to the same document overlap, both will compute their splice against the same base content, and the second push would silently overwrite the first. Callers must serialize edits to the same document. (In the current code the corresponding client method is `sync_dirty_files`, which re-reads from disk and sends `didChange`; there is no `change_document` method.)
-
-**Code Snippet:**
-```python
-async def edit_document(
-    client: IsabelleLSPClient,
-    file_path: str,
-    new_content: Optional[str] = None,
-    start_line: Optional[int] = None,
-    end_line: Optional[int] = None,
-    new_text: Optional[str] = None,
-    sync_to_disk: bool = True,
-    wait_for_processing: bool = True,
-) -> EditResult:
-    """Edit theory file and trigger PIDE reprocessing."""
-
-    # Validate: exactly one edit mode
-    has_full = new_content is not None
-    has_range = start_line is not None
-    if has_full == has_range:
-        raise IsabelleToolError(
-            "Provide either new_content (full replacement) "
-            "or start_line/end_line/new_text (line-range edit), not both"
-        )
-
-    # Ensure document is open
-    if file_path not in client.open_documents:
-        await client.open_document(file_path)
-
-    doc = client.open_documents[file_path]
-
-    # Compute new content
-    if has_range:
-        final_content = apply_line_edit(
-            doc.content, start_line, end_line, new_text or ""
-        )
-    else:
-        final_content = new_content
-
-    # Send didChange
-    new_version = await client.change_document(file_path, final_content)
-
-    # Sync to disk
-    if sync_to_disk:
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write(final_content)
-
-    # Wait for PIDE reprocessing
-    processing_complete = False
-    if wait_for_processing:
-        processing_complete = await client.wait_for_processing(
-            file_path, timeout=10.0
-        )
-
-    # Collect ALL diagnostics for the document (not just the edited region)
-    diagnostics = client.get_cached_diagnostics(file_path)
-    diag_items = [parse_diagnostic(d) for d in diagnostics]
-
-    # success = no errors anywhere in the document
-    success = all(d.severity != "error" for d in diag_items)
-
-    return EditResult(
-        success=success,
-        version=new_version,
-        content_length=len(final_content),
-        diagnostics=diag_items,
-        processing_complete=processing_complete,
-    )
-```
-
-**Edge Cases:**
-- Empty `new_text` with valid range → deletes the specified lines
-- `start_line > end_line` → pure insertion before `start_line` (no lines removed)
-- `start_line` beyond file length → append at end of file
-- File modified externally since last `didOpen` → the cached content diverges from disk; the tool uses cached content as the base for line-range edits. Use `new_content` for full replacement when in doubt.
-- PIDE timeout → return `processing_complete=false` with whatever diagnostics are available
-- Unicode recoding → server may send `workspace/applyEdit` to normalize Isabelle symbols; currently not handled (logged only)
-
----
-
-### 3.7 `isabelle_goal`
+### 3.5 `isabelle_goal`
 
 **PIDE Flow:**
 
@@ -756,7 +481,7 @@ class StatePanelManager:
 
 ---
 
-### 3.8 `isabelle_command_output`
+### 3.6 `isabelle_command_output`
 
 **Current mechanism — `PIDE/output_at_position` (patched, position-explicit).**
 The caret is resolved once from the optional `after_text` snippet (or end of line)
@@ -823,91 +548,7 @@ def parse_dynamic_output(html: str) -> List[OutputMessage]:
 
 ---
 
-### 3.9 `isabelle_preview` (Design Target)
-
-> Not exposed as an MCP tool. The LSP-client layer implements `request_preview`;
-> the design below is the intended tool surface.
-
-**PIDE Request:**
-```json
-{
-  "jsonrpc": "2.0",
-  "method": "PIDE/preview_request",
-  "params": {
-    "uri": "file:///path/to/file.thy",
-    "column": 0
-  }
-}
-```
-
-**PIDE Response:**
-```json
-{
-  "jsonrpc": "2.0",
-  "method": "PIDE/preview_response",
-  "params": {
-    "uri": "file:///path/to/file.thy",
-    "column": 0,
-    "label": "Theory Name",
-    "content": "<html>...full document HTML...</html>"
-  }
-}
-```
-
-**Implementation Notes:**
-1. Send `preview_request` notification
-2. Wait for `preview_response` notification
-3. Match by URI and column
-4. Timeout after 30 seconds (preview generation can be slow)
-
-**Code Snippet:**
-```python
-class PreviewManager:
-    def __init__(self):
-        self.preview_futures: Dict[str, asyncio.Future] = {}
-
-    async def request_preview(
-        self,
-        client: IsabelleLSPClient,
-        file_path: str
-    ) -> PreviewResult:
-        """Request document preview"""
-        uri = file_path_to_uri(file_path)
-        key = f"{uri}:0"
-
-        # Create future for response
-        future = asyncio.Future()
-        self.preview_futures[key] = future
-
-        # Send request
-        await client.notify("PIDE/preview_request", {
-            "uri": uri,
-            "column": 0
-        })
-
-        # Wait for response
-        try:
-            response = await asyncio.wait_for(future, timeout=30.0)
-            return PreviewResult(
-                html_content=response["content"],
-                title=response.get("label", "Preview")
-            )
-        except asyncio.TimeoutError:
-            raise IsabelleToolError("Timeout waiting for preview")
-
-    def handle_preview_response(self, uri: str, column: int, label: str, content: str):
-        """Called when PIDE/preview_response received"""
-        key = f"{uri}:{column}"
-        if key in self.preview_futures:
-            self.preview_futures[key].set_result({
-                "label": label,
-                "content": content
-            })
-```
-
----
-
-### 3.10 `isabelle_session_info`
+### 3.7 `isabelle_session_info`
 
 **Implementation Notes:**
 - Query the current LSP client session name
@@ -1001,83 +642,7 @@ async def ensure_document_open(client: IsabelleLSPClient, file_path: str):
 > `open_document` does not hardcode a delay; processing is awaited dynamically via
 > the `ProcessingTracker` (`wait_for_processing` / `wait_for_processing_bounded`).
 
-### 4.4 Document Change Management
-
-> **Current code:** there is no `change_document` method. On-disk edits are pushed
-> by `sync_dirty_files` (re-read from disk → `didChange` if content changed),
-> driven by the FileWatcher + per-tool-call/background-loop flush (§3.6). The
-> `change_document` pseudocode below illustrates the underlying full-replacement
-> `didChange` it performs.
-
-**Protocol context**: Isabelle's `vscode_server` reports `textDocumentSync = 2` (Incremental per LSP spec). However, the LSP spec guarantees that a client can always send full content replacement (omitting `range` in `contentChanges`) regardless of the announced sync kind. We use this full-replacement approach for simplicity.
-
-```python
-async def change_document(self, file_path: str, new_content: str) -> int:
-    """Send textDocument/didChange with full content replacement.
-
-    The server debounces input (100ms vscode_input_delay), flushes to PIDE,
-    and pushes updated diagnostics (debounced 500ms vscode_output_delay).
-
-    Args:
-        file_path: Must be already open (call ensure_document_open first)
-        new_content: Complete new file content
-
-    Returns:
-        New document version number
-    """
-    doc = self.open_documents[file_path]
-    doc.version += 1
-    doc.content = new_content
-
-    await self.notify("textDocument/didChange", {
-        "textDocument": {
-            "uri": doc.uri,
-            "version": doc.version,
-        },
-        "contentChanges": [{"text": new_content}],
-    })
-
-    return doc.version
-
-
-async def wait_for_processing(self, file_path: str, timeout: float = 10.0) -> bool:
-    """Wait for PIDE to finish reprocessing after a change.
-
-    Heuristic: consider complete when no publishDiagnostics received
-    for 500ms+ (matching vscode_output_delay).
-
-    Returns:
-        True if processing completed within timeout
-
-    Known limitations:
-        - False positive: if PIDE takes >500ms between diagnostic batches
-          (e.g., processing a large proof), we falsely report completion
-          before the second batch arrives.
-        - False negative: if the file has zero diagnostics after the edit,
-          no publishDiagnostics is sent at all, so we wait until timeout.
-        - NOTE: the current `wait_for_processing` no longer relies on this
-          diagnostics-quiet heuristic — it waits on the `ProcessingTracker`, which
-          tracks PIDE/decoration background_running/unprocessed ranges directly.
-    """
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        await asyncio.sleep(0.3)
-        if self.is_processing_complete(file_path):
-            return True
-    return False
-```
-
-**Timing Considerations:**
-
-After `didChange`, there are two debounce delays before the client sees results:
-- `vscode_input_delay` (100ms): server batches rapid edits before flushing to PIDE
-- `vscode_output_delay` (500ms): server batches diagnostic updates before pushing
-
-So the minimum round-trip for a single edit is ~600ms + PIDE processing time.
-For small edits to already-loaded theories, total round-trip is typically 1-2 seconds.
-For large files or complex proofs, it can take 5-10+ seconds.
-
-### 4.5 Error Handling
+### 4.4 Error Handling
 
 ```python
 def check_pide_response(response: Any, operation: str, *, allow_none: bool = False):

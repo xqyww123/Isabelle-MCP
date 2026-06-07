@@ -9,11 +9,6 @@
 > server exposes these MCP tools: hover, definition, local occurrences,
 > diagnostics, goal, command output, session info, and the evaluation tools
 > (`isabelle_evaluate_to`, `isabelle_evaluation_status`, `isabelle_cancel_evaluation`).
-> It does **not** currently expose `isabelle_completions`, `isabelle_preview`, or
-> `isabelle_edit` as MCP tools — though the LSP-client layer already implements
-> completion and preview support, it is simply not surfaced as a tool yet.
-> Sections that present these three as live tools are retained as design notes
-> until they are exposed.
 
 ## 1. Executive Summary
 
@@ -34,15 +29,15 @@ Isa-LSP is a Model Context Protocol (MCP) server that provides AI agents (like C
 ### 1.3 Scope
 
 **In Scope (MVP - LSP/PIDE Native Support Only):**
-- Standard LSP-based MCP tools (hover, definition, local occurrences, diagnostics; completion is a design target)
-- PIDE-specific MCP tools (proof state, command output; preview is a design target)
+- Standard LSP-based MCP tools (hover, definition, local occurrences, diagnostics)
+- PIDE-specific MCP tools (proof state, command output)
 - 1 session management tool (session info)
 - Document open/close state management (`didOpen`, `didClose`)
 - Async notification handling (diagnostics and selected PIDE notifications)
 - Session lifecycle management
 
 **Out of Scope:**
-- Document editing (`isabelle_edit`) for the current release
+- Document editing for the current release
 - Direct VSCode extension integration
 - Non-LSP Isabelle interfaces (jEdit, raw PIDE)
 - **Advanced LSP features not implemented by `isabelle vscode_server`:**
@@ -114,8 +109,7 @@ def tool() -> LocalOccurrencesResult: ...
 ## 3. Feature Catalog
 
 The current server registers **9 MCP tools**: three evaluation tools and six
-query tools. (`isabelle_completions`, `isabelle_preview`, and `isabelle_edit`
-below are design targets, not registered tools.)
+query tools.
 
 ### 3.0 Evaluation Tools (3 tools)
 
@@ -146,20 +140,13 @@ Based on `isabelle vscode_server` analysis - **only LSP-native features**:
 **Priority**: High (Core feature)
 **Pattern**: Like `lean_hover_info`
 
-#### Tool 2: `isabelle_completions` (Design Target)
-**Purpose**: Get code completion suggestions (syntax, semantic, paths, spelling)
-**Current Status**: Not exposed as an MCP tool (the LSP-client layer supports it via `get_completions`)
-**LSP Mapping**: `textDocument/completion` ✅
-**Priority**: High (Core feature)
-**Pattern**: Like `lean_completions`
-
-#### Tool 3: `isabelle_definition`
+#### Tool 2: `isabelle_definition`
 **Purpose**: Find where a symbol is defined
 **LSP Mapping**: `textDocument/definition` ✅
 **Priority**: High (Navigation)
 **Pattern**: Like `lean_declaration_file`
 
-#### Tool 4: `isabelle_local_occurrences`
+#### Tool 3: `isabelle_local_occurrences`
 **Purpose**: Find in-file occurrences (definition + uses) of a locally-defined entity
 **LSP Mapping**: `textDocument/documentHighlight` ✅
 **Priority**: Medium (Navigation)
@@ -169,38 +156,22 @@ Based on `isabelle vscode_server` analysis - **only LSP-native features**:
 
 Isabelle-specific features - **only PIDE-native methods**:
 
-#### Tool 5: `isabelle_goal`
+#### Tool 4: `isabelle_goal`
 **Purpose**: Get the Isar command at a position and the proof state (subgoals) after it runs
 **PIDE Mapping**: `PIDE/state_*` sequence ✅
 **Priority**: **CRITICAL** (Most important tool for theorem proving)
 **Pattern**: Like `lean_goal`; targeting is by optional `after_text`, not a column
 
-#### Tool 6: `isabelle_command_output`
+#### Tool 5: `isabelle_command_output`
 **Purpose**: Get the Isar command at a position and the prover messages it produced
 (including the full error/warning message text — this is where error detail is read)
 **PIDE Mapping**: `PIDE/dynamic_output` notifications ✅
 **Priority**: Medium (Debugging)
 **Pattern**: New (Isabelle-specific); targeting is by optional `after_text`
 
-#### Tool 7: `isabelle_preview` (Design Target)
-**Purpose**: Generate HTML preview/documentation
-**Current Status**: Not exposed as an MCP tool (the LSP-client layer supports it via `request_preview`)
-**PIDE Mapping**: `PIDE/preview_request` → `PIDE/preview_response` ✅
-**Priority**: Low (Documentation generation)
-**Pattern**: New (Isabelle-specific)
+### 3.3 Session Management Tools (1 tool)
 
-### 3.3 Document Editing Tool (Design Target)
-
-#### Tool 8: `isabelle_edit`
-**Purpose**: Edit theory file content and trigger PIDE reprocessing (like editing in VS Code)
-**Current Status**: Not implemented in the current server
-**LSP Mapping**: `textDocument/didChange` (Full sync)
-**Priority**: **HIGH** if implemented (enables interactive theorem proving workflow)
-**Pattern**: New (no Lean equivalent — enables the edit-check-fix loop)
-
-### 3.4 Session Management Tools (1 tool)
-
-#### Tool 9: `isabelle_session_info`
+#### Tool 6: `isabelle_session_info`
 **Purpose**: Get the current session name
 **LSP Mapping**: In-memory client state ✅
 **Priority**: Low (Introspection)
@@ -268,48 +239,7 @@ class HoverInfo(BaseModel):
 
 ---
 
-#### 4.1.2 `isabelle_completions` (Design Target)
-
-**Current Status**: Not exposed as an MCP tool. The LSP-client layer supports it (`get_completions`); the spec below is the intended tool surface.
-
-**Description**: Get code completion suggestions at a position.
-
-**Tool Annotations**:
-```python
-ToolAnnotations(
-    title="Completions",
-    readOnlyHint=True,
-    idempotentHint=True,
-)
-```
-
-**Input Parameters**:
-```python
-file_path: Annotated[str, Field(description="Absolute path to .thy file")]
-line: Annotated[int, Field(description="Line number (1-indexed)", ge=1)]
-column: Annotated[int, Field(description="Column number (1-indexed)", ge=1)]
-max_completions: Annotated[int, Field(
-    description="Maximum number of completions to return", ge=1
-)] = 32
-```
-
-**Output Model**:
-```python
-class CompletionItem(BaseModel):
-    label: str = Field(description="Completion text")
-    kind: str = Field(description="function | variable | keyword | constant | class | module")
-    detail: Optional[str] = Field(None, description="Additional info (e.g., type)")
-    documentation: Optional[str] = Field(None, description="Description")
-    insert_text: str = Field(description="Text to insert")
-
-class CompletionsResult(BaseModel):
-    items: List[CompletionItem] = Field(default_factory=list)
-    line_context: str = Field(description="Source line for reference")
-```
-
----
-
-#### 4.1.3 `isabelle_definition`
+#### 4.1.2 `isabelle_definition`
 
 **Description**: Find where a symbol is defined.
 
@@ -347,7 +277,7 @@ class DeclarationLocation(BaseModel):
 
 ---
 
-#### 4.1.4 `isabelle_local_occurrences`
+#### 4.1.3 `isabelle_local_occurrences`
 
 **Description**: Find every in-file occurrence (definition + uses) of a locally-defined entity, given a symbol on a line. Only entities whose definition is in the current file resolve; global constants and free/bound variables return nothing.
 
@@ -502,176 +432,9 @@ class CommandOutputResult(BaseModel):
 
 ---
 
-#### 4.2.3 `isabelle_preview` (Design Target)
+### 4.3 Session Management Tools
 
-**Current Status**: Not exposed as an MCP tool. The LSP-client layer supports it (`request_preview`); the spec below is the intended tool surface.
-
-**Description**: Generate HTML preview/documentation rendering of a theory file.
-
-**Tool Annotations**:
-```python
-ToolAnnotations(
-    title="Preview",
-    readOnlyHint=True,
-    idempotentHint=True,
-)
-```
-
-**Input Parameters**:
-```python
-file_path: Annotated[str, Field(description="Absolute path to .thy file")]
-```
-
-**Output Model**:
-```python
-class PreviewResult(BaseModel):
-    html_content: str = Field(description="HTML preview of theory")
-    title: str = Field(description="Document title")
-```
-
----
-
-### 4.3 Document Editing Tool (Design Target)
-
-#### 4.3.1 `isabelle_edit` ✏️ Mutating
-
-**Description**: Design target for editing theory file content and triggering
-PIDE incremental reprocessing. This tool is not registered in the current
-server.
-
-**Tool Annotations**:
-```python
-ToolAnnotations(
-    title="Edit Document",
-    readOnlyHint=False,
-    idempotentHint=False,
-)
-```
-
-**Input Parameters**:
-```python
-file_path: Annotated[str, Field(description="Absolute path to .thy file")]
-
-# Option A: Full content replacement
-new_content: Annotated[Optional[str], Field(
-    description="Complete new file content. Mutually exclusive with line-range parameters."
-)] = None
-
-# Option B: Line-range replacement
-start_line: Annotated[Optional[int], Field(
-    description="First line to replace (1-indexed, inclusive)", ge=1
-)] = None
-end_line: Annotated[Optional[int], Field(
-    description="Last line to replace (1-indexed, inclusive). "
-    "If end_line < start_line, text is inserted before start_line without removing any lines.", ge=0
-)] = None
-new_text: Annotated[Optional[str], Field(
-    description="Replacement text for the line range"
-)] = None
-
-# Behavior options
-sync_to_disk: Annotated[bool, Field(
-    description="Also write the updated content to the file on disk (default: true)"
-)] = True
-wait_for_processing: Annotated[bool, Field(
-    description="Wait for PIDE to finish reprocessing before returning (default: true)"
-)] = True
-```
-
-**Output Model**:
-```python
-class EditResult(BaseModel):
-    success: bool = Field(description="True if no errors in the entire document after reprocessing")
-    version: int = Field(description="New document version after edit")
-    content_length: int = Field(description="Total length of document after edit (characters)")
-    diagnostics: List[DiagnosticMessage] = Field(
-        default_factory=list,
-        description="All diagnostics for the document after PIDE reprocessing"
-    )
-    processing_complete: bool = Field(
-        description="Whether PIDE finished reprocessing the document"
-    )
-```
-
-**Example: Replace a proof tactic**:
-```json
-// Request
-{
-  "file_path": "/path/to/Theory.thy",
-  "start_line": 42,
-  "end_line": 42,
-  "new_text": "  by (simp add: assms)"
-}
-
-// Response
-{
-  "success": true,
-  "version": 3,
-  "content_length": 1547,
-  "diagnostics": [],
-  "processing_complete": true
-}
-```
-
-**Example: Insert a new lemma (without removing any lines)**:
-```json
-// Request: insert before line 50 (end_line=49 < start_line=50 → pure insert)
-{
-  "file_path": "/path/to/Theory.thy",
-  "start_line": 50,
-  "end_line": 49,
-  "new_text": "lemma new_lemma: \"P ⟶ P\"\n  by auto\n"
-}
-
-// Response
-{
-  "success": true,
-  "version": 4,
-  "content_length": 1612,
-  "diagnostics": [],
-  "processing_complete": true
-}
-```
-
-**Example: Full content replacement**:
-```json
-// Request
-{
-  "file_path": "/path/to/Theory.thy",
-  "new_content": "theory Theory imports Main begin\n\nlemma \"True\" by simp\n\nend"
-}
-
-// Response
-{
-  "success": true,
-  "version": 2,
-  "content_length": 62,
-  "diagnostics": [],
-  "processing_complete": true
-}
-```
-
-**Edge Cases**:
-- File not yet opened → auto-open via `didOpen` before applying change
-- Both `new_content` and line-range params provided → error
-- Neither provided → error
-- `start_line` beyond file length → append at end
-- Empty `new_text` with valid range → delete lines
-- PIDE processing timeout → return `processing_complete=false` with partial diagnostics
-
-**Caveats and Known Limitations**:
-- After an edit, previously cached results from `isabelle_goal`, `isabelle_hover`, etc. are stale. Always re-query after editing.
-- When `sync_to_disk=False`, the LSP buffer diverges from the file on disk. A subsequent `open_document` (which reads from disk) would overwrite the in-buffer changes. Avoid `sync_to_disk=False` unless performing a sequence of edits followed by a single disk write.
-- The `wait_for_processing` heuristic (no new `publishDiagnostics` for 500ms+) can be unreliable: if PIDE takes >500ms between diagnostic batches it may falsely report completion, and if the file has zero diagnostics it will wait until timeout. See API_DESIGN.md Section 3.6 for details.
-- Concurrent edits are not safe: if two `isabelle_edit` calls overlap, the line-range splice may produce incorrect results because both use the same cached content as base. Serialize edit calls.
-
-For protocol details and implementation guidance, see API_DESIGN.md Section 3.6.
-
----
-
-### 4.4 Session Management Tools
-
-#### 4.4.1 `isabelle_session_info`
+#### 4.3.1 `isabelle_session_info`
 
 **Description**: Get the name of the current Isabelle session.
 
@@ -694,7 +457,7 @@ class SessionInfo(BaseModel):
 
 ---
 
-### 4.5 Evaluation Tools
+### 4.4 Evaluation Tools
 
 These three tools drive Isabelle's processing. All return a **plain-text per-file
 snapshot** (a `ToolResult` with `output_schema=None`, i.e. no structured output
@@ -717,7 +480,7 @@ no decoration (e.g. an unopened dependency) the snapshot falls back to
 uses `unprocessed`/`consolidated` to show "in progress" vs "clean". Full
 error/warning message *text* is fetched separately via `isabelle_command_output`.
 
-#### 4.5.1 `isabelle_evaluate_to`
+#### 4.4.1 `isabelle_evaluate_to`
 
 **Description**: Start evaluating a theory file up to a location on a line.
 Auto-starts the prover. The result may indicate evaluation is still in progress.
@@ -733,13 +496,13 @@ after_text: Annotated[Optional[str], Field(
 )] = None
 ```
 
-#### 4.5.2 `isabelle_evaluation_status`
+#### 4.4.2 `isabelle_evaluation_status`
 
 **Description**: Check the progress of an ongoing evaluation. Returns the current
 per-file snapshot (errors / warnings / running line spans) and whether it finished.
 **Input Parameters**: None. Reports "No evaluation in progress." when idle.
 
-#### 4.5.3 `isabelle_cancel_evaluation`
+#### 4.4.3 `isabelle_cancel_evaluation`
 
 **Description**: Cancel an ongoing evaluation. Stops Isabelle from processing
 further; already-processed results remain valid for querying. **Input Parameters**:
@@ -792,10 +555,9 @@ evaluation; cancel it, fix the command, and re-evaluate.
 
 ---
 
-### 4.6 File Synchronization
+### 4.5 File Synchronization
 
-There is no `isabelle_edit` tool (it remains a design target, §4.3). Instead, the
-agent edits `.thy`/`.ML` files on disk with ordinary tools, and the server pushes
+The agent edits `.thy`/`.ML` files on disk with ordinary tools, and the server pushes
 those edits to Isabelle automatically:
 
 - **Editor-opened `.thy` (the MCP's job).** A `FileWatcher` watches the parent
@@ -855,7 +617,7 @@ The server-level instructions string delivered to the agent on connect is the
 the single source of truth; it is **not** reproduced here, to avoid drift.
 
 Its key points: positions are 1-indexed and file paths absolute; you edit `.thy`
-files on disk and the server syncs them to Isabelle automatically (§4.6);
+files on disk and the server syncs them to Isabelle automatically (§4.5);
 evaluation is asynchronous, so poll `isabelle_evaluation_status` and cancel a stuck
 run rather than waiting for `complete`; and errors do not halt checking.
 
@@ -867,17 +629,13 @@ run rather than waiting for `complete`; and errors do not halt checking.
 
 1. Current server registers 9 MCP tools.
 2. Standard LSP features (hover, definition, local occurrences) are
-   implemented and covered by tests. Completion is supported at the LSP-client
-   layer (`get_completions`) but not yet exposed as an MCP tool.
+   implemented and covered by tests.
 3. PIDE tools use Isabelle2024 native notifications:
    - `isabelle_goal` uses `PIDE/caret_update`, `PIDE/state_init`,
      `PIDE/state_output`, and `PIDE/state_exit`.
    - `isabelle_command_output` uses `PIDE/dynamic_output`.
 4. PIDE tools are best-effort: they may timeout if Isabelle emits no matching
    notification for the requested position/file.
-5. `isabelle_completions`, `isabelle_preview`, and `isabelle_edit` are not
-   exposed as MCP tools in the current server (completion and preview have
-   LSP-client support; the design specs are retained above).
 
 ### 7.2 Interface Consistency
 
