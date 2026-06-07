@@ -4,7 +4,7 @@
 import pytest
 
 from isabelle_mcp.lsp_client import IsabelleLSPClient
-from isabelle_mcp.utils import MCPColumn, MCPLine
+from isabelle_mcp.utils import MCPLine
 
 
 @pytest.mark.integration
@@ -60,12 +60,12 @@ class TestToolsIntegration:
     async def test_hover(self, lsp_client, theory_file):
         from isabelle_mcp.tools import hover_info
         await lsp_client.open_document(theory_file)
-        result = await hover_info(lsp_client, theory_file, MCPLine(5), MCPColumn(12))
+        result = await hover_info(lsp_client, theory_file, MCPLine(5), "my_const")
         assert isinstance(result.line_context, str)
 
     @pytest.mark.asyncio
     async def test_definition(self, lsp_client, theory_file):
         from isabelle_mcp.tools import declaration_location
         await lsp_client.open_document(theory_file)
-        result = await declaration_location(lsp_client, theory_file, MCPLine(8), MCPColumn(10))
+        result = await declaration_location(lsp_client, theory_file, MCPLine(8), "my_const")
         assert isinstance(result.locations, list)
