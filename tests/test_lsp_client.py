@@ -55,6 +55,22 @@ class TestIsabelleLSPClient:
         spawn.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_query_binary_version_reads_isabelle_version(self):
+        # The LSP handshake omits serverInfo.version, so the version comes from
+        # `isabelle version`; we take its first non-empty line.
+        client = IsabelleLSPClient()
+        proc = MagicMock()
+        proc.communicate = AsyncMock(return_value=(b"Isabelle2024\n", b""))
+        with patch('asyncio.create_subprocess_exec', AsyncMock(return_value=proc)):
+            assert await client._query_binary_version() == "Isabelle2024"
+
+    @pytest.mark.asyncio
+    async def test_query_binary_version_unknown_on_failure(self):
+        client = IsabelleLSPClient()
+        with patch('asyncio.create_subprocess_exec', AsyncMock(side_effect=OSError)):
+            assert await client._query_binary_version() == "unknown"
+
+    @pytest.mark.asyncio
     async def test_send_message(self):
         client = IsabelleLSPClient()
         client.process = MagicMock()

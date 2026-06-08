@@ -286,7 +286,29 @@ class IsabelleLSPClient:
         self.reader_task = asyncio.create_task(self._read_loop())
         self.stderr_task = asyncio.create_task(self._drain_stderr())
         await self.initialize()
+        # Isabelle's vscode_server does not report serverInfo.version in the LSP
+        # handshake, so fall back to the `isabelle` binary for a real version string.
+        if self.isabelle_version in ("", "unknown"):
+            self.isabelle_version = await self._query_binary_version()
         await self._seed_symbols()
+
+    async def _query_binary_version(self) -> str:
+        """Best-effort real version string from `isabelle version`.
+
+        Uses the same ``isabelle`` resolved from PATH as the running session, so
+        the reported version matches the prover. Returns "unknown" on any failure.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "isabelle", "version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+        except (OSError, asyncio.TimeoutError):
+            return "unknown"
+        lines = out.decode(errors="replace").strip().splitlines()
+        return lines[0].strip() if lines and lines[0].strip() else "unknown"
 
     async def initialize(self) -> dict[str, Any]:
         response = await self.request("initialize", {
@@ -297,7 +319,7 @@ class IsabelleLSPClient:
         result = response if isinstance(response, dict) else {}
         if result:
             self.server_capabilities = result.get("capabilities", {})
-            self.isabelle_version = result.get("serverInfo", {}).get("version", "unknown")
+            self.isabelle_version = result.get("serverInfo", {}).get("version", "")
         await self.notify("initialized", {})
         return result
 
