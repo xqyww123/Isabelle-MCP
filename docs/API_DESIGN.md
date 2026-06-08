@@ -13,7 +13,7 @@
 ## 1. Overview
 
 This document provides API design and implementation guidance for Isa-LSP. The
-current server exposes 9 MCP tools.
+current server exposes 11 MCP tools.
 For high-level specifications, see SPECIFICATION.md. For architecture, see
 ARCHITECTURE.md.
 
@@ -46,6 +46,8 @@ ARCHITECTURE.md.
 
 | MCP Tool | Implementation | External Commands |
 |----------|----------------|-------------------|
+| `isabelle_launch` | Spawn the prover; set logic + `-d` session dirs | `isabelle vscode_server -l <session> -d <dirs…>` |
+| `isabelle_terminate` | LSP `shutdown`/`exit` + process teardown | - |
 | `isabelle_session_info` | Query LSP client state | - |
 
 ---
@@ -564,7 +566,54 @@ def session_info(ctx: Context) -> SessionInfo:
     if not client:
         raise IsabelleToolError("No active session")
 
-    return SessionInfo(current_session=client.logic)
+    return SessionInfo(current_session=client.logic, version=client.isabelle_version or None)
+```
+
+---
+
+### 3.8 `isabelle_launch`
+
+**Implementation Notes:**
+- Must be called before any evaluation/query tool — the prover does not auto-start.
+- Serializes under the evaluation-state lock; idempotent for the same session, and
+  restarts (shutdown → start) when a different session is requested.
+- Sets `client.session_dirs` (default `[cwd]` → `-d $cwd`) and `client.logic` before
+  `client.start()`.
+
+**Code Snippet:**
+```python
+async def isabelle_launch(session: str, session_dirs: list[str] | None = None) -> SessionInfo:
+    async with _evaluation_state_lock:
+        if client.process is not None:
+            if client.logic == session:
+                return await session_info(client)
+            await client.shutdown()
+            client.process = None
+        client.session_dirs = session_dirs if session_dirs is not None else [os.path.realpath(os.getcwd())]
+        client.logic = session
+        await client.start()
+        return await session_info(client)
+```
+
+---
+
+### 3.9 `isabelle_terminate`
+
+**Implementation Notes:**
+- Tears the prover down (`shutdown()` then `client.process = None`) and clears the
+  FileWatcher's directory watches; the MCP server process stays alive for a relaunch.
+- `shutdown()` also resets the global `evaluation_state`, so the next launch starts clean.
+
+**Code Snippet:**
+```python
+async def isabelle_terminate() -> ToolResult:
+    if client is None or client.process is None:
+        return text_result("No Isabelle session is running.")
+    async with _evaluation_state_lock:
+        await client.shutdown()
+        client.process = None
+        file_watcher.clear_watches()
+    return text_result("Isabelle session terminated.")
 ```
 
 ---

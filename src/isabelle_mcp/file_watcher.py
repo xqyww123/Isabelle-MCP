@@ -186,6 +186,16 @@ class FileWatcher:
         except (KeyError, OSError) as e:
             logger.debug("unschedule %s failed: %s", directory, e)
 
+    def clear_watches(self) -> None:
+        """Drop all directory watches without stopping the observer.
+
+        Called on ``isabelle_terminate``: ``shutdown()`` clears ``open_documents``
+        directly (bypassing ``close_document``), so without this the watched dirs
+        would accumulate across launch/terminate cycles toward ``MAX_WATCHED_DIRS``.
+        """
+        for directory in list(self._watched_dirs):
+            self.remove_watch(directory)
+
     def _dispatch(self, path: str) -> None:
         """Schedule the sink for *path* if it is a watched extension (thread-safe).
 

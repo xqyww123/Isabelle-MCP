@@ -12,6 +12,7 @@ from fastmcp.tools.tool import ToolResult
 from mcp.types import TextContent
 
 from isabelle_mcp.evaluation import (
+    _evaluation_state_lock,
     cancel_evaluation,
     evaluate_to,
     evaluation_status,
@@ -45,7 +46,6 @@ logger = logging.getLogger(__name__)
 
 _lsp_client: IsabelleLSPClient | None = None
 _file_watcher: FileWatcher | None = None
-_server_logic: str = "HOL"
 _server_extra_args: list[str] = []
 
 
@@ -68,11 +68,12 @@ async def _file_change_sink(path: str) -> None:
 @asynccontextmanager
 async def server_lifespan(_app: Any) -> AsyncGenerator[None]:
     global _lsp_client, _file_watcher
-    # project_root stays None for now (shared HTTP server has no meaningful root) →
-    # evaluation snapshots render absolute paths. Set a real per-agent root here with
-    # the stdio-per-agent refactor.
+    # Per-agent stdio server: project_root is this process's cwd (each agent launches
+    # the server from its project dir), so evaluation snapshots render paths relative
+    # to it. The session/logic is chosen at run time via isabelle_launch — the prover
+    # is NOT started here.
     _lsp_client = IsabelleLSPClient(
-        logic=_server_logic, extra_args=_server_extra_args, project_root=None,
+        extra_args=_server_extra_args, project_root=os.path.realpath(os.getcwd()),
     )
     _file_watcher = FileWatcher()
     _file_watcher.start()
@@ -99,12 +100,90 @@ async def _ensure_lsp_started() -> IsabelleLSPClient:
     if _lsp_client is None:
         raise IsabelleToolError("LSP client not initialized")
     if _lsp_client.process is None:
-        await _lsp_client.start()
+        raise IsabelleToolError(
+            'No Isabelle session is running. Call isabelle_launch(session="HOL") '
+            "first (ask the user which session/logic to use if unsure).",
+        )
     # Backstop sync at every tool-call start: Layer 2 (re-stat open docs and push the
     # changed ones) + Layer 3 (wait out the server's debounce if a dependency just
     # changed). Catches anything the event-driven watcher missed.
     await resync_and_check_freshness(_lsp_client)
     return _lsp_client
+
+
+def _default_session_dirs() -> list[str]:
+    """Default ``-d`` dirs when the agent doesn't pass any: the server's cwd, but
+    ONLY if it is a session-root dir (has ROOT/ROOTS). ``isabelle vscode_server``
+    rejects a ``-d`` dir lacking ROOT/ROOTS ("Bad session root directory"), so a
+    blind ``-d $cwd`` would break for scratch/non-project cwds. Built-in sessions
+    (HOL, …) need no ``-d`` at all.
+    """
+    cwd = os.path.realpath(os.getcwd())
+    if os.path.exists(os.path.join(cwd, "ROOT")) or os.path.exists(os.path.join(cwd, "ROOTS")):
+        return [cwd]
+    return []
+
+
+# ── Session management ────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def isabelle_launch(
+    session: str, session_dirs: list[str] | None = None,
+) -> SessionInfo:
+    """Start (or restart) the Isabelle prover with the given session/logic.
+
+    **Must be called before any evaluation or query tool** — the prover does not
+    auto-start. Returns the running session name and server version.
+
+    Calling it again with the same session is a no-op; with a different session it
+    restarts the prover (any in-progress evaluation is discarded).
+
+    Args:
+        session: Isabelle session/logic name, e.g. "HOL", "HOL-Analysis", "Minilang".
+            If you are unsure which session to use, ask the user.
+        session_dirs: Extra ``-d`` session search directories for non-builtin
+            sessions (Isabelle reads their ROOT/ROOTS to discover the session).
+            Defaults to the server's working directory when that directory is itself
+            a session root (contains ROOT/ROOTS), otherwise none. Built-in sessions
+            (HOL, HOL-Analysis, …) need no session dirs.
+    """
+    if _lsp_client is None:
+        raise IsabelleToolError("LSP client not initialized")
+    async with _evaluation_state_lock:
+        if _lsp_client.process is not None:
+            if _lsp_client.logic == session:
+                return await session_info(_lsp_client)
+            # Switching sessions: tear the old prover down before starting anew.
+            await _lsp_client.shutdown()
+            _lsp_client.process = None
+        _lsp_client.session_dirs = (
+            session_dirs if session_dirs is not None else _default_session_dirs()
+        )
+        _lsp_client.logic = session
+        await _lsp_client.start()
+        return await session_info(_lsp_client)
+
+
+@mcp.tool(output_schema=None)
+async def isabelle_terminate() -> ToolResult:
+    """Terminate the running Isabelle prover.
+
+    The MCP server itself stays up; you can start a fresh prover (e.g. a different
+    session) with isabelle_launch afterwards.
+    """
+    if _lsp_client is None or _lsp_client.process is None:
+        return ToolResult(content=[TextContent(
+            type="text", text="No Isabelle session is running.",
+        )])
+    async with _evaluation_state_lock:
+        await _lsp_client.shutdown()
+        _lsp_client.process = None
+        if _file_watcher is not None:
+            _file_watcher.clear_watches()
+    return ToolResult(content=[TextContent(
+        type="text", text="Isabelle session terminated.",
+    )])
 
 
 # ── Evaluation tools ──────────────────────────────────────────────────
@@ -176,7 +255,8 @@ async def isabelle_hover(file_path: str, line: int, symbol: str) -> HoverInfo:
     Finds all occurrences of the symbol on the line (up to 10), queries each,
     and deduplicates results. Accepts both ASCII and Unicode symbol forms.
 
-    Auto-starts evaluation if the line has not been evaluated yet.
+    Auto-evaluates the line first if needed; requires a launched session
+    (see isabelle_launch).
 
     Args:
         file_path: Absolute path to .thy file
@@ -195,7 +275,8 @@ async def isabelle_definition(file_path: str, line: int, symbol: str) -> Declara
     Finds all occurrences of the symbol on the line (up to 10), queries each,
     and deduplicates locations. Accepts both ASCII and Unicode symbol forms.
 
-    Auto-starts evaluation if the line has not been evaluated yet.
+    Auto-evaluates the line first if needed; requires a launched session
+    (see isabelle_launch).
 
     Args:
         file_path: Absolute path to .thy file
@@ -219,7 +300,8 @@ async def isabelle_local_occurrences(file_path: str, line: int, symbol: str) -> 
     references to global constants from imported theories, and plain free/bound
     variables, return no occurrences.
 
-    Auto-starts evaluation if the line has not been evaluated yet.
+    Auto-evaluates the line first if needed; requires a launched session
+    (see isabelle_launch).
 
     Args:
         file_path: Absolute path to .thy file
@@ -238,8 +320,8 @@ async def isabelle_goal(
     """Get the Isar command at a position and the proof state after it executes.
 
     Returns the command enclosing the position — its full source text and range —
-    together with the subgoals remaining after that command runs. Auto-starts
-    evaluation if the line has not been evaluated yet.
+    together with the subgoals remaining after that command runs. Auto-evaluates
+    the line first if needed; requires a launched session (see isabelle_launch).
 
     Args:
         file_path: Absolute path to .thy file
@@ -260,8 +342,8 @@ async def isabelle_command_output(
 
     Returns the command enclosing the position — its full source text and range —
     together with the prover output it emitted (normal/tracing/warning/error/
-    information/state messages). Auto-starts evaluation if the line has not been
-    evaluated yet.
+    information/state messages). Auto-evaluates the line first if needed; requires
+    a launched session (see isabelle_launch).
 
     Args:
         file_path: Absolute path to .thy file
@@ -284,7 +366,7 @@ async def isabelle_session_info() -> SessionInfo:
 
 
 def main() -> None:
-    global _server_logic, _server_extra_args
+    global _server_extra_args
     import argparse
     import sys
 
@@ -294,16 +376,9 @@ def main() -> None:
         return
 
     parser = argparse.ArgumentParser(
-        description="Isabelle MCP Server",
-        usage="%(prog)s -s SESSION [options] [-- ISABELLE_ARGS...]",
+        description="Isabelle MCP Server (stdio; one dedicated server per agent)",
+        usage="%(prog)s [-- ISABELLE_ARGS...]",
     )
-    parser.add_argument(
-        "-s", "--session", required=True,
-        help="Isabelle session/logic name (e.g. HOL, HOL-Analysis)",
-    )
-    parser.add_argument("--http", action="store_true", help="Run as HTTP server (shared across clients)")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8371)
 
     argv = sys.argv[1:]
     if "--" in argv:
@@ -311,15 +386,10 @@ def main() -> None:
         own_argv, extra = argv[:idx], argv[idx + 1:]
     else:
         own_argv, extra = argv, []
-    args = parser.parse_args(own_argv)
+    parser.parse_args(own_argv)  # reject unknown flags
 
-    _server_logic = args.session
     _server_extra_args = extra
-
-    if args.http:
-        mcp.run(transport="streamable-http", host=args.host, port=args.port)
-    else:
-        mcp.run()
+    mcp.run()
 
 
 if __name__ == "__main__":

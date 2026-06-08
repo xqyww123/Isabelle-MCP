@@ -452,14 +452,18 @@ Still open:
 ### 7.5 Paths
 
 - Accept + display **relative** paths; normalize to absolute internally for
-  `file://` URIs and all path-keyed state. Project-root definition is tied to the
-  stdio-per-agent refactor (§7.6) — decide the root there.
+  `file://` URIs and all path-keyed state. **Resolved:** the project root is the
+  per-agent stdio server's CWD (`os.path.realpath(os.getcwd())`), set in the
+  lifespan; a path that escapes the root falls back to absolute.
 
 ### 7.6 Adjacent / out-of-scope work
 
-- Shared HTTP server → **stdio-per-agent** (each bound to its agent's process).
-  Drives the relative-path model.
-- `instructions.py` — owned by the user.
+- **Done:** Shared HTTP server → **stdio-per-agent** (each bound to its agent's
+  process). `--http`/`--host`/`--port` removed; stdio is the only transport. The
+  session is chosen at run time via `isabelle_launch(session, session_dirs=None)`
+  (+ `isabelle_terminate()`), not a CLI/config arg.
+- `instructions.py` — owned by the user; should gain an "`isabelle_launch` first"
+  step in its workflow (left to the user).
 - After implementing the above, re-sync `SPECIFICATION.md`, `API_DESIGN.md`,
   `ARCHITECTURE.md`, `README.md` (tool list loses `isabelle_diagnostics`; the
   evaluation tools' output is now a plain string).

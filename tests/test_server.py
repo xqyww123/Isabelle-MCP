@@ -12,8 +12,10 @@ from isabelle_mcp.server import (
     isabelle_evaluation_status,
     isabelle_goal,
     isabelle_hover,
+    isabelle_launch,
     isabelle_local_occurrences,
     isabelle_session_info,
+    isabelle_terminate,
 )
 
 
@@ -115,24 +117,26 @@ class TestServerLifespan:
                 mock_instance.start.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_custom_session(self):
+    async def test_passes_extra_args_and_cwd_root(self):
+        import os
+
         import isabelle_mcp.server as server_mod
         from isabelle_mcp.server import server_lifespan
 
-        server_mod._server_logic = "HOL-Analysis"
-        server_mod._server_extra_args = ["-d", "/extra"]
+        server_mod._server_extra_args = ["-o", "threads=4"]
         try:
             with patch('isabelle_mcp.server.IsabelleLSPClient') as MockClient:
                 mock_instance = MagicMock()
                 mock_instance.process = None
                 MockClient.return_value = mock_instance
                 async with server_lifespan(MagicMock()):
+                    # No logic= (session is chosen at run time via isabelle_launch);
+                    # project_root is the server's cwd.
                     MockClient.assert_called_with(
-                        logic='HOL-Analysis', extra_args=["-d", "/extra"],
-                        project_root=None,
+                        extra_args=["-o", "threads=4"],
+                        project_root=os.path.realpath(os.getcwd()),
                     )
         finally:
-            server_mod._server_logic = "HOL"
             server_mod._server_extra_args = []
 
 
@@ -167,34 +171,139 @@ class TestServerMain:
         import sys
 
         from isabelle_mcp.server import main, mcp
-        with patch.object(sys, 'argv', ['isabelle-mcp', '-s', 'HOL']):
+        with patch.object(sys, 'argv', ['isabelle-mcp']):
             with patch.object(mcp, 'run') as mock_run:
                 main()
-                mock_run.assert_called_once()
-
-    def test_session_required(self):
-        import sys
-
-        from isabelle_mcp.server import main
-        with patch.object(sys, 'argv', ['isabelle-mcp']):
-            with pytest.raises(SystemExit, match="2"):
-                main()
+                # stdio: run() called with no transport kwargs.
+                mock_run.assert_called_once_with()
 
     def test_extra_args_passthrough(self):
         import sys
 
         import isabelle_mcp.server as server_mod
         from isabelle_mcp.server import main, mcp
-        with patch.object(sys, 'argv', ['isabelle-mcp', '-s', 'HOL-Analysis', '--', '-d', '/extra', '-o', 'threads=4']):
+        with patch.object(sys, 'argv', ['isabelle-mcp', '--', '-d', '/extra', '-o', 'threads=4']):
             with patch.object(mcp, 'run'):
                 main()
-                assert server_mod._server_logic == "HOL-Analysis"
                 assert server_mod._server_extra_args == ["-d", "/extra", "-o", "threads=4"]
 
     def test_typo_rejected(self):
         import sys
 
         from isabelle_mcp.server import main
-        with patch.object(sys, 'argv', ['isabelle-mcp', '-s', 'HOL', '--httpp']):
+        with patch.object(sys, 'argv', ['isabelle-mcp', '--nope']):
             with pytest.raises(SystemExit, match="2"):
                 main()
+
+
+def _launch_mock(*, running: bool, logic: str = "HOL"):
+    """A mock IsabelleLSPClient for the launch/terminate tests."""
+    client = MagicMock()
+    client.process = MagicMock() if running else None
+    client.logic = logic
+    client.isabelle_version = "Isabelle2024"
+    client.start = AsyncMock()
+    client.shutdown = AsyncMock()
+    return client
+
+
+class TestSessionManagement:
+    @pytest.mark.asyncio
+    async def test_ensure_raises_before_launch(self):
+        import isabelle_mcp.server as server_mod
+        from isabelle_mcp.utils import IsabelleToolError
+
+        client = _launch_mock(running=False)
+        with patch.object(server_mod, '_lsp_client', client):
+            with pytest.raises(IsabelleToolError, match="isabelle_launch"):
+                await server_mod._ensure_lsp_started()
+
+    @pytest.mark.asyncio
+    async def test_launch_starts_prover_with_default_dirs(self):
+        import isabelle_mcp.server as server_mod
+
+        client = _launch_mock(running=False)
+        with patch.object(server_mod, '_lsp_client', client), \
+                patch.object(server_mod, '_default_session_dirs', return_value=["/root"]):
+            result = await isabelle_launch("HOL")
+        client.start.assert_awaited_once()
+        client.shutdown.assert_not_awaited()
+        assert client.logic == "HOL"
+        assert client.session_dirs == ["/root"]
+        assert result.current_session == "HOL"
+        assert result.version == "Isabelle2024"
+
+    def test_default_session_dirs_with_root(self, tmp_path):
+        import os
+
+        import isabelle_mcp.server as server_mod
+
+        root = os.path.realpath(str(tmp_path))
+        (tmp_path / "ROOTS").write_text("contrib\n")
+        with patch('isabelle_mcp.server.os.getcwd', return_value=root):
+            assert server_mod._default_session_dirs() == [root]
+
+    def test_default_session_dirs_without_root(self, tmp_path):
+        import os
+
+        import isabelle_mcp.server as server_mod
+
+        root = os.path.realpath(str(tmp_path))
+        with patch('isabelle_mcp.server.os.getcwd', return_value=root):
+            # isabelle rejects a -d dir without ROOT/ROOTS, so default to none.
+            assert server_mod._default_session_dirs() == []
+
+    @pytest.mark.asyncio
+    async def test_launch_explicit_session_dirs(self):
+        import isabelle_mcp.server as server_mod
+
+        client = _launch_mock(running=False)
+        with patch.object(server_mod, '_lsp_client', client):
+            await isabelle_launch("Minilang", session_dirs=["/proj"])
+        assert client.session_dirs == ["/proj"]
+
+    @pytest.mark.asyncio
+    async def test_launch_idempotent_same_session(self):
+        import isabelle_mcp.server as server_mod
+
+        client = _launch_mock(running=True, logic="HOL")
+        with patch.object(server_mod, '_lsp_client', client):
+            result = await isabelle_launch("HOL")
+        client.start.assert_not_awaited()
+        client.shutdown.assert_not_awaited()
+        assert result.current_session == "HOL"
+
+    @pytest.mark.asyncio
+    async def test_launch_switches_session_restarts(self):
+        import isabelle_mcp.server as server_mod
+
+        client = _launch_mock(running=True, logic="HOL")
+        with patch.object(server_mod, '_lsp_client', client):
+            await isabelle_launch("HOL-Analysis")
+        client.shutdown.assert_awaited_once()
+        client.start.assert_awaited_once()
+        assert client.logic == "HOL-Analysis"
+
+    @pytest.mark.asyncio
+    async def test_terminate_running(self):
+        import isabelle_mcp.server as server_mod
+
+        client = _launch_mock(running=True)
+        watcher = MagicMock()
+        with patch.object(server_mod, '_lsp_client', client), \
+                patch.object(server_mod, '_file_watcher', watcher):
+            result = await isabelle_terminate()
+        client.shutdown.assert_awaited_once()
+        assert client.process is None
+        watcher.clear_watches.assert_called_once()
+        assert "terminated" in result.content[0].text.lower()
+
+    @pytest.mark.asyncio
+    async def test_terminate_not_running(self):
+        import isabelle_mcp.server as server_mod
+
+        client = _launch_mock(running=False)
+        with patch.object(server_mod, '_lsp_client', client):
+            result = await isabelle_terminate()
+        client.shutdown.assert_not_awaited()
+        assert "No Isabelle session" in result.content[0].text

@@ -4,7 +4,8 @@
 **Date:** 2026-06-04
 **Status:** Updated for async evaluation model + file-sync (FileWatcher) model
 
-> The server exposes 9 MCP tools: 3 evaluation lifecycle tools and
+> The server exposes 11 MCP tools: 2 session-lifecycle tools
+> (`isabelle_launch` / `isabelle_terminate`), 3 evaluation lifecycle tools, and
 > 6 query tools.  The previous blocking model (where every tool waited
 > for Isabelle to process the file) has been replaced by an explicit
 > evaluate-then-query workflow.
@@ -38,7 +39,10 @@ Isa-LSP is a Python-based MCP (Model Context Protocol) server that acts as a bri
 │  └────────────┬─────────────────────────────────────────┘   │
 │               │                                              │
 │  ┌────────────▼─────────────────────────────────────────┐   │
-│  │  MCP Tool Handlers (9 tools)                         │   │
+│  │  MCP Tool Handlers (11 tools)                        │   │
+│  │  Session lifecycle:                                  │   │
+│  │  - isabelle_launch                                   │   │
+│  │  - isabelle_terminate                                │   │
 │  │  Evaluation (plain-text snapshot):                   │   │
 │  │  - isabelle_evaluate_to                              │   │
 │  │  - isabelle_evaluation_status                        │   │
@@ -616,7 +620,7 @@ AI Agent calls isabelle_goal(file, line)
 ### 4.3 Shutdown Flow
 
 ```
-User calls isabelle_shutdown_session() OR
+User calls isabelle_terminate() OR
 Process termination detected
          │
          ├─→ Send LSP shutdown request

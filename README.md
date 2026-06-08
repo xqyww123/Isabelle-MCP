@@ -4,13 +4,14 @@ MCP server bridging AI agents with Isabelle's theorem prover via its LSP impleme
 
 **Python ≥ 3.10 | v0.1.0 (MVP)**
 
-> ⚠️ **One agent per server instance.** This server holds a single shared
-> Isabelle session with global mutable state — one set of open documents, one
+> ⚠️ **One agent per server instance.** This server holds a single Isabelle
+> session with global mutable state — one set of open documents, one
 > caret/perspective, and one evaluation in flight at a time. It is
-> **single-threaded and not concurrency-safe**: pointing multiple agents at
-> one instance, or interleaving concurrent requests (including via the shared
-> `--http` mode), corrupts the shared evaluation/caret/document state with
-> catastrophic, hard-to-debug results. Run one dedicated server per agent.
+> **single-threaded and not concurrency-safe**: pointing multiple agents at one
+> instance, or interleaving concurrent requests, corrupts the evaluation/caret/
+> document state with catastrophic, hard-to-debug results. The server runs over
+> **stdio**, so each agent already gets its own dedicated server process (and its
+> own `isabelle vscode_server`) — just don't share one or drive it concurrently.
 
 ## Quick Start
 
@@ -21,27 +22,28 @@ pip install -e ".[dev]"
 {
   "mcpServers": {
     "isabelle": {
-      "command": "isabelle-mcp",
-      "args": ["-s", "HOL"]
+      "command": "isabelle-mcp"
     }
   }
 }
 ```
 
+The session/logic is **not** configured here — the agent picks it at run time by
+calling the `isabelle_launch` tool (see Tools below).
+
 ## Running the server
 
 ```bash
-isabelle-mcp -s HOL                              # stdio transport (default)
-isabelle-mcp -s HOL-Analysis --http --port 8371  # shared HTTP server
-isabelle-mcp -s HOL -- -o editor_output_state=true  # args after `--` go to Isabelle
+isabelle-mcp                                  # stdio transport (the only transport)
+isabelle-mcp -- -o editor_output_state=true   # args after `--` go to isabelle vscode_server
 ```
+
+The server starts no prover at launch; the connected agent calls `isabelle_launch`
+to start one for a chosen session.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `-s`, `--session` | *(required)* | Isabelle session/logic, e.g. `HOL`, `HOL-Analysis` |
-| `--http` | off (stdio) | Run as a shared HTTP server instead of stdio |
-| `--host` | `127.0.0.1` | HTTP bind host |
-| `--port` | `8371` | HTTP bind port |
+| `--version` | — | Print the version and exit |
 | `-- ...` | — | Everything after `--` is forwarded to `isabelle vscode_server` |
 
 ### Environment variables
@@ -51,14 +53,15 @@ These are read once at process startup; a connected agent cannot change them.
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `ISA_LSP_EVAL_POLL_INTERVAL` | `10` | Seconds an evaluate/poll call waits before returning `in_progress` |
-| `ISA_LSP_SYNC_INTERVAL` | `1` | Seconds between background pushes of file-system edits to Isabelle |
 | `ISA_LSP_DUMP` | unset | If set to a path, append a JSON wire-log of all LSP traffic (debugging) |
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| `isabelle_evaluate_to` | Evaluate the theory up to a line (auto-starts the prover); returns a per-file snapshot of errors / warnings / running command lines |
+| `isabelle_launch` | Start (or restart) the prover for a session/logic (e.g. `HOL`, `Minilang`); **call this first** |
+| `isabelle_terminate` | Terminate the running prover (the MCP server stays up; you can relaunch) |
+| `isabelle_evaluate_to` | Evaluate the theory up to a line; returns a per-file snapshot of errors / warnings / running command lines |
 | `isabelle_evaluation_status` | Poll progress of a running evaluation (same snapshot) |
 | `isabelle_cancel_evaluation` | Cancel a running evaluation |
 | `isabelle_hover` | Type info and documentation at position |

@@ -109,6 +109,9 @@ class MockLSPClient:
         self.logic = "HOL"
         self.initialized = True
         self.project_root = None
+        # Present so launch/terminate/guard tests can simulate a (not-)running prover.
+        self.process = None
+        self.isabelle_version = ""
         self.open_documents: dict[str, DocumentState] = {}
         self.diagnostics_cache: dict[str, list[dict[str, Any]]] = {}
         self.processing_status: dict[str, bool] = {}

@@ -590,7 +590,11 @@ async def check_evaluation_guard(
     file_path: str,
     line: MCPLine,
 ) -> "EvaluationView | str | None":
-    """Ensure *line* has been evaluated; raise, warn, or auto-start.
+    """Ensure *line* has been evaluated; raise, warn, or auto-start evaluation.
+
+    (Auto-starts *evaluation of unevaluated lines* on an already-running session —
+    it does not start the prover; the session must first be launched via
+    ``isabelle_launch``.)
 
     Returns:
       - ``None``: line is fully processed, caller can proceed.
@@ -628,9 +632,13 @@ def _relativize(path: str, root: str | None) -> str:
     if root is None:
         return real
     try:
-        return os.path.relpath(real, root)
+        rel = os.path.relpath(real, root)
     except ValueError:
         return real
+    # Only relativize when the file actually lives under root; otherwise relpath
+    # produces ugly ../../.. traversals (e.g. project_root=cwd but the .thy is
+    # elsewhere) — fall back to the absolute path in that case.
+    return real if rel.startswith("..") else rel
 
 
 def _fmt_spans(spans: list[tuple[int, int]]) -> str:

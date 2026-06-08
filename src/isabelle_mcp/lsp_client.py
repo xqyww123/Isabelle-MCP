@@ -248,6 +248,10 @@ class IsabelleLSPClient:
     # ── Lifecycle ──────────────────────────────────────────────────────
 
     async def start(self) -> None:
+        # Re-entry guard: a live process must be shut down before re-starting, else
+        # the old reader/stderr tasks leak and two read-loops race on one stdout.
+        if self.process is not None and self.process.returncode is None:
+            return
         cmd = [
             "isabelle", "vscode_server", "-l", self.logic,
             "-o", "vscode_pide_extensions",
@@ -352,6 +356,14 @@ class IsabelleLSPClient:
         self._dynamic_output_cache_by_position.clear()
         self._preview_waiters.clear()
         self._processing_trackers.clear()
+
+        # Reset the module-global evaluation singleton so a later relaunch starts
+        # clean — otherwise a terminate mid-evaluation leaves evaluation_state.active
+        # True and the next session rejects every evaluate_to. Lazy import avoids the
+        # import cycle with evaluation.py (which imports this module).
+        from isabelle_mcp.evaluation import evaluation_state
+        evaluation_state.cancel()
+        evaluation_state.auto_opened_files.clear()
 
     # ── JSON-RPC transport ──────────────────────────────────────────────
 

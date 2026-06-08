@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from isabelle_mcp.lsp_client import DocumentState, IsabelleLSPClient
-from isabelle_mcp.utils import IsabelleToolError, LSPCharacter, LSPLine
+from isabelle_mcp.utils import IsabelleToolError, LSPCharacter, LSPLine, MCPLine
 
 
 class TestIsabelleLSPClient:
@@ -28,6 +28,31 @@ class TestIsabelleLSPClient:
     def test_init_session_dirs(self):
         client = IsabelleLSPClient(session_dirs=["/extra/sessions"])
         assert client.session_dirs == ["/extra/sessions"]
+
+    @pytest.mark.asyncio
+    async def test_shutdown_resets_evaluation_state(self):
+        # A terminate mid-evaluation must not leave the global eval singleton active,
+        # else the next launched session rejects every evaluate_to.
+        from isabelle_mcp.evaluation import evaluation_state
+
+        evaluation_state.start("/tmp/x.thy", MCPLine(5))
+        evaluation_state.auto_opened_files.add("/tmp/y.thy")
+        assert evaluation_state.active
+
+        client = IsabelleLSPClient()  # process is None → shutdown skips teardown
+        await client.shutdown()
+
+        assert evaluation_state.active is False
+        assert evaluation_state.auto_opened_files == set()
+
+    @pytest.mark.asyncio
+    async def test_start_is_reentrant_noop_when_running(self):
+        client = IsabelleLSPClient()
+        client.process = MagicMock()
+        client.process.returncode = None  # "alive"
+        with patch('asyncio.create_subprocess_exec') as spawn:
+            await client.start()
+        spawn.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_send_message(self):

@@ -6,8 +6,8 @@
 
 > Documentation reliability note:
 > This document contains both current behavior and design targets. The current
-> server exposes these MCP tools: hover, definition, local occurrences,
-> diagnostics, goal, command output, session info, and the evaluation tools
+> server exposes these MCP tools: session launch/terminate, hover, definition,
+> local occurrences, goal, command output, session info, and the evaluation tools
 > (`isabelle_evaluate_to`, `isabelle_evaluation_status`, `isabelle_cancel_evaluation`).
 
 ## 1. Executive Summary
@@ -31,7 +31,7 @@ Isa-LSP is a Model Context Protocol (MCP) server that provides AI agents (like C
 **In Scope (MVP - LSP/PIDE Native Support Only):**
 - Standard LSP-based MCP tools (hover, definition, local occurrences, diagnostics)
 - PIDE-specific MCP tools (proof state, command output)
-- 1 session management tool (session info)
+- 3 session management tools (launch, terminate, session info)
 - Document open/close state management (`didOpen`, `didClose`)
 - Async notification handling (diagnostics and selected PIDE notifications)
 - Session lifecycle management
@@ -108,7 +108,8 @@ def tool() -> LocalOccurrencesResult: ...
 
 ## 3. Feature Catalog
 
-The current server registers **9 MCP tools**: three evaluation tools and six
+The current server registers **11 MCP tools**: two prover-lifecycle tools
+(`isabelle_launch` / `isabelle_terminate`), three evaluation tools, and six
 query tools.
 
 ### 3.0 Evaluation Tools (3 tools)
@@ -116,7 +117,7 @@ query tools.
 Evaluation drives Isabelle's processing; the query tools below read its results.
 
 #### Tool: `isabelle_evaluate_to`
-**Purpose**: Start checking a theory file up to a target line (auto-starts the prover)
+**Purpose**: Start checking a theory file up to a target line (requires a launched session)
 **Returns**: Plain-text per-file snapshot (errors / warnings / running lines) — may
 report `in_progress`; poll with `isabelle_evaluation_status`
 **Priority**: High (entry point for all checking)
@@ -169,10 +170,23 @@ Isabelle-specific features - **only PIDE-native methods**:
 **Priority**: Medium (Debugging)
 **Pattern**: New (Isabelle-specific); targeting is by optional `after_text`
 
-### 3.3 Session Management Tools (1 tool)
+### 3.3 Session Management Tools (3 tools)
 
-#### Tool 6: `isabelle_session_info`
-**Purpose**: Get the current session name
+#### Tool 6: `isabelle_launch`
+**Purpose**: Start (or restart) the prover for a chosen session/logic; must be
+called before any evaluation/query tool (the prover does not auto-start)
+**LSP Mapping**: Spawns `isabelle vscode_server -l <session> -d <dirs…>` ✅
+**Priority**: High (entry point)
+**Pattern**: New (lifecycle)
+
+#### Tool 7: `isabelle_terminate`
+**Purpose**: Terminate the running prover (the MCP server stays up; relaunch allowed)
+**LSP Mapping**: LSP `shutdown`/`exit` then process teardown ✅
+**Priority**: Low (lifecycle)
+**Pattern**: New (lifecycle)
+
+#### Tool 8: `isabelle_session_info`
+**Purpose**: Get the current session name and server version
 **LSP Mapping**: In-memory client state ✅
 **Priority**: Low (Introspection)
 **Pattern**: New (info query)
@@ -319,7 +333,7 @@ class LocalOccurrencesResult(BaseModel):
 **Description**: Get the Isar command enclosing a position and the proof state
 (remaining subgoals) **after** that command runs. **MOST IMPORTANT tool for theorem
 proving — use often!** An empty `subgoals` list means the proof is finished at that
-command. Auto-starts evaluation if the line has not been evaluated yet.
+command. Auto-evaluates the line first if needed (requires a launched session).
 
 Without `after_text`, the command at the end of the line is used. Pass `after_text`
 to target the command right after that snippet on the line. To see a tactic's
@@ -387,8 +401,8 @@ class GoalState(BaseModel):
 #### 4.2.2 `isabelle_command_output`
 
 **Description**: Get the Isar command enclosing a position and the prover output it
-produced. Auto-starts evaluation if the line has not been evaluated yet. Targeting
-follows the same `after_text` rule as `isabelle_goal`.
+produced. Auto-evaluates the line first if needed (requires a launched session).
+Targeting follows the same `after_text` rule as `isabelle_goal`.
 
 **Tool Annotations**:
 ```python
@@ -434,9 +448,52 @@ class CommandOutputResult(BaseModel):
 
 ### 4.3 Session Management Tools
 
-#### 4.3.1 `isabelle_session_info`
+#### 4.3.1 `isabelle_launch`
 
-**Description**: Get the name of the current Isabelle session.
+**Description**: Start (or restart) the Isabelle prover with the given
+session/logic. **Must be called before any evaluation or query tool** — the prover
+does not auto-start. Calling it with the same session is a no-op; a different session
+restarts the prover (any in-progress evaluation is discarded).
+
+**Tool Annotations**:
+```python
+ToolAnnotations(
+    title="Launch Session",
+    idempotentHint=True,
+)
+```
+
+**Input Parameters**:
+```python
+session: Annotated[str, Field(description="Session/logic name, e.g. HOL, HOL-Analysis, Minilang")]
+session_dirs: Annotated[Optional[list[str]], Field(
+    description="Extra -d session search dirs for non-builtin sessions; "
+                "defaults to the server's working directory."
+)] = None
+```
+
+**Output Model**: `SessionInfo` (below) — the running session name and server version.
+
+#### 4.3.2 `isabelle_terminate`
+
+**Description**: Terminate the running prover. The MCP server itself stays up; a fresh
+prover (e.g. a different session) can be started afterwards with `isabelle_launch`.
+Returns a plain-text `ToolResult` (`output_schema=None`).
+
+**Tool Annotations**:
+```python
+ToolAnnotations(
+    title="Terminate Session",
+    destructiveHint=True,
+    idempotentHint=True,
+)
+```
+
+**Input Parameters**: None
+
+#### 4.3.3 `isabelle_session_info`
+
+**Description**: Get the name and server version of the current Isabelle session.
 
 **Tool Annotations**:
 ```python
@@ -453,6 +510,7 @@ ToolAnnotations(
 ```python
 class SessionInfo(BaseModel):
     current_session: str = Field(description="Current logic/session name")
+    version: str | None = Field(default=None, description="Isabelle server version (None if unknown)")
 ```
 
 ---
@@ -483,7 +541,7 @@ error/warning message *text* is fetched separately via `isabelle_command_output`
 #### 4.4.1 `isabelle_evaluate_to`
 
 **Description**: Start evaluating a theory file up to a location on a line.
-Auto-starts the prover. The result may indicate evaluation is still in progress.
+Requires a launched session. The result may indicate evaluation is still in progress.
 
 **Input Parameters**:
 ```python
@@ -627,7 +685,7 @@ run rather than waiting for `complete`; and errors do not halt checking.
 
 ### 7.1 Functional Status
 
-1. Current server registers 9 MCP tools.
+1. Current server registers 11 MCP tools.
 2. Standard LSP features (hover, definition, local occurrences) are
    implemented and covered by tests.
 3. PIDE tools use Isabelle2024 native notifications:
@@ -639,7 +697,8 @@ run rather than waiting for `complete`; and errors do not halt checking.
 
 ### 7.2 Interface Consistency
 
-1. Current tool names are `isabelle_evaluate_to`, `isabelle_evaluation_status`,
+1. Current tool names are `isabelle_launch`, `isabelle_terminate`,
+   `isabelle_evaluate_to`, `isabelle_evaluation_status`,
    `isabelle_cancel_evaluation`, `isabelle_hover`, `isabelle_definition`,
    `isabelle_local_occurrences`, `isabelle_goal`, `isabelle_command_output`, and
    `isabelle_session_info`.

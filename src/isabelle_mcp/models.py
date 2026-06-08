@@ -189,6 +189,9 @@ class EvaluationView:
 
 class SessionInfo(BaseModel):
     current_session: str = Field(description="Current logic/session name (e.g., HOL)")
+    version: str | None = Field(
+        default=None, description="Isabelle server version reported at initialize (None if unknown)"
+    )
 
 
 # Needed because models reference DiagnosticMessage via forward ref.
