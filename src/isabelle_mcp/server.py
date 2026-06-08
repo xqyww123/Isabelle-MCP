@@ -101,8 +101,8 @@ async def _ensure_lsp_started() -> IsabelleLSPClient:
         raise IsabelleToolError("LSP client not initialized")
     if _lsp_client.process is None:
         raise IsabelleToolError(
-            'No Isabelle session is running. Call isabelle_launch(session="HOL") '
-            "first (ask the user which session/logic to use if unsure).",
+            "No Isabelle session is running. Call isabelle_launch(session=...) "
+            "first to start one (ask the user if the session is unclear).",
         )
     # Backstop sync at every tool-call start: Layer 2 (re-stat open docs and push the
     # changed ones) + Layer 3 (wait out the server's debounce if a dependency just
