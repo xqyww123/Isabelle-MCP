@@ -5,6 +5,10 @@ You work by editing `.thy` or `.ML` files on disk and calling the MCP tools to
 evaluate them and query the proof states. Changes to the files are synced and
 re-evaluated automatically.
 
+This tool is not meant to fully replace the `isabelle` command line — you are
+still strongly encouraged to use commands like `isabelle getenv ISABELLE_HOME`
+and `isabelle getenv AFP` to locate key directories.
+
 Before any other tool, call `isabelle_launch(session)` to start a session
 (e.g. "Main"); ask the user which session/logic to use if unsure.
 
@@ -28,6 +32,35 @@ back as diagnostics, not a halt.
 ## Conventions
 
 - Positions are **1-indexed**; file paths must be **absolute**.
+
+## Working with the `isabelle` command line
+
+**Locate key directories.** `isabelle getenv NAME` prints `NAME=value` (several
+names allowed):
+- `ISABELLE_HOME` — the distribution (read-only install).
+- `ISABELLE_HOME_USER` — your per-user dir; all config below lives here.
+- `AFP` — the AFP `thys` dir (only if AFP is registered as a component).
+
+**Sessions & components.** A session is declared in a `ROOT` file
+(`session NAME = parent + theories …`); a `ROOTS` file lists subdirectories to
+recurse into. To make a session directory permanently discoverable (no `-d`
+needed), register it: `isabelle components -u /abs/dir` appends it to
+`$ISABELLE_HOME_USER/etc/components` (one path per line, `#` comments out;
+`-x DIR` removes, `isabelle components -l` lists). A registered directory
+contributes its `ROOT`/`ROOTS` and its own `etc/settings`.
+
+**Environment variables.** Isabelle does not reliably read environment variables
+from the calling shell. Set them persistently in
+`$ISABELLE_HOME_USER/etc/settings` (a bash-sourced file: `VAR=value` lines), or
+in a component's own `etc/settings`.
+
+**Building.** `isabelle build -b SESSION` builds a session's heap image; `-d DIR`
+adds a session directory, `-v` is verbose. For parallelism use `-o threads=N` —
+it gives the prover N worker **threads inside** the session (0 = guess from
+hardware), e.g. `isabelle build -o threads=8 -b HOL`. Avoid `-j N` (build N
+separate **sessions** at once): it multiplies memory use and is rarely what you
+want here. `-o NAME=VAL` overrides any system option (`isabelle options -l` to
+list).
 """
 
 
