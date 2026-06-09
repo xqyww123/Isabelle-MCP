@@ -132,6 +132,28 @@ def _is_evaluation_complete(
     return all(_dependency_done(theory_map[d]) for d in deps if d in theory_map)
 
 
+def _complete_message(
+    dest: int,
+    running_commands: list[RunningCommand],
+    files: list[FileSnapshot],
+) -> str:
+    """Message for a reached destination, honest about leftover running/failed work.
+
+    The destination line is reached, but the command at/after it may still be
+    running (e.g. a stuck tactic) and earlier commands may have failed (errors do
+    not halt checking). Surface those counts instead of a bare "complete" so the
+    agent knows whether to keep watching or cancel.
+    """
+    n_running = len(running_commands)
+    n_failed = sum(fs.error_count for fs in files)
+    if n_running == 0 and n_failed == 0:
+        return f"Evaluation complete, arrived at line {dest}."
+    return (
+        f"Evaluation arrived at line {dest} with {n_running} statement(s) still "
+        f"running and {n_failed} statement(s) failed."
+    )
+
+
 def _in_progress_message(running_commands: list[RunningCommand]) -> str:
     if running_commands:
         parts = []
@@ -432,7 +454,7 @@ async def evaluate_to(
     # drop their decoration trackers).
     files = _snapshot_files(client, file_path, theories, auto_opened)
     message = (
-        f"Evaluation complete, arrived at line {dest}."
+        _complete_message(dest, running_commands, files)
         if status == "complete"
         else _in_progress_message(running_commands)
     )
@@ -474,7 +496,7 @@ async def evaluation_status(
         return EvaluationView(
             status="complete",
             destination_line=dest,
-            message=f"Evaluation complete, arrived at line {dest}.",
+            message=_complete_message(dest, running_commands, files),
             files=files,
             running_commands=running_commands,
         )

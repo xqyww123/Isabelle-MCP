@@ -10,7 +10,8 @@ from isabelle_mcp.evaluation import (
     resync_changed_open_documents_locked,
     sync_file_locked,
 )
-from isabelle_mcp.models import EvaluationView, FileSnapshot
+from isabelle_mcp.evaluation import _complete_message
+from isabelle_mcp.models import EvaluationView, FileSnapshot, RunningCommand
 from isabelle_mcp.processing import ProcessingTracker, parse_decoration_ranges
 from isabelle_mcp.utils import IsabelleToolError, MCPLine
 
@@ -254,6 +255,45 @@ class TestSnapshotCategorization:
         fs = _build_file_snapshot(mock_lsp_client, path, {path: ts})
         assert not fs.lined
         assert fs.state == "in_progress"
+
+
+class TestCompleteMessage:
+    def _run(self, line, text="apply simp"):
+        return RunningCommand(
+            file_path="/proj/Foo.thy", start_line=line, end_line=line,
+            text=text, elapsed_seconds=42.0,
+        )
+
+    def _fs(self, error_count=0):
+        return FileSnapshot(
+            "/proj/Foo.thy", lined=True,
+            state="problems" if error_count else "clean",
+            error_count=error_count,
+        )
+
+    def test_clean_complete(self):
+        assert _complete_message(11, [], [self._fs()]) == (
+            "Evaluation complete, arrived at line 11."
+        )
+
+    def test_running_only(self):
+        msg = _complete_message(11, [self._run(11)], [self._fs()])
+        assert msg == (
+            "Evaluation arrived at line 11 with 1 statement(s) still running "
+            "and 0 statement(s) failed."
+        )
+
+    def test_failed_only(self):
+        msg = _complete_message(11, [], [self._fs(error_count=2)])
+        assert msg == (
+            "Evaluation arrived at line 11 with 0 statement(s) still running "
+            "and 2 statement(s) failed."
+        )
+
+    def test_running_and_failed_sum_across_files(self):
+        files = [self._fs(error_count=1), self._fs(error_count=2)]
+        msg = _complete_message(11, [self._run(11), self._run(11)], files)
+        assert "2 statement(s) still running and 3 statement(s) failed" in msg
 
 
 class TestRendering:
