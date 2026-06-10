@@ -442,8 +442,8 @@ class IsabelleLSPClient:
             f"'{self.logic}' (heap image). Isabelle IGNORES edits to "
             "precompiled theories: changed content is never reprocessed, and "
             "once the file differs from the heap every evaluation/query on it "
-            "fails. Treat it as read-only. To edit it, relaunch with the "
-            "session's base session via isabelle_launch."
+            "fails. Treat it as read-only. To edit it, relaunch via "
+            "isabelle_launch with a base session not including the theory."
         )
 
     async def initialize(self) -> dict[str, Any]:
