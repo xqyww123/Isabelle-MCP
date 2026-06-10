@@ -12,6 +12,18 @@ from isabelle_mcp.lsp_client import DocumentState, IsabelleLSPClient
 from isabelle_mcp.utils import IsabelleToolError, LSPCharacter, LSPLine, MCPLine
 
 
+@pytest.fixture(autouse=True)
+def _pin_isabelle_version():
+    # Tests must not depend on the host's installed Isabelle version. Pin the
+    # cached version detector to a known pre-2025 value; individual tests that
+    # care about a specific version override it in-body.
+    import isabelle_mcp.lsp_client as lc
+    saved = lc._isabelle_version_cache
+    lc._isabelle_version_cache = ("Isabelle2024", 2024)
+    yield
+    lc._isabelle_version_cache = saved
+
+
 class TestIsabelleLSPClient:
     def test_init_default(self):
         client = IsabelleLSPClient()
@@ -55,20 +67,48 @@ class TestIsabelleLSPClient:
         spawn.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_query_binary_version_reads_isabelle_version(self):
-        # The LSP handshake omits serverInfo.version, so the version comes from
-        # `isabelle version`; we take its first non-empty line.
-        client = IsabelleLSPClient()
-        proc = MagicMock()
-        proc.communicate = AsyncMock(return_value=(b"Isabelle2024\n", b""))
-        with patch('asyncio.create_subprocess_exec', AsyncMock(return_value=proc)):
-            assert await client._query_binary_version() == "Isabelle2024"
+    async def test_start_html_output_version_gated(self):
+        # vscode_html_output=true is required on 2025+ (the plain-text state panel is
+        # broken upstream) but does NOT exist pre-2025 — passing it would abort the
+        # server. Gate it on the detected major year. Capture the launch cmd by raising
+        # right after it is built.
+        import isabelle_mcp.lsp_client as lc
+        captured = {}
 
-    @pytest.mark.asyncio
-    async def test_query_binary_version_unknown_on_failure(self):
-        client = IsabelleLSPClient()
-        with patch('asyncio.create_subprocess_exec', AsyncMock(side_effect=OSError)):
-            assert await client._query_binary_version() == "unknown"
+        async def fake_exec(*cmd, **kw):
+            captured["cmd"] = cmd
+            raise RuntimeError("stop after cmd built")
+
+        with patch("asyncio.create_subprocess_exec", fake_exec):
+            lc._isabelle_version_cache = ("Isabelle2025-2", 2025)
+            with pytest.raises(RuntimeError):
+                await IsabelleLSPClient().start()
+            assert "vscode_html_output=true" in captured["cmd"]
+
+            lc._isabelle_version_cache = ("Isabelle2024", 2024)
+            with pytest.raises(RuntimeError):
+                await IsabelleLSPClient().start()
+            assert "vscode_html_output=true" not in captured["cmd"]
+
+    def test_version_detector_reads_isabelle_version(self):
+        # `isabelle version` is the single source for the version string AND the
+        # major year used to branch version-specific protocol (state_init / unicode
+        # option). It is probed once and cached for the process. (The autouse
+        # fixture restores the cache afterwards.)
+        import isabelle_mcp.lsp_client as lc
+        lc._isabelle_version_cache = None
+        run = MagicMock(return_value=MagicMock(stdout="Isabelle2025-2\n"))
+        with patch("isabelle_mcp.lsp_client.subprocess.run", run):
+            assert lc.isabelle_version() == "Isabelle2025-2"
+            assert lc.isabelle_year() == 2025
+        run.assert_called_once()  # cached: the second access does not re-probe
+
+    def test_version_detector_unknown_on_failure(self):
+        import isabelle_mcp.lsp_client as lc
+        lc._isabelle_version_cache = None
+        with patch("isabelle_mcp.lsp_client.subprocess.run", MagicMock(side_effect=OSError)):
+            assert lc.isabelle_version() == "unknown"
+            assert lc.isabelle_year() is None
 
     @pytest.mark.asyncio
     async def test_send_message(self):
@@ -466,6 +506,37 @@ class TestIsabelleLSPClient:
         assert calls[0][0] == "PIDE/caret_update"
         assert calls[1] == ("PIDE/state_init", {})
         assert calls[-1] == ("PIDE/state_exit", {"id": 99})
+
+    @pytest.mark.asyncio
+    async def test_get_goals_2025_uses_state_init_request(self):
+        # Isabelle2025 made PIDE/state_init a request (replies with the panel's
+        # state_id). The panel still pushes state_output as a notification, which
+        # the waiter captures — but the panel is only created if state_init is sent
+        # as a *request*. Sent as a notification (pre-2025 path), 2025 returns no
+        # goals (the bug this branch fixes).
+        import isabelle_mcp.lsp_client as lc
+        lc._isabelle_version_cache = ("Isabelle2025-2", 2025)
+        client = IsabelleLSPClient()
+        calls = []
+
+        async def fake_notify(method, params):
+            calls.append((method, params))
+
+        async def fake_request(method, params, timeout=None):
+            calls.append(("REQUEST", method, params))
+            if method == "PIDE/state_init":
+                client._handle_state_output({"id": 7, "content": "<pre>1. Q</pre>"})
+            return {"state_id": 7}
+
+        client.notify = AsyncMock(side_effect=fake_notify)
+        client.request = AsyncMock(side_effect=fake_request)
+        goals = await client.get_goals_at_position("/tmp/Test.thy", LSPLine(7), 3)
+
+        assert goals == ["Q"]
+        # state_init went out as a REQUEST, never as a notification.
+        assert ("REQUEST", "PIDE/state_init", {}) in calls
+        assert ("PIDE/state_init", {}) not in calls
+        assert calls[-1] == ("PIDE/state_exit", {"id": 7})
 
     @pytest.mark.asyncio
     async def test_get_goals_timeout_cleans_init_waiter(self):

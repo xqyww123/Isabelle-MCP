@@ -210,6 +210,69 @@ class TestCancelEvaluation:
         assert not evaluation_state.active
 
 
+def _fork(path: str) -> RunningCommand:
+    return RunningCommand(
+        file_path=path, start_line=5, end_line=5,
+        text='value "slow"', elapsed_seconds=3.0,
+    )
+
+
+class TestLingeringFork:
+    """evaluate_to clears `active` once the frontier reaches the target, but a
+    forked command (value / async proof) may still run. status and cancel must
+    keep seeing and interrupting it — not short-circuit to 'no evaluation'."""
+
+    @pytest.mark.asyncio
+    async def test_status_sees_lingering_fork(
+        self, temp_theory_file, mock_lsp_client, monkeypatch,
+    ):
+        mock_lsp_client._processing_trackers[temp_theory_file] = MockProcessingTracker(
+            all_processed=True,
+        )
+        done = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
+        assert done.status == "complete"
+        assert not evaluation_state.active
+
+        monkeypatch.setattr(
+            mock_lsp_client, "get_all_running_commands",
+            lambda: [_fork(temp_theory_file)],
+        )
+        result = await evaluation_status(mock_lsp_client)
+        assert result.status == "in_progress"      # not collapsed to no_evaluation
+        assert result.running_commands             # the fork is surfaced
+
+    @pytest.mark.asyncio
+    async def test_cancel_interrupts_lingering_fork(
+        self, temp_theory_file, mock_lsp_client, monkeypatch,
+    ):
+        mock_lsp_client._processing_trackers[temp_theory_file] = MockProcessingTracker(
+            all_processed=True,
+        )
+        await evaluate_to(mock_lsp_client, temp_theory_file, 5)
+        assert not evaluation_state.active
+
+        interrupted: list[str] = []
+        monkeypatch.setattr(
+            mock_lsp_client, "get_all_running_commands",
+            lambda: [_fork(temp_theory_file)],
+        )
+
+        async def _spy(fp):
+            interrupted.append(fp)
+
+        monkeypatch.setattr(mock_lsp_client, "force_interrupt", _spy)
+
+        result = await cancel_evaluation(mock_lsp_client)
+        assert result.status == "cancelled"
+        assert interrupted == [temp_theory_file]    # the fork was actually interrupted
+
+    @pytest.mark.asyncio
+    async def test_idle_reports_no_evaluation(self, mock_lsp_client):
+        # No active eval and no running fork → genuinely idle, both stay quiet.
+        assert (await evaluation_status(mock_lsp_client)).status == "no_evaluation"
+        assert (await cancel_evaluation(mock_lsp_client)).status == "no_evaluation"
+
+
 class TestSnapshotCategorization:
     """_build_file_snapshot: decoration union + theory_status fallback."""
 

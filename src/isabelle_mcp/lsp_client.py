@@ -27,7 +27,16 @@ logger = logging.getLogger(__name__)
 
 JsonDict = dict[str, Any]
 
-_unicode_option_cache: str | None = None
+# (full version string, major year) of the `isabelle` on PATH — probed once and
+# cached for the process, since PATH (hence the binary) is fixed within a process.
+# None until the first probe.
+_isabelle_version_cache: tuple[str, int | None] | None = None
+
+# stderr lines matching this surface at WARNING (not DEBUG) so server-side failures
+# — e.g. a swallowed serialization exception — are visible early instead of buried.
+_STDERR_ERROR_RE = re.compile(
+    r"\b(error|exception|fail(?:ed|ure)?|bad json|uncaught|cannot)\b", re.IGNORECASE
+)
 
 # Raw wire dump: when ISA_LSP_DUMP names a file, every JSON-RPC frame in/out of
 # the vscode_server is appended there as one JSON line per frame. Default off so
@@ -77,30 +86,48 @@ def _stat_sigs(paths: list[str]) -> dict[str, StatSig | None]:
     return {p: _stat_sig(p) for p in paths}
 
 
+def _detect_isabelle_version() -> tuple[str, int | None]:
+    """Probe the `isabelle` on PATH: ``(full version string, major year)``.
+
+    Runs ``isabelle version`` once and caches the result for the process. Returns
+    ``("unknown", None)`` when the version cannot be determined.
+    """
+    global _isabelle_version_cache
+    if _isabelle_version_cache is None:
+        ver = "unknown"
+        try:
+            out = subprocess.run(
+                ["isabelle", "version"],
+                capture_output=True, text=True, timeout=30, check=False,
+            ).stdout.strip()
+            ver = out.splitlines()[0].strip() if out else "unknown"
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning("Could not detect Isabelle version: %s", exc)
+        match = re.search(r"Isabelle(\d{4})", ver)
+        _isabelle_version_cache = (ver or "unknown", int(match.group(1)) if match else None)
+    return _isabelle_version_cache
+
+
+def isabelle_version() -> str:
+    """Full version string of the `isabelle` on PATH, e.g. ``"Isabelle2025-2"``."""
+    return _detect_isabelle_version()[0]
+
+
+def isabelle_year() -> int | None:
+    """Major year (e.g. ``2025``) of the `isabelle` on PATH; ``None`` if unknown."""
+    return _detect_isabelle_version()[1]
+
+
 def unicode_symbols_option() -> str:
     """Return the version-correct vscode_server option for unicode symbol output.
 
     Isabelle2025 renamed ``vscode_unicode_symbols`` to ``vscode_unicode_symbols_output``
-    (passing the old name aborts the 2025 server at startup). Detect the version via
-    ``ISABELLE_IDENTIFIER`` (e.g. "Isabelle2024", "Isabelle2025-2"); fall back to the
-    pre-2025 name if detection fails. Cached for the process.
+    (passing the old name aborts the 2025 server at startup). Falls back to the
+    pre-2025 name when the version cannot be detected.
     """
-    global _unicode_option_cache
-    if _unicode_option_cache is not None:
-        return _unicode_option_cache
-    name = "vscode_unicode_symbols"
-    try:
-        out = subprocess.run(
-            ["isabelle", "getenv", "-b", "ISABELLE_IDENTIFIER"],
-            capture_output=True, text=True, timeout=30, check=False,
-        ).stdout.strip()
-        match = re.search(r"Isabelle(\d{4})", out)
-        if match and int(match.group(1)) >= 2025:
-            name = "vscode_unicode_symbols_output"
-    except (OSError, subprocess.SubprocessError) as exc:
-        logger.warning("Could not detect Isabelle version (%s); using %s", exc, name)
-    _unicode_option_cache = name
-    return name
+    year = isabelle_year()
+    return "vscode_unicode_symbols_output" if year is not None and year >= 2025 \
+        else "vscode_unicode_symbols"
 
 
 def read_vscode_load_delay(default: float = 0.5) -> float:
@@ -262,6 +289,14 @@ class IsabelleLSPClient:
             # with a later "-o editor_output_state=true" in extra_args to include it.
             "-o", "editor_output_state=false",
         ]
+        # Isabelle2025 routes the state/dynamic panels through Pretty_Text_Panel, which
+        # by default emits plain text + decorations — but that path is broken upstream
+        # (`decorations.map(_.json)` eta-expands `Decoration.json(file)` into a lambda →
+        # "Bad JSON value", so the state panel silently emits nothing and isabelle_goal
+        # returns []). Force the HTML branch, which parse_goals_from_html already consumes.
+        # The option does not exist pre-2025 (passing it aborts the server), so gate it.
+        if (isabelle_year() or 0) >= 2025:
+            cmd += ["-o", "vscode_html_output=true"]
         for d in self.session_dirs:
             cmd.extend(["-d", d])
         if self.verbose:
@@ -286,29 +321,13 @@ class IsabelleLSPClient:
         self.reader_task = asyncio.create_task(self._read_loop())
         self.stderr_task = asyncio.create_task(self._drain_stderr())
         await self.initialize()
-        # Isabelle's vscode_server does not report serverInfo.version in the LSP
-        # handshake, so fall back to the `isabelle` binary for a real version string.
+        # The LSP handshake omits serverInfo.version, so fall back to the cached
+        # `isabelle version` probe (the same module-level detector that drives
+        # unicode_symbols_option / the state-panel protocol choice). It resolves
+        # the same `isabelle` on PATH that launched this session, so it matches.
         if self.isabelle_version in ("", "unknown"):
-            self.isabelle_version = await self._query_binary_version()
+            self.isabelle_version = isabelle_version()
         await self._seed_symbols()
-
-    async def _query_binary_version(self) -> str:
-        """Best-effort real version string from `isabelle version`.
-
-        Uses the same ``isabelle`` resolved from PATH as the running session, so
-        the reported version matches the prover. Returns "unknown" on any failure.
-        """
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "isabelle", "version",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=30.0)
-        except (OSError, asyncio.TimeoutError):
-            return "unknown"
-        lines = out.decode(errors="replace").strip().splitlines()
-        return lines[0].strip() if lines and lines[0].strip() else "unknown"
 
     async def initialize(self) -> dict[str, Any]:
         response = await self.request("initialize", {
@@ -496,7 +515,15 @@ class IsabelleLSPClient:
                 line = await self.process.stderr.readline()
                 if not line:
                     break
-                logger.debug("isabelle stderr: %s", line.decode("utf-8", errors="replace").rstrip())
+                text = line.decode("utf-8", errors="replace").rstrip()
+                if not text:
+                    continue
+                # Surface error-ish stderr at WARNING so server-side failures (e.g. a
+                # swallowed serialization exception) are visible early, not buried in DEBUG.
+                if _STDERR_ERROR_RE.search(text):
+                    logger.warning("isabelle stderr: %s", text)
+                else:
+                    logger.debug("isabelle stderr: %s", text)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -571,6 +598,26 @@ class IsabelleLSPClient:
             self._handle_dynamic_output(params)
         elif method == "PIDE/preview_response":
             self._handle_preview_response(params)
+        elif method in ("window/logMessage", "window/showMessage"):
+            self._surface_server_message(params)
+
+    def _surface_server_message(self, params: Any) -> None:
+        """Surface a server-originated LSP log/show message so server-side errors are
+        not silently swallowed. Isabelle reports prover/serialization failures here
+        (LSP MessageType: 1=Error, 2=Warning, 3=Info, 4=Log); routing them through the
+        logger makes them visible early instead of being dropped on the floor."""
+        if not isinstance(params, dict):
+            return
+        text = str(params.get("message", "")).strip()
+        if not text:
+            return
+        mtype = params.get("type")
+        if mtype == 1:
+            logger.error("isabelle server: %s", text)
+        elif mtype == 2:
+            logger.warning("isabelle server: %s", text)
+        else:
+            logger.debug("isabelle server: %s", text)
 
     async def _handle_decoration(self, params: Any) -> None:
         if not isinstance(params, dict):
@@ -1091,7 +1138,18 @@ class IsabelleLSPClient:
                 await asyncio.sleep(0.15)
 
                 self._state_init_waiters.append(init_future)
-                await self.notify("PIDE/state_init", {})
+                # Isabelle2025 turned PIDE/state_init from a notification into a
+                # *request* (it replies with the new panel's state_id). Sent as a
+                # plain notification on 2025+, the panel is never created, no
+                # state_output arrives, and goals come back empty. The waiter above
+                # still captures the state_output (a notification in both versions);
+                # we only need the request to actually build the panel. Pre-2025
+                # keeps the notification form. Undetected version → assume pre-2025.
+                year = isabelle_year()
+                if year is not None and year >= 2025:
+                    await self.request("PIDE/state_init", {}, timeout=30.0)
+                else:
+                    await self.notify("PIDE/state_init", {})
 
                 try:
                     result = await self._wait_for_state_output(

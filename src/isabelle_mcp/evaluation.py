@@ -470,14 +470,31 @@ async def evaluate_to(
     )
 
 
+def _no_evaluation_view() -> EvaluationView:
+    return EvaluationView(
+        status="no_evaluation",
+        message="No evaluation in progress.",
+    )
+
+
+def _no_pending_work(client: IsabelleLSPClient) -> bool:
+    """Whether there is genuinely nothing left to watch or cancel.
+
+    ``evaluate_to`` clears ``evaluation_state.active`` as soon as the execution
+    frontier reaches the target line — but the command there may have forked
+    background work (``value``, an asynchronous proof) that keeps running. Such a
+    fork is invisible to ``active`` and shows up only in the running-command
+    list, so both ``evaluation_status`` and ``cancel_evaluation`` consult that
+    list before reporting that nothing is in progress.
+    """
+    return not evaluation_state.active and not client.get_all_running_commands()
+
+
 async def evaluation_status(
     client: IsabelleLSPClient,
 ) -> EvaluationView:
-    if not evaluation_state.active:
-        return EvaluationView(
-            status="no_evaluation",
-            message="No evaluation in progress.",
-        )
+    if _no_pending_work(client):
+        return _no_evaluation_view()
 
     theories, running_commands = await _build_status_snapshot(
         client, evaluation_state,
@@ -490,7 +507,10 @@ async def evaluation_status(
         target, evaluation_state.destination_line, client, theories,
     )
     files = _snapshot_files(client, target, theories, auto_opened)
-    if complete:
+    # Only the active evaluation owns the complete→cleanup transition; once
+    # ``active`` is False the cleanup already ran and we are merely surfacing a
+    # lingering fork, which must stay visible (not collapse back to "complete").
+    if evaluation_state.active and complete:
         await _cleanup_auto_opened(client, evaluation_state)
         evaluation_state.complete()
         return EvaluationView(
@@ -589,13 +609,15 @@ async def cancel_evaluation(
     client: IsabelleLSPClient,
 ) -> EvaluationView:
     async with _evaluation_state_lock:
-        if not evaluation_state.active:
-            return EvaluationView(
-                status="no_evaluation",
-                message="No evaluation in progress.",
-            )
+        if _no_pending_work(client):
+            return _no_evaluation_view()
 
-        fp = evaluation_state.file_path
+        # When the active evaluation already completed but a fork is still
+        # running, ``file_path`` may be the stale (now-closed) target; fall back
+        # to whichever file still holds a running command so force_interrupt's
+        # doc lookup resolves. (cancel_execution itself is global.)
+        running = client.get_all_running_commands()
+        fp = evaluation_state.file_path or (running[0].file_path if running else "")
         dest = int(evaluation_state.destination_line)
         await client.force_interrupt(fp)
         await _cleanup_auto_opened(client, evaluation_state)
