@@ -19,6 +19,10 @@ my-better-isabelle patch          # apply patches + rebuild the Scala components
 my-better-isabelle status         # verify: every patch reports "applied"
 ```
 
+Patching modifies the Isabelle installation in place, so it needs **write
+access to `ISABELLE_HOME`**. If `status` reports any patch as not-applied,
+**stop immediately and ask the user for help** — do not try to work around it.
+
 Compatibility notes:
 
 - Needs Python ≥ 3.12 (the package has no other dependencies). If `pip` is not
@@ -93,6 +97,8 @@ isabelle-mcp install --isabelle-bin /path/to/Isabelle2024/bin/isabelle
 isabelle-mcp install --claude --name isabelle-lsp
 ```
 
+If both clients are installed, it registers into both; pass `--claude` /
+`--codex` to target just one.
 It is idempotent (re-running re-registers cleanly) and registers an absolute
 path to `isabelle-mcp` so the client need not share your `PATH`. It also
 verifies the my-better-isabelle-prover patches (step 1) and aborts with
@@ -108,6 +114,9 @@ claude mcp add -s user isabelle-lsp -- isabelle-mcp
 # Codex (writes ~/.codex/config.toml)
 codex mcp add isabelle-lsp -- isabelle-mcp
 ```
+
+Verify with `claude mcp list` / `codex mcp list`, then restart or reconnect the
+agent so it picks up the new server.
 
 ## Using it
 
