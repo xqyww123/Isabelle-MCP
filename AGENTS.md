@@ -121,7 +121,7 @@ agent so it picks up the new server.
 ## Using it
 
 The prover does **not** auto-start. Before any other tool, call
-`isabelle_launch()` (defaults to the `Main` session; pass another
-session/logic if needed) to start a session. The
+`isabelle_launch(...)` with the session/logic that fits the work (bare
+`Main` is only a minimal fallback) to start a session. The
 server's own instructions (delivered at the MCP handshake) describe the full
 workflow and the `isabelle` command-line tips.

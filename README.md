@@ -104,7 +104,7 @@ These are read once at process startup; a connected agent cannot change them.
 
 | Tool | Description |
 |------|-------------|
-| `isabelle_launch` | Start (or restart) the prover for a session/logic (default `Main`); **call this first** |
+| `isabelle_launch` | Start (or restart) the prover with the session/logic that fits the work (bare `Main` is only a minimal fallback); **call this first** |
 | `isabelle_terminate` | Terminate the running prover (the MCP server stays up; you can relaunch) |
 | `isabelle_evaluate_to` | Evaluate the theory up to a line; returns a per-file snapshot of errors / warnings / running command lines |
 | `isabelle_evaluation_status` | Poll progress of a running evaluation (same snapshot) |

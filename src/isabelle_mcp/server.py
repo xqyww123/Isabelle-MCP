@@ -143,12 +143,9 @@ async def isabelle_launch(
 
     Args:
         session: Isabelle session/logic name, e.g. "HOL-Analysis", "Minilang".
-            Defaults to "Main" when omitted. The session only determines which
-            theories come **precompiled** (its heap image); Isabelle can still
-            load any other theory dynamically, just slowly — it gets re-checked
-            from source. "Main" precompiles rather little, so loading substantial
-            imports under it is slow: pick the session that best fits the actual
-            work. If the right session is unclear, ask the user.
+            Pick the one that fits the work (ask the user if unclear) — a
+            session only provides precompiled theories; anything else still
+            loads, just slowly. The "Main" fallback precompiles very little.
         session_dirs: Extra ``-d`` session search directories for non-builtin
             sessions (Isabelle reads their ROOT/ROOTS to discover the session).
             Defaults to the server's working directory when that directory is itself
