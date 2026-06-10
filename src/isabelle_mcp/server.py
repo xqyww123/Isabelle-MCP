@@ -131,7 +131,7 @@ def _default_session_dirs() -> list[str]:
 
 @mcp.tool()
 async def isabelle_launch(
-    session: str, session_dirs: list[str] | None = None,
+    session: str = "Main", session_dirs: list[str] | None = None,
 ) -> SessionInfo:
     """Start (or restart) the Isabelle prover with the given session/logic.
 
@@ -143,7 +143,8 @@ async def isabelle_launch(
 
     Args:
         session: Isabelle session/logic name, e.g. "HOL", "HOL-Analysis", "Minilang".
-            If you are unsure which session to use, ask the user.
+            Defaults to "Main" when omitted. If another session is likely intended
+            but unclear, ask the user.
         session_dirs: Extra ``-d`` session search directories for non-builtin
             sessions (Isabelle reads their ROOT/ROOTS to discover the session).
             Defaults to the server's working directory when that directory is itself
