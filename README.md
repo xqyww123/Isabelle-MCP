@@ -71,35 +71,6 @@ For Claude Desktop, register manually instead
 }
 ```
 
-The session/logic is **not** configured here — the agent picks it at run time by
-calling the `isabelle_launch` tool (see Tools below).
-
-## Running the server
-
-```bash
-isabelle-mcp                                  # stdio transport (the only transport)
-isabelle-mcp -- -o editor_output_state=true   # args after `--` go to isabelle vscode_server
-```
-
-The server starts no prover at launch; the connected agent calls `isabelle_launch`
-to start one for a chosen session.
-
-| Flag | Default | Meaning |
-|------|---------|---------|
-| `install` | — | Register the server with Claude Code / Codex (see `isabelle-mcp install --help`) |
-| `--version` | — | Print the version and exit |
-| `--skip-patch-check` | — | Skip the my-better-isabelle-prover patch verification at session launch |
-| `-- ...` | — | Everything after `--` is forwarded to `isabelle vscode_server` |
-
-### Environment variables
-
-These are read once at process startup; a connected agent cannot change them.
-
-| Variable | Default | Effect |
-|----------|---------|--------|
-| `ISABELLE_MCP_EVAL_POLL_INTERVAL` | `10` | Seconds an evaluate/poll call waits before returning `in_progress` |
-| `ISABELLE_MCP_DUMP` | unset | If set to a path, append a JSON wire-log of all LSP traffic (debugging) |
-
 ## Tools
 
 | Tool | Description |
