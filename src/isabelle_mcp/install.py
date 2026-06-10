@@ -216,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
             "or pass --claude / --codex."
         )
         return 1
-    print('done. In your agent, call isabelle_launch("HOL") before any other tool.')
+    print("done. In your agent, call isabelle_launch() before any other tool.")
     return 0
 
 

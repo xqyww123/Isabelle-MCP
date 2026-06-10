@@ -147,4 +147,4 @@ if [ "$did" -eq 0 ]; then
   echo "error: no target client found. Install Claude Code or Codex, or pass --claude / --codex." >&2
   exit 1
 fi
-echo "done. In your agent, call isabelle_launch(\"HOL\") before any other tool."
+echo "done. In your agent, call isabelle_launch() before any other tool."

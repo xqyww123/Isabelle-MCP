@@ -142,7 +142,7 @@ async def isabelle_launch(
     restarts the prover (any in-progress evaluation is discarded).
 
     Args:
-        session: Isabelle session/logic name, e.g. "HOL", "HOL-Analysis", "Minilang".
+        session: Isabelle session/logic name, e.g. "HOL-Analysis", "Minilang".
             Defaults to "Main" when omitted. If another session is likely intended
             but unclear, ask the user.
         session_dirs: Extra ``-d`` session search directories for non-builtin
