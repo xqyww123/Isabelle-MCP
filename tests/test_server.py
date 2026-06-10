@@ -234,6 +234,7 @@ def _launch_mock(*, running: bool, logic: str = "HOL"):
     client.isabelle_version = "Isabelle2024"
     client.start = AsyncMock()
     client.shutdown = AsyncMock()
+    client.enumerate_heap_sources = AsyncMock()
     return client
 
 

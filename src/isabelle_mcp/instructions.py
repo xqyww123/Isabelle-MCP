@@ -16,7 +16,8 @@ it is just slow, because the theory and all its imports are checked from
 source.
 
 **Precompiled theories cannot be edited.** The session you launch must NOT
-contain the theories you intend to work on. In particular, do NOT launch a
+contain the theories you intend to work on. (`isabelle_evaluate_to` warns
+when its target file is precompiled into the running session — heed it.) In particular, do NOT launch a
 project's own session to edit that project — it typically precompiles exactly
 the target theories. Launch the project session's **base session** instead
 (the parent in its ROOT entry, `session NAME = BASE + …`): the imports come

@@ -185,6 +185,9 @@ class EvaluationView:
     message: str = ""
     files: list[FileSnapshot] = field(default_factory=list)
     running_commands: list[RunningCommand] = field(default_factory=list)
+    # Set when the target file is precompiled into the running session's heap
+    # (edits to it are ignored by Isabelle); rendered as a prominent warning.
+    heap_warning: str | None = None
 
 
 class SessionInfo(BaseModel):

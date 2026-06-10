@@ -168,7 +168,15 @@ async def isabelle_launch(
             session_dirs if session_dirs is not None else _default_session_dirs()
         )
         _lsp_client.logic = session
-        await _lsp_client.start()
+        # Enumerate the heap's source files (for precompiled-theory warnings)
+        # in parallel with the server start; it never raises.
+        enum_task = asyncio.create_task(_lsp_client.enumerate_heap_sources())
+        try:
+            await _lsp_client.start()
+        except BaseException:
+            enum_task.cancel()
+            raise
+        await enum_task
         return await session_info(_lsp_client)
 
 

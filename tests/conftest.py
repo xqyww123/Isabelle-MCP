@@ -3,7 +3,7 @@ from typing import Any
 
 import pytest
 
-from isabelle_mcp.lsp_client import DocumentState
+from isabelle_mcp.lsp_client import DocumentState, IsabelleLSPClient
 from isabelle_mcp.utils import LSPCharacter, LSPLine, set_symbols_text
 
 
@@ -116,6 +116,7 @@ class MockLSPClient:
         self.diagnostics_cache: dict[str, list[dict[str, Any]]] = {}
         self.processing_status: dict[str, bool] = {}
         self._processing_trackers: dict[str, Any] = {}
+        self.heap_sources: set[str] = set()
 
         self.hover_response = None
         self.definition_response = None
@@ -130,6 +131,9 @@ class MockLSPClient:
 
     async def shutdown(self):
         self.initialized = False
+
+    # Reuse the real precompiled-heap warning logic (duck-typed on .heap_sources/.logic).
+    heap_warning = IsabelleLSPClient.heap_warning
 
     async def open_document(
         self,

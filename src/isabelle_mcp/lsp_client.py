@@ -232,6 +232,11 @@ class IsabelleLSPClient:
         self.session_dirs = session_dirs or []
         self.verbose = verbose
         self.extra_args = extra_args or []
+        # Real paths of every source file precompiled into the running logic's
+        # heap chain (filled by enumerate_heap_sources at launch). Such files
+        # cannot be edited: PIDE ignores their changes and never reprocesses
+        # them, so tools warn instead of silently wedging.
+        self.heap_sources: set[str] = set()
         # Skip the my-better-isabelle-prover patch verification at start() — for
         # hand-patched setups the patch manager cannot recognize (isabelle-mcp
         # --skip-patch-check; the install.sh flag of the same name passes it).
@@ -381,6 +386,65 @@ class IsabelleLSPClient:
         if self.isabelle_version in ("", "unknown"):
             self.isabelle_version = isabelle_version()
         await self._seed_symbols()
+
+    @staticmethod
+    def parse_build_sources(listing: str) -> set[str]:
+        """Parse ``isabelle build -n -l`` output into a set of real paths.
+
+        File lines are two-space-indented absolute paths grouped under
+        ``Session ...`` headers. A listing without any header means the command
+        really failed (e.g. undefined session) → empty set. The exit code is
+        NOT a failure signal: any out-of-date session in the chain yields
+        exit 1 while still printing the complete listing.
+        """
+        if "Session " not in listing:
+            return set()
+        return {
+            os.path.realpath(line.strip())
+            for line in listing.splitlines()
+            if line.startswith("  ")
+        }
+
+    async def enumerate_heap_sources(self) -> None:
+        """Fill ``heap_sources`` for the current logic via ``isabelle build -n -l``.
+
+        ``-n`` reads the existing build databases only (no build, no prover);
+        the listing comes from the same ``Sessions.deps`` computation PIDE uses
+        for its loaded-theories set. Runs once per launch (in parallel with the
+        server start); on failure it degrades to an empty set — no warnings.
+        """
+        self.heap_sources = set()
+        cmd = ["isabelle", "build", "-n", "-l"]
+        for d in self.session_dirs:
+            cmd += ["-d", d]
+        cmd.append(self.logic)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120.0)
+            self.heap_sources = self.parse_build_sources(stdout.decode(errors="replace"))
+            if not self.heap_sources:
+                logger.warning(
+                    "heap source enumeration found nothing for session %r", self.logic
+                )
+        except (OSError, asyncio.TimeoutError) as exc:
+            logger.warning("heap source enumeration failed: %s", exc)
+
+    def heap_warning(self, file_path: str) -> str | None:
+        """Warning text when *file_path* is precompiled into the running heap."""
+        if os.path.realpath(file_path) not in self.heap_sources:
+            return None
+        return (
+            f"{file_path} is PRECOMPILED into the running session "
+            f"'{self.logic}' (heap image). Isabelle IGNORES edits to "
+            "precompiled theories: changed content is never reprocessed, and "
+            "once the file differs from the heap every evaluation/query on it "
+            "fails. Treat it as read-only. To edit it, relaunch with the "
+            "session's base session via isabelle_launch."
+        )
 
     async def initialize(self) -> dict[str, Any]:
         response = await self.request("initialize", {

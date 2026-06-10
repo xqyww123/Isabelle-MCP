@@ -40,6 +40,12 @@ EVAL_POLL_INTERVAL: float = float(
     os.environ.get("ISABELLE_MCP_EVAL_POLL_INTERVAL", "10"),
 )
 
+# Wait cap for files precompiled into the running heap: an unmodified one
+# completes instantly (PIDE replays its markup from the build database), a
+# modified one never completes (PIDE refuses to reprocess loaded theories) —
+# there is nothing to wait for either way.
+HEAP_POLL_INTERVAL: float = 3.0
+
 # During a long evaluation, re-stat open docs at most this often (seconds) so an
 # edit landing mid-evaluation is still pushed, without stat'ing on every wakeup.
 _LONG_EVAL_RESTAT_INTERVAL: float = 3.0
@@ -418,6 +424,7 @@ async def evaluate_to(
             )
 
         await client.open_document(file_path)
+        heap_warning = client.heap_warning(file_path)
         doc = client.open_documents.get(file_path)
         total_lines = (doc.content.count("\n") + 1) if doc else 1
         anchor_line = _resolve_line(line, total_lines)
@@ -441,7 +448,8 @@ async def evaluate_to(
             tracker.require_fresh_update()
         await client.set_caret(file_path, dest_line.to_lsp(), lsp_char)
         status, theories, running_commands = await _evaluation_wait_loop(
-            client, file_path, dest_line, evaluation_state, EVAL_POLL_INTERVAL,
+            client, file_path, dest_line, evaluation_state,
+            HEAP_POLL_INTERVAL if heap_warning else EVAL_POLL_INTERVAL,
         )
     except Exception:
         await _cleanup_auto_opened(client, evaluation_state)
@@ -453,20 +461,32 @@ async def evaluate_to(
     # Build the snapshot BEFORE cleanup closes the auto-opened deps (which would
     # drop their decoration trackers).
     files = _snapshot_files(client, file_path, theories, auto_opened)
-    message = (
-        _complete_message(dest, running_commands, files)
-        if status == "complete"
-        else _in_progress_message(running_commands)
-    )
-    if status == "complete":
+    if heap_warning and status != "complete":
+        # The file differs from its precompiled copy, so PIDE will never
+        # reprocess it — abandon the evaluation instead of leaving it pending.
         await _cleanup_auto_opened(client, evaluation_state)
-        evaluation_state.complete()
+        evaluation_state.cancel()
+        status = "cancelled"
+        message = (
+            "Evaluation abandoned: the file differs from its precompiled copy "
+            "and Isabelle will never reprocess it. Do not retry or poll."
+        )
+    else:
+        message = (
+            _complete_message(dest, running_commands, files)
+            if status == "complete"
+            else _in_progress_message(running_commands)
+        )
+        if status == "complete":
+            await _cleanup_auto_opened(client, evaluation_state)
+            evaluation_state.complete()
     return EvaluationView(
         status=status,
         destination_line=dest,
         message=message,
         files=files,
         running_commands=running_commands,
+        heap_warning=heap_warning,
     )
 
 
@@ -727,6 +747,8 @@ def format_evaluation_result(view: EvaluationView, root: str | None = None) -> s
     if view.status == "no_evaluation":
         return view.message or "No evaluation in progress."
     buf = io.StringIO()
+    if view.heap_warning:
+        buf.write("⚠️ " + view.heap_warning + "\n\n")
     buf.write(view.message.rstrip("\n") if view.message else view.status)
     for fs in view.files:
         buf.write("\n\n")
