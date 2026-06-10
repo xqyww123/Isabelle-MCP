@@ -9,8 +9,15 @@ This tool is not meant to fully replace the `isabelle` command line — you are
 still strongly encouraged to use commands like `isabelle getenv ISABELLE_HOME`
 and `isabelle getenv AFP` to locate key directories.
 
-Before any other tool, call `isabelle_launch(session)` to start a session
-(e.g. "Main"); ask the user which session/logic to use if unsure.
+Before any other tool, call `isabelle_launch()` to start a session (defaults
+to "Main"). The session only determines which theories come **precompiled**
+(the session's heap image); Isabelle can still load any other theory
+dynamically — it is just slow, because the theory and all its imports are
+checked from source. "Main" precompiles rather little, so substantial imports
+load slowly under it: pick the session that best fits the actual work (e.g.
+"HOL-Analysis" for analysis; a project's own session via `session_dirs`,
+building its heap first with `isabelle build -b SESSION` if needed). Ask the
+user which session/logic to use if unsure.
 
 When your call starts an evaluation, either by `isabelle_evaluate_to` or other query commands,
 the call may not wait for the evaluation to finish, but may return earlier with the current
