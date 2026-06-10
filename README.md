@@ -1,8 +1,22 @@
-# Isa-LSP: MCP Server for Isabelle
+# Isabelle-MCP
 
-MCP server bridging AI agents with Isabelle's theorem prover via its LSP implementation.
+MCP server that lets AI agents (Claude Code, Codex, …) drive the Isabelle
+theorem prover through its LSP/PIDE commands — fully autonomously, with no
+human in the loop.
 
-**Python ≥ 3.10 | v0.1.0 (MVP)**
+**Python ≥ 3.12 | v0.1.0 (MVP)**
+
+## Purpose
+
+This MCP server exists so that Claude / Codex can issue Isabelle LSP commands
+**without any human mediation**. The entire Isabelle process is encapsulated
+behind the MCP tools — it exposes **no UI to the user**. The agent works by
+editing `.thy`/`.ML` files on disk and calling the tools to evaluate them and
+query proof states; nobody watches or steers the prover interactively.
+
+This server is **not designed for human–AI collaboration** (there is no
+jEdit/VSCode front-end in the picture). It implements a single
+AI ↔ Isabelle, no-human-in-the-loop model.
 
 > ⚠️ **One agent per server instance.** This server holds a single Isabelle
 > session with global mutable state — one set of open documents, one
@@ -13,12 +27,41 @@ MCP server bridging AI agents with Isabelle's theorem prover via its LSP impleme
 > **stdio**, so each agent already gets its own dedicated server process (and its
 > own `isabelle vscode_server`) — just don't share one or drive it concurrently.
 
+> [!IMPORTANT]
+> **Patch Isabelle first — this server does not work on a stock Isabelle.** It
+> drives `isabelle vscode_server` through PIDE LSP requests
+> (`PIDE/output_at_position`, `PIDE/cancel_execution`, …) that only exist after
+> applying the
+> [my-better-isabelle-prover](https://github.com/xqyww123/my_better_isabelle_prover)
+> patches:
+>
+> ```bash
+> pip install my-better-isabelle-prover   # via pip or uv tool; needs Python ≥ 3.12
+> my-better-isabelle patch                # apply patches + rebuild the Scala components
+> my-better-isabelle status               # verify: every patch reports "applied"
+> ```
+>
+> `isabelle-mcp install` checks this (when `isabelle` is reachable) and refuses to
+> register the server against an unpatched Isabelle. The server re-checks at
+> run time too: every `isabelle_launch` verifies the patches (via its bundled
+> copy of the patch manager) and refuses to start an unpatched Isabelle —
+> bypass with `isabelle-mcp --skip-patch-check` for hand-patched setups the
+> patch manager cannot recognize. Compatibility notes
+> (PEP 668, non-global Isabelle, …) are in [AGENTS.md](AGENTS.md).
+
 ## Quick Start
 
 ```bash
-pip install -e ".[dev]"
+pip install isabelle-mcp      # or: uv tool install isabelle-mcp
 
-# Claude Desktop config (~/.config/claude/claude_desktop_config.json):
+# register into Claude Code / Codex (auto-detects whichever is installed):
+isabelle-mcp install
+```
+
+For Claude Desktop, register manually instead
+(`~/.config/claude/claude_desktop_config.json`):
+
+```json
 {
   "mcpServers": {
     "isabelle": {
@@ -43,7 +86,9 @@ to start one for a chosen session.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
+| `install` | — | Register the server with Claude Code / Codex (see `isabelle-mcp install --help`) |
 | `--version` | — | Print the version and exit |
+| `--skip-patch-check` | — | Skip the my-better-isabelle-prover patch verification at session launch |
 | `-- ...` | — | Everything after `--` is forwarded to `isabelle vscode_server` |
 
 ### Environment variables
@@ -52,8 +97,8 @@ These are read once at process startup; a connected agent cannot change them.
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `ISA_LSP_EVAL_POLL_INTERVAL` | `10` | Seconds an evaluate/poll call waits before returning `in_progress` |
-| `ISA_LSP_DUMP` | unset | If set to a path, append a JSON wire-log of all LSP traffic (debugging) |
+| `ISABELLE_MCP_EVAL_POLL_INTERVAL` | `10` | Seconds an evaluate/poll call waits before returning `in_progress` |
+| `ISABELLE_MCP_DUMP` | unset | If set to a path, append a JSON wire-log of all LSP traffic (debugging) |
 
 ## Tools
 
@@ -78,6 +123,7 @@ PIDE tools (goal, command_output) are best-effort wrappers around async PIDE not
 ## Development
 
 ```bash
+pip install -e ".[dev]"             # editable install from a checkout
 pytest                              # unit tests
 pytest -m integration               # requires running Isabelle
 python -m mypy src/                 # type checking

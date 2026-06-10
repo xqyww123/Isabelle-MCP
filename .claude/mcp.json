@@ -1,11 +1,8 @@
 {
   "mcpServers": {
     "isabelle-lsp": {
-      "command": "/home/qiyuan/miniconda3/bin/isa-lsp",
-      "args": [],
-      "env": {
-        "ISABELLE_SESSION": "HOL"
-      }
+      "command": "/home/qiyuan/miniconda3/bin/isabelle-mcp",
+      "args": []
     }
   }
 }

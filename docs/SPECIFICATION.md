@@ -1,4 +1,4 @@
-# Isa-LSP Functional Specification
+# Isabelle-MCP Functional Specification
 
 **Version:** 0.1.0
 **Date:** 2026-06-04
@@ -14,7 +14,7 @@
 
 ### 1.1 Project Overview
 
-Isa-LSP is a Model Context Protocol (MCP) server that provides AI agents (like Claude) with programmatic access to Isabelle's Language Server Protocol (LSP) capabilities. It bridges the gap between AI-assisted theorem proving and Isabelle's interactive proof environment (PIDE) by exposing both standard LSP features and Isabelle-specific extensions through a clean, tool-based interface.
+Isabelle-MCP is a Model Context Protocol (MCP) server that provides AI agents (like Claude) with programmatic access to Isabelle's Language Server Protocol (LSP) capabilities. It bridges the gap between AI-assisted theorem proving and Isabelle's interactive proof environment (PIDE) by exposing both standard LSP features and Isabelle-specific extensions through a clean, tool-based interface.
 
 **Design Philosophy:** Follow the proven patterns from `lean-lsp-mcp`, maintaining consistent naming conventions, structured outputs, and user experience patterns.
 
@@ -722,7 +722,7 @@ Documentation must not mark future/design-target behavior as implemented.
 
 ## Appendix A: Comparison with lean-lsp-mcp
 
-| Feature | lean-lsp-mcp | Isa-LSP | Notes |
+| Feature | lean-lsp-mcp | Isabelle-MCP | Notes |
 |---------|--------------|---------|-------|
 | Tool naming | `lean_*` | `isabelle_*` | System prefix |
 | Position indexing | 1-indexed | 1-indexed | ✅ Consistent |

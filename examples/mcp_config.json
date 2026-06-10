@@ -1,10 +1,7 @@
 {
   "mcpServers": {
     "isabelle-lsp": {
-      "command": "isa-lsp",
-      "env": {
-        "ISABELLE_SESSION": "HOL"
-      },
+      "command": "isabelle-mcp",
       "description": "Isabelle theorem prover LSP integration"
     }
   }

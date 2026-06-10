@@ -37,7 +37,7 @@ from isabelle_mcp.utils import (
 logger = logging.getLogger(__name__)
 
 EVAL_POLL_INTERVAL: float = float(
-    os.environ.get("ISA_LSP_EVAL_POLL_INTERVAL", "10"),
+    os.environ.get("ISABELLE_MCP_EVAL_POLL_INTERVAL", "10"),
 )
 
 # During a long evaluation, re-stat open docs at most this often (seconds) so an

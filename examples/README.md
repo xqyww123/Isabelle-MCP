@@ -14,7 +14,7 @@ This directory contains examples demonstrating how to use the Isabelle LSP MCP s
 ### 1. Install the package
 
 ```bash
-cd /path/to/Isa-LSP
+cd /path/to/Isabelle-MCP
 pip install -e .
 ```
 
@@ -22,10 +22,10 @@ pip install -e .
 
 ```bash
 # Using default HOL session
-isa-lsp
+isabelle-mcp
 
 # Or with custom session
-ISABELLE_SESSION=Main isa-lsp
+ISABELLE_SESSION=Main isabelle-mcp
 ```
 
 ### 3. Connect with MCP client
@@ -71,8 +71,8 @@ Run the included test theory files:
 # Check if simple_theory.thy is valid
 python -c "
 import asyncio
-from isa_lsp.lsp_client import IsabelleLSPClient
-from isa_lsp.tools import diagnostic_messages
+from isabelle_mcp.lsp_client import IsabelleLSPClient
+from isabelle_mcp.tools import diagnostic_messages
 
 async def test():
     client = IsabelleLSPClient(logic='HOL')

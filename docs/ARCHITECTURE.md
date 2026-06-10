@@ -1,4 +1,4 @@
-# Isa-LSP Architecture Design
+# Isabelle-MCP Architecture Design
 
 **Version:** 0.2.0
 **Date:** 2026-06-04
@@ -12,7 +12,7 @@
 
 ## 1. Overview
 
-Isa-LSP is a Python-based MCP (Model Context Protocol) server that acts as a bridge between AI agents and Isabelle's Language Server Protocol (LSP) implementation (`isabelle vscode_server`). The architecture follows the proven patterns from `lean-lsp-mcp` while adapting to Isabelle's PIDE (Prover IDE) specific features.
+Isabelle-MCP is a Python-based MCP (Model Context Protocol) server that acts as a bridge between AI agents and Isabelle's Language Server Protocol (LSP) implementation (`isabelle vscode_server`). The architecture follows the proven patterns from `lean-lsp-mcp` while adapting to Isabelle's PIDE (Prover IDE) specific features.
 
 ### 1.1 High-Level Architecture
 
@@ -29,7 +29,7 @@ Isa-LSP is a Python-based MCP (Model Context Protocol) server that acts as a bri
                  │ JSON-RPC requests/responses
                  │
 ┌────────────────▼────────────────────────────────────────────┐
-│               Isa-LSP MCP Server (Python)                    │
+│               Isabelle-MCP MCP Server (Python)                    │
 │                                                              │
 │  ┌──────────────────────────────────────────────────────┐   │
 │  │  FastMCP Server                                       │   │
@@ -832,7 +832,7 @@ end
 
 **Installation:**
 ```bash
-cd contrib/Isa-LSP
+cd contrib/Isabelle-MCP
 pip install -e .
 ```
 

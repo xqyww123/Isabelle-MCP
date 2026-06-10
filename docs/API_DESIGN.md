@@ -1,4 +1,4 @@
-# Isa-LSP API Design Document
+# Isabelle-MCP API Design Document
 
 **Version:** 0.1.0
 **Date:** 2026-06-04
@@ -12,7 +12,7 @@
 
 ## 1. Overview
 
-This document provides API design and implementation guidance for Isa-LSP. The
+This document provides API design and implementation guidance for Isabelle-MCP. The
 current server exposes 11 MCP tools.
 For high-level specifications, see SPECIFICATION.md. For architecture, see
 ARCHITECTURE.md.

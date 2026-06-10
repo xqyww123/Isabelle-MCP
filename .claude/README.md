@@ -22,7 +22,7 @@ The `mcp.json` file configures Claude Code to use the Isabelle LSP MCP server, w
 First, install the package in development mode:
 
 ```bash
-cd /path/to/Isa-LSP
+cd /path/to/Isabelle-MCP
 pip install -e .
 ```
 
@@ -37,7 +37,7 @@ pip install -e ".[dev]"
 Check that the server is installed:
 
 ```bash
-isa-lsp --version
+isabelle-mcp --version
 ```
 
 ### 3. Configure Isabelle Session
@@ -97,7 +97,7 @@ If the server doesn't start, check:
 Run manually to see errors:
 
 ```bash
-python -m isa_lsp.server
+python -m isabelle_mcp.server
 ```
 
 ### LSP Connection Issues
@@ -147,7 +147,7 @@ For development with auto-reload:
   "mcpServers": {
     "isabelle-lsp": {
       "command": "python",
-      "args": ["-m", "isa_lsp.server"],
+      "args": ["-m", "isabelle_mcp.server"],
       "env": {
         "PYTHONPATH": "${workspaceFolder}/src",
         "LOG_LEVEL": "DEBUG"

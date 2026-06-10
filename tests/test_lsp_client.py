@@ -24,6 +24,59 @@ def _pin_isabelle_version():
     lc._isabelle_version_cache = saved
 
 
+def _status_result(returncode: int, stdout: str = "", stderr: str = "") -> MagicMock:
+    return MagicMock(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+class TestPatchCheck:
+    """check_isabelle_patched mirrors the scripts/install.sh classification."""
+
+    def _run(self, run_mock):
+        from isabelle_mcp.lsp_client import check_isabelle_patched
+        with patch("isabelle_mcp.lsp_client.subprocess.run", run_mock):
+            check_isabelle_patched()
+
+    def test_all_applied_passes(self):
+        run = MagicMock(return_value=_status_result(
+            0, stdout="Patch status for Isabelle2024:\n"
+                       "  [    applied]  pide_control/lsp.scala.patch  (...)\n",
+        ))
+        self._run(run)  # no raise
+        # Invoked via the server's own interpreter (-m), not a PATH lookup: the
+        # patch manager is a declared dependency, so this never misses.
+        import sys
+        assert run.call_args[0][0][:3] == [sys.executable, "-m", "my_better_isabelle_prover"]
+
+    def test_not_applied_demands_patch(self):
+        run = MagicMock(return_value=_status_result(
+            1, stdout="  [not-applied]  pide_control/lsp.scala.patch  (...)\n",
+        ))
+        with pytest.raises(IsabelleToolError, match="my-better-isabelle patch"):
+            self._run(run)
+
+    def test_unsupported_version(self):
+        run = MagicMock(return_value=_status_result(
+            1, stderr="Error: no patches available for Isabelle2022.\n",
+        ))
+        with pytest.raises(IsabelleToolError, match="not supported"):
+            self._run(run)
+
+    def test_isabelle_missing_reported_as_such(self):
+        # my-better-isabelle needs `isabelle` on PATH to identify the install;
+        # surface that as the familiar "isabelle command not found" error, not
+        # as a bogus "missing patches" one.
+        run = MagicMock(return_value=_status_result(
+            1, stderr="Error: 'isabelle' not found on PATH.\n",
+        ))
+        with pytest.raises(IsabelleToolError, match="isabelle command not found"):
+            self._run(run)
+
+    def test_checker_failure_is_hard_error(self):
+        run = MagicMock(side_effect=OSError("exec failed"))
+        with pytest.raises(IsabelleToolError, match="Could not check"):
+            self._run(run)
+
+
 class TestIsabelleLSPClient:
     def test_init_default(self):
         client = IsabelleLSPClient()
@@ -79,7 +132,8 @@ class TestIsabelleLSPClient:
             captured["cmd"] = cmd
             raise RuntimeError("stop after cmd built")
 
-        with patch("asyncio.create_subprocess_exec", fake_exec):
+        with patch("asyncio.create_subprocess_exec", fake_exec), \
+                patch("isabelle_mcp.lsp_client.check_isabelle_patched"):
             lc._isabelle_version_cache = ("Isabelle2025-2", 2025)
             with pytest.raises(RuntimeError):
                 await IsabelleLSPClient().start()
@@ -89,6 +143,30 @@ class TestIsabelleLSPClient:
             with pytest.raises(RuntimeError):
                 await IsabelleLSPClient().start()
             assert "vscode_html_output=true" not in captured["cmd"]
+
+    @pytest.mark.asyncio
+    async def test_start_refuses_unpatched_isabelle(self):
+        # The patch check runs BEFORE the vscode_server is spawned: an unpatched
+        # Isabelle must never get a (doomed) server process.
+        with patch("asyncio.create_subprocess_exec") as spawn, \
+                patch("isabelle_mcp.lsp_client.check_isabelle_patched",
+                      side_effect=IsabelleToolError("missing patches")):
+            with pytest.raises(IsabelleToolError, match="missing patches"):
+                await IsabelleLSPClient().start()
+        spawn.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_start_skip_patch_check(self):
+        # --skip-patch-check (for hand-patched setups the patch manager cannot
+        # recognize) must bypass the verification entirely.
+        async def fake_exec(*cmd, **kw):
+            raise RuntimeError("stop after cmd built")
+
+        with patch("asyncio.create_subprocess_exec", fake_exec), \
+                patch("isabelle_mcp.lsp_client.check_isabelle_patched") as check:
+            with pytest.raises(RuntimeError):
+                await IsabelleLSPClient(skip_patch_check=True).start()
+        check.assert_not_called()
 
     def test_version_detector_reads_isabelle_version(self):
         # `isabelle version` is the single source for the version string AND the

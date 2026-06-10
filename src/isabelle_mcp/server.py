@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 _lsp_client: IsabelleLSPClient | None = None
 _file_watcher: FileWatcher | None = None
 _server_extra_args: list[str] = []
+_skip_patch_check: bool = False
 
 
 async def _file_change_sink(path: str) -> None:
@@ -74,6 +75,7 @@ async def server_lifespan(_app: Any) -> AsyncGenerator[None]:
     # is NOT started here.
     _lsp_client = IsabelleLSPClient(
         extra_args=_server_extra_args, project_root=os.path.realpath(os.getcwd()),
+        skip_patch_check=_skip_patch_check,
     )
     _file_watcher = FileWatcher()
     _file_watcher.start()
@@ -366,9 +368,13 @@ async def isabelle_session_info() -> SessionInfo:
 
 
 def main() -> None:
-    global _server_extra_args
+    global _server_extra_args, _skip_patch_check
     import argparse
     import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "install":
+        from isabelle_mcp.install import main as install_main
+        raise SystemExit(install_main(sys.argv[2:]))
 
     if "--version" in sys.argv:
         from isabelle_mcp import __version__
@@ -377,7 +383,14 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         description="Isabelle MCP Server (stdio; one dedicated server per agent)",
-        usage="%(prog)s [-- ISABELLE_ARGS...]",
+        usage="%(prog)s [--skip-patch-check] [-- ISABELLE_ARGS...]\n"
+        "       %(prog)s install [--name NAME] [--isabelle-bin BIN] [--claude] [--codex]\n"
+        "                        [--skip-patch-check]",
+    )
+    parser.add_argument(
+        "--skip-patch-check", action="store_true",
+        help="launch sessions without verifying the my-better-isabelle-prover "
+             "patches (for setups the patch manager cannot recognize)",
     )
 
     argv = sys.argv[1:]
@@ -386,9 +399,10 @@ def main() -> None:
         own_argv, extra = argv[:idx], argv[idx + 1:]
     else:
         own_argv, extra = argv, []
-    parser.parse_args(own_argv)  # reject unknown flags
+    args = parser.parse_args(own_argv)  # reject unknown flags
 
     _server_extra_args = extra
+    _skip_patch_check = args.skip_patch_check
     mcp.run()
 
 

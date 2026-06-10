@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
@@ -38,10 +39,10 @@ _STDERR_ERROR_RE = re.compile(
     r"\b(error|exception|fail(?:ed|ure)?|bad json|uncaught|cannot)\b", re.IGNORECASE
 )
 
-# Raw wire dump: when ISA_LSP_DUMP names a file, every JSON-RPC frame in/out of
+# Raw wire dump: when ISABELLE_MCP_DUMP names a file, every JSON-RPC frame in/out of
 # the vscode_server is appended there as one JSON line per frame. Default off so
 # the shared/live server is unaffected.
-_DUMP_PATH: str | None = os.environ.get("ISA_LSP_DUMP") or None
+_DUMP_PATH: str | None = os.environ.get("ISABELLE_MCP_DUMP") or None
 
 
 def _wire_dump(direction: str, message: JsonDict) -> None:
@@ -148,6 +149,51 @@ def read_vscode_load_delay(default: float = 0.5) -> float:
         return default
 
 
+def check_isabelle_patched() -> None:
+    """Refuse to drive an unpatched Isabelle — the runtime twin of the
+    ``scripts/install.sh`` registration check (same classification, same wording).
+
+    The server only works on an Isabelle carrying the my-better-isabelle-prover
+    patches: it speaks PIDE LSP requests (``PIDE/output_at_position``,
+    ``PIDE/cancel_execution``, …) that the stock ``vscode_server`` does not
+    expose. The patch manager is a declared dependency, so it is run through
+    ``sys.executable -m`` (always present in the server's own environment, PATH
+    notwithstanding); the *Isabelle* it inspects is the ``isabelle`` on PATH —
+    the same binary :meth:`IsabelleLSPClient.start` is about to spawn.
+
+    Raises IsabelleToolError unless every patch reports "applied".
+    """
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "my_better_isabelle_prover", "-q", "status"],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise IsabelleToolError(
+            f"Could not check the my-better-isabelle-prover patch status: {exc}"
+        ) from exc
+    out = (proc.stdout + proc.stderr).strip()
+    if "'isabelle' not found" in out:
+        raise IsabelleToolError(
+            "isabelle command not found. Is Isabelle installed and in PATH?"
+        )
+    if "no patches available" in out:
+        raise IsabelleToolError(
+            "This Isabelle version is not supported by my-better-isabelle-prover, "
+            "whose patches Isabelle-MCP requires:\n" + out + "\n"
+            "Use a supported Isabelle (or, for a hand-patched setup the patch "
+            "manager cannot recognize, start the server with --skip-patch-check)."
+        )
+    if proc.returncode != 0 or "[not-applied]" in out or "No patches found" in out:
+        raise IsabelleToolError(
+            "This Isabelle is missing the required my-better-isabelle-prover "
+            "patches:\n" + out + "\n"
+            "Ask the user to apply them (this rebuilds Isabelle's Scala "
+            "components, so it takes a few minutes):\n"
+            "  my-better-isabelle patch"
+        )
+
+
 @dataclass
 class DocumentState:
     file_path: str
@@ -180,11 +226,16 @@ class IsabelleLSPClient:
         verbose: bool = False,
         extra_args: list[str] | None = None,
         project_root: str | None = None,
+        skip_patch_check: bool = False,
     ):
         self.logic = logic
         self.session_dirs = session_dirs or []
         self.verbose = verbose
         self.extra_args = extra_args or []
+        # Skip the my-better-isabelle-prover patch verification at start() — for
+        # hand-patched setups the patch manager cannot recognize (isabelle-mcp
+        # --skip-patch-check; the install.sh flag of the same name passes it).
+        self.skip_patch_check = skip_patch_check
         # Base directory for relativizing displayed paths. ``None`` (the current
         # placeholder) → renderers show absolute paths. A real per-agent root will
         # be set with the stdio-per-agent refactor.
@@ -279,6 +330,8 @@ class IsabelleLSPClient:
         # the old reader/stderr tasks leak and two read-loops race on one stdout.
         if self.process is not None and self.process.returncode is None:
             return
+        if not self.skip_patch_check:
+            check_isabelle_patched()
         cmd = [
             "isabelle", "vscode_server", "-l", self.logic,
             "-o", "vscode_pide_extensions",
