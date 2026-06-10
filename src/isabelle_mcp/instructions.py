@@ -10,15 +10,25 @@ still strongly encouraged to use commands like `isabelle getenv ISABELLE_HOME`
 and `isabelle getenv AFP` to locate key directories.
 
 Before any other tool, call `isabelle_launch(session)` to start a session.
-Choose the session that best fits the actual work — e.g. "HOL-Analysis" for
-analysis, or a project's own session via `session_dirs` (building its heap
-first with `isabelle build -b SESSION` if needed) — and ask the user if
-unsure. The session only determines which theories come **precompiled** (the
+The session only determines which theories come **precompiled** (the
 session's heap image); Isabelle can still load any other theory dynamically —
 it is just slow, because the theory and all its imports are checked from
-source. Omitting the session falls back to "Main", which precompiles very
-little, so substantial imports load slowly under it — avoid bare "Main"
-unless the work truly needs only the basics.
+source.
+
+**Precompiled theories cannot be edited.** The session you launch must NOT
+contain the theories you intend to work on. In particular, do NOT launch a
+project's own session to edit that project — it typically precompiles exactly
+the target theories. Launch the project session's **base session** instead
+(the parent in its ROOT entry, `session NAME = BASE + …`): the imports come
+precompiled while the target theories stay editable. Build the base heap
+first with `isabelle build -b BASE` if needed; non-builtin sessions need
+`session_dirs`.
+
+Choose the session closest to the work that does not swallow the target
+theories — e.g. "HOL-Analysis" for analysis — and ask the user if unsure.
+Omitting the session falls back to "Main", which precompiles very little, so
+substantial imports load slowly under it — avoid bare "Main" unless the work
+truly needs only the basics.
 
 When your call starts an evaluation, either by `isabelle_evaluate_to` or other query commands,
 the call may not wait for the evaluation to finish, but may return earlier with the current

@@ -145,7 +145,10 @@ async def isabelle_launch(
         session: Isabelle session/logic name, e.g. "HOL-Analysis", "Minilang".
             Pick the one that fits the work (ask the user if unclear) — a
             session only provides precompiled theories; anything else still
-            loads, just slowly. The "Main" fallback precompiles very little.
+            loads, just slowly. Precompiled theories cannot be edited, so the
+            session must NOT contain the theories you will work on — for a
+            project, use its base session, not the project's own session.
+            The "Main" fallback precompiles very little.
         session_dirs: Extra ``-d`` session search directories for non-builtin
             sessions (Isabelle reads their ROOT/ROOTS to discover the session).
             Defaults to the server's working directory when that directory is itself
