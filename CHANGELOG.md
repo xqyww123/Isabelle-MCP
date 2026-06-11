@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+- Unicode guard on every MCP push path: content read from disk
+  (`open_document` didOpen, `sync_dirty_files` didChange — both the
+  event-driven watcher sink and the tool-call stat backstop funnel through it;
+  dependency files synced by the server's own File_Watcher are not covered) is
+  checked for non-ASCII, off the event loop. Policy is ASCII-or-nothing: when
+  converting every glyph with an Isabelle ASCII notation (`α`→`\<alpha>`,
+  `⟹`→`\<Longrightarrow>`, `x₁`→`x\<^sub>1`, leading UTF-8 BOM stripped)
+  yields a fully ASCII result, the file is atomically rewritten on disk via
+  compare-and-replace (a concurrent external write aborts the rename instead
+  of being clobbered — the modified-since-read fence), so disk, document
+  model, and prover stay byte-identical (column positions included; the
+  rewrite matches what the vscode_server's `Symbol.encode` already fed the
+  prover, i.e. jEdit's save canonicalization, and also normalizes CRLF to LF).
+  When non-ASCII remains after conversion (no symbol-table entry — e.g. CJK
+  comments), the file is left untouched and the original is pushed; never
+  writing a non-ASCII result makes rewrite feedback loops impossible. Each
+  event queues a warning that a new server middleware appends to the next
+  tool response, instructing the agent to write Isabelle ASCII directly and
+  to re-read rewritten files; warn-only bullets are deduplicated per file
+  until its non-ASCII character set changes. The server instructions now
+  state the ASCII convention up front.
+
 ## 0.1.1
 
 - Fixed the "Evaluation in progress" latch: completion checking used to demand

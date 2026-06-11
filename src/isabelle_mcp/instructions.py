@@ -51,6 +51,10 @@ back as diagnostics, not a halt.
 ## Conventions
 
 - Positions are **1-indexed**; file paths must be **absolute**.
+- Write **Isabelle ASCII notation** (`\\<alpha>`, `\\<Longrightarrow>`,
+  `x\\<^sub>1`) in `.thy`/`.ML` files, never Unicode glyphs (α, ⟹, x₁): a file
+  whose glyphs all have ASCII forms is auto-rewritten on disk (re-read it
+  before further edits); otherwise you get a warning to fix it yourself.
 
 ## Working with the `isabelle` command line
 

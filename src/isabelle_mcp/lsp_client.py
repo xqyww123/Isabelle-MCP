@@ -14,6 +14,7 @@ from typing import Any, ClassVar
 
 from isabelle_mcp.models import RunningCommand
 from isabelle_mcp.processing import ProcessingTracker, parse_decoration_ranges
+from isabelle_mcp.unicode_guard import record_warning, sanitize_read
 from isabelle_mcp.utils import (
     IsabelleToolError,
     LSPCharacter,
@@ -848,8 +849,17 @@ class IsabelleLSPClient:
             return
 
         if content is None:
-            with open(file_path, encoding='utf-8') as f:
-                content = f.read()
+            # Unicode guard (off the event loop): may rewrite the file in
+            # Isabelle ASCII; the returned text matches disk afterwards, so the
+            # stat_sig taken below stays coherent. Caller-passed content (no
+            # current callers) bypasses the guard — it has no disk counterpart
+            # to keep in sync.
+            content, guard_warning = await asyncio.to_thread(sanitize_read, file_path)
+            if guard_warning is not None:
+                record_warning(file_path, guard_warning)
+            if file_path in self.open_documents:
+                # Another coroutine opened it while we were off-loop.
+                return
 
         uri = file_path_to_uri(file_path)
 
@@ -1115,11 +1125,18 @@ class IsabelleLSPClient:
             if doc is None:
                 continue
             try:
-                with open(path, encoding="utf-8") as f:
-                    content = f.read()
+                # Unicode guard (off the event loop): may rewrite the file in
+                # Isabelle ASCII; the returned text matches disk afterwards, so
+                # the stat_sig refresh below stays coherent.
+                content, guard_warning = await asyncio.to_thread(sanitize_read, path)
             except OSError:
                 # Deleted/unreadable: drop the signature so a later recreate re-syncs.
                 doc.stat_sig = None
+                continue
+            if guard_warning is not None:
+                record_warning(path, guard_warning)
+            if self.open_documents.get(path) is not doc:
+                # Closed (or replaced) while we were off-loop: don't didChange it.
                 continue
             if content != doc.content:
                 doc.version += 1

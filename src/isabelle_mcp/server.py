@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastmcp import FastMCP
+from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools.tool import ToolResult
 from mcp.types import TextContent
 
@@ -39,6 +40,7 @@ from isabelle_mcp.tools import (
     local_occurrences,
     session_info,
 )
+from isabelle_mcp.unicode_guard import drain_warnings
 from isabelle_mcp.utils import IsabelleToolError, MCPLine
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -96,6 +98,35 @@ mcp = FastMCP(
     instructions=get_instructions(),
     lifespan=server_lifespan,
 )
+
+
+class UnicodeWarningMiddleware(Middleware):
+    """Append queued unicode-conversion warnings to the next tool response.
+
+    The unicode guard (``unicode_guard.sanitize_read``) runs on the push paths
+    and queues a warning per affected file; this middleware drains the queue
+    after each successful tool call and appends the warning — with the
+    instruction to emit Isabelle ASCII — as an extra text block. On a tool
+    error the queue is left intact for the next call.
+    """
+
+    async def on_call_tool(
+        self, context: MiddlewareContext, call_next: CallNext,
+    ) -> ToolResult:
+        result = await call_next(context)
+        # Task-augmented calls (SEP-1686) return CreateTaskResult, which has no
+        # content list — leave the queue for the next regular call.
+        if not isinstance(result, ToolResult):
+            return result
+        warning = drain_warnings()
+        if warning is not None:
+            result.content = [
+                *result.content, TextContent(type="text", text=warning),
+            ]
+        return result
+
+
+mcp.add_middleware(UnicodeWarningMiddleware())
 
 
 async def _ensure_lsp_started() -> IsabelleLSPClient:
