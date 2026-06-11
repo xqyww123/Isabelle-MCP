@@ -12,7 +12,14 @@ class TestLSPClientIntegration:
     @pytest.fixture
     async def lsp_client(self):
         client = IsabelleLSPClient(logic="HOL")
-        await client.start()
+        try:
+            await client.start()
+        except BaseException:
+            # start() failing pre-handshake (e.g. HOL heap not built on this
+            # machine) would otherwise leak a wedged vscode_server for the
+            # whole test run.
+            await client.shutdown()
+            raise
         yield client
         await client.shutdown()
 
@@ -42,7 +49,14 @@ class TestToolsIntegration:
     @pytest.fixture
     async def lsp_client(self):
         client = IsabelleLSPClient(logic="HOL")
-        await client.start()
+        try:
+            await client.start()
+        except BaseException:
+            # start() failing pre-handshake (e.g. HOL heap not built on this
+            # machine) would otherwise leak a wedged vscode_server for the
+            # whole test run.
+            await client.shutdown()
+            raise
         yield client
         await client.shutdown()
 

@@ -1,6 +1,7 @@
 """Isabelle LSP MCP Server — FastMCP entry point."""
 
 import asyncio
+import contextlib
 import logging
 import os
 from collections.abc import AsyncGenerator
@@ -172,6 +173,13 @@ async def isabelle_launch(
     Calling it again with the same session is a no-op; with a different session it
     restarts the prover (any in-progress evaluation is discarded).
 
+    No need to check whether the session is built — launch checks
+    automatically: when its heap image (or any heap in its dependency chain)
+    is missing or outdated, or the session name is undefined, it fails fast
+    (~5s) instead of building implicitly. Run the `isabelle build -b ...`
+    command from the error yourself, then relaunch — this server never builds
+    sessions.
+
     Args:
         session: Isabelle session/logic name, e.g. "HOL-Analysis", "Minilang".
             Pick the one that fits the work (ask the user if unclear) — a
@@ -179,7 +187,9 @@ async def isabelle_launch(
             loads, just slowly. Precompiled theories cannot be edited, so the
             session must NOT contain the theories you will work on — for a
             project, use its base session, not the project's own session.
-            The "Main" fallback precompiles very little.
+            The "Main" fallback precompiles very little. You need not check
+            whether the session is built — launch checks automatically and
+            errors with the exact build command if it is not.
         session_dirs: Extra ``-d`` session search directories for non-builtin
             sessions (Isabelle reads their ROOT/ROOTS to discover the session).
             Defaults to the server's working directory when that directory is itself
@@ -190,24 +200,58 @@ async def isabelle_launch(
         raise IsabelleToolError("LSP client not initialized")
     async with _evaluation_state_lock:
         if _lsp_client.process is not None:
-            if _lsp_client.logic == session:
+            alive = _lsp_client.process.returncode is None
+            if alive and _lsp_client.logic == session:
                 return await session_info(_lsp_client)
-            # Switching sessions: tear the old prover down before starting anew.
+            # Switching sessions — or recovering from a crashed server (the
+            # process object lingers with a returncode): tear down, start anew.
             await _lsp_client.shutdown()
             _lsp_client.process = None
         _lsp_client.session_dirs = (
             session_dirs if session_dirs is not None else _default_session_dirs()
         )
         _lsp_client.logic = session
-        # Enumerate the heap's source files (for precompiled-theory warnings)
-        # in parallel with the server start; it never raises.
+        # Probe the build status and enumerate the heap's source files (for
+        # precompiled-theory warnings) in parallel with the server start.
         enum_task = asyncio.create_task(_lsp_client.enumerate_heap_sources())
         try:
+            # Fails fast (~4s) on a missing heap (pre-handshake type-1 message
+            # surfaced by _surface_server_message) or an undefined session name
+            # (JSON-RPC error reply to `initialize`).
             await _lsp_client.start()
+            # Raises when the probe itself could not run (fail-closed).
+            await enum_task
+            if _lsp_client.heap_built is False:
+                if any(a in ("-R", "-A") for a in _lsp_client.extra_args):
+                    # -R/-A run the logic on its *requirements* heaps; the
+                    # session itself need not be built, so the probe's verdict
+                    # does not apply.
+                    logger.warning(
+                        "heap freshness gate bypassed: -R/-A in extra args"
+                    )
+                else:
+                    names = ", ".join(_lsp_client.unfinished_sessions) \
+                        or "some session(s) in the dependency chain"
+                    raise IsabelleToolError(
+                        f"Heap image(s) cannot be verified as up-to-date "
+                        f"(outdated, missing, or no build record) for: {names}. "
+                        f"Rebuild first ({_lsp_client.build_hint()}) and call "
+                        f"isabelle_launch again — the MCP server never builds "
+                        f"sessions itself."
+                    )
         except BaseException:
+            # Cancellation-safe cleanup: the synchronous part runs first, so
+            # even a CancelledError caught here cannot leave a half-started
+            # server behind that the next same-session launch would mistake
+            # for a healthy one.
             enum_task.cancel()
+            _lsp_client.kill()
+            with contextlib.suppress(BaseException):
+                await enum_task  # retrieve its result/exception (no orphans)
+            with contextlib.suppress(BaseException):
+                await _lsp_client.reap()
+            _lsp_client.process = None
             raise
-        await enum_task
         return await session_info(_lsp_client)
 
 

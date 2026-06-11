@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import re
+import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -32,6 +34,25 @@ from isabelle_mcp.utils import (
 logger = logging.getLogger(__name__)
 
 JsonDict = dict[str, Any]
+
+
+def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
+    """SIGKILL the subprocess's whole process group.
+
+    Isabelle tools are bash wrappers around a java child. Killing only the
+    wrapper leaves the child alive holding the stdout/stderr pipes open, and
+    asyncio resolves ``process.wait()`` only once every pipe disconnects — so
+    a plain ``proc.kill()`` makes that wait hang forever. Requires the process
+    to have been spawned with ``start_new_session=True`` (it is then its own
+    group leader); falls back to killing just the wrapper otherwise.
+    """
+    if proc.returncode is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
 
 # (full version string, major year) of the `isabelle` on PATH — probed once and
 # cached for the process, since PATH (hence the binary) is fixed within a process.
@@ -242,6 +263,11 @@ class IsabelleLSPClient:
         # cannot be edited: PIDE ignores their changes and never reprocesses
         # them, so tools warn instead of silently wedging.
         self.heap_sources: set[str] = set()
+        # Build-status verdict from the launch-time `isabelle build -n -b` probe:
+        # None = not probed, True = whole chain built and current, False = some
+        # session unbuilt/outdated (named in unfinished_sessions when known).
+        self.heap_built: bool | None = None
+        self.unfinished_sessions: list[str] = []
         # Skip the my-better-isabelle-prover patch verification at start() — for
         # hand-patched setups the patch manager cannot recognize (isabelle-mcp
         # --skip-patch-check; the install.sh flag of the same name passes it).
@@ -296,6 +322,13 @@ class IsabelleLSPClient:
         self.isabelle_version: str = ""
         self.start_time: float = 0.0
 
+        # Pre-handshake server-reported errors (type-1 log/show messages). With
+        # `vscode_server -n`, a missing heap image wedges the server before it
+        # ever answers `initialize`; the only signal is one such message, so it
+        # is surfaced on the pending request instead of a blind timeout.
+        self.startup_errors: list[str] = []
+        self._handshake_done: bool = False
+
     # ── Progress monitoring ────────────────────────────────────────────
 
     async def _wait_with_progress(
@@ -340,10 +373,17 @@ class IsabelleLSPClient:
         # the old reader/stderr tasks leak and two read-loops race on one stdout.
         if self.process is not None and self.process.returncode is None:
             return
+        # Reset before anything that can raise, so a failed start never leaves a
+        # stale handshake flag or another session's startup errors behind.
+        self._handshake_done = False
+        self.startup_errors = []
         if not self.skip_patch_check:
             check_isabelle_patched()
         cmd = [
-            "isabelle", "vscode_server", "-l", self.logic,
+            # -n: never build the session heap implicitly — a missing heap would
+            # otherwise turn launch into a silent, hour-scale build that looks
+            # like a hang. Build status is checked explicitly at launch instead.
+            "isabelle", "vscode_server", "-n", "-l", self.logic,
             "-o", "vscode_pide_extensions",
             "-o", unicode_symbols_option(),
             "-o", "vscode_caret_perspective=1",
@@ -372,6 +412,9 @@ class IsabelleLSPClient:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                # Own process group, so kill() can take down the whole
+                # bash-wrapper + java tree (see _kill_process_tree).
+                start_new_session=True,
             )
         except FileNotFoundError as exc:
             raise IsabelleToolError(
@@ -384,6 +427,7 @@ class IsabelleLSPClient:
         self.reader_task = asyncio.create_task(self._read_loop())
         self.stderr_task = asyncio.create_task(self._drain_stderr())
         await self.initialize()
+        self._handshake_done = True
         # The LSP handshake omits serverInfo.version, so fall back to the cached
         # `isabelle version` probe (the same module-level detector that drives
         # unicode_symbols_option / the state-panel protocol choice). It resolves
@@ -410,16 +454,45 @@ class IsabelleLSPClient:
             if line.startswith("  ")
         }
 
-    async def enumerate_heap_sources(self) -> None:
-        """Fill ``heap_sources`` for the current logic via ``isabelle build -n -l``.
+    @staticmethod
+    def parse_unfinished_sessions(listing: str) -> list[str]:
+        """Session names from the ``Unfinished session(s): A, B`` line that
+        ``isabelle build -n -v`` prints when something in the chain is unbuilt
+        or not up-to-date. No such line → empty list (callers fall back to a
+        generic message)."""
+        for line in listing.splitlines():
+            if line.startswith("Unfinished session(s):"):
+                names = line.split(":", 1)[1]
+                return [n.strip() for n in names.split(",") if n.strip()]
+        return []
 
-        ``-n`` reads the existing build databases only (no build, no prover);
-        the listing comes from the same ``Sessions.deps`` computation PIDE uses
-        for its loaded-theories set. Runs once per launch (in parallel with the
-        server start); on failure it degrades to an empty set — no warnings.
+    def build_hint(self) -> str:
+        """The exact command that builds the launched session (and its whole
+        dependency chain). Options must precede the session name — Isabelle's
+        option parsing stops at the first positional argument."""
+        parts = ["isabelle", "build", "-b"]
+        for d in self.session_dirs:
+            parts += ["-d", shlex.quote(d)]
+        parts.append(shlex.quote(self.logic))
+        return " ".join(parts)
+
+    async def enumerate_heap_sources(self) -> None:
+        """Probe the current logic via ``isabelle build -n -b -v -l``: fills
+        ``heap_sources`` plus the build-status verdict ``heap_built`` /
+        ``unfinished_sessions``.
+
+        ``-n`` is a strict dry run (reads the existing build databases only —
+        no build, no prover); ``-b`` makes the verdict require the stored heap
+        image, matching what ``vscode_server`` actually loads; the listing
+        comes from the same ``Sessions.deps`` computation PIDE uses for its
+        loaded-theories set. Runs once per launch (in parallel with the server
+        start). Raises IsabelleToolError when the probe itself cannot run
+        (fail-closed): launch treats an unverifiable build status as an error.
         """
         self.heap_sources = set()
-        cmd = ["isabelle", "build", "-n", "-l"]
+        self.heap_built = None
+        self.unfinished_sessions = []
+        cmd = ["isabelle", "build", "-n", "-b", "-v", "-l"]
         for d in self.session_dirs:
             cmd += ["-d", d]
         cmd.append(self.logic)
@@ -428,15 +501,34 @@ class IsabelleLSPClient:
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
+                # Own process group: `isabelle build` is a bash wrapper around
+                # a java child, and aborting must take down both.
+                start_new_session=True,
             )
+        except OSError as exc:
+            raise IsabelleToolError(
+                f"Could not verify the session's build status "
+                f"(`{' '.join(cmd[:6])} ...` failed to run): {exc}"
+            ) from exc
+        try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120.0)
-            self.heap_sources = self.parse_build_sources(stdout.decode(errors="replace"))
-            if not self.heap_sources:
-                logger.warning(
-                    "heap source enumeration found nothing for session %r", self.logic
-                )
-        except (OSError, asyncio.TimeoutError) as exc:
-            logger.warning("heap source enumeration failed: %s", exc)
+        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+            _kill_process_tree(proc)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise IsabelleToolError(
+                "Could not verify the session's build status: `isabelle build "
+                "-n` timed out after 120s (it only checksums sources — check "
+                "disk/CPU load and retry the launch)."
+            ) from exc
+        listing = stdout.decode(errors="replace")
+        self.heap_built = proc.returncode == 0
+        self.unfinished_sessions = self.parse_unfinished_sessions(listing)
+        self.heap_sources = self.parse_build_sources(listing)
+        if not self.heap_sources:
+            logger.warning(
+                "heap source enumeration found nothing for session %r", self.logic
+            )
 
     def heap_warning(self, file_path: str) -> str | None:
         """Warning text when *file_path* is precompiled into the running heap."""
@@ -452,11 +544,24 @@ class IsabelleLSPClient:
         )
 
     async def initialize(self) -> dict[str, Any]:
-        response = await self.request("initialize", {
-            "processId": None,
-            "rootUri": None,
-            "capabilities": {},
-        }, timeout=30.0)
+        try:
+            response = await self.request("initialize", {
+                "processId": None,
+                "rootUri": None,
+                "capabilities": {},
+            }, timeout=30.0)
+        except IsabelleToolError as exc:
+            # Attach buffered pre-handshake server errors to a blind timeout.
+            # Only the timeout path needs this: the fail-fast path's exception
+            # (set by _surface_server_message) already carries the message, and
+            # a JSON-RPC error reply ("Undefined session(s): ...") is
+            # self-explanatory — appending heap hints there would mislead.
+            if isinstance(exc.__cause__, asyncio.TimeoutError) and self.startup_errors:
+                raise IsabelleToolError(
+                    f"{exc} — the server reported during startup: "
+                    + " | ".join(self.startup_errors)
+                ) from exc
+            raise
         result = response if isinstance(response, dict) else {}
         if result:
             self.server_capabilities = result.get("capabilities", {})
@@ -493,8 +598,34 @@ class IsabelleLSPClient:
                 return content
         return ""
 
+    def kill(self) -> None:
+        """Synchronously kill the server process tree. No awaits — safe to call
+        from a cleanup path that must survive task cancellation."""
+        if self.process is not None:
+            _kill_process_tree(self.process)
+
+    async def reap(self) -> None:
+        """Reap a killed/dead server: cancel the reader tasks, collect the
+        process, clear per-session state. Counterpart of kill()."""
+        await self._cancel_background_tasks()
+        if self.process is not None:
+            with contextlib.suppress(Exception):
+                # Killed via the process group, so the pipes are closed and
+                # this resolves promptly; the timeout is defense-in-depth —
+                # never let launch cleanup hang on a wait.
+                await asyncio.wait_for(self.process.wait(), timeout=5.0)
+        self._clear_session_state()
+
     async def shutdown(self) -> None:
         if self.process and self.process.returncode is None:
+            if not self._handshake_done:
+                # The handshake never completed (e.g. a missing heap image
+                # wedges the server before it answers `initialize`): the
+                # graceful protocol below could only burn ~10s of timeouts,
+                # so kill outright.
+                self.kill()
+                await self.reap()
+                return
             try:
                 await asyncio.wait_for(self.request("shutdown", {}, timeout=5.0), timeout=5.0)
             except (asyncio.TimeoutError, IsabelleToolError):
@@ -505,9 +636,15 @@ class IsabelleLSPClient:
             try:
                 await asyncio.wait_for(self.process.wait(), timeout=5.0)
             except asyncio.TimeoutError:
-                self.process.kill()
+                # Group kill: killing just the bash wrapper would leave the
+                # java child holding the pipes and this wait would never end.
+                _kill_process_tree(self.process)
                 await self.process.wait()
 
+        self._clear_session_state()
+
+    def _clear_session_state(self) -> None:
+        self._handshake_done = False
         self.open_documents.clear()
         self._dep_stat_sigs.clear()
         self.pending_requests.clear()
@@ -547,7 +684,11 @@ class IsabelleLSPClient:
 
         try:
             await self._send(message)
-        except Exception:
+        except BaseException:
+            # BaseException: a CancelledError here (e.g. parked on _write_lock)
+            # must not leak the pending entry — a later writer (such as the
+            # pre-handshake type-1 handler) would set an exception nobody
+            # retrieves.
             self.pending_requests.pop(req_id, None)
             raise
 
@@ -736,6 +877,25 @@ class IsabelleLSPClient:
         mtype = params.get("type")
         if mtype == 1:
             logger.error("isabelle server: %s", text)
+            if not self._handshake_done:
+                # A pre-handshake error (e.g. "Missing heap image ...") wedges
+                # the server before it ever answers `initialize` — fail the
+                # pending request now instead of letting it time out blind.
+                # Failing ALL pending futures is safe here: isabelle_launch
+                # holds _evaluation_state_lock for the whole start sequence and
+                # every other request path enters through _ensure_lsp_started,
+                # which takes that same lock first — so the only pending
+                # request at this point is `initialize`.
+                self.startup_errors.append(text)
+                failure = IsabelleToolError(
+                    f"Isabelle server failed during startup: {text}\n"
+                    f"If a heap image is missing or outdated, build it first "
+                    f"({self.build_hint()}) and call isabelle_launch again — "
+                    f"the MCP server never builds sessions itself."
+                )
+                for fut in self.pending_requests.values():
+                    if not fut.done():
+                        fut.set_exception(failure)
         elif mtype == 2:
             logger.warning("isabelle server: %s", text)
         else:

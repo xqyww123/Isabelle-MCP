@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- `isabelle_launch` now fails fast (~5s) when the session is not ready,
+  instead of `vscode_server` silently building a missing heap for up to hours
+  (it now runs with `-n`) or silently loading a stale one:
+  - missing heap in the chain → the server's pre-handshake "Missing heap
+    image" error is surfaced on the `initialize` request (previously a blind
+    30s timeout), with the exact `isabelle build -b ...` command to run;
+  - outdated/unverifiable heap → rejected after the handshake via the launch
+    probe (`isabelle build -n -b -v -l`, a strict dry run), naming the
+    unfinished sessions; bypassed with a warning when `-R`/`-A` is in the
+    server's extra args (requirements-only mode needs no own heap);
+  - undefined session name → the JSON-RPC error reply is reported as-is;
+  - the probe failing to run at all (OSError/timeout) is now a launch error
+    (fail-closed) rather than a silent degradation.
+  The MCP server never builds sessions itself. Launch failures are cleaned up
+  cancellation-safely (kill-first), so a half-started server can no longer be
+  mistaken for a running one by the next launch; a crashed server is likewise
+  detected and restarted instead of returning a stale no-op success.
+
 - Decoration freshness is now a single GLOBAL edit clock instead of per-file
   stamps (review follow-up to the 0.1.1 latch fix). Any edit-send — didOpen,
   didChange (including force_interrupt's synthetic edit), or a detected

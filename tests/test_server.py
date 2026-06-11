@@ -230,11 +230,21 @@ def _launch_mock(*, running: bool, logic: str = "HOL"):
     """A mock IsabelleLSPClient for the launch/terminate tests."""
     client = MagicMock()
     client.process = MagicMock() if running else None
+    if running:
+        client.process.returncode = None  # the no-op path checks liveness
     client.logic = logic
+    client.extra_args = []
     client.isabelle_version = "Isabelle2024"
     client.start = AsyncMock()
     client.shutdown = AsyncMock()
+    client.reap = AsyncMock()
+    client.kill = MagicMock()
     client.enumerate_heap_sources = AsyncMock()
+    # Explicit build-status verdict: the staleness gate must be skipped on the
+    # success path by intent, not by MagicMock-auto-attribute accident.
+    client.heap_built = True
+    client.unfinished_sessions = []
+    client.build_hint = MagicMock(return_value="isabelle build -b HOL")
     return client
 
 
@@ -314,6 +324,100 @@ class TestSessionManagement:
         client.shutdown.assert_awaited_once()
         client.start.assert_awaited_once()
         assert client.logic == "HOL-Analysis"
+
+    @pytest.mark.asyncio
+    async def test_launch_restarts_crashed_server(self):
+        # A lingering process object with a returncode is a CRASHED server,
+        # not a running one: the same-session no-op must not report success.
+        import isabelle_mcp.server as server_mod
+
+        client = _launch_mock(running=True, logic="HOL")
+        client.process.returncode = 1
+        with patch.object(server_mod, '_lsp_client', client):
+            await isabelle_launch("HOL")
+        client.shutdown.assert_awaited_once()
+        client.start.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_launch_rejects_unverified_heap(self):
+        # Probe verdict heap_built=False (outdated/missing/no build record)
+        # → launch refuses, names the unfinished sessions, gives the build
+        # command, and tears the just-started server down.
+        import isabelle_mcp.server as server_mod
+        from isabelle_mcp.utils import IsabelleToolError
+
+        client = _launch_mock(running=False)
+        client.heap_built = False
+        client.unfinished_sessions = ["HOL-Library", "Minilang"]
+        with patch.object(server_mod, '_lsp_client', client):
+            with pytest.raises(IsabelleToolError) as exc_info:
+                await isabelle_launch("Minilang", session_dirs=["/proj"])
+        assert "HOL-Library, Minilang" in str(exc_info.value)
+        assert "isabelle build -b HOL" in str(exc_info.value)
+        client.kill.assert_called_once()
+        client.reap.assert_awaited_once()
+        assert client.process is None
+
+    @pytest.mark.asyncio
+    async def test_launch_unverified_heap_unnamed_fallback(self):
+        # No "Unfinished session(s)" line parsed → generic wording, no crash.
+        import isabelle_mcp.server as server_mod
+        from isabelle_mcp.utils import IsabelleToolError
+
+        client = _launch_mock(running=False)
+        client.heap_built = False
+        with patch.object(server_mod, '_lsp_client', client):
+            with pytest.raises(IsabelleToolError, match="dependency chain"):
+                await isabelle_launch("HOL")
+
+    @pytest.mark.asyncio
+    async def test_launch_heap_gate_bypassed_for_requirements_mode(self):
+        # -R/-A in the server's extra args run the logic on its requirements
+        # heaps; the session itself need not be built → gate must not fire.
+        import isabelle_mcp.server as server_mod
+
+        client = _launch_mock(running=False)
+        client.heap_built = False
+        client.extra_args = ["-R", "Foo"]
+        with patch.object(server_mod, '_lsp_client', client):
+            result = await isabelle_launch("Foo")
+        client.start.assert_awaited_once()
+        client.kill.assert_not_called()
+        assert result.version == "Isabelle2024"
+
+    @pytest.mark.asyncio
+    async def test_launch_start_failure_cleans_up(self):
+        # start() failing (missing heap / undefined session) must leave NO
+        # half-started server behind: kill-first cleanup, process detached —
+        # otherwise the next same-session launch would no-op on a wedged one.
+        import isabelle_mcp.server as server_mod
+        from isabelle_mcp.utils import IsabelleToolError
+
+        client = _launch_mock(running=False)
+        client.process = MagicMock()  # as if start() spawned before failing
+        client.start = AsyncMock(side_effect=IsabelleToolError("Missing heap image"))
+        with patch.object(server_mod, '_lsp_client', client):
+            with pytest.raises(IsabelleToolError, match="Missing heap image"):
+                await isabelle_launch("HOL")
+        client.kill.assert_called_once()
+        assert client.process is None
+
+    @pytest.mark.asyncio
+    async def test_launch_probe_failure_is_fail_closed(self):
+        # enumerate_heap_sources raising (probe could not run) aborts the
+        # launch and cleans up, even though start() itself succeeded.
+        import isabelle_mcp.server as server_mod
+        from isabelle_mcp.utils import IsabelleToolError
+
+        client = _launch_mock(running=False)
+        client.enumerate_heap_sources = AsyncMock(
+            side_effect=IsabelleToolError("Could not verify the session's build status")
+        )
+        with patch.object(server_mod, '_lsp_client', client):
+            with pytest.raises(IsabelleToolError, match="build status"):
+                await isabelle_launch("HOL")
+        client.kill.assert_called_once()
+        assert client.process is None
 
     @pytest.mark.asyncio
     async def test_terminate_running(self):

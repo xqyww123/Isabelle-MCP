@@ -715,6 +715,98 @@ def _mock_process_client() -> IsabelleLSPClient:
     return client
 
 
+class TestPreHandshakeFailFast:
+    """Pre-handshake type-1 server messages must fail the pending initialize
+    immediately (with `vscode_server -n`, a missing heap wedges the server
+    before it ever answers initialize — the message is the only signal)."""
+
+    def _client(self) -> IsabelleLSPClient:
+        return IsabelleLSPClient(logic="Minilang", session_dirs=["/proj"])
+
+    @pytest.mark.asyncio
+    async def test_type1_before_handshake_fails_pending_request(self):
+        client = self._client()
+        fut = asyncio.get_running_loop().create_future()
+        client.pending_requests[1] = fut
+        client._surface_server_message(
+            {"type": 1, "message": 'Missing heap image for session "X"'})
+        assert client.startup_errors == ['Missing heap image for session "X"']
+        with pytest.raises(IsabelleToolError) as exc_info:
+            fut.result()
+        msg = str(exc_info.value)
+        assert 'Missing heap image for session "X"' in msg
+        # The fix command: options BEFORE the session name (Isabelle stops
+        # option parsing at the first positional argument).
+        assert "isabelle build -b -d /proj Minilang" in msg
+
+    @pytest.mark.asyncio
+    async def test_type1_after_handshake_only_logs(self):
+        client = self._client()
+        client._handshake_done = True
+        fut = asyncio.get_running_loop().create_future()
+        client.pending_requests[1] = fut
+        client._surface_server_message({"type": 1, "message": "later error"})
+        assert not fut.done()
+        assert client.startup_errors == []
+        fut.cancel()
+
+    @pytest.mark.asyncio
+    async def test_non_error_types_never_fail_requests(self):
+        client = self._client()
+        fut = asyncio.get_running_loop().create_future()
+        client.pending_requests[1] = fut
+        client._surface_server_message({"type": 3, "message": "Welcome to Isabelle"})
+        client._surface_server_message({"type": 2, "message": "some warning"})
+        assert not fut.done()
+        assert client.startup_errors == []
+        fut.cancel()
+
+    @pytest.mark.asyncio
+    async def test_done_futures_left_untouched(self):
+        # A future already resolved (or cancelled by wait_for) must not get
+        # set_exception → no InvalidStateError, no never-retrieved warning.
+        client = self._client()
+        fut = asyncio.get_running_loop().create_future()
+        fut.set_result("done")
+        client.pending_requests[1] = fut
+        client._surface_server_message({"type": 1, "message": "late error"})
+        assert fut.result() == "done"
+
+    @pytest.mark.asyncio
+    async def test_initialize_timeout_attaches_startup_errors(self):
+        # Blind timeout (the type-1 raced past the request) → the buffered
+        # server message is appended so the error is never just "timed out".
+        client = self._client()
+        client.startup_errors = ['Missing heap image for session "X"']
+
+        async def fake_request(method, params, timeout=None):
+            try:
+                raise asyncio.TimeoutError
+            except asyncio.TimeoutError as exc:
+                raise IsabelleToolError(
+                    "LSP request 'initialize' timed out after 30.0s") from exc
+
+        client.request = fake_request
+        with pytest.raises(IsabelleToolError, match="Missing heap image"):
+            await client.initialize()
+
+    @pytest.mark.asyncio
+    async def test_initialize_other_errors_pass_through_unchanged(self):
+        # A JSON-RPC error reply ("Undefined session(s)") is self-explanatory;
+        # appending heap hints there would mislead.
+        client = self._client()
+        client.startup_errors = ["unrelated noise"]
+
+        async def fake_request(method, params, timeout=None):
+            raise IsabelleToolError('Undefined session(s): "Nope"')
+
+        client.request = fake_request
+        with pytest.raises(IsabelleToolError) as exc_info:
+            await client.initialize()
+        assert "unrelated noise" not in str(exc_info.value)
+        assert "Undefined session" in str(exc_info.value)
+
+
 class TestStatSigAndResync:
     @pytest.mark.asyncio
     async def test_open_records_stat_sig(self, tmp_path):

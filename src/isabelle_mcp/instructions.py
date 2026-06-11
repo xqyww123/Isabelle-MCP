@@ -15,6 +15,12 @@ session's heap image); Isabelle can still load any other theory dynamically —
 it is just slow, because the theory and all its imports are checked from
 source.
 
+You do NOT need to check whether the session is built — `isabelle_launch`
+checks automatically. It never builds implicitly: when the session's heap (or
+any heap in its dependency chain) is missing or outdated, or the name is
+undefined, it fails fast with the exact `isabelle build -b ...` command to
+run — run it yourself (it may take long), then relaunch.
+
 **Precompiled theories cannot be edited.** The session you launch must NOT
 contain the theories you intend to work on. (`isabelle_evaluate_to` warns
 when its target file is precompiled into the running session — heed it.) In particular, do NOT launch a
@@ -22,8 +28,8 @@ project's own session to edit that project — it typically precompiles exactly
 the target theories. Launch the project session's **base session** instead
 (the parent in its ROOT entry, `session NAME = BASE + …`): the imports come
 precompiled while the target theories stay editable. Build the base heap
-first with `isabelle build -b BASE` if needed; non-builtin sessions need
-`session_dirs`.
+first with `isabelle build -b BASE` if needed (launch errors out if you
+don't); non-builtin sessions need `session_dirs`.
 
 Choose the session closest to the work that does not swallow the target
 theories — e.g. "HOL-Analysis" for analysis — and ask the user if unsure.
