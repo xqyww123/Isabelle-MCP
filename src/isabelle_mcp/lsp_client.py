@@ -868,6 +868,10 @@ class IsabelleLSPClient:
             file_path=file_path, uri=uri, version=1, content=content,
             stat_sig=_stat_sig(file_path),
         )
+        # A tracker existing here means a late decoration push (in flight while
+        # the document was closed) recreated it with ranges for the OLD content —
+        # give the reopened document the same post-edit grace as a didChange.
+        self._note_doc_update_sent(file_path)
         self._add_file_watch(file_path)
 
         if wait_for_diagnostics:
@@ -1053,6 +1057,7 @@ class IsabelleLSPClient:
         # The model now diverges from disk (synthetic space, never written out).
         # Drop the signature so the next stat backstop re-reads disk and heals it.
         doc.stat_sig = None
+        self._note_doc_update_sent(_canon(file_path))
 
     def file_all_processed(self, file_path: str) -> bool:
         """True if the entire file has been processed (no unprocessed/running)."""
@@ -1064,6 +1069,16 @@ class IsabelleLSPClient:
     def get_processing_tracker(self, file_path: str) -> ProcessingTracker | None:
         """Return the ProcessingTracker for *file_path*, or None."""
         return self._processing_trackers.get(file_path)
+
+    def _note_doc_update_sent(self, file_path: str) -> None:
+        """Stamp *file_path*'s tracker after sending it a didChange (see
+        :meth:`ProcessingTracker.note_doc_update_sent`). No-op without a tracker:
+        then there is no cached decoration state to mistrust, and the
+        ``_initialized`` gate already keeps an empty tracker from passing for
+        "processed"."""
+        tracker = self._processing_trackers.get(file_path)
+        if tracker is not None:
+            tracker.note_doc_update_sent()
 
     async def resync_changed_open_documents(self) -> None:
         """Tool-call backstop (Layer 2): re-stat every open doc; sync changed ones.
@@ -1114,6 +1129,7 @@ class IsabelleLSPClient:
                     "textDocument": {"uri": doc.uri, "version": doc.version},
                     "contentChanges": [{"text": content}],
                 })
+                self._note_doc_update_sent(path)
             doc.stat_sig = _stat_sig(path)
 
     # ── Standard LSP queries ────────────────────────────────────────────

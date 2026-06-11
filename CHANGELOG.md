@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Fixed the "Evaluation in progress" latch: completion checking used to demand
+  a decoration push strictly newer than the evaluation start
+  (`require_fresh_update`), but the server never re-sends unchanged
+  decorations, so an evaluation whose decorations did not change reported
+  "in progress" forever (snapshot showing `clean`, zero running commands),
+  survived `cancel_evaluation`, and only a session switch recovered.
+  Decoration-cache freshness now recovers by clock instead: every `didChange`
+  we send stamps the file's tracker, and the cache is distrusted only for
+  `ISABELLE_MCP_DECORATION_GRACE` seconds (default 1.0, covering the server's
+  `vscode_input_delay` + `vscode_output_delay`) after the last stamp.
+  Caret-only moves no longer invalidate the cache — stale decorations can only
+  over-report unprocessed regions there, never fake completion — so
+  re-evaluating an unchanged file completes immediately.
+
 - `isabelle_launch` now verifies the my-better-isabelle-prover patches before
   spawning `isabelle vscode_server` and refuses to start an unpatched Isabelle
   (run `my-better-isabelle patch` to fix). The check runs the patch manager

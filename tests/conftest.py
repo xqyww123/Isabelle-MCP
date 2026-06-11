@@ -74,7 +74,7 @@ class MockProcessingTracker:
     def all_processed(self) -> bool:
         return self._all_processed
 
-    def require_fresh_update(self) -> None:
+    def note_doc_update_sent(self) -> None:
         pass
 
     def get_running_ranges(self) -> list[tuple[int, int, int, int]]:

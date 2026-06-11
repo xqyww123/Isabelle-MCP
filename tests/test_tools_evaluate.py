@@ -41,7 +41,7 @@ class MockProcessingTracker:
     def all_processed(self):
         return self._all_processed
 
-    def require_fresh_update(self):
+    def note_doc_update_sent(self):
         pass
 
     def get_running_ranges(self):

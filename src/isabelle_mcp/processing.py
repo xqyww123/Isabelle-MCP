@@ -4,12 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time as _time
 from collections.abc import Callable
 
 from isabelle_mcp.utils.core import LSPLine
 
 logger = logging.getLogger(__name__)
+
+# How long after sending a document edit (didChange) the cached decoration state
+# is treated as stale. The server batches input (vscode_input_delay = 0.1s) and
+# throttles decoration output (vscode_output_delay = 0.5s), so the push that
+# reflects an edit arrives within ~0.6s; after this grace period the cache is
+# current. The server stays silent forever when the recomputed decorations equal
+# the published ones, so freshness must recover by clock — waiting for a push
+# would latch "in progress" permanently on a no-op re-evaluation.
+DECORATION_GRACE: float = float(
+    os.environ.get("ISABELLE_MCP_DECORATION_GRACE", "1.0"),
+)
 
 _TRACKED_TYPES = frozenset({
     "background_unprocessed1", "background_running1",
@@ -67,8 +79,9 @@ class ProcessingTracker:
         self._overview_error: list[tuple[int, int, int, int]] = []
         self._overview_warning: list[tuple[int, int, int, int]] = []
         self._initialized: bool = False
-        self._update_count: int = 0
-        self._min_required_updates: int = 0
+        # Monotonic time of the last didChange we sent for this file; -inf when
+        # no edit has been sent (a tracker created by the first push is fresh).
+        self._last_doc_update_sent: float = float("-inf")
         self._condition: asyncio.Condition = asyncio.Condition()
 
     async def update(self, parsed: dict[str, list[tuple[int, int, int, int]]]) -> None:
@@ -95,21 +108,29 @@ class ProcessingTracker:
             if "text_overview_warning" in parsed:
                 self._overview_warning = parsed["text_overview_warning"]
             self._initialized = True
-            self._update_count += 1
             self._condition.notify_all()
 
     @property
     def _fresh(self) -> bool:
-        return self._initialized and self._update_count >= self._min_required_updates
+        return self._initialized and self._grace_remaining() == 0.0
 
-    def require_fresh_update(self) -> None:
-        """Invalidate cached state until the next decoration update arrives.
+    def _grace_remaining(self) -> float:
+        """Seconds left until the post-edit grace window elapses (0 if elapsed)."""
+        return max(
+            0.0, DECORATION_GRACE - (_time.monotonic() - self._last_doc_update_sent),
+        )
 
-        Call this after moving the caret to a new destination: PIDE
-        decorations are perspective-aware, so the old decoration data
-        may not cover the new target line.
+    def note_doc_update_sent(self) -> None:
+        """Record that a didChange for this file was just sent to the server.
+
+        Until :data:`DECORATION_GRACE` seconds pass, the cached decoration state
+        is treated as stale — it may still describe the pre-edit document, and
+        trusting it would let an empty unprocessed list pass for "evaluation
+        complete" before the server even assimilated the edit. Caret-only moves
+        need no stamp: they can only shrink processing requirements, so a stale
+        cache errs toward "not yet processed" (waits longer, never lies done).
         """
-        self._min_required_updates = self._update_count + 1
+        self._last_doc_update_sent = _time.monotonic()
 
     def range_processed(self, start_line: LSPLine, end_line: LSPLine) -> bool:
         """True if no unprocessed/running range overlaps [start_line, end_line]."""
@@ -139,7 +160,8 @@ class ProcessingTracker:
             while not self.range_processed(start_line, end_line):
                 try:
                     await asyncio.wait_for(
-                        self._condition.wait(), timeout=check_interval,
+                        self._condition.wait(),
+                        timeout=self._wait_timeout(check_interval),
                     )
                 except asyncio.TimeoutError:
                     health_check()
@@ -163,7 +185,7 @@ class ProcessingTracker:
                 try:
                     await asyncio.wait_for(
                         self._condition.wait(),
-                        timeout=min(remaining, check_interval),
+                        timeout=min(remaining, self._wait_timeout(check_interval)),
                     )
                 except asyncio.TimeoutError:
                     if _time.monotonic() >= deadline:
@@ -171,12 +193,24 @@ class ProcessingTracker:
                     health_check()
         return True
 
+    def _wait_timeout(self, check_interval: float) -> float:
+        """Wait-slice for the condition loops: wake when the grace window elapses.
+
+        No push arrives when decorations did not change, so a wait gated only on
+        the condition variable would sleep the full *check_interval* past the
+        moment the cache became trustworthy again.
+        """
+        grace = self._grace_remaining()
+        if grace > 0.0:
+            return min(check_interval, grace + 0.05)
+        return check_interval
+
     def line_reached(self, line: int) -> bool:
         """True if *line* (0-indexed) is NOT inside any unprocessed range.
 
         Ignores running ranges — a forked proof means the eval chain has
-        already passed this line.  Returns False when the tracker is
-        awaiting a fresh decoration update (see :meth:`require_fresh_update`).
+        already passed this line.  Returns False inside the post-edit grace
+        window (see :meth:`note_doc_update_sent`).
         """
         if not self._fresh:
             return False
@@ -229,6 +263,5 @@ class ProcessingTracker:
             self._overview_error.clear()
             self._overview_warning.clear()
             self._initialized = False
-            self._update_count = 0
-            self._min_required_updates = 0
+            self._last_doc_update_sent = float("-inf")
             self._condition.notify_all()

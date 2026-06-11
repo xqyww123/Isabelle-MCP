@@ -443,9 +443,9 @@ async def evaluate_to(
         evaluation_state.start(file_path, dest_line)
 
     try:
-        tracker = client.get_processing_tracker(file_path)
-        if tracker is not None:
-            tracker.require_fresh_update()
+        # No freshness invalidation here: the didChange send paths stamp the
+        # tracker (ProcessingTracker.note_doc_update_sent), and a caret-only move
+        # cannot make stale decorations claim "processed" for work that isn't.
         await client.set_caret(file_path, dest_line.to_lsp(), lsp_char)
         status, theories, running_commands = await _evaluation_wait_loop(
             client, file_path, dest_line, evaluation_state,
