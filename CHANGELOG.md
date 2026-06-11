@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.2
 
 - `isabelle_launch` now fails fast (~5s) when the session is not ready,
   instead of `vscode_server` silently building a missing heap for up to hours
