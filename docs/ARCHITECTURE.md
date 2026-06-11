@@ -481,6 +481,10 @@ class DiagnosticCache:
 > Illustrative only. Processing/completion status is **not** derived from this cache;
 > it comes from the per-file `ProcessingTracker`, which consumes `PIDE/decoration`
 > `background_running1`/`background_unprocessed1` ranges directly.
+>
+> Tracker freshness is clock-based: every edit-send (didOpen/didChange/external-dep
+> change) bumps a global timestamp, and cached decorations are distrusted for
+> `DECORATION_GRACE` (default 2 s) afterwards — see `processing.note_edit_sent`.
 
 ---
 

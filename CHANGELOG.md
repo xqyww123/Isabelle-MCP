@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Decoration freshness is now a single GLOBAL edit clock instead of per-file
+  stamps (review follow-up to the 0.1.1 latch fix). Any edit-send — didOpen,
+  didChange (including force_interrupt's synthetic edit), or a detected
+  change/deletion of an external import/.ML dependency (synced by the server's
+  own File_Watcher; detected at tool-call entry) — distrusts every file's
+  cached decorations for `ISABELLE_MCP_DECORATION_GRACE` seconds (default
+  2.0: covers both the didChange publish chain ~0.6s and the external-dep
+  worst chain ~1.1s with margin). This closes two holes in 0.1.1: editing A
+  then immediately evaluating B, which imports A, could return a stale
+  "complete" (a dep edited while an evaluation is already mid-flight is
+  instead caught by the live theory_status dependency gate), and the stamp
+  being silently dropped when a didChange preceded the file's first
+  decoration push. An invalid grace env value now logs a warning and falls
+  back to the default instead of crashing at import. A heap-precompiled
+  file's evaluation now re-checks once past the grace gate before declaring
+  the file divergent, so a concurrent edit elsewhere can no longer trigger a
+  spurious "Evaluation abandoned" on an unmodified precompiled file.
+
 - Unicode guard on every MCP push path: content read from disk
   (`open_document` didOpen, `sync_dirty_files` didChange — both the
   event-driven watcher sink and the tool-call stat backstop funnel through it;

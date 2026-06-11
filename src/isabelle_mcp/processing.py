@@ -12,16 +12,66 @@ from isabelle_mcp.utils.core import LSPLine
 
 logger = logging.getLogger(__name__)
 
-# How long after sending a document edit (didChange) the cached decoration state
-# is treated as stale. The server batches input (vscode_input_delay = 0.1s) and
-# throttles decoration output (vscode_output_delay = 0.5s), so the push that
-# reflects an edit arrives within ~0.6s; after this grace period the cache is
-# current. The server stays silent forever when the recomputed decorations equal
-# the published ones, so freshness must recover by clock — waiting for a push
-# would latch "in progress" permanently on a no-op re-evaluation.
-DECORATION_GRACE: float = float(
-    os.environ.get("ISABELLE_MCP_DECORATION_GRACE", "1.0"),
-)
+# How long after any edit reaches the server the cached decoration state is
+# treated as stale. The 2.0s default covers both publish chains with margin:
+# our own didChange (input batch 0.1s + decoration output throttle 0.5s ≈ 0.6s)
+# and an external dependency edit (the server's File_Watcher debounce
+# vscode_load_delay 0.5s + the same 0.6s ≈ 1.1s, anchored at our detection
+# time which may lag the disk change by up to the debounce). The server stays
+# silent forever when the recomputed decorations equal the published ones, so
+# freshness must recover by clock — waiting for a push would latch
+# "in progress" permanently on a no-op re-evaluation.
+def _read_grace() -> float:
+    """Parse ISABELLE_MCP_DECORATION_GRACE (default 2.0; invalid → warn + 2.0).
+
+    A non-positive value disables the gate entirely — cached decorations are
+    then always trusted, reintroducing the post-edit stale-read races.
+    """
+    raw = os.environ.get("ISABELLE_MCP_DECORATION_GRACE", "2.0")
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid ISABELLE_MCP_DECORATION_GRACE=%r; using 2.0", raw,
+        )
+        return 2.0
+
+
+DECORATION_GRACE: float = _read_grace()
+
+# Monotonic time of the last edit known to have reached the server's document
+# model — GLOBAL, not per file: PIDE invalidation propagates across imports, so
+# any edit makes every file's cached decorations untrustworthy for the grace
+# period. -inf until the first edit (a freshly started server is fresh).
+_last_edit_sent: float = float("-inf")
+
+
+def note_edit_sent() -> None:
+    """Record that the server's document model just changed.
+
+    Call this when WE send content — didOpen, didChange (including
+    force_interrupt's synthetic edit) — and when Layer-3 dependency tracking
+    observes that an external import/.ML file changed on disk (those are synced
+    by the server's own File_Watcher, not by our didChange).
+
+    For :data:`DECORATION_GRACE` seconds afterwards every tracker's cached
+    decoration state is distrusted: it may still describe the pre-edit
+    document, and trusting it would let an empty unprocessed list pass for
+    "evaluation complete" before the server even assimilated the edit.
+
+    Caret-only moves are deliberately NOT edits: decorations always cover the
+    whole document, independent of the caret perspective (empirically
+    verified — see docs/TECH_NOTE.md, "decoration covers the whole document"),
+    so after a caret move the stale cache can only OVER-report unprocessed
+    regions — it waits longer, it never claims unchecked work done.
+    """
+    global _last_edit_sent
+    _last_edit_sent = _time.monotonic()
+
+
+def _grace_remaining() -> float:
+    """Seconds left until the post-edit grace window elapses (0 if elapsed)."""
+    return max(0.0, DECORATION_GRACE - (_time.monotonic() - _last_edit_sent))
 
 _TRACKED_TYPES = frozenset({
     "background_unprocessed1", "background_running1",
@@ -79,9 +129,6 @@ class ProcessingTracker:
         self._overview_error: list[tuple[int, int, int, int]] = []
         self._overview_warning: list[tuple[int, int, int, int]] = []
         self._initialized: bool = False
-        # Monotonic time of the last didChange we sent for this file; -inf when
-        # no edit has been sent (a tracker created by the first push is fresh).
-        self._last_doc_update_sent: float = float("-inf")
         self._condition: asyncio.Condition = asyncio.Condition()
 
     async def update(self, parsed: dict[str, list[tuple[int, int, int, int]]]) -> None:
@@ -112,25 +159,7 @@ class ProcessingTracker:
 
     @property
     def _fresh(self) -> bool:
-        return self._initialized and self._grace_remaining() == 0.0
-
-    def _grace_remaining(self) -> float:
-        """Seconds left until the post-edit grace window elapses (0 if elapsed)."""
-        return max(
-            0.0, DECORATION_GRACE - (_time.monotonic() - self._last_doc_update_sent),
-        )
-
-    def note_doc_update_sent(self) -> None:
-        """Record that a didChange for this file was just sent to the server.
-
-        Until :data:`DECORATION_GRACE` seconds pass, the cached decoration state
-        is treated as stale — it may still describe the pre-edit document, and
-        trusting it would let an empty unprocessed list pass for "evaluation
-        complete" before the server even assimilated the edit. Caret-only moves
-        need no stamp: they can only shrink processing requirements, so a stale
-        cache errs toward "not yet processed" (waits longer, never lies done).
-        """
-        self._last_doc_update_sent = _time.monotonic()
+        return self._initialized and _grace_remaining() == 0.0
 
     def range_processed(self, start_line: LSPLine, end_line: LSPLine) -> bool:
         """True if no unprocessed/running range overlaps [start_line, end_line]."""
@@ -198,9 +227,11 @@ class ProcessingTracker:
 
         No push arrives when decorations did not change, so a wait gated only on
         the condition variable would sleep the full *check_interval* past the
-        moment the cache became trustworthy again.
+        moment the cache became trustworthy again. The +0.05 keeps a float-tick
+        wake from landing just BEFORE expiry (and then re-sleeping a whole
+        check_interval); it is pure latency slack.
         """
-        grace = self._grace_remaining()
+        grace = _grace_remaining()
         if grace > 0.0:
             return min(check_interval, grace + 0.05)
         return check_interval
@@ -210,7 +241,7 @@ class ProcessingTracker:
 
         Ignores running ranges — a forked proof means the eval chain has
         already passed this line.  Returns False inside the post-edit grace
-        window (see :meth:`note_doc_update_sent`).
+        window (see :func:`note_edit_sent`).
         """
         if not self._fresh:
             return False
@@ -263,5 +294,4 @@ class ProcessingTracker:
             self._overview_error.clear()
             self._overview_warning.clear()
             self._initialized = False
-            self._last_doc_update_sent = float("-inf")
             self._condition.notify_all()

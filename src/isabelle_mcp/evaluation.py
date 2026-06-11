@@ -26,6 +26,7 @@ from isabelle_mcp.models import (
     RunningCommand,
     TheoryStatus,
 )
+from isabelle_mcp.processing import _grace_remaining, note_edit_sent
 from isabelle_mcp.utils import (
     IsabelleToolError,
     LSPCharacter,
@@ -443,9 +444,10 @@ async def evaluate_to(
         evaluation_state.start(file_path, dest_line)
 
     try:
-        # No freshness invalidation here: the didChange send paths stamp the
-        # tracker (ProcessingTracker.note_doc_update_sent), and a caret-only move
-        # cannot make stale decorations claim "processed" for work that isn't.
+        # No freshness invalidation here: every edit-send path calls
+        # note_edit_sent (didOpen/didChange/dep change), and a caret-only move
+        # cannot make stale decorations claim "processed" for work that isn't
+        # (see note_edit_sent's docstring).
         await client.set_caret(file_path, dest_line.to_lsp(), lsp_char)
         status, theories, running_commands = await _evaluation_wait_loop(
             client, file_path, dest_line, evaluation_state,
@@ -455,6 +457,17 @@ async def evaluate_to(
         await _cleanup_auto_opened(client, evaluation_state)
         evaluation_state.cancel()
         raise
+
+    if heap_warning and status != "complete" and evaluation_state.active:
+        # The miss may be only the post-edit grace gate (a concurrent edit
+        # re-armed it inside the short heap budget) — an unmodified precompiled
+        # file replays instantly once the gate opens. Re-check past the gate
+        # before declaring the file divergent and telling the agent not to retry.
+        grace = _grace_remaining()
+        if grace > 0:
+            status, theories, running_commands = await _evaluation_wait_loop(
+                client, file_path, dest_line, evaluation_state, grace + 0.2,
+            )
 
     dest = int(dest_line)
     auto_opened = set(evaluation_state.auto_opened_files)
@@ -596,9 +609,13 @@ async def _dependency_freshness_wait(client: IsabelleLSPClient) -> float:
     need_wait = False
     for node, sig in sigs.items():
         prev = client._dep_stat_sigs.get(node, _UNSEEN)
-        if prev is not _UNSEEN and sig is not None and sig != prev:
+        if prev is not _UNSEEN and sig != prev:
+            # A dep changed — or was deleted (sig None) — on disk: the server's
+            # File_Watcher will didChange it internally; an edit like any other,
+            # so start the decoration grace.
+            note_edit_sent()
             # sig = (ino, size, mtime_ns, ctime_ns); recent edit ⇒ within the debounce.
-            if (now - sig[2] / 1e9) < delay:
+            if sig is not None and (now - sig[2] / 1e9) < delay:
                 need_wait = True
         client._dep_stat_sigs[node] = sig
     for gone in set(client._dep_stat_sigs) - set(sigs):

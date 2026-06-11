@@ -824,3 +824,69 @@ class TestStatSigAndResync:
         # set_caret via the symlink path resolves to the same DocumentState (no error).
         await client.set_caret(str(link), LSPLine(0))
 
+
+
+class TestEditStampWiring:
+    """Every path that puts content into the server's document model must bump
+    the global edit clock (processing.note_edit_sent) — otherwise the freshness
+    gate silently never engages and the pre-0.1.1 stale-cache races return."""
+
+    @staticmethod
+    def _reset_clock(monkeypatch):
+        from isabelle_mcp import processing
+        monkeypatch.setattr(processing, "_last_edit_sent", float("-inf"))
+
+    @staticmethod
+    def _clock_running() -> bool:
+        from isabelle_mcp import processing
+        return processing._grace_remaining() > 0.0
+
+    @pytest.mark.asyncio
+    async def test_did_open_bumps_edit_clock(self, tmp_path, monkeypatch):
+        client = _mock_process_client()
+        f = tmp_path / "Foo.thy"
+        f.write_text("theory Foo begin end")
+        self._reset_clock(monkeypatch)
+        await client.open_document(str(f), wait_for_diagnostics=False)
+        assert self._clock_running()
+
+    @pytest.mark.asyncio
+    async def test_sync_dirty_files_bumps_edit_clock_only_on_change(
+        self, tmp_path, monkeypatch,
+    ):
+        client = _mock_process_client()
+        f = tmp_path / "Foo.thy"
+        f.write_text("theory Foo begin end")
+        await client.open_document(str(f), wait_for_diagnostics=False)
+
+        self._reset_clock(monkeypatch)
+        await client.sync_dirty_files({str(f)})   # content unchanged: no didChange
+        assert not self._clock_running()
+
+        f.write_text("theory Foo begin (*v2*) end")
+        await client.sync_dirty_files({str(f)})   # didChange sent
+        assert self._clock_running()
+
+    @pytest.mark.asyncio
+    async def test_force_interrupt_bumps_edit_clock(self, tmp_path, monkeypatch):
+        client = _mock_process_client()
+        f = tmp_path / "Foo.thy"
+        f.write_text("theory Foo begin end")
+        await client.open_document(str(f), wait_for_diagnostics=False)
+        client.request = AsyncMock()              # PIDE/cancel_execution
+        self._reset_clock(monkeypatch)
+        await client.force_interrupt(str(f))      # synthetic didChange
+        assert self._clock_running()
+
+    @pytest.mark.asyncio
+    async def test_reopen_already_open_does_not_bump(self, tmp_path, monkeypatch):
+        """open_document on an already-open doc early-returns BEFORE the bump —
+        otherwise every tool call (each re-enters open_document) would re-arm
+        the grace and a tight polling client could never see a fresh cache."""
+        client = _mock_process_client()
+        f = tmp_path / "Foo.thy"
+        f.write_text("theory Foo begin end")
+        await client.open_document(str(f), wait_for_diagnostics=False)
+        self._reset_clock(monkeypatch)
+        await client.open_document(str(f), wait_for_diagnostics=False)
+        assert not self._clock_running()

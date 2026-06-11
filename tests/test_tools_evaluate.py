@@ -41,8 +41,6 @@ class MockProcessingTracker:
     def all_processed(self):
         return self._all_processed
 
-    def note_doc_update_sent(self):
-        pass
 
     def get_running_ranges(self):
         return list(self._running)
@@ -408,6 +406,33 @@ class TestDecorationClear:
         assert tr.get_overview_warning_ranges() == []
 
 
+class TestLatchRegression:
+    """The 0.1.1 latch, pinned at the level it occurred: evaluate_to with a REAL
+    tracker must complete when no decoration push follows the edit (the server
+    re-sends nothing when decorations are unchanged). Pre-fix code waited for a
+    strictly-newer push and reported in_progress forever."""
+
+    @pytest.mark.asyncio
+    async def test_evaluate_completes_without_new_push_after_edit(
+        self, mock_lsp_client, temp_theory_file, monkeypatch,
+    ):
+        from isabelle_mcp import processing
+
+        monkeypatch.setattr(processing, "DECORATION_GRACE", 0.1)
+        monkeypatch.setattr(processing, "_last_edit_sent", float("-inf"))
+        monkeypatch.setattr(ev, "EVAL_POLL_INTERVAL", 5.0)
+
+        tracker = ProcessingTracker()
+        await tracker.update(
+            {"background_unprocessed1": [], "background_running1": []},
+        )
+        processing.note_edit_sent()  # an edit went out; no push will ever follow
+        mock_lsp_client._processing_trackers[temp_theory_file] = tracker
+
+        view = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
+        assert view.status == "complete"
+
+
 class TestLockedSync:
     @pytest.mark.asyncio
     async def test_sync_file_locked_pushes_single_path(self, mock_lsp_client):
@@ -448,3 +473,34 @@ class TestLockedSync:
         mock_lsp_client.resync_changed_open_documents = fake_resync
         await resync_changed_open_documents_locked(mock_lsp_client)
         assert called["n"] == 1
+
+
+class TestDependencyEditStamp:
+    """Layer-3: an external import/.ML file changing on disk is an edit too
+    (the server's own File_Watcher will didChange it internally) — detection
+    must bump the global edit clock."""
+
+    @pytest.mark.asyncio
+    async def test_external_dep_change_bumps_edit_clock(
+        self, mock_lsp_client, tmp_path, monkeypatch,
+    ):
+        from isabelle_mcp import processing
+
+        dep = tmp_path / "Helper.ML"
+        dep.write_text("val x = 1;")
+        mock_lsp_client._dep_stat_sigs = {}
+        mock_lsp_client.vscode_load_delay = 0.5
+
+        async def theory_status():
+            return [{"node_name": str(dep), "external": True}]
+
+        mock_lsp_client.request_theory_status = theory_status
+        monkeypatch.setattr(processing, "_last_edit_sent", float("-inf"))
+
+        await ev._dependency_freshness_wait(mock_lsp_client)  # baseline stat
+        assert processing._grace_remaining() == 0.0           # no change yet
+
+        dep.write_text("val x = 2; (* edited externally *)")
+        wait = await ev._dependency_freshness_wait(mock_lsp_client)
+        assert processing._grace_remaining() > 0.0            # clock bumped
+        assert wait > 0.0                                     # debounce wait requested

@@ -74,9 +74,6 @@ class MockProcessingTracker:
     def all_processed(self) -> bool:
         return self._all_processed
 
-    def note_doc_update_sent(self) -> None:
-        pass
-
     def get_running_ranges(self) -> list[tuple[int, int, int, int]]:
         return []
 
@@ -104,6 +101,12 @@ class MockProcessingTracker:
 
 class MockLSPClient:
     """Mock LSP client for unit testing."""
+
+    # Real ProcessingTracker wait loops health-check through the client.
+    STALL_TIMEOUT = 60.0
+
+    def _check_server_health(self, stall_timeout: float) -> None:
+        pass
 
     def __init__(self):
         self.logic = "HOL"
@@ -264,6 +267,20 @@ def _reset_evaluation_state():
     evaluation_state.cancel()
     yield
     evaluation_state.cancel()
+
+
+@pytest.fixture(autouse=True)
+def _reset_edit_clock(monkeypatch):
+    """Isolate the global edit clock per test.
+
+    Real-client tests bump processing._last_edit_sent (didOpen/didChange paths);
+    without this reset a leaked stamp would freshness-gate any real-tracker
+    assertion in the next ~2s of the suite. Pinning DECORATION_GRACE also
+    shields assertions from an ISABELLE_MCP_DECORATION_GRACE env override
+    (read at import time)."""
+    from isabelle_mcp import processing
+    monkeypatch.setattr(processing, "_last_edit_sent", float("-inf"))
+    monkeypatch.setattr(processing, "DECORATION_GRACE", 2.0)
 
 
 @pytest.fixture
