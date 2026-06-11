@@ -671,9 +671,12 @@ class TestIsabelleLSPClient:
         assert await second == "second"
         assert [call[1]["line"] for call in calls if "line" in call[1]] == [1, 2]
 
-    def test_fail_pending_waiters_fails_and_clears_all_waiters(self):
+    async def test_fail_pending_waiters_fails_and_clears_all_waiters(self):
+        # async (not sync + get_event_loop): pytest-asyncio >= 1.x clears the
+        # event loop after every async test, so a later sync get_event_loop()
+        # raises "There is no current event loop" on Python 3.12+.
         client = IsabelleLSPClient()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         request_future = loop.create_future()
         state_init_future = loop.create_future()
         dynamic_future = loop.create_future()
