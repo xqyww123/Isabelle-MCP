@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.1
 
 - Fixed the "Evaluation in progress" latch: completion checking used to demand
   a decoration push strictly newer than the evaluation start
