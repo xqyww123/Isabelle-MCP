@@ -107,6 +107,21 @@ def _ranges_overlap(
     return range_start <= query_end and range_end >= query_start
 
 
+def clip_line_range(
+    start_line: int, end_line: int, n_lines: int,
+) -> tuple[int, int] | None:
+    """Clamp a 0-indexed ``[start_line, end_line]`` to a document of *n_lines*.
+
+    Returns the clamped ``(start, end)``, or ``None`` when the range begins past
+    EOF. Shared by the per-file snapshot and the running-command collector so a
+    transiently stale decoration tracker (whose ranges may outlive a file shrink)
+    never reports lines beyond the current content.
+    """
+    if start_line >= n_lines:
+        return None
+    return (start_line, min(end_line, n_lines - 1))
+
+
 class ProcessingTracker:
     """Tracks whether PIDE has finished processing specific lines of a file.
 

@@ -26,7 +26,7 @@ from isabelle_mcp.models import (
     RunningCommand,
     TheoryStatus,
 )
-from isabelle_mcp.processing import _grace_remaining, note_edit_sent
+from isabelle_mcp.processing import _grace_remaining, clip_line_range, note_edit_sent
 from isabelle_mcp.utils import (
     IsabelleToolError,
     LSPCharacter,
@@ -246,11 +246,25 @@ async def _build_status_snapshot(
 # Per-file snapshot (decoration primary, theory_status fallback)
 # ---------------------------------------------------------------------------
 
-def _line_spans(ranges: list[tuple[int, int, int, int]]) -> list[tuple[int, int]]:
-    """0-indexed decoration tuples → sorted 1-indexed (start_line, end_line) spans."""
-    spans = [
-        (int(LSPLine(r[0]).to_mcp()), int(LSPLine(r[2]).to_mcp())) for r in ranges
-    ]
+def _line_spans(
+    ranges: list[tuple[int, int, int, int]], n_lines: int | None = None,
+) -> list[tuple[int, int]]:
+    """0-indexed decoration tuples → sorted 1-indexed (start_line, end_line) spans.
+
+    When *n_lines* is given, ranges that begin past EOF are dropped and end lines
+    are clamped to the current content (see :func:`clip_line_range`) — a stale
+    tracker outliving a file shrink must not surface phantom spans past EOF.
+    """
+    spans: list[tuple[int, int]] = []
+    for r in ranges:
+        if n_lines is not None:
+            clipped = clip_line_range(r[0], r[2], n_lines)
+            if clipped is None:
+                continue
+            s0, e0 = clipped
+        else:
+            s0, e0 = r[0], r[2]
+        spans.append((int(LSPLine(s0).to_mcp()), int(LSPLine(e0).to_mcp())))
     return sorted(spans)
 
 
@@ -281,6 +295,8 @@ def _build_file_snapshot(
     """
     ts = ts_map.get(file_path)
     tracker = client.get_processing_tracker(file_path)
+    doc = client.open_documents.get(file_path)
+    n_lines = (doc.content.count("\n") + 1) if doc else None
 
     if tracker is not None:
         bad = tracker.get_bad_ranges()
@@ -298,9 +314,11 @@ def _build_file_snapshot(
         # problem/activity that the (stale) decoration does NOT reflect — e.g. a
         # dependency re-invalidated by an edit, whose decoration lags.
         if deco_has_content or not ts_active_or_problem:
-            errors = _merge_spans(_line_spans(oerr) + _line_spans(bad))
-            warnings = _line_spans(owarn)
-            running_spans = _line_spans(running)
+            errors = _merge_spans(
+                _line_spans(oerr, n_lines) + _line_spans(bad, n_lines)
+            )
+            warnings = _line_spans(owarn, n_lines)
+            running_spans = _line_spans(running, n_lines)
             state = "problems" if (errors or warnings) else "clean"
             return FileSnapshot(
                 file_path=file_path, lined=True, state=state,

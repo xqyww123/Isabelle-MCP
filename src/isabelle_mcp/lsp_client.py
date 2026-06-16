@@ -17,6 +17,7 @@ from typing import Any, ClassVar
 from isabelle_mcp.models import RunningCommand
 from isabelle_mcp.processing import (
     ProcessingTracker,
+    clip_line_range,
     note_edit_sent,
     parse_decoration_ranges,
 )
@@ -1171,9 +1172,10 @@ class IsabelleLSPClient:
                 continue
             lines = doc.content.split("\n")
             for sl, sc, el, ec, onset in tracker.get_running_ranges_with_onset():
-                el_clamped = min(el, len(lines) - 1)
-                if sl >= len(lines):
+                clipped = clip_line_range(sl, el, len(lines))
+                if clipped is None:
                     continue
+                sl, el_clamped = clipped
                 ec_clamped = min(ec, len(lines[el_clamped]))
                 if sl == el_clamped:
                     text = lines[sl][sc:ec_clamped]
