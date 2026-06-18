@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.3
+
+- Per-file snapshots now clamp decoration ranges to the current document length,
+  so a tracker whose ranges outlive a file shrink can no longer surface phantom
+  error/warning/running spans past EOF (e.g. the "cancel reports no evaluation in
+  progress but the snapshot still lists running:N" contradiction). The start-skip
+  + end-clamp is extracted into `processing.clip_line_range` and shared by
+  `_build_file_snapshot`/`_line_spans` and `get_all_running_commands`.
+
 ## 0.1.2
 
 - `isabelle_launch` now fails fast (~5s) when the session is not ready,
