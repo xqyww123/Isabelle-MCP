@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.1.4
+
+- `isabelle_evaluate_to`/`isabelle_evaluation_status` no longer report a file
+  `clean`/`complete` while a proof in it is still being checked. Completion was
+  gated only on the destination line being reached, which ignores forked proofs
+  still running earlier in the evaluated prefix; with the target at end-of-file
+  the frontier could "arrive" while a mid-file proof was in flight, so the
+  snapshot was taken before its failure surfaced — intermittently summarising a
+  file as `clean` that actually had a failing `qed`/proof.
+  Completion now additionally requires the whole evaluated prefix `[0, dest]` to
+  be quiet (no running/unprocessed command). On reaching the destination the
+  result is `complete` only if the prefix is quiet; otherwise it returns
+  `in_progress` immediately, listing the still-busy lines as `running:` and a new
+  `pending:` field (`FileSnapshot.pending`, the unprocessed prefix clipped to the
+  destination), and the caller polls `evaluation_status` to convergence. A proof
+  that ultimately fails now always surfaces its error in the final `complete`,
+  never `clean`. Verified against a real `vscode_server` that PIDE delivers
+  "leave running/unprocessed" and "become error" in the same decoration push, so
+  a quiet prefix can never hide a just-failed command.
+
 ## 0.1.3
 
 - Per-file snapshots now clamp decoration ranges to the current document length,
