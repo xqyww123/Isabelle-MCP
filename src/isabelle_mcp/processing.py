@@ -237,6 +237,40 @@ class ProcessingTracker:
                     health_check()
         return True
 
+    async def wait_until_line_reached_bounded(
+        self,
+        line: LSPLine,
+        timeout: float,
+        health_check: Callable[[], None],
+        check_interval: float = 5.0,
+    ) -> bool:
+        """Like :meth:`wait_until_processed_bounded`, but the predicate is
+        :meth:`line_reached` — wake as soon as the execution frontier passes *line*
+        (that line leaves the unprocessed set), regardless of forks still running
+        EARLIER in the prefix.
+
+        The evaluation wait loop uses this to react the instant the frontier reaches
+        the destination; the caller then decides complete vs in_progress from a
+        separate prefix-quiet (:meth:`range_processed`) check, so trailing forks do
+        not make this wait block. Returns False on timeout.
+        """
+        deadline = _time.monotonic() + timeout
+        async with self._condition:
+            while not self.line_reached(line):
+                remaining = deadline - _time.monotonic()
+                if remaining <= 0:
+                    return False
+                try:
+                    await asyncio.wait_for(
+                        self._condition.wait(),
+                        timeout=min(remaining, self._wait_timeout(check_interval)),
+                    )
+                except asyncio.TimeoutError:
+                    if _time.monotonic() >= deadline:
+                        return False
+                    health_check()
+        return True
+
     def _wait_timeout(self, check_interval: float) -> float:
         """Wait-slice for the condition loops: wake when the grace window elapses.
 

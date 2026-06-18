@@ -122,12 +122,18 @@ def _dependency_done(t: TheoryStatus) -> bool:
     return False
 
 
-def _is_evaluation_complete(
+def _frontier_reached(
     file_path: str,
     dest_line: MCPLine,
     client: IsabelleLSPClient,
     theories: list[TheoryStatus],
 ) -> bool:
+    """The execution frontier has passed *dest_line* and every import is done.
+
+    Checks only that dest_line itself left the unprocessed set; it deliberately
+    ignores forks still running EARLIER in the prefix — that is :func:`_prefix_quiet`'s
+    job. Reaching the frontier is the trigger to decide complete vs in_progress.
+    """
     tracker = client.get_processing_tracker(file_path)
     if not tracker or not tracker.line_reached(dest_line.to_lsp()):
         return False
@@ -137,6 +143,36 @@ def _is_evaluation_complete(
     deps = _get_recursive_dependencies(target_name, theories)
     theory_map = {t.theory_name: t for t in theories}
     return all(_dependency_done(theory_map[d]) for d in deps if d in theory_map)
+
+
+def _prefix_quiet(
+    file_path: str,
+    dest_line: MCPLine,
+    client: IsabelleLSPClient,
+) -> bool:
+    """No unprocessed/running command overlaps the evaluated prefix ``[0, dest]``.
+
+    True only once trailing forked proofs in the prefix have joined. At that instant
+    any failure decoration is already present: PIDE delivers "leave running/
+    unprocessed" and "become bad/error" in the SAME decoration push (verified
+    empirically), so a quiet prefix can never hide a just-failed command.
+    """
+    tracker = client.get_processing_tracker(file_path)
+    if tracker is None:
+        return False
+    return tracker.range_processed(LSPLine(0), dest_line.to_lsp())
+
+
+def _is_evaluation_complete(
+    file_path: str,
+    dest_line: MCPLine,
+    client: IsabelleLSPClient,
+    theories: list[TheoryStatus],
+) -> bool:
+    """Strict completion: frontier reached AND the evaluated prefix is fully quiet."""
+    return _frontier_reached(
+        file_path, dest_line, client, theories,
+    ) and _prefix_quiet(file_path, dest_line, client)
 
 
 def _complete_message(
@@ -268,6 +304,32 @@ def _line_spans(
     return sorted(spans)
 
 
+def _pending_spans(
+    ranges: list[tuple[int, int, int, int]],
+    dest_lsp: int,
+    n_lines: int | None,
+) -> list[tuple[int, int]]:
+    """Unprocessed decoration ranges clipped to the evaluated prefix ``[0, dest_lsp]``.
+
+    0-indexed LSP tuples → sorted, merged 1-indexed ``(start, end)`` line spans.
+    Ranges beginning past *dest_lsp* are dropped; ends are capped at *dest_lsp* (and
+    at EOF via :func:`clip_line_range` when *n_lines* is given) so the unevaluated
+    tail past the destination is never reported as pending work.
+    """
+    spans: list[tuple[int, int]] = []
+    for r in ranges:
+        if r[0] > dest_lsp:
+            continue
+        s0, e0 = r[0], min(r[2], dest_lsp)
+        if n_lines is not None:
+            clipped = clip_line_range(s0, e0, n_lines)
+            if clipped is None:
+                continue
+            s0, e0 = clipped
+        spans.append((int(LSPLine(s0).to_mcp()), int(LSPLine(e0).to_mcp())))
+    return _merge_spans(spans)
+
+
 def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
     """Merge line spans that share a line into one (dedupes the two error channels)."""
     if not spans:
@@ -287,11 +349,14 @@ def _build_file_snapshot(
     client: IsabelleLSPClient,
     file_path: str,
     ts_map: dict[str, TheoryStatus],
+    dest_line: MCPLine | None = None,
 ) -> FileSnapshot:
     """One file's problem snapshot. Decoration if current, else theory_status counts.
 
     Built fully synchronously (no await between getter reads) so the union/merge sees
-    one consistent tracker state.
+    one consistent tracker state. *dest_line* (set only for the evaluation target)
+    surfaces the still-unprocessed prefix ``[0, dest]`` as ``pending`` so an
+    in_progress snapshot never renders a bare "clean" while work remains.
     """
     ts = ts_map.get(file_path)
     tracker = client.get_processing_tracker(file_path)
@@ -319,12 +384,22 @@ def _build_file_snapshot(
             )
             warnings = _line_spans(owarn, n_lines)
             running_spans = _line_spans(running, n_lines)
-            state = "problems" if (errors or warnings) else "clean"
+            pending_spans = (
+                _pending_spans(unproc, int(dest_line.to_lsp()), n_lines)
+                if dest_line is not None else []
+            )
+            if errors or warnings:
+                state = "problems"
+            elif running_spans or pending_spans:
+                state = "in_progress"
+            else:
+                state = "clean"
             return FileSnapshot(
                 file_path=file_path, lined=True, state=state,
                 errors=errors, warnings=warnings, running=running_spans,
+                pending=pending_spans,
                 error_count=len(errors), warning_count=len(warnings),
-                running_count=len(running_spans),
+                running_count=len(running_spans), pending_count=len(pending_spans),
             )
 
     # theory_status fallback (counts only, no line numbers)
@@ -367,10 +442,13 @@ def _snapshot_files(
     target: str,
     theories: list[TheoryStatus],
     auto_opened: set[str],
+    dest_line: MCPLine | None = None,
 ) -> list[FileSnapshot]:
     ts_map = {t.node_name: t for t in theories}
+    # Only the evaluation target gets dest_line — pending is the prefix [0, dest] of
+    # the file actually being evaluated; deps/other files have no destination.
     return [
-        _build_file_snapshot(client, f, ts_map)
+        _build_file_snapshot(client, f, ts_map, dest_line if f == target else None)
         for f in _relevant_files(client, target, auto_opened)
     ]
 
@@ -408,15 +486,22 @@ async def _evaluation_wait_loop(
             # Push any edit that landed mid-evaluation; PIDE re-checks incrementally.
             await resync_changed_open_documents_locked(client)
         theories, running_commands = await _build_status_snapshot(client, state)
-        if _is_evaluation_complete(file_path, dest_line, client, theories):
-            return "complete", theories, running_commands
+        # Decide the instant the frontier reaches dest: prefix quiet → complete;
+        # otherwise return in_progress NOW (no grace). Trailing forks are reported
+        # (running/pending lines), not waited on — the caller polls to convergence.
+        if _frontier_reached(file_path, dest_line, client, theories):
+            if _prefix_quiet(file_path, dest_line, client):
+                return "complete", theories, running_commands
+            return "in_progress", theories, running_commands
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return "in_progress", theories, running_commands
         tracker = client.get_processing_tracker(file_path)
         if tracker:
-            await tracker.wait_until_processed_bounded(
-                LSPLine(0), dest_line.to_lsp(),
+            # Wake when the frontier reaches dest (not when the whole prefix is
+            # quiet), so the decision above is prompt and never a pseudo-grace.
+            await tracker.wait_until_line_reached_bounded(
+                dest_line.to_lsp(),
                 timeout=min(remaining, 5.0),
                 health_check=lambda: client._check_server_health(client.STALL_TIMEOUT),
             )
@@ -491,7 +576,7 @@ async def evaluate_to(
     auto_opened = set(evaluation_state.auto_opened_files)
     # Build the snapshot BEFORE cleanup closes the auto-opened deps (which would
     # drop their decoration trackers).
-    files = _snapshot_files(client, file_path, theories, auto_opened)
+    files = _snapshot_files(client, file_path, theories, auto_opened, dest_line)
     if heap_warning and status != "complete":
         # The file differs from its precompiled copy, so PIDE will never
         # reprocess it — abandon the evaluation instead of leaving it pending.
@@ -557,7 +642,9 @@ async def evaluation_status(
     complete = _is_evaluation_complete(
         target, evaluation_state.destination_line, client, theories,
     )
-    files = _snapshot_files(client, target, theories, auto_opened)
+    files = _snapshot_files(
+        client, target, theories, auto_opened, evaluation_state.destination_line,
+    )
     # Only the active evaluation owns the complete→cleanup transition; once
     # ``active`` is False the cleanup already ran and we are merely surfacing a
     # lingering fork, which must stay visible (not collapse back to "complete").
@@ -765,6 +852,8 @@ def _format_file_snapshot(fs: FileSnapshot, root: str | None) -> str:
             rows.append(f"  warnings: {_fmt_spans(fs.warnings)}")
         if fs.running:
             rows.append(f"  running: {_fmt_spans(fs.running)}")
+        if fs.pending:
+            rows.append(f"  pending: {_fmt_spans(fs.pending)}")
         if not rows:
             return f"{name}: clean"
         return f"{name}:\n" + "\n".join(rows)

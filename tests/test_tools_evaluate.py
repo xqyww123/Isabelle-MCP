@@ -19,9 +19,12 @@ from isabelle_mcp.utils import IsabelleToolError, MCPLine
 class MockProcessingTracker:
     """Configurable tracker stub exposing the decoration getters the snapshot reads."""
 
-    def __init__(self, *, all_processed=True, bad=None, overview_error=None,
+    def __init__(self, *, all_processed=True, frontier=None, quiet=None,
+                 bad=None, overview_error=None,
                  overview_warning=None, running=None, unprocessed=None):
         self._all_processed = all_processed
+        self._frontier = all_processed if frontier is None else frontier
+        self._quiet = all_processed if quiet is None else quiet
         self._bad = bad or []
         self._oerr = overview_error or []
         self._owarn = overview_warning or []
@@ -29,10 +32,10 @@ class MockProcessingTracker:
         self._unproc = unprocessed or []
 
     def range_processed(self, start_line, end_line):
-        return self._all_processed
+        return self._quiet
 
     def line_reached(self, line):
-        return self._all_processed
+        return self._frontier
 
     def line_running(self, line):
         return False
@@ -63,7 +66,12 @@ class MockProcessingTracker:
     async def wait_until_processed_bounded(
         self, start_line, end_line, timeout=5.0, health_check=None, check_interval=5.0,
     ):
-        return self._all_processed
+        return self._quiet
+
+    async def wait_until_line_reached_bounded(
+        self, line, timeout=5.0, health_check=None, check_interval=5.0,
+    ):
+        return self._frontier
 
 
 @pytest.fixture(autouse=True)
@@ -153,6 +161,36 @@ class TestEvaluateTo:
                 mock_lsp_client, temp_theory_file, 5, after_text="no_such_token_zzz",
             )
 
+    @pytest.mark.asyncio
+    async def test_fork_pending_returns_in_progress_not_clean(
+        self, temp_theory_file, mock_lsp_client,
+    ):
+        # Frontier reached dest, but a trailing command in the prefix is still
+        # unprocessed (a queued/in-flight fork). Must NOT report complete/clean;
+        # returns in_progress immediately (grace=0) and lists the pending line.
+        mock_lsp_client._processing_trackers[temp_theory_file] = MockProcessingTracker(
+            frontier=True, quiet=False, unprocessed=[(7, 0, 7, 5)],  # 0-idx 7 -> line 8
+        )
+        result = await evaluate_to(mock_lsp_client, temp_theory_file, 9)
+        assert result.status == "in_progress"
+        assert "clean" not in result.message.lower()
+        fs = _file(result, temp_theory_file)
+        assert fs is not None and fs.lined
+        assert fs.pending == [(8, 8)]
+        assert fs.state != "clean"
+
+    @pytest.mark.asyncio
+    async def test_pending_clipped_to_dest(self, temp_theory_file, mock_lsp_client):
+        # Unprocessed spans past the destination; pending is capped at dest, never
+        # reporting the unevaluated tail.
+        mock_lsp_client._processing_trackers[temp_theory_file] = MockProcessingTracker(
+            frontier=True, quiet=False, unprocessed=[(2, 0, 9, 5)],  # 0-idx lines 2..9
+        )
+        result = await evaluate_to(mock_lsp_client, temp_theory_file, 5)  # dest line 5
+        fs = _file(result, temp_theory_file)
+        assert fs is not None
+        assert fs.pending == [(3, 5)]  # 0-idx 2..4 (capped at dest) -> 1-idx 3..5
+
 
 class TestEvaluationStatus:
     @pytest.mark.asyncio
@@ -187,6 +225,29 @@ class TestEvaluationStatus:
         r2 = await evaluation_status(mock_lsp_client)
         # Both errors present — not just the newly-appeared one.
         assert _file(r2, temp_theory_file).errors == [(3, 3), (4, 4)]
+
+    @pytest.mark.asyncio
+    async def test_fork_resolves_to_error_then_complete(
+        self, temp_theory_file, mock_lsp_client,
+    ):
+        # While the fork is in flight: frontier reached, prefix not quiet -> in_progress.
+        mock_lsp_client._processing_trackers[temp_theory_file] = MockProcessingTracker(
+            frontier=True, quiet=False, unprocessed=[(7, 0, 7, 5)],
+        )
+        r1 = await evaluate_to(mock_lsp_client, temp_theory_file, 9)
+        assert r1.status == "in_progress"
+
+        # Fork joins and FAILS: same push clears the busy state AND posts the error
+        # (modelled as quiet=True with the overview_error now present).
+        mock_lsp_client._processing_trackers[temp_theory_file] = MockProcessingTracker(
+            frontier=True, quiet=True, overview_error=[(7, 0, 7, 5)],  # line 8
+        )
+        r2 = await evaluation_status(mock_lsp_client)
+        assert r2.status == "complete"
+        fs = _file(r2, temp_theory_file)
+        assert fs is not None and fs.errors == [(8, 8)]
+        assert fs.state == "problems"
+        assert "0 statement(s) still running and 1 statement(s) failed" in r2.message
 
 
 class TestCancelEvaluation:
@@ -317,6 +378,30 @@ class TestSnapshotCategorization:
         assert not fs.lined
         assert fs.state == "in_progress"
 
+    def test_pending_surfaced_for_target_with_dest(self, mock_lsp_client):
+        from isabelle_mcp.evaluation import _build_file_snapshot
+        path = "/tmp/T.thy"
+        # Unprocessed prefix, no errors -> in_progress with the pending lines, not clean.
+        mock_lsp_client._processing_trackers[path] = MockProcessingTracker(
+            unprocessed=[(2, 0, 4, 5)],  # 0-idx 2..4 -> 1-idx 3..5
+        )
+        fs = _build_file_snapshot(
+            mock_lsp_client, path, {path: self._ts(path)}, dest_line=MCPLine(8),
+        )
+        assert fs.lined
+        assert fs.pending == [(3, 5)] and fs.pending_count == 1
+        assert fs.errors == [] and fs.state == "in_progress"
+
+    def test_pending_absent_without_dest(self, mock_lsp_client):
+        # Non-target files (dest_line=None) never surface pending, even when unprocessed.
+        from isabelle_mcp.evaluation import _build_file_snapshot
+        path = "/tmp/Dep.thy"
+        mock_lsp_client._processing_trackers[path] = MockProcessingTracker(
+            unprocessed=[(2, 0, 4, 5)],
+        )
+        fs = _build_file_snapshot(mock_lsp_client, path, {path: self._ts(path)})
+        assert fs.pending == [] and fs.state == "clean"
+
 
 class TestCompleteMessage:
     def _run(self, line, text="apply simp"):
@@ -379,6 +464,17 @@ class TestRendering:
     def test_render_no_evaluation(self):
         view = EvaluationView(status="no_evaluation", message="No evaluation in progress.")
         assert format_evaluation_result(view, None) == "No evaluation in progress."
+
+    def test_render_pending_row_not_clean(self):
+        view = EvaluationView(
+            status="in_progress", destination_line=10,
+            message="Evaluation in progress. Call evaluation_status to check progress.",
+            files=[FileSnapshot("/proj/Foo.thy", lined=True, state="in_progress",
+                                pending=[(7, 9)], pending_count=1)],
+        )
+        out = format_evaluation_result(view, "/proj")
+        assert "pending: 7-9" in out
+        assert "Foo.thy: clean" not in out
 
 
 class TestDecorationClear:

@@ -122,6 +122,32 @@ async def test_bounded_wait_wakes_when_grace_elapses():
     assert elapsed < _GRACE + 2.0
 
 
+async def test_line_reached_wait_returns_despite_trailing_run():
+    """wait_until_line_reached_bounded keys on the FRONTIER, not prefix-quiet: it
+    returns as soon as the dest line leaves unprocessed, even with an earlier
+    command still running (so the eval loop can decide complete vs in_progress)."""
+    tracker = ProcessingTracker()
+    await tracker.update({
+        "background_unprocessed1": [],
+        "background_running1": [(7, 0, 7, 0)],
+    })
+    ok = await tracker.wait_until_line_reached_bounded(
+        LSPLine(9), timeout=5.0, health_check=_noop_health_check,
+    )
+    assert ok
+    # The prefix is NOT quiet — line 7 is still running — yet the wait returned.
+    assert not tracker.range_processed(LSPLine(0), LSPLine(9))
+
+
+async def test_line_reached_wait_times_out_when_unreached():
+    tracker = ProcessingTracker()
+    await tracker.update({"background_unprocessed1": [(3, 0, 9, 0)]})
+    ok = await tracker.wait_until_line_reached_bounded(
+        LSPLine(5), timeout=0.1, health_check=_noop_health_check,
+    )
+    assert not ok
+
+
 async def test_reset_keeps_global_grace():
     """reset() clears per-file decoration state; the global edit clock is not
     per-file state and must survive (the edit still happened)."""

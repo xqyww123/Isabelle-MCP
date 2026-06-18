@@ -167,9 +167,15 @@ class FileSnapshot:
     errors: list[tuple[int, int]] = field(default_factory=list)
     warnings: list[tuple[int, int]] = field(default_factory=list)
     running: list[tuple[int, int]] = field(default_factory=list)
+    # Unprocessed spans of the target file within the evaluated prefix [0, dest]:
+    # commands not yet finished (forked-but-queued proofs, or lines the frontier has
+    # not closed). Surfaced so an in_progress snapshot never renders a bare "clean"
+    # while work remains. Only the evaluation target carries these (dest-clipped).
+    pending: list[tuple[int, int]] = field(default_factory=list)
     error_count: int = 0
     warning_count: int = 0
     running_count: int = 0
+    pending_count: int = 0
 
 
 @dataclass

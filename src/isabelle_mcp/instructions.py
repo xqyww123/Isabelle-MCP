@@ -43,6 +43,12 @@ progress. You must keep polling `isabelle_evaluation_status` to watch it through
 it reports progress (per-theory percentage and command counts), any new errors,
 and which commands are still running and for how long.
 
+A result is only reported `clean`/`complete` once the proofs up to your target have fully
+checked — including forked proofs running in the background. If a result shows `running:` or
+`pending:` line numbers, work is still in flight there: keep polling `isabelle_evaluation_status`
+until those clear before trusting a clean verdict (a proof that ultimately fails surfaces its
+error only when its fork joins).
+
 Watch for a stuck evaluation — a bad edit can make a command loop forever.
 A stuck command burns large amounts of CPU and can bog down the whole system, so
 cancel it promptly: cancel with `isabelle_cancel_evaluation`, fix the command,

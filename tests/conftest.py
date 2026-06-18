@@ -56,16 +56,26 @@ def temp_theory_with_errors(tmp_path):
 
 
 class MockProcessingTracker:
-    """ProcessingTracker stub where everything is already processed."""
+    """ProcessingTracker stub where everything is already processed.
 
-    def __init__(self, *, all_processed: bool = True):
+    *frontier* (line_reached) and *quiet* (range_processed) default to
+    *all_processed* but can be set independently to model "frontier reached the
+    target but a trailing fork in the prefix is still in flight".
+    """
+
+    def __init__(
+        self, *, all_processed: bool = True,
+        frontier: bool | None = None, quiet: bool | None = None,
+    ):
         self._all_processed = all_processed
+        self._frontier = all_processed if frontier is None else frontier
+        self._quiet = all_processed if quiet is None else quiet
 
     def range_processed(self, start_line: LSPLine, end_line: LSPLine) -> bool:
-        return self._all_processed
+        return self._quiet
 
     def line_reached(self, line: int) -> bool:
-        return self._all_processed
+        return self._frontier
 
     def line_running(self, line: int) -> bool:
         return False
@@ -96,7 +106,13 @@ class MockProcessingTracker:
         self, start_line: LSPLine, end_line: LSPLine,
         timeout: float = 5.0, health_check=None, check_interval: float = 5.0,
     ) -> bool:
-        return self._all_processed
+        return self._quiet
+
+    async def wait_until_line_reached_bounded(
+        self, line: LSPLine,
+        timeout: float = 5.0, health_check=None, check_interval: float = 5.0,
+    ) -> bool:
+        return self._frontier
 
 
 class MockLSPClient:
