@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.0
+
+- New `isabelle_find_theorems` tool: search the theorem database in the
+  proof/theory context at a position (like Isabelle's `find_theorems`), with
+  name/pattern/intro/elim/dest/solves/simp criteria. Requires
+  `my-better-isabelle-prover>=0.1.1`, which ships the `PIDE/find_theorems`
+  query patch the tool drives.
+- Tool-call cancellation is now leak- and orphan-free. MCP runs each tool
+  handler in an anyio cancel scope that re-delivers the cancellation at every
+  checkpoint; the evaluation paths previously left `evaluation_state.active`
+  stuck `True` on a cancel (wedging every later `isabelle_evaluate_to`) and
+  could orphan auto-opened dependency documents on the server. Evaluation state
+  is now reset synchronously before any cleanup await (covering the heap grace
+  re-check and `cancel_evaluation`'s `force_interrupt`), auto-opened documents
+  are tracked before the opening await and closed under a bounded shield so a
+  cancel can neither skip nor hang their cleanup, and `open_document` registers
+  the document before sending `didOpen` so a cancel there cannot orphan it.
+
 ## 0.1.4
 
 - `isabelle_evaluate_to`/`isabelle_evaluation_status` no longer report a file
