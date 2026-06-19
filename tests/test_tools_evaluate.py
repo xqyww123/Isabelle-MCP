@@ -529,6 +529,162 @@ class TestLatchRegression:
         assert view.status == "complete"
 
 
+class TestCancelSafety:
+    """v4 cancel-safety regression guards: a CancelledError on ANY evaluate_to
+    await must reset evaluation_state.active (not wedge the :523 guard) and must not
+    orphan auto-opened docs. Each test reds on the pre-v4 code (`except Exception`
+    misses CancelledError / reset-after-await / grace re-check outside the try /
+    F2 add-after-open)."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_in_first_wait_loop_resets_state(
+        self, temp_theory_file, mock_lsp_client, monkeypatch,
+    ):
+        import asyncio
+
+        async def fake_loop(client, file_path, dest_line, state, timeout):
+            state.auto_opened_files.add("/tmp/Dep_cancel.thy")
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(ev, "_evaluation_wait_loop", fake_loop)
+        with pytest.raises(asyncio.CancelledError):
+            await evaluate_to(mock_lsp_client, temp_theory_file, 5)
+        # except BaseException ran: active reset, detached snapshot cleaned.
+        assert evaluation_state.active is False
+        assert evaluation_state.auto_opened_files == set()
+
+    @pytest.mark.asyncio
+    async def test_cancel_in_complete_cleanup_resets_state(
+        self, temp_theory_file, mock_lsp_client, monkeypatch,
+    ):
+        import asyncio
+
+        async def fake_loop(client, file_path, dest_line, state, timeout):
+            state.auto_opened_files.add("/tmp/Dep_complete.thy")
+            return "complete", [], []
+
+        async def boom_close(file_path):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(ev, "_evaluation_wait_loop", fake_loop)
+        monkeypatch.setattr(mock_lsp_client, "close_document", boom_close)
+        with pytest.raises(asyncio.CancelledError):
+            await evaluate_to(mock_lsp_client, temp_theory_file, 5)
+        # 改动 D: complete() runs BEFORE the cleanup await, so active is reset even
+        # though the cleanup is cancelled; the finally still discards the path.
+        assert evaluation_state.active is False
+        assert evaluation_state.auto_opened_files == set()
+
+    @pytest.mark.asyncio
+    async def test_cancel_in_grace_recheck_resets_state(
+        self, temp_theory_file, mock_lsp_client, monkeypatch,
+    ):
+        import asyncio
+        import os
+
+        from isabelle_mcp import processing
+
+        mock_lsp_client.heap_sources = {os.path.realpath(temp_theory_file)}
+        monkeypatch.setattr(processing, "DECORATION_GRACE", 100.0)
+        processing.note_edit_sent()  # open the grace window → _grace_remaining() > 0
+
+        calls = []
+
+        async def fake_loop(client, file_path, dest_line, state, timeout):
+            calls.append(1)
+            if len(calls) == 1:
+                return "in_progress", [], []
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(ev, "_evaluation_wait_loop", fake_loop)
+        with pytest.raises(asyncio.CancelledError):
+            await evaluate_to(mock_lsp_client, temp_theory_file, 5)
+        # The cancel landed on the SECOND (grace re-check) wait loop, now inside the
+        # try; 改动 C/F1 resets state instead of leaking active=True.
+        assert calls == [1, 1]
+        assert evaluation_state.active is False
+
+    @pytest.mark.asyncio
+    async def test_f2_pretracks_dep_before_cancelled_open(
+        self, mock_lsp_client, monkeypatch,
+    ):
+        import asyncio
+
+        from isabelle_mcp.lsp_client import _canon
+
+        dep = "/tmp/Dep_f2_pretrack.thy"
+        canon = _canon(dep)
+
+        async def status():
+            return [{
+                "node_name": dep, "theory_name": "D", "external": False,
+                "imports": [], "ok": False, "total": 1, "unprocessed": 0,
+                "running": 0, "warned": 0, "failed": 1, "finished": 0,
+                "canceled": False, "consolidated": False, "percentage": 0,
+            }]
+
+        async def open_cancel(file_path, *a, **k):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(mock_lsp_client, "request_theory_status", status)
+        monkeypatch.setattr(mock_lsp_client, "open_document", open_cancel)
+        evaluation_state.auto_opened_files = set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await ev._build_status_snapshot(mock_lsp_client, evaluation_state)
+        # F2: the node is tracked BEFORE the cancellable open await, so a cancel there
+        # leaves it recoverable (a later cleanup closes it) rather than orphaned.
+        assert canon in evaluation_state.auto_opened_files
+        evaluation_state.auto_opened_files = set()  # don't leak into later tests
+
+    @pytest.mark.asyncio
+    async def test_cleanup_closes_all_under_outer_cancel(
+        self, mock_lsp_client, monkeypatch,
+    ):
+        import anyio
+
+        closed = []
+
+        async def rec_close(path):
+            await anyio.sleep(0)  # checkpoint where a re-delivered cancel would fire
+            closed.append(path)
+
+        monkeypatch.setattr(mock_lsp_client, "close_document", rec_close)
+        evaluation_state.auto_opened_files = {"/tmp/A.thy", "/tmp/B.thy", "/tmp/C.thy"}
+        with anyio.CancelScope() as scope:
+            scope.cancel()
+            await ev._cleanup_auto_opened(mock_lsp_client, evaluation_state)
+        # S1: each close is shielded, so ALL paths close despite the cancelled scope
+        # (v4 without the shield aborted at the first close, orphaning the rest — it
+        # actually closed ZERO, leaving the un-iterated paths tracked).
+        assert sorted(closed) == ["/tmp/A.thy", "/tmp/B.thy", "/tmp/C.thy"]
+        assert evaluation_state.auto_opened_files == set()
+        evaluation_state.auto_opened_files = set()
+
+    @pytest.mark.asyncio
+    async def test_cancel_evaluation_resets_state_when_force_interrupt_cancelled(
+        self, temp_theory_file, mock_lsp_client, monkeypatch,
+    ):
+        import asyncio
+
+        from isabelle_mcp.evaluation import cancel_evaluation
+
+        evaluation_state.start(temp_theory_file, MCPLine(5))  # active=True, in progress
+        evaluation_state.auto_opened_files.add("/tmp/Dep_cancel_eval.thy")
+
+        async def boom(fp):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(mock_lsp_client, "force_interrupt", boom)
+        with pytest.raises(asyncio.CancelledError):
+            await cancel_evaluation(mock_lsp_client)
+        # S3: the try/finally reset state even though force_interrupt was cancelled
+        # before evaluation_state.cancel() could run (else active wedges every later
+        # evaluate_to).
+        assert evaluation_state.active is False
+        assert evaluation_state.auto_opened_files == set()
+
+
 class TestLockedSync:
     @pytest.mark.asyncio
     async def test_sync_file_locked_pushes_single_path(self, mock_lsp_client):

@@ -379,6 +379,39 @@ class TestIsabelleLSPClient:
             Path(temp_file).unlink()
 
     @pytest.mark.asyncio
+    async def test_open_document_registers_before_didopen(self):
+        # S2: registration must precede the didOpen send, so a cancel re-delivered at
+        # the didOpen drain still leaves an open_documents entry — close_document can
+        # then send the matching didClose instead of orphaning a server-opened doc.
+        import asyncio
+
+        from isabelle_mcp.lsp_client import _canon
+
+        client = IsabelleLSPClient()
+        client.process = MagicMock()
+        client.process.stdin = MagicMock()
+        client.process.stdin.write = MagicMock()
+        client.process.stdin.drain = AsyncMock()
+
+        async def notify_cancel(method, params):
+            if method == "textDocument/didOpen":
+                raise asyncio.CancelledError()
+
+        client.notify = notify_cancel
+
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.thy', delete=False) as f:
+            f.write("theory Test imports Main begin end")
+            temp_file = f.name
+
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await client.open_document(temp_file, wait_for_diagnostics=False)
+            assert _canon(temp_file) in client.open_documents
+        finally:
+            Path(temp_file).unlink()
+
+    @pytest.mark.asyncio
     async def test_close_document(self):
         client = IsabelleLSPClient()
         client.process = MagicMock()

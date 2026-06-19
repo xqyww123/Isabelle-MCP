@@ -11,6 +11,7 @@ PIDE/cancel_execution for global cancellation.
 
 from __future__ import annotations
 
+import anyio
 import asyncio
 import io
 import logging
@@ -19,7 +20,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
-from isabelle_mcp.lsp_client import IsabelleLSPClient, _stat_sig, _stat_sigs
+from isabelle_mcp.lsp_client import IsabelleLSPClient, _canon, _stat_sig, _stat_sigs
 from isabelle_mcp.models import (
     EvaluationView,
     FileSnapshot,
@@ -50,6 +51,11 @@ HEAP_POLL_INTERVAL: float = 3.0
 # During a long evaluation, re-stat open docs at most this often (seconds) so an
 # edit landing mid-evaluation is still pushed, without stat'ing on every wakeup.
 _LONG_EVAL_RESTAT_INTERVAL: float = 3.0
+
+# Per-document close budget during cancel cleanup: each close is shielded from a
+# re-delivered cancel so every auto-opened doc is actually closed (not orphaned), but
+# bounded so a stalled stdin.drain() cannot hang an already-cancelled request.
+_CLOSE_TIMEOUT: float = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -266,13 +272,24 @@ async def _build_status_snapshot(
     theories = [_parse_theory_status(t) for t in raw_theories]
 
     for t in theories:
-        if not t.ok and t.node_name and t.node_name not in evaluation_state.auto_opened_files:
-            if client.open_documents.get(t.node_name) is None:
+        if not t.ok and t.node_name:
+            # Canonicalize so the open_documents membership check (keyed by _canon)
+            # and auto_opened_files agree with open_document/close_document, which
+            # both apply _canon — otherwise a symlinked node_name desyncs them.
+            node = _canon(t.node_name)
+            if (node not in evaluation_state.auto_opened_files
+                    and client.open_documents.get(node) is None):
+                # Track BEFORE the await: open_document registers the node in
+                # client.open_documents and sends didOpen before its trailing
+                # wait_for_first_diagnostics await, where anyio may re-deliver a
+                # cancel. Adding only after would orphan a server-opened doc that
+                # _cleanup_auto_opened (it closes only this set) never closes.
+                evaluation_state.auto_opened_files.add(node)
                 try:
-                    await client.open_document(t.node_name)
-                    evaluation_state.auto_opened_files.add(t.node_name)
+                    await client.open_document(node)
                 except OSError:
-                    pass
+                    # open failed before didOpen (e.g. unreadable path) → untrack.
+                    evaluation_state.auto_opened_files.discard(node)
 
     running_commands = client.get_all_running_commands()
     return theories, running_commands
@@ -456,12 +473,25 @@ def _snapshot_files(
 async def _cleanup_auto_opened(
     client: IsabelleLSPClient, state: EvaluationState,
 ) -> None:
-    for path in state.auto_opened_files:
+    # Snapshot the paths synchronously, BEFORE the first await: anyio re-delivers the
+    # cancel at every checkpoint and a concurrent evaluate_to may flip ``active`` and
+    # re-register files via start() — neither must race the read. Callers flip active
+    # (cancel/complete) immediately before this call with no await in between, so the
+    # snapshot is atomic w.r.t. the active flip.
+    #
+    # Each close is SHIELDED (anyio is level-triggered: a cancel is re-delivered at
+    # every checkpoint, so without shielding the first close would abort the loop and
+    # orphan the not-yet-closed docs — a later start() wipes the set, leaking them on
+    # the server). The shield is bounded by _CLOSE_TIMEOUT so a stalled stdin.drain()
+    # can never hang an already-cancelled request. Discard each path after its attempt.
+    for path in list(state.auto_opened_files):
         try:
-            await client.close_document(path)
+            with anyio.move_on_after(_CLOSE_TIMEOUT, shield=True):
+                await client.close_document(path)
         except Exception:
             logger.warning("Failed to close auto-opened file %s", path, exc_info=True)
-    state.auto_opened_files.clear()
+        finally:
+            state.auto_opened_files.discard(path)
 
 
 # ---------------------------------------------------------------------------
@@ -556,21 +586,27 @@ async def evaluate_to(
             client, file_path, dest_line, evaluation_state,
             HEAP_POLL_INTERVAL if heap_warning else EVAL_POLL_INTERVAL,
         )
-    except Exception:
-        await _cleanup_auto_opened(client, evaluation_state)
-        evaluation_state.cancel()
-        raise
 
-    if heap_warning and status != "complete" and evaluation_state.active:
-        # The miss may be only the post-edit grace gate (a concurrent edit
-        # re-armed it inside the short heap budget) — an unmodified precompiled
-        # file replays instantly once the gate opens. Re-check past the gate
-        # before declaring the file divergent and telling the agent not to retry.
-        grace = _grace_remaining()
-        if grace > 0:
-            status, theories, running_commands = await _evaluation_wait_loop(
-                client, file_path, dest_line, evaluation_state, grace + 0.2,
-            )
+        if heap_warning and status != "complete" and evaluation_state.active:
+            # The miss may be only the post-edit grace gate (a concurrent edit
+            # re-armed it inside the short heap budget) — an unmodified precompiled
+            # file replays instantly once the gate opens. Re-check past the gate
+            # before declaring the file divergent and telling the agent not to retry.
+            grace = _grace_remaining()
+            if grace > 0:
+                status, theories, running_commands = await _evaluation_wait_loop(
+                    client, file_path, dest_line, evaluation_state, grace + 0.2,
+                )
+    except BaseException:
+        # CancelledError is a BaseException (the old ``except Exception`` missed it)
+        # and anyio re-delivers it at EVERY checkpoint, so it can fire on either
+        # wait-loop await. Reset synchronously FIRST (no checkpoint → always runs),
+        # then close the detached snapshot — _cleanup_auto_opened shields each close so
+        # it completes despite the re-delivered cancel and cannot hang (bounded by
+        # _CLOSE_TIMEOUT). Mirrors isabelle_launch's cancellation cleanup.
+        evaluation_state.cancel()
+        await _cleanup_auto_opened(client, evaluation_state)
+        raise
 
     dest = int(dest_line)
     auto_opened = set(evaluation_state.auto_opened_files)
@@ -580,8 +616,8 @@ async def evaluate_to(
     if heap_warning and status != "complete":
         # The file differs from its precompiled copy, so PIDE will never
         # reprocess it — abandon the evaluation instead of leaving it pending.
-        await _cleanup_auto_opened(client, evaluation_state)
         evaluation_state.cancel()
+        await _cleanup_auto_opened(client, evaluation_state)
         status = "cancelled"
         message = (
             "Evaluation abandoned: the file differs from its precompiled copy "
@@ -594,8 +630,8 @@ async def evaluate_to(
             else _in_progress_message(running_commands)
         )
         if status == "complete":
-            await _cleanup_auto_opened(client, evaluation_state)
             evaluation_state.complete()
+            await _cleanup_auto_opened(client, evaluation_state)
     return EvaluationView(
         status=status,
         destination_line=dest,
@@ -649,8 +685,8 @@ async def evaluation_status(
     # ``active`` is False the cleanup already ran and we are merely surfacing a
     # lingering fork, which must stay visible (not collapse back to "complete").
     if evaluation_state.active and complete:
-        await _cleanup_auto_opened(client, evaluation_state)
         evaluation_state.complete()
+        await _cleanup_auto_opened(client, evaluation_state)
         return EvaluationView(
             status="complete",
             destination_line=dest,
@@ -761,9 +797,15 @@ async def cancel_evaluation(
         running = client.get_all_running_commands()
         fp = evaluation_state.file_path or (running[0].file_path if running else "")
         dest = int(evaluation_state.destination_line)
-        await client.force_interrupt(fp)
-        await _cleanup_auto_opened(client, evaluation_state)
-        evaluation_state.cancel()
+        # Guard force_interrupt: a re-delivered cancel on any of its awaits (the cancel
+        # request + 2 notifies) must still reset state, else active stays True and wedges
+        # every later evaluate_to. cancel() is synchronous; _cleanup_auto_opened is
+        # self-shielding so its closes complete despite the cancel.
+        try:
+            await client.force_interrupt(fp)
+        finally:
+            evaluation_state.cancel()
+            await _cleanup_auto_opened(client, evaluation_state)
         return EvaluationView(
             status="cancelled",
             destination_line=dest,

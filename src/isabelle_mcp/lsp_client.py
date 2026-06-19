@@ -1087,6 +1087,15 @@ class IsabelleLSPClient:
         event = asyncio.Event()
         self._first_diagnostic_event[file_path] = event
 
+        # Register in open_documents BEFORE didOpen: notify -> _send awaits stdin.drain(),
+        # a cancel checkpoint. If registration lagged the didOpen, a re-delivered cancel
+        # there would leave the server holding the doc with no open_documents entry, so
+        # close_document (which pops that dict) could never send the matching didClose —
+        # an orphan. Registering first keeps the two in sync under cancellation.
+        self.open_documents[file_path] = DocumentState(
+            file_path=file_path, uri=uri, version=1, content=content,
+            stat_sig=_stat_sig(file_path),
+        )
         await self.notify("textDocument/didOpen", {
             "textDocument": {
                 "uri": uri,
@@ -1095,10 +1104,6 @@ class IsabelleLSPClient:
                 "text": content,
             }
         })
-        self.open_documents[file_path] = DocumentState(
-            file_path=file_path, uri=uri, version=1, content=content,
-            stat_sig=_stat_sig(file_path),
-        )
         note_edit_sent()  # didOpen pushes content: an edit-send like any other
         self._add_file_watch(file_path)
 
