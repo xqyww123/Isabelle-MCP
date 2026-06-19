@@ -27,6 +27,7 @@ from isabelle_mcp.instructions import get_instructions
 from isabelle_mcp.lsp_client import IsabelleLSPClient
 from isabelle_mcp.models import (
     DeclarationLocation,
+    FindTheoremsResult,
     GoalState,
     HoverInfo,
     LocalOccurrencesResult,
@@ -35,6 +36,7 @@ from isabelle_mcp.models import (
 from isabelle_mcp.tools import (
     command_output,
     declaration_location,
+    find_theorems,
     format_command_output,
     goal,
     hover_info,
@@ -422,6 +424,70 @@ async def isabelle_goal(
     file_path = os.path.realpath(file_path)
     lsp = await _ensure_lsp_started()
     return await goal(lsp, file_path, MCPLine(line), after_text)
+
+
+@mcp.tool()
+async def isabelle_find_theorems(
+    file_path: str,
+    line: int,
+    after_text: str | None = None,
+    names: list[str] | None = None,
+    exclude_names: list[str] | None = None,
+    intro: bool | None = None,
+    elim: bool | None = None,
+    dest: bool | None = None,
+    solves: bool | None = None,
+    patterns: list[str] | None = None,
+    exclude_patterns: list[str] | None = None,
+    simp: list[str] | None = None,
+    exclude_simp: list[str] | None = None,
+    limit: int | None = None,
+    allow_duplicates: bool = False,
+) -> FindTheoremsResult:
+    """Search the theorem database, like Isabelle's ``find_theorems``.
+
+    The search runs in the proof/theory context at the given position (resolved
+    like isabelle_goal: ``line`` + optional ``after_text``). Criteria are combined
+    conjunctively; each returns matching theorems as name + statement. Auto-
+    evaluates the line first if needed; requires a launched session.
+
+    IMPORTANT — position matters: the goal-relative criteria (``intro``/``elim``/
+    ``dest``/``solves`` and bare ``patterns`` that use schematic ``_`` against the
+    current goal) only make sense when the caret is INSIDE an open proof. Using
+    ``intro``/``elim``/``dest``/``solves`` at a theory-level caret (no goal) is an
+    error and is surfaced as such. Name/pattern searches work in any context.
+
+    Args:
+        file_path: Absolute path to .thy file.
+        line: Line number (1-indexed) — the context to search in.
+        after_text: Optional text on the line; the command right after it is the
+            context. Without it, the command at the end of the line is used.
+        names: Each restricts to facts whose name CONTAINS the string (a substring
+            match, with ``*`` as a wildcard — e.g. "add" also matches "padd_0");
+            multiple names are AND-ed.
+        exclude_names: Like ``names`` but excludes matches (``-name:``).
+        intro/elim/dest/solves: Tri-state — True = must be such a rule (or, for
+            ``solves``, must solve the current goal); False = must NOT be; None =
+            don't care.
+        patterns: Term patterns the theorem must match, e.g. "_ + _ = _ + _"
+            (ASCII notation; ``_`` is a wildcard). AND-ed.
+        exclude_patterns: Like ``patterns`` but excluded.
+        simp: Each is a simp-rule LHS pattern the theorem (as a simp rule) must
+            match. exclude_simp excludes.
+        exclude_simp: Like ``simp`` but excluded.
+        limit: Max theorems to return (default ~40, Isabelle's find_theorems_limit).
+        allow_duplicates: Keep alpha-equivalent duplicates (default removes them).
+    """
+    file_path = os.path.realpath(file_path)
+    lsp = await _ensure_lsp_started()
+    return await find_theorems(
+        lsp, file_path, MCPLine(line), after_text,
+        names=names, exclude_names=exclude_names,
+        intro=intro, elim=elim, dest=dest, solves=solves,
+        patterns=patterns, exclude_patterns=exclude_patterns,
+        simp=simp, exclude_simp=exclude_simp,
+        limit=limit, allow_duplicates=allow_duplicates,
+    )
 
 
 @mcp.tool(output_schema=None)

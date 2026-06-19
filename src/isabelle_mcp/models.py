@@ -124,6 +124,39 @@ class CommandOutputResult(BaseModel):
     note: str | None = Field(default=None, description="Warning note (e.g. line still running)")
 
 
+class ThmEntry(BaseModel):
+    name: str = Field(description="Fact name (qualified), suitable for citing in a proof")
+    statement: str = Field(description="The theorem's proposition as rendered by Isabelle")
+
+
+class FindTheoremsResult(BaseModel):
+    command: CommandSpan | None = Field(
+        default=None,
+        description=(
+            "The Isar command at the queried position. None if no command sits exactly "
+            "there. When command is None but theorems/found are present, the caret was "
+            "between commands and the search ran in the preceding command's context "
+            "(see note); None does NOT by itself mean nothing was searched."
+        ),
+    )
+    found: int | None = Field(
+        default=None,
+        description=(
+            "Total number of theorems matching the criteria, before the display limit. "
+            "None when Isabelle reports only a 'displaying N' tally (no limit cap hit)."
+        ),
+    )
+    displayed: int | None = Field(
+        default=None,
+        description="Number of theorems actually returned in `theorems` (after the limit).",
+    )
+    theorems: list[ThmEntry] = Field(
+        default_factory=list,
+        description="Matching theorems (name + statement), most relevant last as Isabelle orders them.",
+    )
+    note: str | None = Field(default=None, description="Warning/info note (e.g. line still running, unicode rewritten)")
+
+
 class TheoryStatus(BaseModel):
     node_name: str = Field(description="File path from PIDE/theory_status")
     theory_name: str = Field(description="Qualified theory name (e.g. Test.A)")

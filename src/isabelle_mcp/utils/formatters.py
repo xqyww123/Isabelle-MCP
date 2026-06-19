@@ -7,7 +7,7 @@ from typing import Any
 
 from bs4 import BeautifulSoup, NavigableString
 
-from isabelle_mcp.utils.core import LSPCharacter, LSPLine, MCPColumn, MCPLine
+from isabelle_mcp.utils.core import IsabelleToolError, LSPCharacter, LSPLine, MCPColumn, MCPLine
 
 
 def _pide_html_to_text(el: Any) -> str:
@@ -148,6 +148,100 @@ def parse_command_output_html(html: str) -> list[dict[str, str]]:
     parser.feed(html)
     parser.close()
     return parser.messages
+
+
+def _collapse_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _parse_find_theorems_tally(text: str) -> tuple[int | None, int | None]:
+    """Parse find_theorems' tally line into (found, displayed).
+
+    Three shapes are emitted (find_theorems.ML:476-491):
+      - "found N theorem(s)"            with an OPTIONAL same-line "(M displayed)"
+        suffix when the limit truncated the result (returned < found).
+      - "displaying N theorem(s)"       when no limit cap was hit (total unknown).
+      - "found nothing"                 when there were no matches.
+
+    ``text`` must be the output text BEFORE the first theorem item (see
+    parse_find_theorems_from_html): find_theorems first echoes the query criteria
+    — including the user's quoted name/pattern strings — and only then prints the
+    tally, so a criterion literally containing "found 5 theorem(s)" would otherwise
+    be mistaken for the tally. The criteria echo precedes the tally, so we take the
+    LAST "found N" / "displaying N" match in this pre-item region.
+    """
+    if "found nothing" in text:
+        return 0, 0
+    matches = list(re.finditer(r"found (\d+) theorem\(s\)(?:\s*\((\d+) displayed\))?", text))
+    if matches:
+        m = matches[-1]
+        found = int(m.group(1))
+        displayed = int(m.group(2)) if m.group(2) is not None else found
+        return found, displayed
+    matches = list(re.finditer(r"displaying (\d+) theorem\(s\)", text))
+    if matches:
+        return None, int(matches[-1].group(1))
+    return None, None
+
+
+def _split_name_and_statement(text: str) -> tuple[str, str]:
+    """Split a single theorem entry "name: statement" at the first ':'.
+
+    pretty_thm_head (find_theorems.ML:456-458) emits the fact name (with an
+    optional "(i)" index suffix) followed by ":" then a break. Fact names never
+    contain ':', so the first ':' is the boundary.
+    """
+    text = _collapse_ws(text)
+    idx = text.find(":")
+    if idx == -1:
+        return "", text
+    return text[:idx].strip(), text[idx + 1 :].strip()
+
+
+def parse_find_theorems_from_html(html: str) -> tuple[int | None, int | None, list[tuple[str, str]]]:
+    """Parse rendered find_theorems output into (found, displayed, [(name, stmt), ...]).
+
+    The wire content is browser HTML (the Scala side routes find_theorems output
+    through Browser_Info.make_html, mirroring PIDE/output_at_position), so the same
+    span-keyed helpers used for goals/command output apply.
+
+    Raises IsabelleToolError when the output carries an Isabelle error message —
+    e.g. "Current goal required for intro search criterion" when a goal-requiring
+    criterion (intro/elim/dest/solves) is used at a non-proof caret. Such an error
+    is embedded in the output body (Query_Operation still reports status finished),
+    so it must be surfaced here rather than returned as a bogus theorem.
+    """
+    if not html:
+        return None, None, []
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Surface embedded ML errors instead of treating them as results.
+    error_nodes = soup.find_all(class_=["error_message", "error"])
+    if error_nodes:
+        msg = _collapse_ws(" ".join(_pide_html_to_text(e) for e in error_nodes))
+        raise IsabelleToolError(msg or "find_theorems failed")
+
+    # Each theorem is a Pretty.item (find_theorems.ML:494); make_html renders it as
+    # <span class="item"> (verified against real wire output). Split on those, like
+    # parse_goals_from_html splits on its markup-derived spans.
+    item_nodes = soup.find_all("span", class_="item")
+
+    # Parse the tally from the text BEFORE the first item only, so neither a
+    # theorem statement nor (via _parse_find_theorems_tally) the criteria echo can
+    # be mistaken for the tally. With no items (e.g. "found nothing"), use all text.
+    if item_nodes:
+        pre_item_strings = item_nodes[0].find_all_previous(string=True)
+        tally_text = _collapse_ws("".join(str(s) for s in reversed(pre_item_strings)))
+    else:
+        tally_text = _collapse_ws(_pide_html_to_text(soup))
+    found, displayed = _parse_find_theorems_tally(tally_text)
+
+    theorems: list[tuple[str, str]] = []
+    for node in item_nodes:
+        entry = _pide_html_to_text(node)
+        if entry.strip():
+            theorems.append(_split_name_and_statement(entry))
+    return found, displayed, theorems
 
 
 def get_line_from_file(file_path: str, line: MCPLine) -> str:
