@@ -160,6 +160,79 @@ def _default_session_dirs() -> list[str]:
     return []
 
 
+# Isabelle reports any prover that dies before the PIDE initialization handshake
+# with a fixed sentinel: "Session startup failed / standard_output terminated /
+# Return code: 127 (COMMAND NOT FOUND)". That 127 is Process_Result.startup_failure,
+# a placeholder that REPLACES the prover's real exit code — it does NOT mean a shell
+# command was missing. Detect it so launch can rewrite it into a meaningful error
+# rather than leaking the misleading text to the agent.
+_STARTUP_FAILURE_MARKERS = ("Session startup failed", "COMMAND NOT FOUND")
+
+
+def _is_startup_failure(exc: BaseException) -> bool:
+    """True when *exc* carries Isabelle's pre-handshake startup-failure sentinel."""
+    msg = str(exc)
+    return any(m in msg for m in _STARTUP_FAILURE_MARKERS)
+
+
+def _heap_unbuilt_error(
+    client: IsabelleLSPClient, *, require_unfinished: bool
+) -> IsabelleToolError | None:
+    """Actionable "rebuild the heap" error when the launch-time build probe found the
+    session's heap chain missing/outdated; ``None`` when the heap looks fine or the
+    verdict does not apply.
+
+    The probe verdict (``isabelle build -n -b``) is the only reliable signal for
+    "is this session built": a heap file merely existing is not enough, because
+    loading validates the whole ancestor chain's consistency, not just presence.
+
+    ``require_unfinished`` gates the strict form used on the server-startup failure
+    path: only substitute this message when the probe positively named unfinished
+    (hence *defined*) sessions, so an undefined-session error — which leaves
+    ``unfinished_sessions`` empty — keeps its own clear wording instead of being
+    mis-reported as a stale heap.
+    """
+    if client.heap_built is not False:
+        return None
+    if any(a in ("-R", "-A") for a in client.extra_args):
+        # -R/-A run the logic on its *requirements* heaps; the session itself need
+        # not be built, so the probe's verdict does not apply.
+        logger.warning("heap freshness gate bypassed: -R/-A in extra args")
+        return None
+    if require_unfinished and not client.unfinished_sessions:
+        return None
+    names = ", ".join(client.unfinished_sessions) \
+        or "some session(s) in the dependency chain"
+    return IsabelleToolError(
+        f"Heap image(s) cannot be verified as up-to-date "
+        f"(outdated, missing, or no build record) for: {names}. "
+        f"Rebuild first ({client.build_hint()}) and call "
+        f"isabelle_launch again — the MCP server never builds sessions itself."
+    )
+
+
+def _startup_failure_error(
+    client: IsabelleLSPClient, orig: BaseException
+) -> IsabelleToolError:
+    """Rewrite Isabelle's opaque startup-failure sentinel into an actionable error.
+
+    Used when the prover died before initialization but the build probe did not
+    pin the cause to a specific unfinished session (so ``_heap_unbuilt_error`` did
+    not fire). Names the likely causes instead of leaking "Return code: 127
+    (COMMAND NOT FOUND)", which reads like a missing shell command but is not.
+    """
+    return IsabelleToolError(
+        f"Isabelle failed to start the prover for session {client.logic!r}: the "
+        f"prover process terminated before initialization. (Isabelle reports this "
+        f"as the generic sentinel 'Return code: 127 (COMMAND NOT FOUND)'; it does "
+        f"NOT mean a shell command was missing.) The usual cause is a missing, "
+        f"outdated, or incompatible heap image somewhere in the session's "
+        f"dependency chain; it can also be the prover being killed (e.g. out of "
+        f"memory). Verify and rebuild the session heap with "
+        f"`{client.build_hint()}`, then relaunch. Underlying prover message: {orig}"
+    )
+
+
 # ── Session management ────────────────────────────────────────────────
 
 
@@ -217,30 +290,40 @@ async def isabelle_launch(
         # precompiled-theory warnings) in parallel with the server start.
         enum_task = asyncio.create_task(_lsp_client.enumerate_heap_sources())
         try:
-            # Fails fast (~4s) on a missing heap (pre-handshake type-1 message
-            # surfaced by _surface_server_message) or an undefined session name
-            # (JSON-RPC error reply to `initialize`).
-            await _lsp_client.start()
-            # Raises when the probe itself could not run (fail-closed).
+            try:
+                # Fails fast (~4s) on a missing heap (pre-handshake type-1
+                # message surfaced by _surface_server_message) or an undefined
+                # session name (JSON-RPC error reply to `initialize`).
+                await _lsp_client.start()
+            except IsabelleToolError as start_exc:
+                # start() failed. Wait for the concurrent build probe so we can
+                # replace an opaque prover error with an actionable one. The
+                # prover dies before its PIDE handshake for a whole class of
+                # reasons (missing/outdated/incompatible heap anywhere in the
+                # chain, OOM, ...) and Isabelle collapses them all into the same
+                # misleading "Return code: 127 (COMMAND NOT FOUND)". Prefer the
+                # precise "rebuild the heap" verdict when the probe positively
+                # names unfinished (hence defined) sessions; otherwise, if this
+                # is that startup-failure sentinel, rewrite it into a generic
+                # startup-failure message. Any other error (e.g. an undefined
+                # session) keeps its own clear wording.
+                with contextlib.suppress(BaseException):
+                    await enum_task
+                heap_err = _heap_unbuilt_error(
+                    _lsp_client, require_unfinished=True
+                )
+                if heap_err is not None:
+                    raise heap_err from start_exc
+                if _is_startup_failure(start_exc):
+                    raise _startup_failure_error(_lsp_client, start_exc) \
+                        from start_exc
+                raise
+            # start() succeeded. Raises when the probe itself could not run
+            # (fail-closed); then reject a loaded-but-stale/unbuilt heap.
             await enum_task
-            if _lsp_client.heap_built is False:
-                if any(a in ("-R", "-A") for a in _lsp_client.extra_args):
-                    # -R/-A run the logic on its *requirements* heaps; the
-                    # session itself need not be built, so the probe's verdict
-                    # does not apply.
-                    logger.warning(
-                        "heap freshness gate bypassed: -R/-A in extra args"
-                    )
-                else:
-                    names = ", ".join(_lsp_client.unfinished_sessions) \
-                        or "some session(s) in the dependency chain"
-                    raise IsabelleToolError(
-                        f"Heap image(s) cannot be verified as up-to-date "
-                        f"(outdated, missing, or no build record) for: {names}. "
-                        f"Rebuild first ({_lsp_client.build_hint()}) and call "
-                        f"isabelle_launch again — the MCP server never builds "
-                        f"sessions itself."
-                    )
+            heap_err = _heap_unbuilt_error(_lsp_client, require_unfinished=False)
+            if heap_err is not None:
+                raise heap_err
         except BaseException:
             # Cancellation-safe cleanup: the synchronous part runs first, so
             # even a CancelledError caught here cannot leave a half-started
