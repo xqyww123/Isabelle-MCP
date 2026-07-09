@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.1
+
+- `isabelle_launch` no longer surfaces Isabelle's opaque `Return code: 127
+  (COMMAND NOT FOUND)` sentinel when the prover dies before the PIDE
+  handshake. That sentinel is a placeholder for the prover's real exit code,
+  not a missing shell command; the usual cause is a missing, outdated, or
+  incompatible heap somewhere in the session's dependency chain. On failure
+  the launch path now consults the concurrent build probe and reports either
+  the actionable `isabelle build -b ...` rebuild message (when the probe names
+  unfinished sessions) or a generic "Isabelle failed to start the prover"
+  message listing likely causes. Errors for undefined sessions are unchanged,
+  and the happy-path probe/start overlap is preserved.
+
 ## 0.2.0
 
 - New `isabelle_find_theorems` tool: search the theorem database in the
