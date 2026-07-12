@@ -188,17 +188,23 @@ def check_isabelle_patched() -> None:
     notwithstanding); the *Isabelle* it inspects is the ``isabelle`` on PATH —
     the same binary :meth:`IsabelleLSPClient.start` is about to spawn.
 
-    Raises IsabelleToolError unless every patch reports "applied".
+    Raises IsabelleToolError unless every ``user`` patch reports "applied". The
+    ``dev`` patches (Isa-REPL, Isa-Mini) are not our concern and are legitimately
+    absent on a stock ``my-better-isabelle patch`` install, so we ask
+    ``--category user`` and gate on the exit code — never on the stdout text.
     """
     try:
         proc = subprocess.run(
-            [sys.executable, "-m", "my_better_isabelle_prover", "-q", "status"],
+            [sys.executable, "-m", "my_better_isabelle_prover",
+             "-q", "status", "--category", "user"],
             capture_output=True, text=True, timeout=120, check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise IsabelleToolError(
             f"Could not check the my-better-isabelle-prover patch status: {exc}"
         ) from exc
+    if proc.returncode == 0:
+        return
     out = (proc.stdout + proc.stderr).strip()
     if "'isabelle' not found" in out:
         raise IsabelleToolError(
@@ -211,14 +217,13 @@ def check_isabelle_patched() -> None:
             "Use a supported Isabelle (or, for a hand-patched setup the patch "
             "manager cannot recognize, start the server with --skip-patch-check)."
         )
-    if proc.returncode != 0 or "[not-applied]" in out or "No patches found" in out:
-        raise IsabelleToolError(
-            "This Isabelle is missing the required my-better-isabelle-prover "
-            "patches:\n" + out + "\n"
-            "Ask the user to apply them (this rebuilds Isabelle's Scala "
-            "components, so it takes a few minutes):\n"
-            "  my-better-isabelle patch"
-        )
+    raise IsabelleToolError(
+        "This Isabelle is missing the required my-better-isabelle-prover "
+        "patches:\n" + out + "\n"
+        "Ask the user to apply them (this rebuilds Isabelle's Scala "
+        "components, so it takes a few minutes):\n"
+        "  my-better-isabelle patch"
+    )
 
 
 @dataclass

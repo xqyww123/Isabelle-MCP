@@ -39,17 +39,32 @@ class TestPatchCheck:
     def test_all_applied_passes(self):
         run = MagicMock(return_value=_status_result(
             0, stdout="Patch status for Isabelle2024:\n"
-                       "  [    applied]  pide_control/lsp.scala.patch  (...)\n",
+                       "  [    applied]  user  pide_control/lsp.scala.patch  (...)\n",
         ))
         self._run(run)  # no raise
         # Invoked via the server's own interpreter (-m), not a PATH lookup: the
         # patch manager is a declared dependency, so this never misses.
         import sys
-        assert run.call_args[0][0][:3] == [sys.executable, "-m", "my_better_isabelle_prover"]
+        cmd = run.call_args[0][0]
+        assert cmd[:3] == [sys.executable, "-m", "my_better_isabelle_prover"]
+        # We ask only about the `user` category — see below.
+        assert cmd[-2:] == ["--category", "user"]
+
+    def test_unapplied_dev_patches_do_not_block(self):
+        # `status` lists every feature, so the `dev` patches (Isa-REPL, Isa-Mini)
+        # legitimately read `[not-applied]` on a stock `my-better-isabelle patch`
+        # install. Gating on that text would deadlock the user: the server would
+        # demand the very command they just ran. The exit code is the verdict.
+        run = MagicMock(return_value=_status_result(
+            0, stdout="  [    applied]  user  pide_control/lsp.scala.patch  (...)\n"
+                      "  [not-applied]  dev   register_thy/thy_info.ML.patch  (...)\n"
+                      "  dev: 0/6 applied · user: 7/7 applied\n",
+        ))
+        self._run(run)  # no raise
 
     def test_not_applied_demands_patch(self):
         run = MagicMock(return_value=_status_result(
-            1, stdout="  [not-applied]  pide_control/lsp.scala.patch  (...)\n",
+            1, stdout="  [not-applied]  user  pide_control/lsp.scala.patch  (...)\n",
         ))
         with pytest.raises(IsabelleToolError, match="my-better-isabelle patch"):
             self._run(run)

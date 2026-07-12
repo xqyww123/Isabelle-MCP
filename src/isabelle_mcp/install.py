@@ -72,11 +72,18 @@ def _check_patches(skip: bool) -> bool:
             "    my-better-isabelle patch",
         )
         return False
+    # `--category user` asks the only question we care about: are the patches the
+    # *user-facing* systems need applied? The `dev` patches (Isa-REPL, Isa-Mini)
+    # are none of our business, and `status` lists them as not-applied on a stock
+    # `my-better-isabelle patch` install. Gate on the exit code, never on stdout.
     proc = subprocess.run(
-        ["my-better-isabelle", "-q", "status"],
+        ["my-better-isabelle", "-q", "status", "--category", "user"],
         capture_output=True,
         text=True,
     )
+    if proc.returncode == 0:
+        print("✓ my-better-isabelle-prover patches applied")
+        return True
     out = proc.stdout + proc.stderr
     indented = "\n".join("  " + line for line in out.splitlines())
     if "no patches available" in out:
@@ -86,15 +93,12 @@ def _check_patches(skip: bool) -> bool:
             "  Isabelle-MCP needs its patches; point --isabelle-bin at a supported Isabelle.",
         )
         return False
-    if proc.returncode != 0 or "[not-applied]" in out or "No patches found" in out:
-        _eprint(
-            "error: this Isabelle is missing the required my-better-isabelle-prover patches:",
-            indented,
-            "  Apply them with: my-better-isabelle patch",
-        )
-        return False
-    print("✓ my-better-isabelle-prover patches applied")
-    return True
+    _eprint(
+        "error: this Isabelle is missing the required my-better-isabelle-prover patches:",
+        indented,
+        "  Apply them with: my-better-isabelle patch",
+    )
+    return False
 
 
 def _run_add(add_cmd: list[str], client: str) -> None:

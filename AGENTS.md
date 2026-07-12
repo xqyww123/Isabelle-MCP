@@ -15,13 +15,20 @@ patches. You MUST install and apply them before anything else:
 
 ```sh
 pip install my-better-isabelle-prover
-my-better-isabelle patch          # apply patches + rebuild the Scala components
-my-better-isabelle status         # verify: every patch reports "applied"
+my-better-isabelle patch          # apply the `user` patches + rebuild the Scala components
+my-better-isabelle status         # verify: exit code 0 means we have what we need
 ```
 
 Patching modifies the Isabelle installation in place, so it needs **write
-access to `ISABELLE_HOME`**. If `status` reports any patch as not-applied,
-**stop immediately and ask the user for help** — do not try to work around it.
+access to `ISABELLE_HOME`**. If `status` exits non-zero, **stop immediately and
+ask the user for help** — do not try to work around it.
+
+**Judge `status` by its exit code, not by its output.** It lists *every* feature,
+including the `dev` ones that serve Isa-REPL / Isa-Mini rather than this server;
+on a stock `my-better-isabelle patch` install those legitimately read
+`[not-applied]`, and that is fine. Isabelle-MCP only needs the `user` category
+(`my-better-isabelle status --category user`), which is exactly what the
+server's own patch check asks for.
 
 Compatibility notes:
 

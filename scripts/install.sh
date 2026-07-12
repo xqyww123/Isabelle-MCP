@@ -98,15 +98,18 @@ elif ! command -v my-better-isabelle >/dev/null 2>&1; then
   echo "    my-better-isabelle patch" >&2
   exit 1
 else
-  STATUS_OUT="$(my-better-isabelle -q status 2>&1)" && STATUS_RC=0 || STATUS_RC=$?
-  if printf '%s\n' "$STATUS_OUT" | grep -q 'no patches available'; then
-    echo "error: this Isabelle version is not supported by my-better-isabelle-prover:" >&2
-    printf '%s\n' "$STATUS_OUT" | sed 's/^/  /' >&2
-    echo "  Isabelle-MCP needs its patches; point --isabelle-bin at a supported Isabelle." >&2
-    exit 1
-  fi
-  if [ "$STATUS_RC" -ne 0 ] \
-     || printf '%s\n' "$STATUS_OUT" | grep -qF -e '[not-applied]' -e 'No patches found'; then
+  # `--category user` asks the only question we care about: are the patches the
+  # user-facing systems need applied? The `dev` patches (Isa-REPL, Isa-Mini) are
+  # none of our business, and `status` lists them as not-applied on a stock
+  # `my-better-isabelle patch` install. Gate on the exit code, never on stdout.
+  STATUS_OUT="$(my-better-isabelle -q status --category user 2>&1)" && STATUS_RC=0 || STATUS_RC=$?
+  if [ "$STATUS_RC" -ne 0 ]; then
+    if printf '%s\n' "$STATUS_OUT" | grep -q 'no patches available'; then
+      echo "error: this Isabelle version is not supported by my-better-isabelle-prover:" >&2
+      printf '%s\n' "$STATUS_OUT" | sed 's/^/  /' >&2
+      echo "  Isabelle-MCP needs its patches; point --isabelle-bin at a supported Isabelle." >&2
+      exit 1
+    fi
     echo "error: this Isabelle is missing the required my-better-isabelle-prover patches:" >&2
     printf '%s\n' "$STATUS_OUT" | sed 's/^/  /' >&2
     echo "  Apply them with: my-better-isabelle patch" >&2

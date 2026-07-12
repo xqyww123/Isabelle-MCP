@@ -75,11 +75,21 @@ class TestPatchCheck:
     @pytest.mark.parametrize(
         "returncode,output,ok",
         [
-            (0, "patch-a [applied]\npatch-b [applied]\n", True),
-            (0, "patch-a [applied]\npatch-b [not-applied]\n", False),
+            # The verdict is the exit code, never the stdout text. `status` lists
+            # every feature, so `dev` patches we deliberately do not need show up
+            # as `[not-applied]` on a stock install — that must NOT block us.
+            (0, "  [    applied]  user  pide_control/lsp.scala.patch  (...)\n", True),
+            (
+                0,
+                "  [    applied]  user  pide_control/lsp.scala.patch  (...)\n"
+                "  [not-applied]  dev   register_thy/thy_info.ML.patch  (...)\n"
+                "  dev: 0/6 applied · user: 7/7 applied\n",
+                True,
+            ),
+            (1, "  [not-applied]  user  pide_control/lsp.scala.patch  (...)\n", False),
             (1, "boom\n", False),
-            (0, "no patches available for Isabelle2023\n", False),
-            (0, "No patches found\n", False),
+            (1, "no patches available for Isabelle2023\n", False),
+            (3, "Error: feature(s) not registered in categories.toml: newthing.\n", False),
         ],
     )
     def test_status_output(self, monkeypatch, returncode, output, ok):
@@ -102,7 +112,11 @@ class TestPatchCheck:
         )
         monkeypatch.setattr(subprocess, "run", run)
         assert install._check_patches(False) is ok
-        assert run.calls == [["my-better-isabelle", "-q", "status"]]
+        # We ask only about the `user` category: the `dev` patches serve Isa-REPL /
+        # Isa-Mini, not this server.
+        assert run.calls == [
+            ["my-better-isabelle", "-q", "status", "--category", "user"]
+        ]
 
 
 @pytest.mark.usefixtures("server_cmd")

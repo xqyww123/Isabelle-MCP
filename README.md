@@ -38,8 +38,13 @@ AI ↔ Isabelle, no-human-in-the-loop model.
 > ```bash
 > pip install my-better-isabelle-prover   # via pip or uv tool; needs Python ≥ 3.12
 > my-better-isabelle patch                # apply patches + rebuild the Scala components
-> my-better-isabelle status               # verify: every patch reports "applied"
+> my-better-isabelle status               # verify: exit code 0 means Isabelle is ready
 > ```
+>
+> `patch` applies the `user` patches, which is exactly what this server needs.
+> `status` additionally *lists* the patch manager's `dev` features (they serve
+> Isa-REPL / Isa-Mini, not this server); those reading `[not-applied]` is normal —
+> judge by the exit code, not the listing.
 >
 > `isabelle-mcp install` checks this (when `isabelle` is reachable) and refuses to
 > register the server against an unpatched Isabelle. The server re-checks at
