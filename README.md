@@ -25,34 +25,24 @@ AI ↔ Isabelle, no-human-in-the-loop model.
 > instance, or interleaving concurrent requests, corrupts the evaluation/caret/
 > document state with catastrophic, hard-to-debug results. The server runs over
 > **stdio**, so each agent already gets its own dedicated server process (and its
-> own `isabelle vscode_server`) — just don't share one or drive it concurrently.
+> own `isabelle mcp_server`) — just don't share one or drive it concurrently.
 
 > [!IMPORTANT]
-> **Patch Isabelle first — this server does not work on a stock Isabelle.** It
-> drives `isabelle vscode_server` through PIDE LSP requests
-> (`PIDE/output_at_position`, `PIDE/cancel_execution`, …) that only exist after
-> applying the
-> [my-better-isabelle-prover](https://github.com/xqyww123/my_better_isabelle_prover)
-> patches:
+> **No Isabelle patch is needed.** Earlier versions required one: the server drove the
+> stock `isabelle vscode_server`, which lacks the PIDE requests it needs, so the
+> distribution had to be patched. It no longer does. Isabelle-MCP now ships its own
+> Isabelle Scala component — `isabelle mcp_server` — and registers it with your Isabelle
+> the first time you launch a session. Nothing is compiled on your machine (the component
+> carries a prebuilt jar and declares `no_build = true`), so `site-packages` may even be
+> read-only, and **no session heap is invalidated**.
 >
-> ```bash
-> pip install my-better-isabelle-prover   # via pip or uv tool; needs Python ≥ 3.12
-> my-better-isabelle patch                # apply patches + rebuild the Scala components
-> my-better-isabelle status               # verify: exit code 0 means Isabelle is ready
-> ```
+> Requirements: **Isabelle2025-2**, with `isabelle` on `PATH` (or pinned with
+> `isabelle-mcp install --isabelle-bin /path/to/Isabelle/bin/isabelle`). Isabelle2024 is
+> no longer supported — see the `last-isabelle2024-support` tag.
 >
-> `patch` applies the `user` patches, which is exactly what this server needs.
-> `status` additionally *lists* the patch manager's `dev` features (they serve
-> Isa-REPL / Isa-Mini, not this server); those reading `[not-applied]` is normal —
-> judge by the exit code, not the listing.
->
-> `isabelle-mcp install` checks this (when `isabelle` is reachable) and refuses to
-> register the server against an unpatched Isabelle. The server re-checks at
-> run time too: every `isabelle_launch` verifies the patches (via its bundled
-> copy of the patch manager) and refuses to start an unpatched Isabelle —
-> bypass with `isabelle-mcp --skip-patch-check` for hand-patched setups the
-> patch manager cannot recognize. Compatibility notes
-> (PEP 668, non-global Isabelle, …) are in [AGENTS.md](AGENTS.md).
+> To undo the registration: `isabelle-mcp uninstall`. If you remove the package without
+> it, Isabelle will print `### Missing Isabelle component: …` on every command until you
+> run `isabelle components -x <the path it names>` — harmless, but noisy.
 
 ## Quick Start
 
@@ -109,7 +99,7 @@ python -m mypy src/                 # type checking
 
 ```
 server.py         FastMCP entry point — tool registration, lifespan
-lsp_client.py     JSON-RPC 2.0 client for isabelle vscode_server
+lsp_client.py     JSON-RPC 2.0 client for isabelle mcp_server
 tools/            Tool implementations (one file per tool)
 utils/            Position conversion, URI handling, HTML parsing
 models.py         Pydantic output models

@@ -1,0 +1,4 @@
+# -*- shell-script -*- :mode=shellscript:
+
+ISABELLE_MCP_SCALA_HOME="$COMPONENT"
+classpath "$ISABELLE_MCP_SCALA_HOME/lib/isabelle_mcp.jar"

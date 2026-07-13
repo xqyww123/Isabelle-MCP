@@ -611,7 +611,6 @@ dependencies = [
     { name = "beautifulsoup4" },
     { name = "fastmcp" },
     { name = "mcp" },
-    { name = "my-better-isabelle-prover" },
     { name = "pydantic" },
     { name = "watchdog" },
 ]
@@ -634,7 +633,6 @@ requires-dist = [
     { name = "coverage", marker = "extra == 'dev'", specifier = ">=7.0.0" },
     { name = "fastmcp", specifier = ">=3.2,<4" },
     { name = "mcp", specifier = ">=1.0.0" },
-    { name = "my-better-isabelle-prover", specifier = ">=0.1.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.0.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
@@ -880,15 +878,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/de/1d/f4da6f02cdffe04d6362210b807146a26044c88d839208aec273bb0d9184/more_itertools-11.1.0.tar.gz", hash = "sha256:48e8f4d9e7e5878571ecf6f2b4e57634f93cd474cc8cfbd2376f2d11b396e30d", size = 145772, upload-time = "2026-05-22T14:14:29.909Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e8/3d/1087453384dbde46a8c7f9356eead2c58be8a7bf156bca40243377c85715/more_itertools-11.1.0-py3-none-any.whl", hash = "sha256:4b65538ae22f6fed0ce4874efd317463a7489796a0939fa66824dd542125a192", size = 72226, upload-time = "2026-05-22T14:14:28.824Z" },
-]
-
-[[package]]
-name = "my-better-isabelle-prover"
-version = "0.1.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/a1/0e/f90bfeba3d259d4709b6e8b1bd71e12bcd1c1ded322efbf2d01dd5afa5f2/my_better_isabelle_prover-0.1.0.tar.gz", hash = "sha256:ec4817d0093c4499a75fdd7eeb7539cb055704600f214c4dfccc5e77db7e3a1c", size = 14490, upload-time = "2026-06-09T19:40:04.081Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/db/9d/fffd6b139499648763f9cbd4bbe0b0ceebac04d8092f9e9c8b84ce84a526/my_better_isabelle_prover-0.1.0-py3-none-any.whl", hash = "sha256:bb392f085ca543741804d03803e52ef4b2c6dd17583646dce617c506a00778ac", size = 19445, upload-time = "2026-06-09T19:40:05.667Z" },
 ]
 
 [[package]]

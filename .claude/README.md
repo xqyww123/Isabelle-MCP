@@ -102,10 +102,12 @@ python -m isabelle_mcp.server
 
 ### LSP Connection Issues
 
-The server requires Isabelle's `vscode_server` to be available:
+The server ships its own Isabelle component, `isabelle mcp_server`, and registers it
+on first launch. Verify it resolves (checking `vscode_server` proves nothing — it
+still works while `mcp_server` is missing):
 
 ```bash
-isabelle vscode_server --help
+isabelle mcp_server -X   # prints 'Usage: isabelle mcp_server'
 ```
 
 If not available, install Isabelle from: https://isabelle.in.tum.de/

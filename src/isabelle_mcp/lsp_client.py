@@ -22,6 +22,7 @@ from isabelle_mcp.processing import (
     parse_decoration_ranges,
 )
 from isabelle_mcp.unicode_guard import record_warning, sanitize_read
+from isabelle_mcp.component import ensure_component
 from isabelle_mcp.utils import (
     IsabelleToolError,
     LSPCharacter,
@@ -63,7 +64,8 @@ _isabelle_version_cache: tuple[str, int | None] | None = None
 # stderr lines matching this surface at WARNING (not DEBUG) so server-side failures
 # — e.g. a swallowed serialization exception — are visible early instead of buried.
 _STDERR_ERROR_RE = re.compile(
-    r"\b(error|exception|fail(?:ed|ure)?|bad json|uncaught|cannot)\b", re.IGNORECASE
+    r"\b(error|exception|fail(?:ed|ure)?|bad json|uncaught|cannot)\b|unknown isabelle tool",
+    re.IGNORECASE,
 )
 
 # Raw wire dump: when ISABELLE_MCP_DUMP names a file, every JSON-RPC frame in/out of
@@ -176,56 +178,6 @@ def read_vscode_load_delay(default: float = 0.5) -> float:
         return default
 
 
-def check_isabelle_patched() -> None:
-    """Refuse to drive an unpatched Isabelle — the runtime twin of the
-    ``scripts/install.sh`` registration check (same classification, same wording).
-
-    The server only works on an Isabelle carrying the my-better-isabelle-prover
-    patches: it speaks PIDE LSP requests (``PIDE/output_at_position``,
-    ``PIDE/cancel_execution``, …) that the stock ``vscode_server`` does not
-    expose. The patch manager is a declared dependency, so it is run through
-    ``sys.executable -m`` (always present in the server's own environment, PATH
-    notwithstanding); the *Isabelle* it inspects is the ``isabelle`` on PATH —
-    the same binary :meth:`IsabelleLSPClient.start` is about to spawn.
-
-    Raises IsabelleToolError unless every ``user`` patch reports "applied". The
-    ``dev`` patches (Isa-REPL, Isa-Mini) are not our concern and are legitimately
-    absent on a stock ``my-better-isabelle patch`` install, so we ask
-    ``--category user`` and gate on the exit code — never on the stdout text.
-    """
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-m", "my_better_isabelle_prover",
-             "-q", "status", "--category", "user"],
-            capture_output=True, text=True, timeout=120, check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise IsabelleToolError(
-            f"Could not check the my-better-isabelle-prover patch status: {exc}"
-        ) from exc
-    if proc.returncode == 0:
-        return
-    out = (proc.stdout + proc.stderr).strip()
-    if "'isabelle' not found" in out:
-        raise IsabelleToolError(
-            "isabelle command not found. Is Isabelle installed and in PATH?"
-        )
-    if "no patches available" in out:
-        raise IsabelleToolError(
-            "This Isabelle version is not supported by my-better-isabelle-prover, "
-            "whose patches Isabelle-MCP requires:\n" + out + "\n"
-            "Use a supported Isabelle (or, for a hand-patched setup the patch "
-            "manager cannot recognize, start the server with --skip-patch-check)."
-        )
-    raise IsabelleToolError(
-        "This Isabelle is missing the required my-better-isabelle-prover "
-        "patches:\n" + out + "\n"
-        "Ask the user to apply them (this rebuilds Isabelle's Scala "
-        "components, so it takes a few minutes):\n"
-        "  my-better-isabelle patch"
-    )
-
-
 @dataclass
 class DocumentState:
     file_path: str
@@ -262,7 +214,6 @@ class IsabelleLSPClient:
         verbose: bool = False,
         extra_args: list[str] | None = None,
         project_root: str | None = None,
-        skip_patch_check: bool = False,
     ):
         self.logic = logic
         self.session_dirs = session_dirs or []
@@ -278,10 +229,6 @@ class IsabelleLSPClient:
         # session unbuilt/outdated (named in unfinished_sessions when known).
         self.heap_built: bool | None = None
         self.unfinished_sessions: list[str] = []
-        # Skip the my-better-isabelle-prover patch verification at start() — for
-        # hand-patched setups the patch manager cannot recognize (isabelle-mcp
-        # --skip-patch-check; the install.sh flag of the same name passes it).
-        self.skip_patch_check = skip_patch_check
         # Base directory for relativizing displayed paths. ``None`` (the current
         # placeholder) → renderers show absolute paths. A real per-agent root will
         # be set with the stdio-per-agent refactor.
@@ -399,13 +346,16 @@ class IsabelleLSPClient:
         # stale handshake flag or another session's startup errors behind.
         self._handshake_done = False
         self.startup_errors = []
-        if not self.skip_patch_check:
-            check_isabelle_patched()
+        # `isabelle mcp_server` is provided by the Scala component we ship. Registering it is
+        # cheap and idempotent (a single file read once it is in place), and it must happen here
+        # rather than at import: another install can evict our registration at any moment, and a
+        # memoised process would then silently spawn the *other* install's jar and ML prelude.
+        ensure_component()
         cmd = [
             # -n: never build the session heap implicitly — a missing heap would
             # otherwise turn launch into a silent, hour-scale build that looks
             # like a hang. Build status is checked explicitly at launch instead.
-            "isabelle", "vscode_server", "-n", "-l", self.logic,
+            "isabelle", "mcp_server", "-n", "-l", self.logic,
             "-o", "vscode_pide_extensions",
             "-o", unicode_symbols_option(),
             "-o", "vscode_caret_perspective=1",
@@ -757,6 +707,17 @@ class IsabelleLSPClient:
         except Exception as e:
             logger.error(f"Read loop failed: {e}", exc_info=True)
             self._fail_pending_waiters(IsabelleToolError(f"LSP read loop failed: {e}"))
+            return
+        # Clean EOF: the server closed stdout without answering. That is a prover that died before
+        # the handshake — e.g. `isabelle mcp_server` does not exist, so bash printed to stderr and
+        # exited. Waking the waiters here is what turns a content-free 30 s `initialize` timeout
+        # into the child's own words.
+        self._fail_pending_waiters(
+            IsabelleToolError(
+                "The Isabelle server exited before the LSP handshake."
+                + (f"\n{chr(10).join(self.startup_errors)}" if self.startup_errors else "")
+            )
+        )
 
     async def _read_message(self) -> JsonDict | None:
         if not self.process or not self.process.stdout:

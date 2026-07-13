@@ -1,0 +1,22 @@
+title = Isabelle-MCP language server
+module = lib/isabelle_mcp.jar
+no_build = true
+requirements = \
+  env:ISABELLE_SCALA_JAR
+sources = \
+  src/channel.scala \
+  src/dynamic_output.scala \
+  src/language_server.scala \
+  src/lsp.scala \
+  src/mcp_main.scala \
+  src/pretty_text_panel.scala \
+  src/preview_panel.scala \
+  src/state_panel.scala \
+  src/vscode_model.scala \
+  src/vscode_rendering.scala \
+  src/vscode_resources.scala \
+  src/vscode_session.scala \
+  src/vscode_sledgehammer.scala \
+  src/vscode_spell_checker.scala
+services = \
+  isabelle.mcp.Tools

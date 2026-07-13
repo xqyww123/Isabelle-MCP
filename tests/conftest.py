@@ -332,3 +332,16 @@ def sample_diagnostics():
         {"range": {"start": {"line": 4, "character": 0}, "end": {"line": 4, "character": 10}}, "severity": 1, "message": "Type error: expected nat, got bool"},
         {"range": {"start": {"line": 7, "character": 0}, "end": {"line": 7, "character": 5}}, "severity": 2, "message": "Unused variable"},
     ]
+
+
+@pytest.fixture(autouse=True)
+def _reset_component_cache():
+    """Isolate component.py's process-wide resolution.
+
+    `_resolve()` memoises the isabelle binary, its identifier and ISABELLE_HOME_USER — they cannot
+    change while the server runs. Tests, however, fake PATH and `isabelle` freely, so a poisoned
+    entry would leak into every later test (including the ones that talk to a real Isabelle)."""
+    from isabelle_mcp.component import _resolve
+    _resolve.cache_clear()
+    yield
+    _resolve.cache_clear()

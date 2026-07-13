@@ -19,6 +19,10 @@ def _eprint(*lines: str) -> None:
         print(line, file=sys.stderr)
 
 
+from isabelle_mcp.component import ensure_component, unregister_component
+from isabelle_mcp.utils import IsabelleToolError
+
+
 def _find_server_command() -> str | None:
     """Locate the installed ``isabelle-mcp`` command as an absolute path.
 
@@ -38,67 +42,6 @@ def _find_server_command() -> str | None:
     ):
         return os.path.abspath(argv0)
     return None
-
-
-def _check_patches(skip: bool) -> bool:
-    """Verify the my-better-isabelle-prover patches are applied.
-
-    The server only works on an Isabelle carrying the my-better-isabelle-prover
-    patches: it drives ``isabelle vscode_server`` through PIDE requests
-    (PIDE/output_at_position, PIDE/cancel_execution, ...) that the stock build
-    does not expose. Returns False to refuse the registration; the check is
-    skipped only when ``isabelle`` itself is unreachable.
-    """
-    if skip:
-        _eprint(
-            "warn: --skip-patch-check given; the my-better-isabelle-prover patch check",
-            "      was skipped here and will be skipped at every session launch too.",
-            "      The server only works on a patched Isabelle.",
-        )
-        return True
-    if shutil.which("isabelle") is None:
-        _eprint(
-            "warn: 'isabelle' is not on PATH; the server will fail to launch a session,",
-            "      and the my-better-isabelle-prover patch check was skipped.",
-            "      Re-run with --isabelle-bin /path/to/Isabelle/bin/isabelle to pin it.",
-        )
-        return True
-    if shutil.which("my-better-isabelle") is None:
-        _eprint(
-            "error: 'my-better-isabelle' not found on PATH.",
-            "  Isabelle-MCP requires the my-better-isabelle-prover patches. Install the",
-            "  patch manager and apply them first:",
-            "    pip install my-better-isabelle-prover   # or: uv tool / pipx install",
-            "    my-better-isabelle patch",
-        )
-        return False
-    # `--category user` asks the only question we care about: are the patches the
-    # *user-facing* systems need applied? The `dev` patches (Isa-REPL, Isa-Mini)
-    # are none of our business, and `status` lists them as not-applied on a stock
-    # `my-better-isabelle patch` install. Gate on the exit code, never on stdout.
-    proc = subprocess.run(
-        ["my-better-isabelle", "-q", "status", "--category", "user"],
-        capture_output=True,
-        text=True,
-    )
-    if proc.returncode == 0:
-        print("✓ my-better-isabelle-prover patches applied")
-        return True
-    out = proc.stdout + proc.stderr
-    indented = "\n".join("  " + line for line in out.splitlines())
-    if "no patches available" in out:
-        _eprint(
-            "error: this Isabelle version is not supported by my-better-isabelle-prover:",
-            indented,
-            "  Isabelle-MCP needs its patches; point --isabelle-bin at a supported Isabelle.",
-        )
-        return False
-    _eprint(
-        "error: this Isabelle is missing the required my-better-isabelle-prover patches:",
-        indented,
-        "  Apply them with: my-better-isabelle patch",
-    )
-    return False
 
 
 def _run_add(add_cmd: list[str], client: str) -> None:
@@ -156,19 +99,12 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         metavar="BIN",
         help="the isabelle binary to pin into the server's PATH (e.g. "
-        ".../Isabelle2024/bin/isabelle — same convention as my-better-isabelle; "
-        "its directory is accepted too)",
+        ".../Isabelle2025-2/bin/isabelle; its directory is accepted too)",
     )
     parser.add_argument(
         "--claude", action="store_true", help="register only into Claude Code"
     )
     parser.add_argument("--codex", action="store_true", help="register only into Codex")
-    parser.add_argument(
-        "--skip-patch-check",
-        action="store_true",
-        help="register without verifying the my-better-isabelle-prover patches "
-        "(for setups the patch manager cannot recognize)",
-    )
     args = parser.parse_args(argv)
 
     cmd = _find_server_command()
@@ -179,9 +115,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    # Pin the Isabelle binary location into the server's environment when
-    # requested. --isabelle-bin takes the isabelle binary itself (the same
-    # convention as my-better-isabelle); a directory containing one is accepted.
+    # Pin the Isabelle binary location into the server's environment when requested.
+    # --isabelle-bin takes the isabelle binary itself; a directory containing one is accepted.
     path_env: str | None = None
     if args.isabelle_bin:
         if os.path.isdir(args.isabelle_bin):
@@ -192,16 +127,23 @@ def main(argv: list[str] | None = None) -> int:
         if not (os.path.isfile(isa) and os.access(isa, os.X_OK)):
             _eprint(
                 f"error: --isabelle-bin: no executable 'isabelle' at {isa}",
-                "       (pass the isabelle binary, e.g. /path/to/Isabelle2024/bin/isabelle)",
+                "       (pass the isabelle binary, e.g. /path/to/Isabelle2025-2/bin/isabelle)",
             )
             return 1
         path_env = f"{isa_dir}{os.pathsep}{os.environ.get('PATH', '')}"
-        os.environ["PATH"] = path_env  # also lets the patch check below find `isabelle`
+        os.environ["PATH"] = path_env  # also lets ensure_component() below find `isabelle`
 
-    if not _check_patches(args.skip_patch_check):
+    # Register the bundled Scala component that provides `isabelle mcp_server`. The server does
+    # this itself before every launch too — doing it here as well means an install that cannot
+    # work fails now, in front of a human, rather than at the first isabelle_launch.
+    try:
+        component = ensure_component()
+    except IsabelleToolError as exc:
+        _eprint(f"error: {exc}")
         return 1
-    # With --skip-patch-check, also skip the server's own launch-time check.
-    server_args = ["--skip-patch-check"] if args.skip_patch_check else []
+    print(f"✓ Isabelle component registered: {component.path}")
+
+    server_args: list[str] = []
 
     # Default target: whichever client is installed.
     do_claude, do_codex = args.claude, args.codex
@@ -224,6 +166,26 @@ def main(argv: list[str] | None = None) -> int:
         "done. In your agent, call isabelle_launch(session=...) before any other tool"
         " — pick the session that fits the work."
     )
+    return 0
+
+
+def uninstall_main(argv: list[str] | None = None) -> int:
+    """Undo `isabelle-mcp install`: drop the Isabelle component registration.
+
+    `pip uninstall` cannot run hooks, so the registration would otherwise outlive the package —
+    harmless (Isabelle ignores a directory that is gone) but noisy: it warns on stderr of every
+    `isabelle` command until it is removed.
+    """
+    parser = argparse.ArgumentParser(
+        prog="isabelle-mcp uninstall",
+        description="Remove the Isabelle component registration made by `isabelle-mcp install`.",
+    )
+    parser.parse_args(argv)
+    try:
+        unregister_component()
+    except IsabelleToolError as exc:
+        _eprint(f"error: {exc}")
+        return 1
     return 0
 
 

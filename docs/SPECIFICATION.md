@@ -20,9 +20,9 @@ Isabelle-MCP is a Model Context Protocol (MCP) server that provides AI agents (l
 
 ### 1.2 Objectives
 
-1. **Expose Isabelle LSP/PIDE Features**: Make Isabelle's `vscode_server` accessible to AI agents through MCP tools
+1. **Expose Isabelle LSP/PIDE Features**: Make Isabelle's `mcp_server` accessible to AI agents through MCP tools
 2. **Support Interactive Theorem Proving**: Enable AI agents to query proof states, get completions, navigate definitions, and access documentation
-3. **Provide Only Native Features**: Support ONLY features natively implemented by `isabelle vscode_server`
+3. **Provide Only Native Features**: Support ONLY features natively implemented by `isabelle mcp_server`
 4. **Maintain Session Efficiency**: Reuse long-lived LSP server sessions to avoid expensive initialization overhead
 5. **Follow lean-lsp-mcp Patterns**: Consistent interface design, 1-indexed positions, Pydantic models, structured errors
 
@@ -40,7 +40,7 @@ Isabelle-MCP is a Model Context Protocol (MCP) server that provides AI agents (l
 - Document editing for the current release
 - Direct VSCode extension integration
 - Non-LSP Isabelle interfaces (jEdit, raw PIDE)
-- **Advanced LSP features not implemented by `isabelle vscode_server`:**
+- **Advanced LSP features not implemented by `isabelle mcp_server`:**
   - File outline (`textDocument/documentSymbol` not implemented)
   - Code actions (`textDocument/codeAction` not implemented)
   - References (`textDocument/references` not implemented)
@@ -75,7 +75,7 @@ Isabelle-MCP is a Model Context Protocol (MCP) server that provides AI agents (l
 5. **Custom Exceptions**: `IsabelleToolError` for tool failures
 6. **Tool Annotations**: Mark readonly, idempotent, and destructive operations
 7. **Concise Documentation**: Instruction card + docstrings
-8. **Native Features Only**: Only wrap features actually implemented by `isabelle vscode_server`
+8. **Native Features Only**: Only wrap features actually implemented by `isabelle mcp_server`
 
 ### 2.2 Output Model Pattern
 
@@ -133,7 +133,7 @@ line spans, completion)
 
 ### 3.1 Standard LSP Tools (4 tools)
 
-Based on `isabelle vscode_server` analysis - **only LSP-native features**:
+Based on `isabelle mcp_server` analysis - **only LSP-native features**:
 
 #### Tool 1: `isabelle_hover`
 **Purpose**: Get type signature and documentation for symbol
@@ -175,7 +175,7 @@ Isabelle-specific features - **only PIDE-native methods**:
 #### Tool 6: `isabelle_launch`
 **Purpose**: Start (or restart) the prover for a chosen session/logic; must be
 called before any evaluation/query tool (the prover does not auto-start)
-**LSP Mapping**: Spawns `isabelle vscode_server -l <session> -d <dirs…>` ✅
+**LSP Mapping**: Spawns `isabelle mcp_server -l <session> -d <dirs…>` ✅
 **Priority**: High (entry point)
 **Pattern**: New (lifecycle)
 
@@ -626,7 +626,7 @@ those edits to Isabelle automatically:
   the start of each MCP call and pushes any the watcher missed (content comparison is
   the final gate).
 - **Dependency files (the server's job).** `.ML` blobs and imported `.thy` are synced
-  by Isabelle's own vscode_server File_Watcher. Because that watcher debounces by
+  by Isabelle's own mcp_server File_Watcher. Because that watcher debounces by
   `vscode_load_delay` (default `0.5` s), the backstop also stats the `theory_status`
   dependency set and waits out the debounce when a dependency was just edited.
 - Pushing an edit *during* an in-progress evaluation is intentional and supported:
@@ -742,7 +742,7 @@ Documentation must not mark future/design-target behavior as implemented.
 
 ## Appendix B: Future Enhancements (Phase 2)
 
-These features are intentionally excluded from MVP because they are not natively supported by `isabelle vscode_server` and would require significant additional implementation:
+These features are intentionally excluded from MVP because they are not natively supported by `isabelle mcp_server` and would require significant additional implementation:
 
 1. **File Outline (`isabelle_file_outline`)**
    - Requires: Custom file parsing or waiting for `textDocument/documentSymbol` support

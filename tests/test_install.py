@@ -1,8 +1,10 @@
 """Tests for the `isabelle-mcp install` subcommand (isabelle_mcp.install)."""
 
+import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -55,68 +57,13 @@ class TestFindServerCommand:
         assert install._find_server_command() is None
 
 
-class TestPatchCheck:
-    def test_skip_flag_passes(self, capsys):
-        assert install._check_patches(True) is True
-        assert "--skip-patch-check" in capsys.readouterr().err
-
-    def test_no_isabelle_warns_and_passes(self, monkeypatch, capsys):
-        monkeypatch.setattr(shutil, "which", _fake_which({}))
-        assert install._check_patches(False) is True
-        assert "'isabelle' is not on PATH" in capsys.readouterr().err
-
-    def test_no_patch_manager_fails(self, monkeypatch, capsys):
-        monkeypatch.setattr(
-            shutil, "which", _fake_which({"isabelle": "/opt/Isabelle/bin/isabelle"})
-        )
-        assert install._check_patches(False) is False
-        assert "my-better-isabelle" in capsys.readouterr().err
-
-    @pytest.mark.parametrize(
-        "returncode,output,ok",
-        [
-            # The verdict is the exit code, never the stdout text. `status` lists
-            # every feature, so `dev` patches we deliberately do not need show up
-            # as `[not-applied]` on a stock install — that must NOT block us.
-            (0, "  [    applied]  user  pide_control/lsp.scala.patch  (...)\n", True),
-            (
-                0,
-                "  [    applied]  user  pide_control/lsp.scala.patch  (...)\n"
-                "  [not-applied]  dev   register_thy/thy_info.ML.patch  (...)\n"
-                "  dev: 0/6 applied · user: 7/7 applied\n",
-                True,
-            ),
-            (1, "  [not-applied]  user  pide_control/lsp.scala.patch  (...)\n", False),
-            (1, "boom\n", False),
-            (1, "no patches available for Isabelle2023\n", False),
-            (3, "Error: feature(s) not registered in categories.toml: newthing.\n", False),
-        ],
+@pytest.fixture(autouse=True)
+def _no_isabelle(monkeypatch):
+    """`isabelle-mcp install` registers the Scala component; unit tests must not need Isabelle."""
+    monkeypatch.setattr(
+        install, "ensure_component",
+        lambda: SimpleNamespace(path=Path("/fake/isabelle_mcp/scala/Isabelle2025-2")),
     )
-    def test_status_output(self, monkeypatch, returncode, output, ok):
-        monkeypatch.setattr(
-            shutil,
-            "which",
-            _fake_which(
-                {
-                    "isabelle": "/opt/Isabelle/bin/isabelle",
-                    "my-better-isabelle": "/usr/bin/my-better-isabelle",
-                }
-            ),
-        )
-        run = RecordingRun(
-            {
-                ("my-better-isabelle", "-q", "status"): SimpleNamespace(
-                    returncode=returncode, stdout=output, stderr=""
-                )
-            }
-        )
-        monkeypatch.setattr(subprocess, "run", run)
-        assert install._check_patches(False) is ok
-        # We ask only about the `user` category: the `dev` patches serve Isa-REPL /
-        # Isa-Mini, not this server.
-        assert run.calls == [
-            ["my-better-isabelle", "-q", "status", "--category", "user"]
-        ]
 
 
 @pytest.mark.usefixtures("server_cmd")
@@ -124,12 +71,11 @@ class TestMain:
     def test_registers_into_claude_with_absolute_path(self, monkeypatch, capsys):
         run = RecordingRun()
         monkeypatch.setattr(subprocess, "run", run)
-        assert install.main(["--claude", "--skip-patch-check"]) == 0
+        assert install.main(["--claude"]) == 0
         assert ["claude", "mcp", "remove", "isabelle-lsp", "-s", "user"] in run.calls
-        # --skip-patch-check is also passed through to the registered server command
         assert [
             "claude", "mcp", "add", "-s", "user", "isabelle-lsp",
-            "--", "/opt/tools/isabelle-mcp", "--skip-patch-check",
+            "--", "/opt/tools/isabelle-mcp",
         ] in run.calls
         assert "registered 'isabelle-lsp' into Claude Code" in capsys.readouterr().out
 
@@ -147,13 +93,11 @@ class TestMain:
         )
         run = RecordingRun()
         monkeypatch.setattr(subprocess, "run", run)
-        assert install.main(["--skip-patch-check"]) == 0
+        assert install.main([]) == 0
         adds = [c for c in run.calls if c[1:3] == ["mcp", "add"]]
         assert {c[0] for c in adds} == {"claude", "codex"}
 
-    def test_no_skip_flag_means_plain_server_command(self, monkeypatch):
-        # patch check passes via the "isabelle not on PATH" branch (fake PATH
-        # has no isabelle), and the registered command carries no extra args
+    def test_registered_command_carries_no_extra_args(self, monkeypatch):
         run = RecordingRun()
         monkeypatch.setattr(subprocess, "run", run)
         assert install.main(["--claude"]) == 0
@@ -163,16 +107,21 @@ class TestMain:
     def test_custom_name(self, monkeypatch):
         run = RecordingRun()
         monkeypatch.setattr(subprocess, "run", run)
-        assert install.main(["--claude", "--skip-patch-check", "--name", "my-isa"]) == 0
+        assert install.main(["--claude", "--name", "my-isa"]) == 0
         assert ["claude", "mcp", "remove", "my-isa", "-s", "user"] in run.calls
 
     def test_isabelle_bin_pins_path(self, monkeypatch, tmp_path):
+        # install() pins the Isabelle bin dir into this process's PATH so that everything after it
+        # (ensure_component, and the registration itself) sees the requested Isabelle. That is a
+        # real, wanted side effect — so the *test* has to contain it, or the stub `isabelle` below
+        # leaks into every later test that resolves a real one.
+        monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
         isa = tmp_path / "isabelle"
         isa.write_text("#!/bin/sh\n")
         isa.chmod(0o755)
         run = RecordingRun()
         monkeypatch.setattr(subprocess, "run", run)
-        assert install.main(["--claude", "--skip-patch-check", "--isabelle-bin", str(isa)]) == 0
+        assert install.main(["--claude", "--isabelle-bin", str(isa)]) == 0
         add = next(c for c in run.calls if c[1:3] == ["mcp", "add"])
         env_arg = add[add.index("-e") + 1]
         assert env_arg.startswith(f"PATH={tmp_path}")
@@ -180,7 +129,7 @@ class TestMain:
     def test_isabelle_bin_rejects_bad_path(self, tmp_path, capsys):
         assert (
             install.main(
-                ["--claude", "--skip-patch-check", "--isabelle-bin", str(tmp_path / "isabelle")]
+                ["--claude", "--isabelle-bin", str(tmp_path / "isabelle")]
             )
             == 1
         )
@@ -192,7 +141,7 @@ class TestMain:
         )
         monkeypatch.setattr(subprocess, "run", run)
         with pytest.raises(SystemExit) as exc:
-            install.main(["--claude", "--skip-patch-check"])
+            install.main(["--claude"])
         assert exc.value.code == 3
 
 
@@ -200,7 +149,7 @@ class TestMainNoServer:
     def test_no_server_command(self, monkeypatch, capsys):
         monkeypatch.setattr(shutil, "which", _fake_which({}))
         monkeypatch.setattr(sys, "argv", ["isabelle-mcp"])
-        assert install.main(["--skip-patch-check"]) == 1
+        assert install.main([]) == 1
         assert "'isabelle-mcp' not found on PATH" in capsys.readouterr().err
 
     def test_no_client_found(self, monkeypatch, capsys):
@@ -209,7 +158,7 @@ class TestMainNoServer:
         )
         run = RecordingRun()
         monkeypatch.setattr(subprocess, "run", run)
-        assert install.main(["--skip-patch-check"]) == 1
+        assert install.main([]) == 1
         assert "no target client found" in capsys.readouterr().err
 
 

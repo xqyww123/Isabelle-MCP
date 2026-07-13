@@ -3,13 +3,13 @@
 Date: 2026-06-05
 
 This note records a source-code + empirical investigation into **how Isabelle's
-`vscode_server` reports errors, warnings, and `sorry`/`oops`**, and the resulting
+`mcp_server` reports errors, warnings, and `sorry`/`oops`**, and the resulting
 design for what `EvaluationResult` should surface and how it should be rendered.
 
 All Scala/ML citations are from the vendored distribution at
 `contrib/Isabelle2025-2/src/` (verified identical behaviour in `Isabelle2024/`).
 Python citations are from `src/isabelle_mcp/`. Empirical runs used the MCP's own
-`IsabelleLSPClient` driving a real `isabelle vscode_server` (HOL), with the
+`IsabelleLSPClient` driving a real `isabelle mcp_server` (HOL), with the
 decoration handler subclassed to capture *all* decoration types (probe scripts
 were kept under `/tmp/isa_mcp_test/`).
 
@@ -17,7 +17,7 @@ were kept under `/tmp/isa_mcp_test/`).
 
 ## 1. Two independent push channels
 
-Isabelle's `vscode_server` pushes prover feedback to the client over **two
+Isabelle's `mcp_server` pushes prover feedback to the client over **two
 distinct LSP channels**, with **different content, granularity, and semantics**.
 Neither is pulled — both are server-initiated notifications.
 

@@ -135,27 +135,9 @@ class TestServerLifespan:
                     MockClient.assert_called_with(
                         extra_args=["-o", "threads=4"],
                         project_root=os.path.realpath(os.getcwd()),
-                        skip_patch_check=False,
                     )
         finally:
             server_mod._server_extra_args = []
-
-    @pytest.mark.asyncio
-    async def test_passes_skip_patch_check(self):
-        import isabelle_mcp.server as server_mod
-        from isabelle_mcp.server import server_lifespan
-
-        server_mod._skip_patch_check = True
-        try:
-            with patch('isabelle_mcp.server.IsabelleLSPClient') as MockClient:
-                mock_instance = MagicMock()
-                mock_instance.process = None
-                MockClient.return_value = mock_instance
-                async with server_lifespan(MagicMock()):
-                    assert MockClient.call_args.kwargs["skip_patch_check"] is True
-        finally:
-            server_mod._skip_patch_check = False
-
 
 class TestHookRetirement:
     def test_notify_file_change_route_removed(self):
@@ -203,19 +185,6 @@ class TestServerMain:
             with patch.object(mcp, 'run'):
                 main()
                 assert server_mod._server_extra_args == ["-d", "/extra", "-o", "threads=4"]
-
-    def test_skip_patch_check_flag(self):
-        import sys
-
-        import isabelle_mcp.server as server_mod
-        from isabelle_mcp.server import main, mcp
-        try:
-            with patch.object(sys, 'argv', ['isabelle-mcp', '--skip-patch-check']):
-                with patch.object(mcp, 'run'):
-                    main()
-                    assert server_mod._skip_patch_check is True
-        finally:
-            server_mod._skip_patch_check = False
 
     def test_typo_rejected(self):
         import sys

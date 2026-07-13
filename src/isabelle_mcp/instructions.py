@@ -5,21 +5,15 @@ You work by editing `.thy` or `.ML` files on disk and calling the MCP tools to
 evaluate them and query the proof states. Changes to the files are synced and
 re-evaluated automatically.
 
-This tool is not meant to fully replace the `isabelle` command line — you are
-still strongly encouraged to use commands like `isabelle getenv ISABELLE_HOME`
+This tool is not meant to replace the `isabelle` command line — you should
+still use commands like `isabelle getenv ISABELLE_HOME`
 and `isabelle getenv AFP` to locate key directories.
 
 Before any other tool, call `isabelle_launch(session)` to start a session.
 The session only determines which theories come **precompiled** (the
-session's heap image); Isabelle can still load any other theory dynamically —
-it is just slow, because the theory and all its imports are checked from
-source.
+session's heap image); Isabelle can still load any other theory dynamically — it is just slow.
 
-You do NOT need to check whether the session is built — `isabelle_launch`
-checks automatically. It never builds implicitly: when the session's heap (or
-any heap in its dependency chain) is missing or outdated, or the name is
-undefined, it fails fast with the exact `isabelle build -b ...` command to
-run — run it yourself (it may take long), then relaunch.
+You should NEVER check whether the session is built — `isabelle_launch` checks automatically.
 
 **Precompiled theories cannot be edited.** The session you launch must NOT
 contain the theories you intend to work on. (`isabelle_evaluate_to` warns
@@ -27,19 +21,16 @@ when its target file is precompiled into the running session — heed it.) In pa
 project's own session to edit that project — it typically precompiles exactly
 the target theories. Launch the project session's **base session** instead
 (the parent in its ROOT entry, `session NAME = BASE + …`): the imports come
-precompiled while the target theories stay editable. Build the base heap
-first with `isabelle build -b BASE` if needed (launch errors out if you
-don't); non-builtin sessions need `session_dirs`.
+precompiled while the target theories stay editable.
 
 Choose the session closest to the work that does not swallow the target
 theories — e.g. "HOL-Analysis" for analysis — and ask the user if unsure.
 Omitting the session falls back to "Main", which precompiles very little, so
-substantial imports load slowly under it — avoid bare "Main" unless the work
-truly needs only the basics.
+substantial imports load slowly under it.
 
 When your call starts an evaluation, either by `isabelle_evaluate_to` or other query commands,
 the call may not wait for the evaluation to finish, but may return earlier with the current
-progress. You must keep polling `isabelle_evaluation_status` to watch it through:
+progress. You should keep polling `isabelle_evaluation_status` to watch it through:
 it reports progress (per-theory percentage and command counts), any new errors,
 and which commands are still running and for how long.
 
@@ -88,15 +79,15 @@ contributes its `ROOT`/`ROOTS` and its own `etc/settings`.
 from the calling shell. Set them persistently in
 `$ISABELLE_HOME_USER/etc/settings` (a bash-sourced file: `VAR=value` lines), or
 in a component's own `etc/settings`.
-
-**Building.** `isabelle build -b SESSION` builds a session's heap image; `-d DIR`
-adds a session directory, `-v` is verbose. For parallelism use `-o threads=N` —
-it gives the prover N worker **threads inside** the session (0 = guess from
-hardware), e.g. `isabelle build -o threads=8 -b HOL`. Avoid `-j N` (build N
-separate **sessions** at once): it multiplies memory use and is rarely what you
-want here. `-o NAME=VAL` overrides any system option (`isabelle options -l` to
-list).
 """
+
+# **Building.** `isabelle build -b SESSION` builds a session's heap image; `-d DIR`
+# adds a session directory, `-v` is verbose. For parallelism use `-o threads=N` —
+# it gives the prover N worker **threads inside** the session (0 = guess from
+# hardware), e.g. `isabelle build -o threads=8 -b HOL`. Avoid `-j N` (build N
+# separate **sessions** at once): it multiplies memory use and is rarely what you
+# want here. `-o NAME=VAL` overrides any system option (`isabelle options -l` to
+# list).
 
 
 def get_instructions() -> str:

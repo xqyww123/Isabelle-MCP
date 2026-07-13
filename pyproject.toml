@@ -30,7 +30,6 @@ dependencies = [
     "beautifulsoup4>=4.12.0",
     "fastmcp>=3.2,<4",
     "mcp>=1.0.0",
-    "my-better-isabelle-prover>=0.3.0",
     "pydantic>=2.0.0",
     "watchdog>=3.0.0",
 ]
@@ -63,7 +62,10 @@ version = {attr = "isabelle_mcp.__version__"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-isabelle_mcp = ["py.typed"]
+# The Isabelle Scala component ships as a package asset and is registered in place — see
+# docs/COMPONENT_INSTALL_PLAN.md. It carries a prebuilt jar (no_build = true), so nothing is
+# ever compiled on the user's machine and site-packages may be read-only.
+isabelle_mcp = ["py.typed", "scala/**/*"]
 
 [tool.black]
 line-length = 100

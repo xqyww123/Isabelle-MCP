@@ -12,7 +12,9 @@
 
 ## 1. Overview
 
-Isabelle-MCP is a Python-based MCP (Model Context Protocol) server that acts as a bridge between AI agents and Isabelle's Language Server Protocol (LSP) implementation (`isabelle vscode_server`). The architecture follows the proven patterns from `lean-lsp-mcp` while adapting to Isabelle's PIDE (Prover IDE) specific features.
+Isabelle-MCP is a Python-based MCP (Model Context Protocol) server that acts as a bridge between AI agents and Isabelle's Language Server Protocol (LSP) implementation.
+
+> **`isabelle mcp_server`** is *our* LSP server: an Isabelle Scala component that Isabelle-MCP ships (a fork of Isabelle2025-2's `vscode_server` sources, package `isabelle.mcp`). The stock `vscode_server` does not expose the PIDE requests this design needs — `PIDE/theory_status`, `PIDE/cancel_execution`, `PIDE/command_at_position`, `PIDE/output_at_position`, `PIDE/symbols`, `PIDE/find_theorems_*` — so they used to be patched into the Isabelle distribution. They are now our own code, and **no Isabelle patch is required**. See `docs/COMPONENT_INSTALL_PLAN.md` and `src/isabelle_mcp/scala/Isabelle2025-2/docs/CANCELLATION.md`. The architecture follows the proven patterns from `lean-lsp-mcp` while adapting to Isabelle's PIDE (Prover IDE) specific features.
 
 ### 1.1 High-Level Architecture
 
@@ -79,7 +81,7 @@ Isabelle-MCP is a Python-based MCP (Model Context Protocol) server that acts as 
                  │ LSP + PIDE protocols
                  │
 ┌────────────────▼────────────────────────────────────────────┐
-│         isabelle vscode_server (Scala)                       │
+│         isabelle mcp_server (Scala)                       │
 │                                                              │
 │  - Standard LSP methods (hover, completion, definition, etc.)│
 │  - PIDE extensions (state panels, dynamic output, preview)   │
@@ -106,7 +108,7 @@ watches the parent directories of editor-opened `.thy` files (added/removed at
 file to Isabelle as a `didChange` — event-driven, no dirty-set and no background
 loop. A tool-call backstop (`resync_and_check_freshness`) re-stats the open files
 at the start of every tool call to catch anything the watcher missed. Dependency
-files (`.ML` blobs, imported `.thy`) are synced by Isabelle's *own* vscode_server
+files (`.ML` blobs, imported `.thy`) are synced by Isabelle's *own* mcp_server
 File_Watcher, not the MCP. The LSP Client Wrapper also owns a per-file
 `ProcessingTracker` (fed by `PIDE/decoration`) used to decide whether a line has
 been processed.
@@ -160,7 +162,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
 
 ### 2.2 LSP Client Wrapper
 
-**Responsibility:** Manage communication with `isabelle vscode_server`
+**Responsibility:** Manage communication with `isabelle mcp_server`
 
 **File:** `src/isabelle_mcp/lsp_client.py`
 
@@ -189,7 +191,7 @@ class IsabelleLSPClient:
         self.reader_task: Optional[asyncio.Task] = None
 
     async def start(self):
-        """Start isabelle vscode_server process"""
+        """Start isabelle mcp_server process"""
 
     async def initialize(self):
         """Send LSP initialize request"""
@@ -428,7 +430,7 @@ via the `ProcessingTracker`.)
   watcher missed (inotify overflow, NFS, a disabled watcher). Stat'ing runs off the
   event loop via `asyncio.to_thread`.
 - **Dependency files (Layer 3):** `.ML` blobs and imported `.thy` are synced by
-  Isabelle's *own* vscode_server File_Watcher, not the MCP. Because that watcher has a
+  Isabelle's *own* mcp_server File_Watcher, not the MCP. Because that watcher has a
   `vscode_load_delay` debounce (default 0.5 s, read at startup), the tool-call backstop
   also stats the `theory_status` dependency set; if a dep changed within that window it
   waits the delay so the server has certainly noticed it before querying.
@@ -538,7 +540,7 @@ Each query tool calls ``check_evaluation_guard(client, file_path, line)``:
 ### 3.5 Cancel / Force-Interrupt Mechanism
 
 ``cancel_evaluation`` calls ``IsabelleLSPClient.force_interrupt(file_path)``,
-which uses the patched ``PIDE/cancel_execution`` request (verified 2026-05-27):
+which uses our ``PIDE/cancel_execution`` request (verified 2026-05-27):
 
 1. ``PIDE/cancel_execution`` — atomically stops ALL processing globally (target
    file and dependency theories) and interrupts running worker threads.
@@ -579,7 +581,7 @@ async def hover_info(client, file_path, line, symbol):
 ```
 First tool call triggers _ensure_lsp_started()
          │
-         ├─→ Spawn: isabelle vscode_server -l HOL [options]
+         ├─→ Spawn: isabelle mcp_server -l HOL [options]
          │   │
          │   └─→ Start stdin/stdout readers
          │
@@ -635,7 +637,7 @@ Process termination detected
          │
          ├─→ Cancel background reader task
          │
-         ├─→ Terminate isabelle vscode_server process
+         ├─→ Terminate isabelle mcp_server process
          │
          ├─→ Clear document cache
          │
@@ -701,7 +703,7 @@ All `IsabelleToolError` exceptions are caught by FastMCP and returned as error r
 
 ### 6.2 Isabelle Dependencies
 
-- **Isabelle2024**: Includes `isabelle vscode_server`
+- **Isabelle2024**: Includes `isabelle mcp_server`
 - **Logic Images**: Pre-built session heaps (HOL, Main, etc.)
 
 ### 6.3 Development Dependencies
@@ -717,7 +719,7 @@ All `IsabelleToolError` exceptions are caught by FastMCP and returned as error r
 
 ### 7.1 Session Reuse
 
-**Problem:** Starting `isabelle vscode_server` is expensive (10-30s)
+**Problem:** Starting `isabelle mcp_server` is expensive (10-30s)
 
 **Solution:** Keep long-lived process across multiple MCP tool calls
 
@@ -763,10 +765,10 @@ triggers slow theory processing (session loading, long import chain), it
 blocks all other queries for the duration — potentially minutes.
 
 Possible future mitigations:
-1. Patch `isabelle vscode_server` to support position-bound state queries
+1. Extend `isabelle mcp_server` to support position-bound state queries
 2. Insert `print_state_query` overlays directly (requires command IDs not
    exposed by the LSP protocol)
-3. Spawn separate `vscode_server` processes for parallel queries
+3. Spawn separate `mcp_server` processes for parallel queries
 
 **Empty proof state detection:**
 Terminal proof commands (`by`, `done`, `qed`) produce empty `print_state`
@@ -794,7 +796,7 @@ alive but no `state_output` arrives within the grace period, return `[]`.
 
 ### 8.2 Integration Tests
 
-**Target:** End-to-end workflows with real `isabelle vscode_server`
+**Target:** End-to-end workflows with real `isabelle mcp_server`
 
 **Examples:**
 - Session initialization with HOL
@@ -858,7 +860,7 @@ pip install -e .
 **Runtime:**
 - MCP server runs as subprocess of Claude Desktop
 - stdin/stdout used for MCP protocol
-- LSP client spawns `isabelle vscode_server` as subprocess
+- LSP client spawns `isabelle mcp_server` as subprocess
 
 ---
 
@@ -938,7 +940,7 @@ LSP Client
    │            "params": {"textDocument": {"uri": "file://..."},
    │                      "position": {"line": 41, "character": 14}}}
    ▼
-isabelle vscode_server
+isabelle mcp_server
    │ Process request
    │ Query PIDE for hover info
    │
@@ -979,7 +981,7 @@ State Panel Manager
    │ PIDE: {"method": "PIDE/state_init"}
    │
    ▼
-isabelle vscode_server
+isabelle mcp_server
    │ Update caret to line start
    │ Create state panel with server-assigned id
    │ Query PIDE for proof state
@@ -1017,12 +1019,12 @@ Agent edits file.thy on disk (ordinary file tools)
    │   both run under _evaluation_state_lock → client.sync_dirty_files({path})
    │       │ if disk content != cached: bump version, send textDocument/didChange
    │       ▼
-   │   isabelle vscode_server → PIDE incremental re-check → PIDE/decoration
+   │   isabelle mcp_server → PIDE incremental re-check → PIDE/decoration
    │       ▼
    │   ProcessingTracker.update()  (adopts new version's ranges; wakes waiters)
    │
    └─ Dependency files (.ML blobs, imported .thy) — the SERVER's job:
-       Isabelle's own vscode_server File_Watcher disk-watches them (0.5 s debounce).
+       Isabelle's own mcp_server File_Watcher disk-watches them (0.5 s debounce).
        Layer 3: the tool-call backstop stats the theory_status dep set and, if a dep
        changed within the debounce window, waits vscode_load_delay before querying.
 ```

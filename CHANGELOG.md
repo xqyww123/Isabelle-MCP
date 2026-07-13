@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased
+
+- **Isabelle-MCP no longer requires a patched Isabelle.** It ships its own Isabelle
+  Scala component — `isabelle mcp_server`, a fork of Isabelle2025-2's `vscode_server`
+  sources carrying the PIDE requests the stock one lacks — as a package asset, and
+  registers it with Isabelle before the first session launch.
+
+  The component declares `no_build = true` and carries a prebuilt jar, so
+  `isabelle scala_build` skips it entirely: **nothing is compiled on the user's machine**
+  (`site-packages` may be read-only — `sudo pip install`, Docker, Nix all work) and **no
+  session heap is invalidated** (patching `src/Pure/**.ML` used to force a rebuild of Pure,
+  HOL and every AFP session on the machine).
+
+  Global proof cancellation — which needed a Pure ML patch — now comes from an ML prelude
+  injected into the prover at startup (`ML_Process` `use_prelude`), built from the public
+  `EXECUTION` API alone. Verified on a fully un-patched Isabelle: a runaway proof in an
+  *imported* theory falls from ~3.2 cores to ~0.03 on cancel, which the perspective-restriction
+  fallback provably cannot do. See `scala/Isabelle2025-2/docs/CANCELLATION.md`.
+
+  Consequently the `my-better-isabelle-prover` dependency, the launch-time patch check and
+  `--skip-patch-check` are **gone**.
+
+- New: `isabelle-mcp uninstall`, which removes the component registration. `pip` cannot run
+  uninstall hooks, so removing the package without it leaves a dangling entry — harmless
+  (exit code stays 0) but Isabelle then prints `### Missing Isabelle component: …` on the
+  stderr of every command until `isabelle components -x <path>`.
+
+- **Isabelle2024 is no longer supported** — the fork is cut from 2025-2's VSCode sources, three
+  of which do not exist in 2024. The last supporting commit is tagged
+  `last-isabelle2024-support`.
+
+- A prover that dies before the LSP handshake now reports its own words instead of a
+  content-free 30 s `initialize` timeout.
+
 ## 0.2.1
 
 - `isabelle_launch` no longer surfaces Isabelle's opaque `Return code: 127

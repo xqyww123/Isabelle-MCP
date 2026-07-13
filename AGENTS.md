@@ -5,59 +5,42 @@ Guidance for AI coding agents (Claude Code, Codex, …) that want to use the
 
 ## Installing the MCP server
 
-### 1. Patch Isabelle first (REQUIRED)
+### 1. Isabelle (REQUIRED — but no patching)
 
-**Isabelle-MCP does not work on a stock Isabelle.** The server drives
-`isabelle vscode_server` through PIDE LSP requests (`PIDE/output_at_position`,
-`PIDE/cancel_execution`, …) that only exist after applying the
-[my-better-isabelle-prover](https://github.com/xqyww123/my_better_isabelle_prover)
-patches. You MUST install and apply them before anything else:
+**Isabelle-MCP needs Isabelle2025-2, and nothing else.** It used to require a patched
+Isabelle: the server drove the stock `isabelle vscode_server`, which lacks the PIDE
+requests it needs (`PIDE/output_at_position`, `PIDE/cancel_execution`, …), so the
+distribution had to be patched by
+[my-better-isabelle-prover](https://github.com/xqyww123/my_better_isabelle_prover).
 
-```sh
-pip install my-better-isabelle-prover
-my-better-isabelle patch          # apply the `user` patches + rebuild the Scala components
-my-better-isabelle status         # verify: exit code 0 means we have what we need
-```
+**That is no longer true.** Isabelle-MCP ships its own Isabelle Scala component,
+`isabelle mcp_server`, as a package asset, and registers it with Isabelle before the
+first session launch. The component carries a prebuilt jar and declares
+`no_build = true`, so:
 
-Patching modifies the Isabelle installation in place, so it needs **write
-access to `ISABELLE_HOME`**. If `status` exits non-zero, **stop immediately and
-ask the user for help** — do not try to work around it.
+- nothing is compiled on the user's machine — `site-packages` may be read-only
+  (`sudo pip install`, Docker, Nix all work);
+- **no session heap is invalidated** — patching `src/Pure/**.ML` used to force a rebuild
+  of Pure, HOL and every AFP session on the machine;
+- there is no second package to install.
 
-**Judge `status` by its exit code, not by its output.** It lists *every* feature,
-including the `dev` ones that serve Isa-REPL / Isa-Mini rather than this server;
-on a stock `my-better-isabelle patch` install those legitimately read
-`[not-applied]`, and that is fine. Isabelle-MCP only needs the `user` category
-(`my-better-isabelle status --category user`), which is exactly what the
-server's own patch check asks for.
+Requirements:
 
-Compatibility notes:
+- **Isabelle2025-2.** Isabelle2024 is no longer supported (the fork is cut from 2025-2's
+  VSCode sources; three of its files do not exist in 2024). The last supporting commit is
+  tagged `last-isabelle2024-support` in both repositories.
+- `isabelle` on `PATH`, or pinned with
+  `isabelle-mcp install --isabelle-bin /path/to/Isabelle/bin/isabelle` (the binary itself);
+  that pins the directory into the registered server's `PATH`.
 
-- Needs Python ≥ 3.12 (the package has no other dependencies). If `pip` is not
-  the right Python, use `python3 -m pip install my-better-isabelle-prover`.
-- On externally-managed Pythons (PEP 668: Debian/Ubuntu system Python refuses
-  `pip install`), install into a venv, or use `uv tool` instead.
-  Unlike the MCP server below, a project venv is fine here: `my-better-isabelle`
-  only runs from *your* shell (manually and via `isabelle-mcp install`), so it
-  just has to be on your `PATH` at that moment — no globally reachable install
-  is required.
-- `my-better-isabelle` needs the `isabelle` binary to detect the version: put
-  it on `PATH`, or pass `--isabelle-bin /path/to/Isabelle/bin/isabelle` (the
-  binary itself; `isabelle-mcp install --isabelle-bin` takes the same form). The
-  system `patch` command must also be installed.
+`isabelle-mcp uninstall` removes the component registration. Removing the package without
+it leaves a dangling entry: Isabelle then prints `### Missing Isabelle component: …` on the
+stderr of every `isabelle` command (exit code stays 0) until you run
+`isabelle components -x <the path it names>`.
 
-`isabelle-mcp install` (step 4 below) checks this (when `isabelle` is reachable;
-`--skip-patch-check` overrides) and refuses to register the server against an
-unpatched Isabelle.
-
-The server also re-checks **at run time**: every `isabelle_launch` verifies the
-patches before spawning `isabelle vscode_server` and refuses to start an
-unpatched Isabelle, with instructions to run `my-better-isabelle patch`. This
-check uses the server's own bundled copy of the patch manager (a declared
-dependency, invoked via `python -m`), so it works regardless of where — or
-whether — `my-better-isabelle` is on the server's `PATH`; only `isabelle`
-itself must be reachable. For hand-patched setups the patch manager cannot
-recognize, start the server with `isabelle-mcp --skip-patch-check`
-(`isabelle-mcp install --skip-patch-check` registers it that way automatically).
+Design and rationale: `docs/COMPONENT_INSTALL_PLAN.md`; the cancellation mechanism (an ML
+prelude injected at prover startup, built from the public `EXECUTION` API) is in
+`src/isabelle_mcp/scala/Isabelle2025-2/docs/CANCELLATION.md`.
 
 ### 2. Install the package
 
@@ -107,9 +90,9 @@ isabelle-mcp install --claude --name isabelle-lsp
 If both clients are installed, it registers into both; pass `--claude` /
 `--codex` to target just one.
 It is idempotent (re-running re-registers cleanly) and registers an absolute
-path to `isabelle-mcp` so the client need not share your `PATH`. It also
-verifies the my-better-isabelle-prover patches (step 1) and aborts with
-instructions if they are not applied (skip with `--skip-patch-check`).
+path to `isabelle-mcp` so the client need not share your `PATH`. It also registers the Isabelle
+Scala component up front, so an install that cannot work fails there, in front of a
+human, rather than at the first `isabelle_launch`.
 `scripts/install.sh` in a repo checkout does the same thing.
 
 **Or register manually** — the two CLIs take the same `add NAME -- COMMAND` form:

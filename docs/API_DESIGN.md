@@ -40,13 +40,13 @@ ARCHITECTURE.md.
 | MCP Tool | PIDE Methods | Flow |
 |----------|--------------|------|
 | `isabelle_goal` | `PIDE/caret_update`, `PIDE/state_init`, `PIDE/state_output`, `PIDE/state_exit` | Multi-step async; state id assigned by server |
-| `isabelle_command_output` | `PIDE/output_at_position` (patched, position-explicit) | Request-response; returns the enclosing command's source+range and rendered output in one shot |
+| `isabelle_command_output` | `PIDE/output_at_position` (ours, position-explicit) | Request-response; returns the enclosing command's source+range and rendered output in one shot |
 
 ### 2.3 Session Management
 
 | MCP Tool | Implementation | External Commands |
 |----------|----------------|-------------------|
-| `isabelle_launch` | Spawn the prover; set logic + `-d` session dirs | `isabelle vscode_server -l <session> -d <dirs…>` |
+| `isabelle_launch` | Spawn the prover; set logic + `-d` session dirs | `isabelle mcp_server -l <session> -d <dirs…>` |
 | `isabelle_terminate` | LSP `shutdown`/`exit` + process teardown | - |
 | `isabelle_session_info` | Query LSP client state | - |
 
@@ -286,7 +286,7 @@ the symbol's occurrence(s) on the line and issues the LSP request below at each.
 ```
 
 **DocumentHighlightKind (LSP Enum):** The LSP spec defines 1=Text, 2=Read,
-3=Write, but Isabelle's `vscode_server` hardcodes every result to **kind=1
+3=Write, but Isabelle's `mcp_server` hardcodes every result to **kind=1
 (Text)** — the `read`/`write` constructors exist in its source but are never
 called. The underlying def/ref distinction is therefore unavailable, so the MCP
 tool **omits the `kind` field** entirely.
@@ -485,7 +485,7 @@ class StatePanelManager:
 
 ### 3.6 `isabelle_command_output`
 
-**Current mechanism — `PIDE/output_at_position` (patched, position-explicit).**
+**Current mechanism — `PIDE/output_at_position` (ours, position-explicit).**
 The caret is resolved once from the optional `after_text` snippet (or end of line)
 via `resolve_caret`, then a single `PIDE/output_at_position` request returns the
 enclosing command's **source + range AND its rendered output** in one shot. Unlike
@@ -753,7 +753,7 @@ async def test_hover_info():
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_hover_with_real_server():
-    # Start real isabelle vscode_server
+    # Start real isabelle mcp_server
     client = IsabelleLSPClient(logic="HOL")
     await client.start()
 

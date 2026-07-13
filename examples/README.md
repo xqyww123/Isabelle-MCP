@@ -168,7 +168,8 @@ print(f"Current session: {info.current_session}")
 ### Server won't start
 
 - Check that Isabelle is installed: `isabelle version`
-- Check that `isabelle vscode_server` works: `isabelle vscode_server -help`
+- Check that the Isabelle component is registered: `isabelle mcp_server -X`
+  (prints `Usage: isabelle mcp_server`; `isabelle-mcp uninstall` removes it)
 - Check logs for error messages
 
 ### Tools return empty results
