@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # No Isabelle on the runner, so the tests that drive one are deselected. They are the
+      # `integration` mark, and they are what `pytest -m integration` runs locally.
+      - run: uv sync --all-extras --dev
+      - run: uv run pytest -q -m "not integration"
+
+  component:
+    # The release gate. Three things can silently break a release and none of them shows up on the
+    # author's machine: `no_build = true` going missing (the user's machine would then compile the
+    # component, inside our own mcp_server spawn, into a possibly read-only site-packages), the jar
+    # going stale (with no_build there is nothing left to recompile it), and the wheel not carrying
+    # the component at all (package-data globs fail silently).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: Check the component in the source tree
+        run: python scripts/check_component.py
+
+      - name: Build the wheel
+        run: uv build --wheel
+
+      - name: Check the component in what actually ships
+        run: python scripts/check_component.py --wheel dist/*.whl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel
+          path: dist/*.whl

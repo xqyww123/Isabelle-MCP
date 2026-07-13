@@ -419,6 +419,16 @@ or build-enabled component:
 5. Running `isabelle scala_build` against the *shipped* component is a **no-op**, not a rebuild — it
    would silently ship a stale jar. §6.6 is what catches that.
 
+`scripts/check_component.py` enforces all of this (and CI runs it on every push): it fails if the
+shipped `build.props` lost its `no_build` line, if the jar's recorded source digests no longer match
+the sources, if the jar does not declare `isabelle.mcp.Tools`, or if the wheel does not carry the
+component. Run it before releasing:
+
+```bash
+python scripts/check_component.py                      # the source tree
+uv build --wheel && python scripts/check_component.py --wheel dist/*.whl
+```
+
 The jar is **tracked**, so this recipe only runs when a `.scala` source changes — not on every
 release. To check whether it needs to: the jar embeds a SHA1 of every source it was built from
 (`META-INF/isabelle/shasum`); compare those against the files on disk. That check, and the §6.6
