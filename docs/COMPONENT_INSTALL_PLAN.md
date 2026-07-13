@@ -1,6 +1,7 @@
 # Plan — ship the Scala component, drop the patch dependency
 
-**Status:** design approved (rev. 3, after two adversarial reviews). Ready to implement.
+**Status:** IMPLEMENTED (rev. 3, after two adversarial reviews). Kept as the design record —
+every claim below is cited to the Isabelle sources or to a test in `tests/test_component.py`.
 **Goal:** `pip install isabelle-mcp` is the *only* installation step. No Isabelle patch, no heap
 rebuild, no second package, no compile on the user's machine, no manual `isabelle components -u`.
 
