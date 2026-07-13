@@ -418,7 +418,14 @@ or build-enabled component:
 5. Running `isabelle scala_build` against the *shipped* component is a **no-op**, not a rebuild — it
    would silently ship a stale jar. §6.6 is what catches that.
 
-Automating this in CI is out of scope for now, but the wheel gate (§6.6) makes a bad release loud.
+The jar is **tracked**, so this recipe only runs when a `.scala` source changes — not on every
+release. To check whether it needs to: the jar embeds a SHA1 of every source it was built from
+(`META-INF/isabelle/shasum`); compare those against the files on disk. That check, and the §6.6
+gate, are what a CI job should automate. Neither is a prerequisite for releasing.
+
+The jar is pure JVM bytecode (150 `.class` + 16 `.tasty`, no native code), so **one jar serves every
+platform** — which is what lets the wheel stay `py3-none-any`. Its only binding is the Isabelle
+release, which is exactly what the `scala/<identifier>/` key expresses.
 
 ---
 
