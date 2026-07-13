@@ -29,8 +29,11 @@ jobs:
     # The release gate. Three things can silently break a release and none of them shows up on the
     # author's machine: `no_build = true` going missing (the user's machine would then compile the
     # component, inside our own mcp_server spawn, into a possibly read-only site-packages), the jar
-    # going stale (with no_build there is nothing left to recompile it), and the wheel not carrying
-    # the component at all (package-data globs fail silently).
+    # going stale (with no_build there is nothing left to recompile it), and a distribution not
+    # carrying the component at all (package-data and MANIFEST.in both fail silently).
+    #
+    # It builds the very artifacts `publish` uploads, so the thing that ships is the thing that
+    # was checked.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,13 +44,45 @@ jobs:
       - name: Check the component in the source tree
         run: python scripts/check_component.py
 
-      - name: Build the wheel
-        run: uv build --wheel
+      - name: Build the sdist and the wheel
+        run: uv build
 
       - name: Check the component in what actually ships
-        run: python scripts/check_component.py --wheel dist/*.whl
+        run: python scripts/check_component.py dist/*
+
+      - name: The tag must name the version being shipped
+        # Forgetting to bump __version__ before tagging is the easy mistake, and PyPI would take
+        # the upload happily — publishing a version under a tag that names a different one, with
+        # no way to re-upload it later. Assert against the artifact, not the source: the wheel's
+        # filename is the version PyPI will record.
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          expected="isabelle_mcp-${GITHUB_REF_NAME#v}-py3-none-any.whl"
+          if [ ! -f "dist/$expected" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} would publish $(basename dist/*.whl), not $expected — bump __version__ to match the tag"
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheel
-          path: dist/*.whl
+          name: dist
+          path: dist/*
+
+  publish:
+    # The gate has to stand *on* the release path, not beside it: a hand-run `uv build && uv
+    # publish` skips every check above, and a stale jar or a component-less wheel would reach PyPI
+    # with nothing in the way. So PyPI is only ever fed by a run that passed.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, component]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write   # Trusted Publishing: PyPI verifies this run's OIDC identity. No API token
+                        # exists to leak — not in the repo, not in a secret, not on a laptop.
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

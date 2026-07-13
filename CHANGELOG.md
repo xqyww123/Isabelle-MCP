@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 - **Isabelle-MCP no longer requires a patched Isabelle.** It ships its own Isabelle
   Scala component — `isabelle mcp_server`, a fork of Isabelle2025-2's `vscode_server`
@@ -21,6 +21,12 @@
 
   Consequently the `my-better-isabelle-prover` dependency, the launch-time patch check and
   `--skip-patch-check` are **gone**.
+
+  Upgrading from 0.2.x leaves `my-better-isabelle-prover` installed: pip does not remove a
+  package just because nothing depends on it any more. It is inert — it only patches an Isabelle
+  when you run it — but `pip uninstall my-better-isabelle-prover` is safe if you want it gone.
+  Any patches it already applied stay applied; Isabelle-MCP works with a patched Isabelle too,
+  it just no longer needs one.
 
 - New: `isabelle-mcp uninstall`, which removes the component registration. `pip` cannot run
   uninstall hooks, so removing the package without it leaves a dangling entry — harmless

@@ -13,12 +13,14 @@ Three things can silently break a release, and none of them shows up on the auth
      `.scala` file and shipping changes *nothing*. The jar records a SHA1 of every source it was
      compiled from, so "is it current?" is a comparison — this script does it.
 
-  3. **The wheel does not carry the component.** `package-data` globs fail silently.
+  3. **A distribution does not carry the component.** Two independent declarations put it there —
+     `package-data` for the wheel, `MANIFEST.in` for the sdist — and both fail *silently*: you get
+     a perfectly valid package with no component in it.
 
 Run it before releasing, or let CI do it:
 
-    python scripts/check_component.py                      # the source tree
-    python scripts/check_component.py --wheel dist/*.whl   # and what actually ships
+    python scripts/check_component.py             # the source tree
+    python scripts/check_component.py dist/*      # and every artifact that ships
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import sys
+import tarfile
 import tempfile
 import zipfile
 from pathlib import Path
@@ -101,30 +104,43 @@ def check_component(root: Path, name: str) -> None:
         _ok("ML/mcp_prelude.ML present")
 
 
-def check_wheel(wheel: Path) -> None:
-    """The gates again, but against what actually ships. package-data globs fail silently."""
-    print(f"\nwheel: {wheel.name}")
+def check_dist(dist: Path) -> None:
+    """The gates again, against what actually ships.
+
+    A wheel and an sdist carry the component by two independent declarations — `package-data` and
+    `MANIFEST.in` — so each is checked against the artifact itself, not against the one it was
+    built beside. The sdist nests everything under `<name>-<version>/`, so the component is
+    located rather than assumed.
+    """
+    print(f"\n{dist.name}")
     with tempfile.TemporaryDirectory() as tmp:
-        with zipfile.ZipFile(wheel) as z:
-            z.extractall(tmp)
-        shipped = Path(tmp) / "isabelle_mcp" / "scala"
-        if not shipped.is_dir():
-            _fail("the wheel carries no component at all (check package-data / MANIFEST.in)")
+        if dist.suffix == ".whl":
+            with zipfile.ZipFile(dist) as z:
+                z.extractall(tmp)
+        else:
+            with tarfile.open(dist) as t:
+                t.extractall(tmp, filter="data")
+
+        roots = sorted(p for p in Path(tmp).glob("**/isabelle_mcp/scala/*") if p.is_dir())
+        if not roots:
+            _fail(f"{dist.name} carries no component at all "
+                  "(the wheel gets it from package-data, the sdist from MANIFEST.in)")
             return
-        for root in sorted(p for p in shipped.iterdir() if p.is_dir()):
-            check_component(root, f"  in wheel: {root.name}")
+        for root in roots:
+            check_component(root, f"  in {dist.name}: {root.name}")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--wheel", type=Path, help="also check a built wheel")
+    parser.add_argument("dists", nargs="*", type=Path,
+                        help="built artifacts to check too (wheels and sdists)")
     args = parser.parse_args()
 
     print("Isabelle Scala component — release gate")
     for root in sorted(p for p in COMPONENTS.iterdir() if p.is_dir()):
         check_component(root, f"source tree: {root.name}")
-    if args.wheel:
-        check_wheel(args.wheel)
+    for dist in args.dists:
+        check_dist(dist)
 
     n = _fail.count  # type: ignore[attr-defined]
     print(f"\n{'FAILED — ' + str(n) + ' problem(s)' if n else 'OK — safe to release'}")
