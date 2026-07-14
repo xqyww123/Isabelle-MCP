@@ -115,3 +115,8 @@ The prover does **not** auto-start. Before any other tool, call
 `Main` is only a minimal fallback) to start a session. The
 server's own instructions (delivered at the MCP handshake) describe the full
 workflow and the `isabelle` command-line tips.
+
+## Releasing it
+
+**Do not `uv publish`.** A release is a pushed `vX.Y.Z` tag — see
+[CONTRIBUTING.md § Releasing](CONTRIBUTING.md#releasing).
