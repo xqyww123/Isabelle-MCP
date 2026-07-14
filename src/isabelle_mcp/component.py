@@ -109,6 +109,33 @@ def unregister_component() -> None:
 
 # ── the stable half ─────────────────────────────────────────────────────────────
 
+def build_props(path: Path) -> dict[str, str]:
+    """etc/build.props exactly as Isabelle reads it — `java.util.Properties`, via
+    `isabelle.setup.Build.component_context`.
+
+    A value keeps its **trailing** whitespace, and `Build.get_bool` accepts nothing but the exact
+    strings "true"/"false". So `no_build = true ` — one invisible space, on the very line the
+    jar-rebuild recipe has you delete and retype by hand — is not `true`: it aborts *every*
+    `isabelle` command on the machine, `isabelle components -x` included. Hence lstrip, never strip.
+
+    Escapes are deliberately not decoded. Java's unescaping only ever *removes* backslashes, so a
+    value we read as "true" is a value Java reads as "true": we can be wrong only in the
+    fail-loudly direction, never in the wave-it-through one.
+    """
+    props: dict[str, str] = {}
+    lines = iter(path.read_text().splitlines())
+    for line in lines:
+        line = line.lstrip()
+        if not line or line[0] in "#!":     # a comment never continues onto the next line
+            continue
+        while line.endswith("\\"):          # continuation: joined with no separator of its own
+            line = line[:-1] + next(lines, "").lstrip()
+        i = next((n for n, c in enumerate(line) if c in "=: \t"), len(line))
+        key, rest = line[:i], line[i:].lstrip(" \t")
+        props[key] = rest[1:].lstrip(" \t") if rest[:1] in ("=", ":") else rest
+    return props
+
+
 @cache
 def _resolve() -> Component:
     isabelle = shutil.which("isabelle")
@@ -133,15 +160,21 @@ def _resolve() -> Component:
     # The component must ship its jar, and must declare no_build: a build-enabled component would
     # be compiled on the user's machine, inside our own `isabelle mcp_server` spawn, under the LSP
     # handshake deadline — and into site-packages, which may be read-only.
+    #
+    # This runs before ensure_component() writes us into $ISABELLE_HOME_USER/etc/components, and
+    # that is the point: once registered, our build.props is read by *every* Isabelle Scala command
+    # on the machine. A malformed one does not break Isabelle-MCP, it breaks Isabelle — including
+    # the `isabelle components -x` that would undo it. This is the last place to refuse.
     if not (path / "lib" / "isabelle_mcp.jar").is_file():
         raise IsabelleToolError(
             f"The Isabelle-MCP component is incomplete: {path / 'lib' / 'isabelle_mcp.jar'} "
             "is missing. Reinstall the package."
         )
-    if "no_build = true" not in (path / "etc" / "build.props").read_text():
+    no_build = build_props(path / "etc" / "build.props").get("no_build")
+    if no_build != "true":
         raise IsabelleToolError(
-            f"The Isabelle-MCP component at {path} is build-enabled; it must declare "
-            "'no_build = true'. This is a packaging bug — please report it."
+            f"The Isabelle-MCP component at {path} declares no_build = {no_build!r}; it must be "
+            "exactly 'true'. This is a packaging bug — please report it."
         )
 
     home_user = Path(_isabelle(isabelle, "getenv", "-b", "ISABELLE_HOME_USER").strip())

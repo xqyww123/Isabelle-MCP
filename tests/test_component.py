@@ -17,9 +17,46 @@ from isabelle_mcp.component import (
     _OURS,
     _registered,
     _resolve,
+    build_props,
     ensure_component,
     unregister_component,
 )
+
+
+class TestBuildProps:
+    """build.props must be read the way Isabelle reads it: java.util.Properties.
+
+    Checked against the real JVM's `Properties.load` — these cases all agree with it. The trailing
+    whitespace one is why this parser exists at all: `no_build = true ` looks identical to
+    `no_build = true`, but `Build.get_bool` matches the exact string and aborts on anything else, so
+    a component carrying it makes EVERY isabelle command on the machine exit 2 — `isabelle
+    components -x`, the cure, included. A `.strip()` here would wave it through.
+    """
+
+    def _props(self, tmp_path, text):
+        f = tmp_path / "build.props"
+        f.write_text(text)
+        return build_props(f)
+
+    def test_trailing_whitespace_is_part_of_the_value(self, tmp_path):
+        assert self._props(tmp_path, "no_build = true \n")["no_build"] == "true "
+        assert self._props(tmp_path, "no_build = true\t\n")["no_build"] == "true\t"
+
+    def test_leading_whitespace_is_not(self, tmp_path):
+        assert self._props(tmp_path, "   no_build =    true\n")["no_build"] == "true"
+
+    @pytest.mark.parametrize("line", ["no_build=true", "no_build:true", "no_build true"])
+    def test_every_properties_separator(self, tmp_path, line):
+        assert self._props(tmp_path, line + "\n")["no_build"] == "true"
+
+    @pytest.mark.parametrize("hash_", ["#", "!"])
+    def test_comments(self, tmp_path, hash_):
+        assert "no_build" not in self._props(tmp_path, f"{hash_} no_build = true\n")
+
+    def test_continuation_joins_with_no_separator_of_its_own(self, tmp_path):
+        # The space before the backslash is kept; the indent after it is not.
+        assert self._props(tmp_path, "sources = a.scala \\\n    b.scala\n")["sources"] == \
+            "a.scala b.scala"
 
 
 class TestShape:

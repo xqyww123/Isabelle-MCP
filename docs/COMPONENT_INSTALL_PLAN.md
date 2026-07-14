@@ -137,16 +137,29 @@ nothing checking it:
 
 1. the release build works from a **copy** of the component with `no_build` removed; the shipped
    `etc/build.props` is **never** mutated (§7);
-2. the wheel gate asserts the shipped `build.props` **content** contains `no_build = true`, and that
-   the jar's `META-INF/isabelle/services` is exactly `isabelle.mcp.Tools` (§6.6);
-3. `ensure_component()` refuses to register a component whose `build.props` lacks `no_build = true`.
+2. the release gate parses the shipped `build.props` **the way Isabelle does** and requires
+   `no_build` to be exactly `true` (§6.6);
+3. `ensure_component()` refuses to register a component whose `no_build` is not exactly `true`.
+
+> **"Exactly" is not pedantry.** Isabelle reads this file with `java.util.Properties`, which keeps a
+> value's *trailing* whitespace, and `Build.get_bool` switches on the literal string. `no_build =
+> true·` — one invisible space, on the one line §7 has you delete and retype by hand — is therefore
+> not `true`. It aborts **every** `isabelle` command on the user's machine with `*** Bad boolean
+> property`. Both checks above parse rather than grep, because a substring test passes on
+> `# no_build = true` and on `no_build = true·` alike: it says OK to the two states that hurt most.
 
 ### 1.3 Registration goes through **`isabelle components -u/-x`**. We never write `etc/components`.
 
 Rev. 1 planned to edit that file in Python, because `lib/Tools/components:130-131` runs
 `isabelle scala_build || exit $?` *before* `isabelle java isabelle.Components` — so a component that
-fails to compile cannot be removed by `-x`. **With `no_build = true` that chicken-and-egg cannot
-arise**, and the reason to bypass Isabelle's own API goes with it.
+fails to compile cannot be removed by `-x`. With `no_build = true` **that** chicken-and-egg cannot
+arise, and the reason to bypass Isabelle's own API goes with it.
+
+> But note what `no_build` does **not** buy: a component whose `build.props` fails to *parse* is
+> just as unremovable. Verified — with `no_build = true·` registered, `isabelle components -x` is
+> itself among the commands that exit 2, and the user must hand-edit `etc/components` to escape.
+> Registration is a one-way door onto every Isabelle command on the machine, which is why
+> `ensure_component()` validates **before** it opens that door and not after.
 
 `Components.update_components` (`components.scala:305-318`) is exactly right: it normalises
 (`path0.expand.absolute`), requires the directory to exist for `-u` (`Directory(path).check`), drops
@@ -392,11 +405,21 @@ writable": with `no_build = true` neither can happen.
    subsequent `isabelle version`.
 5. **Foreign entries survive.** A registered component on a non-existent path *not* shaped like ours is
    left alone. Blank and `#` lines survive untouched.
-6. **Wheel contents.** `python -m build` → unzip → assert `isabelle_mcp/scala/Isabelle2025-2/` contains
-   `etc/settings`, `ML/mcp_prelude.ML`, the 14 `.scala` files, **`lib/isabelle_mcp.jar`**, and an
-   `etc/build.props` whose **content** contains `no_build = true`; and that the jar's
-   `META-INF/isabelle/services` reads exactly `isabelle.mcp.Tools`. A silent `package-data` miss, or a
-   forgotten `no_build` flip-back, are the two most likely ways to ship a broken release.
+6. **The release gate** (`scripts/check_component.py`, run by CI on the source tree *and* on both
+   built artefacts — §8). Everything it checks is derived from `etc/build.props`, parsed as Isabelle
+   parses it, because that is the file Isabelle actually obeys:
+   - `no_build` is exactly `true`;
+   - the jar's `META-INF/isabelle/services` is what `build.props` declares;
+   - the jar's `META-INF/isabelle/shasum` records **exactly** `<meta_info>` + the declared
+     requirements + the declared sources, and every source still hashes to what the jar recorded.
+     Checking only the entries the jar lists would be blind to a source *added* since it was built —
+     the jar cannot testify about a file it has never heard of;
+   - `build.props` declares no property the gate does not model (a new `scalac_options` feeds the
+     build, and nothing will ever rebuild the jar to honour it);
+   - `ML/mcp_prelude.ML` is present.
+
+   A silent `package-data`/`MANIFEST.in` miss, a forgotten `no_build` flip-back, and a stale jar are
+   the three ways to ship a broken release, and none of them shows up on the author's machine.
 7. **Startup diagnostics.** With `mcp_server` deliberately unregistered, `start()` fails in seconds with
    a message containing `Unknown Isabelle tool` — not a 30 s content-free `initialize` timeout.
 8. **Regression.** `pytest -m integration` (6/6) and the multi-node cancel test (prover CPU falls from
@@ -413,26 +436,25 @@ or build-enabled component:
 2. Register the copy in a scratch `USER_HOME`; run `isabelle scala_build` (**not** `-f`); it compiles
    and writes `lib/isabelle_mcp.jar` in the copy.
 3. Copy that jar back into `src/isabelle_mcp/scala/Isabelle2025-2/lib/` and commit it.
-4. **Never mutate the shipped `etc/build.props`.** A `no_build = false` flipped in place and forgotten
-   is the failure that restores every rev.-1 blocker, invisibly, because the shasum matches on the
-   author's machine.
+4. **Never mutate the shipped `etc/build.props`.** Step 1 says *copy*, and this is why: a `no_build`
+   flipped in place and forgotten restores every rev.-1 blocker, invisibly, because the shasum still
+   matches on the author's machine. And retyping the line by hand is how you get `no_build = true·`,
+   a trailing space that reads as `true` to a human and aborts every `isabelle` command on the user's
+   machine (§1.2). Editing a copy costs nothing; editing the original is the trap.
 5. Running `isabelle scala_build` against the *shipped* component is a **no-op**, not a rebuild — it
    would silently ship a stale jar. §6.6 is what catches that.
 
-`scripts/check_component.py` enforces all of this (and CI runs it on every push): it fails if the
-shipped `build.props` lost its `no_build` line, if the jar's recorded source digests no longer match
-the sources, if the jar does not declare `isabelle.mcp.Tools`, or if the wheel does not carry the
-component. Run it before releasing:
+`scripts/check_component.py` enforces all of this (§6.6), and CI runs it on every push *and* against
+the built wheel and sdist before publishing (§8). Run it before releasing:
 
 ```bash
-python scripts/check_component.py                      # the source tree
-uv build --wheel && python scripts/check_component.py --wheel dist/*.whl
+python scripts/check_component.py             # the source tree
+uv build && python scripts/check_component.py dist/*      # and both artefacts that ship
 ```
 
 The jar is **tracked**, so this recipe only runs when a `.scala` source changes — not on every
-release. To check whether it needs to: the jar embeds a SHA1 of every source it was built from
-(`META-INF/isabelle/shasum`); compare those against the files on disk. That check, and the §6.6
-gate, are what a CI job should automate. Neither is a prerequisite for releasing.
+release. You do not have to remember when: the gate compares the jar's record against what
+`build.props` declares today, so it tells you.
 
 The jar is pure JVM bytecode (150 `.class` + 16 `.tasty`, no native code), so **one jar serves every
 platform** — which is what lets the wheel stay `py3-none-any`. Its only binding is the Isabelle
