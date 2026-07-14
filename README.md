@@ -1,10 +1,13 @@
 # Isabelle-MCP
 
+[![PyPI](https://img.shields.io/pypi/v/isabelle-mcp)](https://pypi.org/project/isabelle-mcp/)
+[![Python](https://img.shields.io/pypi/pyversions/isabelle-mcp)](https://pypi.org/project/isabelle-mcp/)
+[![CI](https://github.com/xqyww123/Isabelle-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/xqyww123/Isabelle-MCP/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 MCP server that lets AI agents (Claude Code, Codex, …) drive the Isabelle
 theorem prover through its LSP/PIDE commands — fully autonomously, with no
 human in the loop.
-
-**Python ≥ 3.12 | v0.1.0 (MVP)**
 
 ## Purpose
 
@@ -79,6 +82,7 @@ For Claude Desktop, register manually instead
 | `isabelle_definition` | Jump to symbol definition |
 | `isabelle_local_occurrences` | In-file occurrences (definition + uses) of a local entity |
 | `isabelle_goal` | **Proof goals** — omit after_text for before/after diff |
+| `isabelle_find_theorems` | Search the theorem database in the context at a position (Isabelle's `find_theorems`): by name, pattern, intro/elim/dest, solves, simp |
 | `isabelle_command_output` | Prover output messages |
 | `isabelle_session_info` | Current session info |
 
@@ -107,4 +111,4 @@ models.py         Pydantic output models
 
 ## License
 
-See LICENSE.
+MIT — see [LICENSE](LICENSE).
