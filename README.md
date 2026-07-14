@@ -1,7 +1,7 @@
 # Isabelle-MCP
 
 [![PyPI](https://img.shields.io/pypi/v/isabelle-mcp)](https://pypi.org/project/isabelle-mcp/)
-[![Python](https://img.shields.io/pypi/pyversions/isabelle-mcp)](https://pypi.org/project/isabelle-mcp/)
+[![Python](https://img.shields.io/badge/python-%E2%89%A5%203.12-blue)](https://pypi.org/project/isabelle-mcp/)
 [![CI](https://github.com/xqyww123/Isabelle-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/xqyww123/Isabelle-MCP/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
