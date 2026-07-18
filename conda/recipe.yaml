@@ -1,0 +1,98 @@
+schema_version: 1
+
+# isabelle-mcp: an MCP server that drives an Isabelle LSP session.
+#
+# This package is shaped UNLIKE the other Isabelle conda components, in two ways that
+# matter:
+#
+# 1. There is NO ROOT and no Isabelle session here -- nothing to build, nothing to add to
+#    the theory-loader path.
+#
+# 2. There are deliberately NO post-link / pre-unlink hooks.  The other components register
+#    themselves with `isabelle components -u` from a conda hook; this one carries its
+#    Isabelle component (a prebuilt Scala jar under src/isabelle_mcp/scala/) as package
+#    DATA and registers it from Python at run time -- see isabelle_mcp/component.py, whose
+#    ensure_component() prunes stale entries and re-registers the live one on every start.
+#    Adding a conda hook here would register a second, competing entry and fight the code
+#    that already owns that file.  If you are copying a hook block from a sibling recipe
+#    into this file, stop: it is wrong here.
+#
+# `noarch: python` for the same reason as isabelle-rpc: conda relocates site-packages into
+# the installing environment, and the .dist-info makes pip stand down instead of
+# overwriting conda's files.
+#
+# The version is NOT duplicated into a ./VERSION file, unlike the sibling repos.  This
+# project already declares it dynamically from isabelle_mcp.__version__ (pyproject.toml
+# `dynamic = ["version"]`), and its own ci.yml asserts the git tag matches that attribute.
+# A VERSION file would be a second source of truth for the same number; CI reads the
+# attribute instead.
+
+context:
+  version: ${{ env.get("ISA_COMPONENT_VERSION", default="0.0.0") }}
+
+source:
+  - path: ../
+
+package:
+  name: isabelle-mcp
+  version: ${{ version }}
+
+build:
+  number: 0
+  noarch: python
+  python:
+    entry_points:
+      - isabelle-mcp = isabelle_mcp.server:main
+  script:
+    interpreter: bash
+    content: |
+      set -euo pipefail
+      # --no-deps: conda resolves dependencies, pip must not.
+      # --no-build-isolation: the build env already has what pyproject needs, and the
+      # builder has no network.
+      $PYTHON -m pip install . --no-deps --no-build-isolation -vv
+
+      # The Scala component travels as package data (pyproject [tool.setuptools.package-data]
+      # ships `scala/**/*`), so pip has already placed it.  Assert it survived: it carries a
+      # prebuilt jar with `no_build = true`, and without it the component registers but
+      # Isabelle finds no module to load.
+      sp=$($PYTHON -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+      test -d "$sp/isabelle_mcp/scala"
+      find "$sp/isabelle_mcp/scala" -name '*.jar' | grep -q . \
+        || { echo "the prebuilt Scala jar did not ship"; exit 1; }
+
+requirements:
+  host:
+    - python >=3.12
+    - pip
+    - setuptools
+  run:
+    - python >=3.12                      # pyproject: requires-python
+    # Not expressible in pyproject, but true and expressible here: this drives an Isabelle
+    # LSP server and registers a component into $ISABELLE_HOME_USER, so it is useless
+    # without the distribution.  Bounded to the series its Scala component is built for.
+    - isabelle >=2025.2,<2025.3
+    # The five pyproject dependencies.  Unlike isabelle-rpc's, every one of these has the
+    # SAME name on conda-forge as on PyPI -- checked, not assumed.
+    - beautifulsoup4 >=4.12.0
+    - fastmcp >=3.2,<4
+    - mcp >=1.0.0
+    - pydantic >=2.0.0
+    - watchdog >=3.0.0
+
+tests:
+  - python:
+      imports:
+        - isabelle_mcp
+      pip_check: true
+
+about:
+  homepage: https://github.com/xqyww123/Isabelle-MCP
+  summary: "MCP server for Isabelle: drive a proof session from an AI client"
+  description: |
+    An MCP (Model Context Protocol) server that drives an Isabelle LSP session, so an AI
+    client can evaluate theories, inspect proof state, and query the library.  Ships a
+    prebuilt Isabelle Scala component as package data and registers it with Isabelle at
+    run time.
+  license: BSD-3-Clause
+  repository: https://github.com/xqyww123/Isabelle-MCP

@@ -1,0 +1,246 @@
+# Release this repo as the conda package `isabelle-mcp` on https://conda.qiyuan.me.
+#
+# Deliberately NOT a copy of the sibling components' workflow.  This package has no
+# Isabelle session and no link hooks: it carries its Isabelle component as package data
+# and registers it from Python at run time (isabelle_mcp/component.py).  So there is no
+# `isabelle components -u` to assert, no ROOT, and nothing to `isabelle build`.  Asserting
+# those here would fail on a perfectly good package -- and copying a sibling file is
+# exactly how that mistake would be made.
+#
+# The version comes from isabelle_mcp.__version__, not a ./VERSION file, because this
+# project already declares it there and its own ci.yml checks the tag against it.  A
+# VERSION file would be a second source of truth for the same number.
+name: release-conda
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and verify only -- do NOT publish to the channel"
+        type: boolean
+        default: false
+      build_number:
+        description: "conda build number - BUMP if republishing the same version with changed content"
+        type: string
+        default: "0"
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: release-conda
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: "Build isabelle-mcp (noarch: python)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Step outputs do not cross jobs; `verify` reads the version through this.
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Read the version from isabelle_mcp.__version__"
+        id: ver
+        run: |
+          set -euo pipefail
+          v=$(python3 -c "import re,pathlib; print(re.search(r'__version__ = \"([^\"]+)\"', pathlib.Path('src/isabelle_mcp/__init__.py').read_text()).group(1))")
+          case "$v" in
+            ''|*-*) echo "::error::version is '$v' -- must be non-empty and contain no '-'"; exit 1 ;;
+          esac
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "building isabelle-mcp $v"
+
+      - name: "The tag must agree with __version__"
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          [ "$tag" = "${{ steps.ver.outputs.version }}" ] || {
+            echo "::error::tag $GITHUB_REF_NAME does not match __version__=${{ steps.ver.outputs.version }}"
+            exit 1; }
+          # The concurrency group holds one pending run, so `git push --tags` with several
+          # tags drops all but the first and last -- as grey, unnotified runs.
+          git fetch --tags --force --quiet
+          newest="$(git tag -l 'v*' --sort=-v:refname | head -1)"
+          [ "$newest" = "$GITHUB_REF_NAME" ] || {
+            echo "::error::$GITHUB_REF_NAME is not the newest v* tag (newest is $newest)."
+            exit 1; }
+
+      - name: Install rattler-build
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/rattler-build \
+            https://github.com/prefix-dev/rattler-build/releases/download/v0.69.1/rattler-build-x86_64-unknown-linux-musl
+          chmod +x /tmp/rattler-build
+          /tmp/rattler-build --version
+
+      - name: Build the package
+        env:
+          ISA_COMPONENT_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          /tmp/rattler-build build \
+            --recipe conda/recipe.yaml \
+            --output-dir "$GITHUB_WORKSPACE/out" \
+            --build-num "${{ inputs.build_number || '0' }}" \
+            --no-test
+          find "$GITHUB_WORKSPACE/out" -name '*.conda' -printf '  %10s  %p\n'
+
+      - name: "Sanity: the payload carries the package, the jar and a dist-info"
+        run: |
+          set -euo pipefail
+          pkg=$(find "$GITHUB_WORKSPACE/out" -name 'isabelle-mcp-*.conda' | head -1)
+          [ -n "$pkg" ] || { echo "::error::no package was produced"; exit 1; }
+          pip install --quiet zstandard
+          work=$(mktemp -d)
+          python3 -c "import sys,zipfile,tarfile,io,zstandard; z=zipfile.ZipFile(sys.argv[1]); b=next(n for n in z.namelist() if n.startswith('pkg-') and n.endswith('.tar.zst')); r=zstandard.ZstdDecompressor().stream_reader(io.BytesIO(z.read(b))); tarfile.open(fileobj=io.BytesIO(r.read())).extractall(sys.argv[2])" "$pkg" "$work"
+          echo "===== payload (top level) ====="
+          find "$work" -maxdepth 2 | sort | head -20
+
+          [ -e "$work/site-packages/isabelle_mcp/__init__.py" ] \
+            || { echo "::error::the python package is missing"; exit 1; }
+
+          # The Scala component is package DATA and carries a PREBUILT jar
+          # (no_build = true), so nothing is compiled on a user's machine and
+          # site-packages may be read-only.  If the jar stops shipping, the component
+          # registers and Isabelle then finds no module to load.
+          find "$work/site-packages/isabelle_mcp/scala" -name '*.jar' | grep -q . \
+            || { echo "::error::the prebuilt Scala jar did not ship"; exit 1; }
+          echo "  OK  python package + Scala component with its jar"
+
+          di=$(find "$work/site-packages" -maxdepth 1 -name 'isabelle_mcp-*.dist-info' | head -1)
+          [ -n "$di" ] || { echo "::error::no .dist-info -- pip would not respect this package"; exit 1; }
+          grep -qx "Version: ${{ steps.ver.outputs.version }}" "$di/METADATA" \
+            || { echo "::error::dist-info version != ${{ steps.ver.outputs.version }}"; exit 1; }
+          echo "  OK  $(basename "$di")"
+
+          # A baked-in lib/pythonX.Y path is the noarch:generic defect: installs green,
+          # fails to import under any other interpreter.
+          ! find "$work" -path '*lib/python3*' -print -quit | grep -q . \
+            || { echo "::error::payload contains a hardcoded lib/pythonX.Y path"; exit 1; }
+
+          # This package must NOT carry link hooks: it registers from Python at run time,
+          # and a conda hook would add a second, competing etc/components entry.
+          ! find "$work" \( -name '*post-link*' -o -name '*pre-unlink*' \) -print -quit | grep -q . \
+            || { echo "::error::this package must not ship link hooks -- see conda/recipe.yaml"; exit 1; }
+          echo "  OK  no link hooks, no hardcoded python path"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: conda-packages
+          path: out/**/*.conda
+          if-no-files-found: error
+
+  # Install and USE the package before publishing.  Publishing is the point of no return:
+  # the channel never deletes, so a broken package becomes the newest resolvable version.
+  verify:
+    name: "Verify before publishing"
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash -l {0}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: conda-packages
+          path: ${{ runner.temp }}/pkgs
+
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          auto-update-conda: true
+
+      - name: Index the freshly built package into a local channel
+        run: |
+          set -euo pipefail
+          conda install -y -n base -c conda-forge conda-index -q
+          CH="$RUNNER_TEMP/local-channel"
+          mkdir -p "$CH/noarch"
+          find "$RUNNER_TEMP/pkgs" -name '*.conda' -exec cp {} "$CH/noarch/" \;
+          # $CONDA/bin/python, not bare `python`: setup-miniconda leaves /usr/bin/python
+          # first on PATH and conda-index went into the BASE env.
+          "$CONDA/bin/python" -m conda_index "$CH" --no-zst --no-bz2 --channeldata --channel-name local
+          echo "CH=$CH" >> "$GITHUB_ENV"
+
+      - name: "Install it -- local channel for us, the rest from conda.qiyuan.me + conda-forge"
+        run: |
+          set -euo pipefail
+          # conda-forge is required: python and the five libraries are not on our channel.
+          conda create -y -n v \
+            -c "file://$CH" -c https://conda.qiyuan.me -c conda-forge --override-channels \
+            isabelle-mcp
+          conda activate v
+          conda list isabelle
+
+      - name: "It imports, exposes its entry point, ships its jar, and pip stands down"
+        run: |
+          set -euo pipefail
+          conda activate v
+          python -c "import isabelle_mcp; print('imported from', isabelle_mcp.__file__); print('version', isabelle_mcp.__version__)"
+          command -v isabelle-mcp
+          v=$(python -c "import importlib.metadata as m; print(m.version('isabelle-mcp'))")
+          [ "$v" = "${{ needs.build.outputs.version }}" ] \
+            || { echo "::error::importlib.metadata reports $v, expected ${{ needs.build.outputs.version }}"; exit 1; }
+          echo "  OK  importlib.metadata.version('isabelle-mcp') = $v"
+
+          # The Scala component must be present in the INSTALLED tree, not just the artifact.
+          jar=$(python -c "import pathlib, isabelle_mcp; p=pathlib.Path(isabelle_mcp.__file__).parent/'scala'; j=sorted(p.rglob('*.jar')); print(j[0] if j else '')")
+          [ -n "$jar" ] || { echo "::error::no Scala jar in the installed tree"; exit 1; }
+          echo "  OK  Scala component: $jar"
+
+          out=$(pip install isabelle-mcp 2>&1) || { echo "$out"; exit 1; }
+          echo "$out" | grep -qi 'already satisfied' \
+            || { echo "::error::pip does not consider the conda package satisfying"; exit 1; }
+          echo "  OK  pip reports 'already satisfied'"
+
+  publish:
+    needs: verify
+    # A dry run stops here; `smoke` needs this job, so it drops out too.
+    if: ${{ !inputs.dry_run }}
+    uses: xqyww123/isabelle-packaging-ci/.github/workflows/publish-conda.yml@main
+    with:
+      artifact: conda-packages
+      package_name: isabelle-mcp
+    # Explicit, not `inherit`: a reusable workflow receives the CALLING repo's secrets, and
+    # naming them re-arms publish-conda.yml's `required: true`.
+    secrets:
+      CONDA_R2_ACCESS_KEY_ID:     ${{ secrets.CONDA_R2_ACCESS_KEY_ID }}
+      CONDA_R2_SECRET_ACCESS_KEY: ${{ secrets.CONDA_R2_SECRET_ACCESS_KEY }}
+
+  smoke:
+    name: "Smoke: conda install from conda.qiyuan.me (${{ matrix.os }})"
+    needs: publish
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        # bash -l: without a login shell the Windows runner's Git-Bash has no conda on PATH.
+        shell: bash -l {0}
+    steps:
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          auto-update-conda: true
+
+      - name: "conda install -c https://conda.qiyuan.me isabelle-mcp"
+        run: |
+          set -euo pipefail
+          conda create -y -n t \
+            -c https://conda.qiyuan.me -c conda-forge --override-channels \
+            isabelle-mcp
+          conda activate t
+          conda list isabelle-mcp
+
+      - name: "It imports and exposes its entry point on this platform"
+        run: |
+          set -euo pipefail
+          conda activate t
+          python -c "import isabelle_mcp; print('imported from', isabelle_mcp.__file__)"
+          command -v isabelle-mcp
+          echo "  OK  installed and importable"
