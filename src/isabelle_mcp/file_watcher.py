@@ -12,6 +12,7 @@ are handled by Isabelle's own vscode_server File_Watcher, not here.
 import asyncio
 import logging
 import os
+import sys
 from collections.abc import Callable, Coroutine
 from typing import Any
 
@@ -22,7 +23,11 @@ MAX_WATCHED_DIRS = 200
 
 
 def _inotify_instances_available() -> int:
-    """Estimate how many inotify instances are still available for this user."""
+    """Estimate how many inotify instances are still available for this user.
+
+    LINUX ONLY -- it reads /proc.  Elsewhere every path returns 0, which the caller
+    must not read as "exhausted"; see the platform guard in Watcher.start.
+    """
     try:
         with open("/proc/sys/fs/inotify/max_user_instances") as f:
             limit = int(f.read().strip())
@@ -84,15 +89,23 @@ class FileWatcher:
         self._sink = sink
 
     def start(self) -> None:
-        avail = _inotify_instances_available()
-        # Reserve at least 10 instances for Isabelle and other processes.
-        if avail < 10:
-            logger.warning(
-                "Only %d inotify instances available (need 10+ headroom); "
-                "disabling filesystem watcher. Tool-call stat backstop still syncs.",
-                avail,
-            )
-            return
+        # The inotify headroom check is LINUX-ONLY.  watchdog uses FSEvents on macOS and
+        # ReadDirectoryChangesW on Windows; neither consumes an inotify instance, and
+        # /proc/sys/fs/inotify does not exist there -- so _inotify_instances_available
+        # returned 0 through its (OSError, ValueError) handler and the watcher disabled
+        # ITSELF on every healthy non-Linux machine, with a warning whose both halves
+        # were false ("only 0 available", "need 10+ headroom").  A warning that fires on
+        # a healthy run is worse than no warning: it trains people to ignore the channel.
+        if sys.platform.startswith("linux"):
+            avail = _inotify_instances_available()
+            # Reserve at least 10 instances for Isabelle and other processes.
+            if avail < 10:
+                logger.warning(
+                    "Only %d inotify instances available (need 10+ headroom); "
+                    "disabling filesystem watcher. Tool-call stat backstop still syncs.",
+                    avail,
+                )
+                return
 
         try:
             from watchdog.events import FileSystemEvent, FileSystemEventHandler
