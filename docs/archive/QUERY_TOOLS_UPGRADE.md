@@ -10,10 +10,9 @@ keep the blanket refusal until part B, as §4.4 requires. Part B's ML half (§5.
 §5.3, §5.4) has landed in the prelude and has been exercised against a live
 prover; its Scala and Python halves have not.
 
-**One thing is open, and it belongs to stage 4:** the sentence for the
-`no_context` status (§5.3) is not drafted, because stage 3 discovered the case
-and stage 3 writes no agent-facing English. Everything else part B owes is
-drafted, approved and written into §5.3.
+**Nothing is open.** The sentence for the `no_context` status — the case stage 3
+discovered — was drafted and approved after stage 3 measured it, and is in §5.3
+with the rest. Stage 4 needs no further sign-off to begin.
 
 **Start here:** §6 stage 4 — the Scala adapter and the jar rebuild. Every design
 decision this document records has been through review; where a section says
@@ -32,8 +31,8 @@ The **ML↔Scala contract stage 4 must implement is §5.1's "The reply, exactly"
 The prelude answers with a status word and a payload and never with a sentence,
 because ML cannot map a command to a line (fact 2 below) and every approved
 reply names a `file:line`. Rendering the nine statuses into the §5.3 sentences
-is stage 4's job, and the `no_context` sentence must be approved before it is
-written.
+is stage 4's job; all eleven sentences, `no_context` included, are approved and
+sit in §5.3.
 
 `mcp_prelude_version` is now `"2"`. §8's version check compares against it.
 
@@ -1311,9 +1310,8 @@ fails at the pristine toplevel, which is exactly where `end` leaves you, so a
 find_theorems query aimed at a theory's final `end` has no search context at
 all. `isabelle_goal` never sees it: at that command `Toplevel.is_proof` is
 already false and the reply is `no_proof_state`. Measured, not deduced: the
-stage-3 probe asked at `end` and got `no_context` back. **Its agent-facing
-sentence is the one piece of part B's wording still unapproved** — stage 4 must
-draft it and get it signed off before rendering it.
+stage-3 probe asked at `end` and got `no_context` back. Its agent-facing
+sentence is approved and sits with the others in §5.3.
 
 ### 5.2 The ML side, and the discipline it must follow
 
@@ -1402,7 +1400,7 @@ design.
 | Exception escaping eval | `eval_result_state` re-raises it into the handler | error reply carrying the message |
 | **Ignored span** (comment/whitespace) | finishes successfully, state is the **predecessor's** (`outer_syntax.ML:271`, `toplevel.ML:419`) | serve the state, noting that the position is a comment and the state is the preceding command's — orientation for a mis-aimed position, not a safety measure |
 | Not a proof state | `Toplevel.is_proof` false; `pretty_state` returns `[]` (`toplevel.ML:237-242`) | "no proof state here" — a definite answer, not a timeout |
-| **No context at all** (find_theorems only) | `Toplevel.context_of` raises, which is where `end` leaves the state | status `no_context`; sentence to be drafted and approved in stage 4 (§5.1) |
+| **No context at all** (find_theorems only) | `Toplevel.context_of` raises, which is where `end` leaves the state | "no theory context here, ask inside the theory" — a definite answer (§5.1) |
 | Command has background work | `Execution.snapshot [Command.eval_exec_id eval] <> []` (the test `document.ML:727-736` uses) | serve the state, noting that forked work may still fail |
 
 **A failed command is deliberately NOT a special case.** When a command fails,
@@ -1422,6 +1420,8 @@ context of that point, which is what the agent wants.
 **The replies, approved.** Positions render as `file:line`, the same form
 everywhere else. The first four are raised as errors; the next two are served
 with the state and a note; the rest cover cancellation, a crash and a timeout.
+The "no theory context" line belongs to `isabelle_find_theorems` alone and was
+approved after stage 3 measured the case; the others were approved before it.
 
 ```
 The command at MyTheory.thy:42 is no longer part of the current document: a file changed while this query was in flight. Retry.
@@ -1435,6 +1435,8 @@ Reading the proof state at MyTheory.thy:42 failed: {message}
 MyTheory.thy:42 is a comment or blank line; this is the proof state after the command before it.
 
 The command at MyTheory.thy:42 is not a proof operation, so there is no proof state here.
+
+There is no theory context at MyTheory.thy:42, so there is nothing to search here. Ask at a line inside the theory.
 
 This command forked work that is still running, so a failure may still surface at MyTheory.thy:42.
 
