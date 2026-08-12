@@ -34,8 +34,7 @@ progress. You should keep polling `isabelle_evaluation_status` to watch it throu
 it reports progress (per-theory percentage and command counts), any new errors,
 and which commands are still running and for how long.
 
-During an evaluation you can still query lines it has already evaluated — except
-`isabelle_goal` and `isabelle_find_theorems`, which are refused until it finishes.
+During an evaluation you can still query any line it has already evaluated.
 
 A result is only reported `clean`/`complete` once the proofs up to your target have fully
 checked — including forked proofs running in the background. If a result shows `running:` or
