@@ -1,12 +1,17 @@
-"""``isabelle_find_theorems`` — search the theorem database from a caret position.
+"""``isabelle_find_theorems`` — search the theorem database in a command's context.
 
 Structured criteria are serialized into Isabelle's ``find_theorems`` surface
-syntax (parsed by ``Find_Theorems.read_query``) and run, at the caret's context,
-through the patched ``PIDE/find_theorems`` query operation. See
-``docs`` and the plan for the design.
+syntax (parsed by ``Find_Theorems.read_query``) and run in the context of the
+command at the requested position, read straight out of the prover's document
+state. See docs/archive/QUERY_TOOLS_UPGRADE.md §5 for the design.
 """
 
-from isabelle_mcp.evaluation import check_evaluation_guard, format_evaluation_result
+from isabelle_mcp import query
+from isabelle_mcp.evaluation import (
+    check_evaluation_guard,
+    format_evaluation_result,
+    relativize,
+)
 from isabelle_mcp.lsp_client import IsabelleLSPClient
 from isabelle_mcp.models import CommandSpan, EvaluationView, FindTheoremsResult, ThmEntry
 from isabelle_mcp.utils import (
@@ -111,6 +116,18 @@ def serialize_find_theorems_query(
     return " ".join(fragments), note
 
 
+# find_theorems reaches the same command-state failures isabelle_goal does, and
+# says the same things about them. The dictionary is named so that giving it its
+# own wording later is one substitution, not a rewrite.
+FIND_THEOREMS_MESSAGES = {
+    **query.PROOF_STATE_MESSAGES,
+    query.NO_CONTEXT: (
+        "There is no theory context at {where}, so there is nothing to search "
+        "here. Ask at a line inside the theory."
+    ),
+}
+
+
 def _combine_notes(*notes: str | None) -> str | None:
     present = [n for n in notes if n]
     return " ".join(present) if present else None
@@ -141,7 +158,7 @@ async def find_theorems(
     # NOT opened here: the guard decides whether opening is allowed. A didOpen
     # globally invalidates decoration freshness, so it must not happen while an
     # evaluation is outstanding; on the paths that may open, evaluate_to does it.
-    guard = await check_evaluation_guard(client, file_path, line, moves_caret=True)
+    guard = await check_evaluation_guard(client, file_path, line)
     if isinstance(guard, EvaluationView):
         raise IsabelleToolError(format_evaluation_result(guard, client.project_root))
     guard_note = guard if isinstance(guard, str) else None
@@ -159,7 +176,7 @@ async def find_theorems(
         )
     )
 
-    query, unicode_note = serialize_find_theorems_query(
+    query_text, unicode_note = serialize_find_theorems_query(
         names=names, exclude_names=exclude_names,
         intro=intro, elim=elim, dest=dest, solves=solves,
         patterns=patterns, exclude_patterns=exclude_patterns,
@@ -168,34 +185,41 @@ async def find_theorems(
     limit_arg = str(limit) if limit else ""
     allow_dups_arg = str(allow_duplicates).lower()
 
-    html = await client.get_find_theorems_at_position(
-        file_path, LSPLine(caret_line), caret_char, query, limit_arg, allow_dups_arg,
+    reply = await client.get_find_theorems_at_position(
+        file_path, LSPLine(caret_line), caret_char,
+        query_text, limit_arg, allow_dups_arg,
     )
-    if html is None:
+    where = f"{relativize(file_path, client.project_root)}:{int(line)}"
+
+    if reply.status == query.NO_COMMAND:
         return FindTheoremsResult(
-            command=command, found=None, displayed=None, theorems=[],
+            command=None, found=None, displayed=None, theorems=[],
             note=_combine_notes(
                 guard_note, unicode_note,
                 "No command at the position; nothing was searched.",
             ),
         )
+    if reply.status != query.OK:
+        raise IsabelleToolError(
+            query.message(reply, where, client.QUERY_BACKSTOP, FIND_THEOREMS_MESSAGES)
+        )
 
-    # html is not None here, so the query DID run. If command is None, the caret was
-    # on an ignored span (blank line / between commands / comment) and the search ran
-    # in the preceding command's context (Isabelle walks backward to the nearest
-    # non-ignored command). Flag that so command=None is not mistaken for
-    # "nothing was searched" — including when that context yields no matches.
+    # The position resolves to a real command, so command=None here would mean the
+    # two resolutions disagreed; the search still ran, in that command's context.
     between_commands_note = (
-        "Caret is between commands; searched in the preceding command's context."
+        "The position is between commands; searched in the preceding command's context."
         if command is None
         else None
     )
 
-    found, displayed, theorems = parse_find_theorems_from_html(html)
+    found, displayed, theorems = parse_find_theorems_from_html(reply.content)
     return FindTheoremsResult(
         command=command,
         found=found,
         displayed=displayed,
         theorems=[ThmEntry(name=name, statement=stmt) for name, stmt in theorems],
-        note=_combine_notes(guard_note, unicode_note, between_commands_note),
+        note=_combine_notes(
+            guard_note, unicode_note, between_commands_note,
+            *query.notes(reply, where),
+        ),
     )

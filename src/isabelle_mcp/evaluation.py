@@ -118,16 +118,6 @@ NOT_EVALUATED_REFUSAL = (
     "Call isabelle_evaluation_status to check progress."
 )
 
-# The two caret-moving query tools stay blocked for as long as they read through
-# the global caret: the evaluation drives that same caret and there is no
-# arbitration between the two writers. Part B removes the dependence, and with it
-# this refusal.
-CARET_BUSY_REFUSAL = (
-    "This query cannot run while an evaluation is in progress. "
-    "Evaluating towards {target}:{target_line}. "
-    "Call isabelle_evaluation_status to check progress."
-)
-
 NOT_OPEN_REFUSAL = (
     "{file} has not been opened yet, and opening it would disturb the evaluation "
     "in progress. Evaluating towards {target}:{target_line}. "
@@ -1180,8 +1170,6 @@ async def check_evaluation_guard(
     client: IsabelleLSPClient,
     file_path: str,
     line: MCPLine,
-    *,
-    moves_caret: bool = False,
 ) -> "EvaluationView | str | None":
     """Ensure *line* has been evaluated; raise, warn, or auto-start evaluation.
 
@@ -1191,13 +1179,8 @@ async def check_evaluation_guard(
 
     The decision is made about the REQUESTED POSITION, not about the global
     evaluation flag: a position that is already processed is served even while an
-    evaluation is outstanding elsewhere. The four position-explicit query tools
-    move no caret, so serving them competes with the evaluation for nothing.
-
-    *moves_caret* marks the two callers for which that is not true — the
-    proof-state half of ``isabelle_goal`` and ``isabelle_find_theorems``, which
-    read through the global caret the evaluation is steering. They keep the
-    blanket refusal until part B makes them position-explicit.
+    evaluation is outstanding elsewhere. Every query tool is position-explicit and
+    moves no caret, so serving one competes with the evaluation for nothing.
 
     Returns:
       - ``None``: line is fully processed, caller can proceed.
@@ -1207,18 +1190,6 @@ async def check_evaluation_guard(
         renders it (``format_evaluation_result``) and raises it.
     Raises :class:`IsabelleToolError` when the position cannot be served.
     """
-    if moves_caret:
-        async with _evaluation_state_lock:
-            if evaluation_state.active:
-                raise IsabelleToolError(
-                    CARET_BUSY_REFUSAL.format(
-                        target=relativize(
-                            evaluation_state.file_path, client.project_root,
-                        ),
-                        target_line=int(evaluation_state.destination_line),
-                    ),
-                )
-
     state = await _settled_position_state(client, file_path, line)
 
     if state == PROCESSED:

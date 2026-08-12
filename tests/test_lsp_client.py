@@ -514,18 +514,6 @@ class TestIsabelleLSPClient:
         assert await client._read_message() == {}
 
     @pytest.mark.asyncio
-    async def test_handle_state_output_resolves_init_waiter(self):
-        client = IsabelleLSPClient()
-        future = asyncio.get_running_loop().create_future()
-        client._state_init_waiters.append(future)
-
-        client._handle_state_output({"id": 42, "content": "<pre>1. P</pre>"})
-
-        assert future.done()
-        assert future.result() == (42, "<pre>1. P</pre>")
-        assert client._state_init_waiters == []
-
-    @pytest.mark.asyncio
     async def test_handle_dynamic_output(self):
         client = IsabelleLSPClient()
         future = asyncio.get_running_loop().create_future()
@@ -539,67 +527,65 @@ class TestIsabelleLSPClient:
         assert client._dynamic_output_cache_by_position[key] == "<div class='writeln'>ok</div>"
 
     @pytest.mark.asyncio
-    async def test_get_goals_uses_state_panel(self):
+    async def test_query_at_position_is_one_request_and_a_cancel(self):
+        # No caret update, no panel, no sleep: one request carrying the token and
+        # the backstop, and a cancel naming the same token on the way out.
         client = IsabelleLSPClient()
-        calls = []
+        client.open_documents["/tmp/Test.thy"] = DocumentState(
+            file_path="/tmp/Test.thy", uri="file:///tmp/Test.thy", version=1, content="",
+        )
+        sent = []
+        client.notify = AsyncMock(side_effect=lambda m, p: sent.append((m, p)))
+        client.request = AsyncMock(return_value={
+            "status": "ok", "comment": False, "forked": True, "content": "<pre>1. P</pre>",
+        })
 
-        async def fake_notify(method, params):
-            calls.append((method, params))
-            if method == "PIDE/state_init":
-                client._handle_state_output({"id": 99, "content": "<pre>1. P</pre>"})
+        reply = await client.get_proof_state_at_position("/tmp/Test.thy", LSPLine(7), 3)
 
-        client.notify = AsyncMock(side_effect=fake_notify)
-        goals = await client.get_goals_at_position("/tmp/Test.thy", LSPLine(7), 3)
-
-        assert goals == ["P"]
-        assert calls[0][0] == "PIDE/caret_update"
-        assert calls[1] == ("PIDE/state_init", {})
-        assert calls[-1] == ("PIDE/state_exit", {"id": 99})
+        assert reply.status == "ok"
+        assert reply.forked is True
+        assert reply.content == "<pre>1. P</pre>"
+        method, params = client.request.call_args[0]
+        assert method == "PIDE/proof_state_at_position"
+        assert params["position"] == {"line": 7, "character": 3}
+        assert params["timeout"] == client.QUERY_BACKSTOP
+        assert sent == [("PIDE/query_cancel", {"token": params["token"]})]
 
     @pytest.mark.asyncio
-    async def test_get_goals_2025_uses_state_init_request(self):
-        # Isabelle2025 made PIDE/state_init a request (replies with the panel's
-        # state_id). The panel still pushes state_output as a notification, which
-        # the waiter captures — but the panel is only created if state_init is sent
-        # as a *request*. Sent as a notification (pre-2025 path), 2025 returns no
-        # goals (the bug this branch fixes).
-        import isabelle_mcp.lsp_client as lc
-        lc._isabelle_version_cache = ("Isabelle2025-2", 2025)
+    async def test_query_at_position_cancels_even_when_the_request_fails(self):
+        # The prover must not keep working on a query nobody will read.
         client = IsabelleLSPClient()
-        calls = []
-
-        async def fake_notify(method, params):
-            calls.append((method, params))
-
-        async def fake_request(method, params, timeout=None):
-            calls.append(("REQUEST", method, params))
-            if method == "PIDE/state_init":
-                client._handle_state_output({"id": 7, "content": "<pre>1. Q</pre>"})
-            return {"state_id": 7}
-
-        client.notify = AsyncMock(side_effect=fake_notify)
-        client.request = AsyncMock(side_effect=fake_request)
-        goals = await client.get_goals_at_position("/tmp/Test.thy", LSPLine(7), 3)
-
-        assert goals == ["Q"]
-        # state_init went out as a REQUEST, never as a notification.
-        assert ("REQUEST", "PIDE/state_init", {}) in calls
-        assert ("PIDE/state_init", {}) not in calls
-        assert calls[-1] == ("PIDE/state_exit", {"id": 7})
-
-    @pytest.mark.asyncio
-    async def test_get_goals_timeout_cleans_init_waiter(self):
-        client = IsabelleLSPClient()
-        client.notify = AsyncMock()
-        client.STALL_TIMEOUT = 0.01
-        client.STATE_OUTPUT_GRACE = 0.01
-        client.PROGRESS_CHECK_INTERVAL = 0.01
-        client._last_server_activity = time.time() - 1.0
+        client.open_documents["/tmp/Test.thy"] = DocumentState(
+            file_path="/tmp/Test.thy", uri="file:///tmp/Test.thy", version=1, content="",
+        )
+        sent = []
+        client.notify = AsyncMock(side_effect=lambda m, p: sent.append((m, p)))
+        client.request = AsyncMock(side_effect=IsabelleToolError("boom"))
 
         with pytest.raises(IsabelleToolError):
-            await client.get_goals_at_position("/tmp/Test.thy", LSPLine(7), 3)
+            await client.get_proof_state_at_position("/tmp/Test.thy", LSPLine(7), 3)
 
-        assert client._state_init_waiters == []
+        assert [m for m, _ in sent] == ["PIDE/query_cancel"]
+
+    @pytest.mark.asyncio
+    async def test_find_theorems_at_position_passes_its_arguments_through(self):
+        client = IsabelleLSPClient()
+        client.open_documents["/tmp/Test.thy"] = DocumentState(
+            file_path="/tmp/Test.thy", uri="file:///tmp/Test.thy", version=1, content="",
+        )
+        client.notify = AsyncMock()
+        client.request = AsyncMock(return_value={"status": "ok", "content": "<pre/>"})
+
+        await client.get_find_theorems_at_position(
+            "/tmp/Test.thy", LSPLine(7), 3, "name: foo", "5", "false",
+        )
+
+        _, params = client.request.call_args[0]
+        assert params["query"] == "name: foo"
+        assert params["limit"] == "5"
+        # The prover reads allow_dups inverted: only the exact string "false"
+        # removes duplicates.
+        assert params["allow_dups"] == "false"
 
     @pytest.mark.asyncio
     async def test_dynamic_output_timeout_no_stale_data(self):
@@ -649,12 +635,10 @@ class TestIsabelleLSPClient:
         client = IsabelleLSPClient()
         loop = asyncio.get_running_loop()
         request_future = loop.create_future()
-        state_init_future = loop.create_future()
         dynamic_future = loop.create_future()
         preview_future = loop.create_future()
 
         client.pending_requests[1] = request_future
-        client._state_init_waiters.append(state_init_future)
         client._dynamic_output_waiters.append((("/tmp/Test.thy", 1, 0), dynamic_future))
         client._dynamic_output_cache_by_position[("/tmp/Test.thy", 1, 0)] = "stale"
         client._preview_waiters[("file:///tmp/Test.thy", 0)] = preview_future
@@ -662,16 +646,10 @@ class TestIsabelleLSPClient:
         exc = IsabelleToolError("transport failed")
         client._fail_pending_waiters(exc)
 
-        for future in (
-            request_future,
-            state_init_future,
-            dynamic_future,
-            preview_future,
-        ):
+        for future in (request_future, dynamic_future, preview_future):
             assert future.done()
             assert future.exception() is exc
         assert client.pending_requests == {}
-        assert client._state_init_waiters == []
         assert client._dynamic_output_waiters == []
         assert client._dynamic_output_cache_by_position == {}
         assert client._preview_waiters == {}

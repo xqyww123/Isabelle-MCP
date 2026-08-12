@@ -158,6 +158,13 @@ class MockLSPClient:
         self.definition_response = None
         self.highlights_response = None
         self.goal_response: list[str] = []
+        # Set to a QueryReply to test a specific status; None means "ok, with
+        # goal_response's subgoals".
+        self.proof_state_reply = None
+        self.find_theorems_reply = None
+        self.find_theorems_html = ""
+        # Whatever QUERY_BACKSTOP the real client would report in a timeout message.
+        self.QUERY_BACKSTOP = 600.0
         self.dynamic_output_response = ""
         self.command_at_position_response: tuple[str, dict[str, Any]] | None = None
         self.output_at_position_response: tuple[str, dict[str, Any], str] | None = None
@@ -260,8 +267,34 @@ class MockLSPClient:
     async def get_highlights(self, file_path: str, line: LSPLine, character: LSPCharacter) -> Any:
         return self.highlights_response
 
-    async def get_goals_at_position(self, file_path: str, line: LSPLine, character: int) -> list[str]:
-        return self.goal_response
+    async def get_proof_state_at_position(
+        self, file_path: str, line: LSPLine, character: int,
+    ):
+        """Answer as the prover would.
+
+        ``proof_state_reply`` forces a specific reply when a test is about a
+        status; otherwise ``goal_response`` (a plain list of subgoals) is dressed
+        up as the ``subgoal``-classed HTML the real path renders, so the tests
+        that only care about goals stay readable.
+        """
+        from isabelle_mcp.query import OK, QueryReply
+        if self.proof_state_reply is not None:
+            return self.proof_state_reply
+        body = "".join(
+            f'<span class="subgoal">{n}. {text}</span>'
+            for n, text in enumerate(self.goal_response, start=1)
+        )
+        return QueryReply(status=OK, content=f"<pre>{body}</pre>" if body else "")
+
+    async def get_find_theorems_at_position(
+        self, file_path: str, line: LSPLine, character: int,
+        query_text: str, limit: str, allow_dups: str,
+    ):
+        from isabelle_mcp.query import OK, QueryReply
+        self.find_theorems_args = (query_text, limit, allow_dups)
+        if self.find_theorems_reply is not None:
+            return self.find_theorems_reply
+        return QueryReply(status=OK, content=self.find_theorems_html)
 
     async def get_command_at_position(
         self, file_path: str, line: LSPLine, character: LSPCharacter,

@@ -1147,24 +1147,22 @@ class TestGuardPositionDecision:
         assert evaluation_state.active is False
 
     @pytest.mark.asyncio
-    async def test_caret_moving_tools_stay_blocked(
+    async def test_every_query_tool_is_now_judged_by_position_alone(
         self, mock_lsp_client, temp_theory_file,
     ):
-        """§4.4: releasing these two would put two writers on the global caret
-        with no arbitration. Part B removes the dependence; until then the
-        blanket refusal IS the mutual exclusion."""
+        """§4.4: the two caret-moving tools used to be refused outright while an
+        evaluation ran, because they and the evaluation both wrote the global
+        caret. Part B removed the caret from both, so the guard has one rule for
+        all six tools and takes no flag saying which one is asking."""
+        import inspect
+
         await mock_lsp_client.open_document(temp_theory_file)   # processed
         evaluation_state.start(temp_theory_file, MCPLine(100))
 
-        # The same position is served for a position-explicit tool ...
         assert await ev.check_evaluation_guard(
             mock_lsp_client, temp_theory_file, MCPLine(5),
         ) is None
-        # ... and refused for a caret-moving one.
-        with pytest.raises(IsabelleToolError, match="cannot run while an evaluation"):
-            await ev.check_evaluation_guard(
-                mock_lsp_client, temp_theory_file, MCPLine(5), moves_caret=True,
-            )
+        assert "moves_caret" not in inspect.signature(ev.check_evaluation_guard).parameters
 
 
 class TestTargetOnTheResultModel:

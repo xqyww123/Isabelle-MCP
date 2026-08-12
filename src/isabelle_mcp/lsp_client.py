@@ -14,7 +14,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
+from isabelle_mcp import query
 from isabelle_mcp.models import RunningCommand
+from isabelle_mcp.query import QueryReply
 from isabelle_mcp.processing import (
     ProcessingTracker,
     clip_line_range,
@@ -28,7 +30,6 @@ from isabelle_mcp.utils import (
     LSPCharacter,
     LSPLine,
     file_path_to_uri,
-    parse_goals_from_html,
     plural,
     set_symbols_text,
     uri_to_file_path,
@@ -202,11 +203,12 @@ class IsabelleLSPClient:
 
     STALL_TIMEOUT: ClassVar[float] = 120.0
     PROGRESS_CHECK_INTERVAL: ClassVar[float] = 5.0
-    STATE_OUTPUT_GRACE: ClassVar[float] = 10.0
-    # find_theorems can legitimately scan a large theorem DB for much longer than a
-    # goal panel takes to (not) produce state output, so it gets its own, longer
-    # grace before a silent server is treated as "no result".
-    FIND_THEOREMS_OUTPUT_GRACE: ClassVar[float] = 30.0
+    # The prover-side backstop for a position-explicit query. It is not the
+    # policy: the client's own wait is progress-monitored rather than
+    # deadline-bound (see request()). This is the point at which a reply that
+    # never comes stops holding a prover-side table entry and an ML task, so it
+    # is generous on purpose.
+    QUERY_BACKSTOP: ClassVar[float] = 600.0
 
     def __init__(
         self,
@@ -257,22 +259,14 @@ class IsabelleLSPClient:
         # The server File_Watcher's debounce; refreshed from options at start().
         self.vscode_load_delay: float = 0.5
 
-        # Caret lock: serializes the entire goal/dynamic_output query cycle.
-        # The Isabelle caret is global — see docs/ARCHITECTURE.md §7.3.
+        # Caret lock: dynamic_output still reads through the global Isabelle
+        # caret, so its query cycle stays serialized. The proof-state and
+        # find_theorems queries no longer touch the caret at all.
         self._caret_lock = asyncio.Lock()
-        self._state_init_waiters: list[asyncio.Future[tuple[int, str]]] = []
 
-        # PIDE find_theorems (async Query_Operation, serialized by _caret_lock).
-        # The output notification carries the rendered HTML; the status notification
-        # signals completion. Each query carries a monotonic token, echoed back in the
-        # output/status notifications, so a straggler from a previous (aborted) query
-        # is ignored rather than corrupting the current query's buffer/waiter. The
-        # buffer is reset to None at each query START so a `finished` arriving with no
-        # output (caret not on a command / command removed) resolves to None.
-        self._find_theorems_waiters: list[asyncio.Future[str | None]] = []
-        self._find_theorems_output: str | None = None
-        self._find_theorems_seq: int = 0
-        self._find_theorems_token: str = ""
+        # Correlation token for position-explicit queries: monotonic, and what a
+        # PIDE/query_cancel names.
+        self._query_seq: int = 0
 
         # PIDE dynamic output
         self._dynamic_output_waiters: list[tuple[tuple[str, int, int], asyncio.Future[str]]] = []
@@ -368,8 +362,9 @@ class IsabelleLSPClient:
         # Isabelle2025 routes the state/dynamic panels through Pretty_Text_Panel, which
         # by default emits plain text + decorations — but that path is broken upstream
         # (`decorations.map(_.json)` eta-expands `Decoration.json(file)` into a lambda →
-        # "Bad JSON value", so the state panel silently emits nothing and isabelle_goal
-        # returns []). Force the HTML branch, which parse_goals_from_html already consumes.
+        # "Bad JSON value", so the panel silently emits nothing). Force the HTML branch.
+        # The proof-state and find_theorems queries no longer go through that panel at
+        # all — they render server-side — so this now only covers dynamic output.
         # The option does not exist pre-2025 (passing it aborts the server), so gate it.
         if (isabelle_year() or 0) >= 2025:
             cmd += ["-o", "vscode_html_output=true"]
@@ -624,9 +619,6 @@ class IsabelleLSPClient:
         self.diagnostic_cache.diagnostics.clear()
         self.diagnostic_cache.last_update.clear()
         self._first_diagnostic_event.clear()
-        self._state_init_waiters.clear()
-        self._find_theorems_waiters.clear()
-        self._find_theorems_output = None
         self._dynamic_output_waiters.clear()
         self._dynamic_output_cache_by_position.clear()
         self._preview_waiters.clear()
@@ -841,12 +833,6 @@ class IsabelleLSPClient:
                 event.set()
         elif method == "PIDE/decoration":
             await self._handle_decoration(params)
-        elif method == "PIDE/state_output":
-            self._handle_state_output(params)
-        elif method == "PIDE/find_theorems_output":
-            self._handle_find_theorems_output(params)
-        elif method == "PIDE/find_theorems_status":
-            self._handle_find_theorems_status(params)
         elif method == "PIDE/dynamic_output":
             self._handle_dynamic_output(params)
         elif method == "PIDE/preview_response":
@@ -910,50 +896,6 @@ class IsabelleLSPClient:
             self._processing_trackers[file_path] = tracker
         await tracker.update(parsed)
 
-    def _handle_state_output(self, params: Any) -> None:
-        if not isinstance(params, dict):
-            return
-        raw_panel_id = params.get("id")
-        html = str(params.get("content", params.get("output", "")))
-        if not isinstance(raw_panel_id, int):
-            return
-
-        if self._state_init_waiters:
-            init_future = self._state_init_waiters.pop(0)
-            if not init_future.done():
-                init_future.set_result((raw_panel_id, html))
-
-    def _handle_find_theorems_output(self, params: Any) -> None:
-        # Keep the latest NON-empty content for the CURRENT query only. The token
-        # guard drops stragglers from a previous (aborted) query whose overlay is
-        # still emitting. apply_query also emits an empty init output at query start
-        # (Editor.Output.init, rendered to ""); the strip() check ignores it so the
-        # buffer is not clobbered or mistaken for a real (empty) result.
-        if not isinstance(params, dict):
-            return
-        if params.get("token") != self._find_theorems_token:
-            return
-        content = params.get("content")
-        if isinstance(content, str) and content.strip():
-            self._find_theorems_output = content
-
-    def _handle_find_theorems_status(self, params: Any) -> None:
-        # Resolve on `finished` reading the per-query buffer. The token guard ignores
-        # a `finished` belonging to a previous query. Within one content_update the
-        # output callback fires before the status callback, so a real output is
-        # already buffered; a `finished` with the buffer still None means no output
-        # was produced (no command at caret / command removed).
-        if not isinstance(params, dict):
-            return
-        if params.get("token") != self._find_theorems_token:
-            return
-        if params.get("status") != "finished":
-            return
-        if self._find_theorems_waiters:
-            future = self._find_theorems_waiters.pop(0)
-            if not future.done():
-                future.set_result(self._find_theorems_output)
-
     def _handle_dynamic_output(self, params: Any) -> None:
         if not isinstance(params, dict):
             return
@@ -979,8 +921,6 @@ class IsabelleLSPClient:
     def _all_waiters(self) -> list[asyncio.Future]:
         futures: list[asyncio.Future] = []
         futures.extend(self.pending_requests.values())
-        futures.extend(self._state_init_waiters)
-        futures.extend(self._find_theorems_waiters)
         futures.extend(future for _, future in self._dynamic_output_waiters)
         futures.extend(self._preview_waiters.values())
         return futures
@@ -990,9 +930,6 @@ class IsabelleLSPClient:
             if not future.done():
                 future.set_exception(exc)
         self.pending_requests.clear()
-        self._state_init_waiters.clear()
-        self._find_theorems_waiters.clear()
-        self._find_theorems_output = None
         self._dynamic_output_waiters.clear()
         self._dynamic_output_cache_by_position.clear()
         self._preview_waiters.clear()
@@ -1481,184 +1418,73 @@ class IsabelleLSPClient:
 
     # ── PIDE extension queries ──────────────────────────────────────────
 
-    async def get_goals_at_position(
-        self, file_path: str, line: LSPLine, character: int,
-    ) -> list[str]:
-        """Get proof goals at a position using PIDE state panels.
+    async def query_at_position(
+        self,
+        method: str,
+        file_path: str,
+        line: LSPLine,
+        character: int,
+        extra: dict[str, Any] | None = None,
+    ) -> QueryReply:
+        """Ask the prover about the command at a position, and return its answer.
 
-        Terminal proof commands (``by``, ``done``, ``qed``) produce empty
-        proof state — Isabelle's state panel sends no ``state_output`` for
-        them.  We detect this via STATE_OUTPUT_GRACE: if the server stays
-        active but no output arrives within that window, return ``[]``.
+        This reads the command's state straight out of the prover's document
+        state: no caret movement, no overlay, no document update. So it is safe
+        during an evaluation, and two of them can be in flight at once.
+
+        A cancel goes out on every exit path — including CancelledError, where
+        nobody is left to read the answer — so the prover does not keep working
+        on a query whose result is already unwanted.
         """
-        uri = file_path_to_uri(file_path)
-        panel_id: int | None = None
+        doc = self.open_documents.get(file_path)
+        if not doc:
+            raise IsabelleToolError(f"Document not open: {file_path}")
 
-        init_future: asyncio.Future[tuple[int, str]] = (
-            asyncio.get_running_loop().create_future()
+        self._query_seq += 1
+        token = str(self._query_seq)
+        params: dict[str, Any] = {
+            "token": token,
+            "textDocument": {"uri": doc.uri},
+            "position": {"line": line, "character": character},
+            "timeout": self.QUERY_BACKSTOP,
+        }
+        params.update(extra or {})
+        try:
+            result = await self.request(method, params)
+        finally:
+            with contextlib.suppress(IsabelleToolError):
+                await self.notify("PIDE/query_cancel", {"token": token})
+
+        if not isinstance(result, dict):
+            return QueryReply(status=query.CRASHED)
+        return QueryReply(
+            status=str(result.get("status") or query.CRASHED),
+            comment=bool(result.get("comment")),
+            forked=bool(result.get("forked")),
+            content=result.get("content") if isinstance(result.get("content"), str) else "",
         )
 
-        try:
-            async with self._caret_lock:
-                await self.notify("PIDE/caret_update", {
-                    "uri": uri, "line": line, "character": character, "focus": True,
-                })
-                await asyncio.sleep(0.15)
-
-                self._state_init_waiters.append(init_future)
-                # Isabelle2025 turned PIDE/state_init from a notification into a
-                # *request* (it replies with the new panel's state_id). Sent as a
-                # plain notification on 2025+, the panel is never created, no
-                # state_output arrives, and goals come back empty. The waiter above
-                # still captures the state_output (a notification in both versions);
-                # we only need the request to actually build the panel. Pre-2025
-                # keeps the notification form. Undetected version → assume pre-2025.
-                year = isabelle_year()
-                if year is not None and year >= 2025:
-                    await self.request("PIDE/state_init", {}, timeout=30.0)
-                else:
-                    await self.notify("PIDE/state_init", {})
-
-                try:
-                    result = await self._wait_for_state_output(
-                        init_future, file_path,
-                    )
-                except IsabelleToolError:
-                    raise self._enrich_timeout_error(file_path)
-
-            if result is None:
-                return []
-            panel_id, html = result
-            return parse_goals_from_html(html)
-
-        finally:
-            # Remove the waiter on EVERY exit path — including CancelledError, which
-            # the inner `except IsabelleToolError` does not catch. _wait_for_state_output
-            # awaits asyncio.shield(future), so a cancelled await leaves the future
-            # pending and still in the list; a leaked waiter would later be resolved
-            # FIFO by an unrelated state_output. (suppress: already removed on the
-            # grace/normal paths.)
-            with contextlib.suppress(ValueError):
-                self._state_init_waiters.remove(init_future)
-            if panel_id is not None:
-                with contextlib.suppress(IsabelleToolError):
-                    await self.notify("PIDE/state_exit", {"id": panel_id})
-
-    async def _wait_for_state_output(
-        self,
-        future: asyncio.Future[tuple[int, str]],
-        file_path: str,
-    ) -> tuple[int, str] | None:
-        """Wait for state_output with empty-proof-state detection.
-
-        Returns None when the server is active but no state_output arrives
-        within STATE_OUTPUT_GRACE — the command has no proof state to show.
-        """
-        start = time.time()
-        while True:
-            try:
-                return await asyncio.wait_for(
-                    asyncio.shield(future), timeout=self.PROGRESS_CHECK_INTERVAL,
-                )
-            except asyncio.TimeoutError:
-                if future.done():
-                    return future.result()
-                self._check_server_health(self.STALL_TIMEOUT)
-                elapsed = time.time() - start
-                process_alive = (
-                    self.process is not None
-                    and self.process.returncode is None
-                )
-                if elapsed > self.STATE_OUTPUT_GRACE and process_alive:
-                    with contextlib.suppress(ValueError):
-                        self._state_init_waiters.remove(future)
-                    logger.debug(
-                        "No state_output after %.1fs (server active) — "
-                        "empty proof state at %s",
-                        elapsed, file_path,
-                    )
-                    return None
+    async def get_proof_state_at_position(
+        self, file_path: str, line: LSPLine, character: int,
+    ) -> QueryReply:
+        """The proof state after the command at a position, rendered as HTML."""
+        return await self.query_at_position(
+            "PIDE/proof_state_at_position", file_path, line, character,
+        )
 
     async def get_find_theorems_at_position(
         self, file_path: str, line: LSPLine, character: int,
-        query: str, limit: str, allow_dups: str,
-    ) -> str | None:
-        """Run find_theorems at a position via the PIDE/find_theorems query.
+        query_text: str, limit: str, allow_dups: str,
+    ) -> QueryReply:
+        """find_theorems in the context of the command at a position.
 
-        Sets the caret (the query runs in that command's context), sends the
-        request, and awaits the rendered output carried by the `finished` status.
-        Returns the output HTML, or None when there is no command at the position
-        (or the command was removed before any output was produced).
+        ``allow_dups`` keeps the prover's own inverted reading: duplicates are
+        removed only when the argument is exactly the string ``"false"``.
         """
-        uri = file_path_to_uri(file_path)
-        future: asyncio.Future[str | None] = (
-            asyncio.get_running_loop().create_future()
+        return await self.query_at_position(
+            "PIDE/find_theorems_at_position", file_path, line, character,
+            {"query": query_text, "limit": limit, "allow_dups": allow_dups},
         )
-        self._find_theorems_seq += 1
-        token = str(self._find_theorems_seq)
-        try:
-            async with self._caret_lock:
-                await self.notify("PIDE/caret_update", {
-                    "uri": uri, "line": line, "character": character, "focus": True,
-                })
-                await asyncio.sleep(0.15)
-
-                # Stamp this query's token and reset the per-query buffer BEFORE
-                # issuing the request, so a straggler from a prior query (different
-                # token) is ignored and no stale result can be read back.
-                self._find_theorems_token = token
-                self._find_theorems_output = None
-                self._find_theorems_waiters.append(future)
-                await self.notify("PIDE/find_theorems_request", {
-                    "token": token, "query": query, "limit": limit, "allow_dups": allow_dups,
-                })
-
-                try:
-                    return await self._wait_for_find_theorems_output(future, file_path)
-                except IsabelleToolError:
-                    raise self._enrich_timeout_error(file_path)
-        finally:
-            # Remove the waiter on EVERY exit path (incl. CancelledError, which the
-            # inner except does not catch and which leaves the shielded future
-            # pending). Then tear down any still-active server overlay; the cancel is
-            # token-guarded on the Scala side, so a late cancel for a query that has
-            # already been superseded by the next one is a no-op (no cross-query
-            # cancellation).
-            with contextlib.suppress(ValueError):
-                self._find_theorems_waiters.remove(future)
-            with contextlib.suppress(IsabelleToolError):
-                await self.notify("PIDE/find_theorems_cancel", {"token": token})
-
-    async def _wait_for_find_theorems_output(
-        self,
-        future: asyncio.Future[str | None],
-        file_path: str,
-    ) -> str | None:
-        """Wait for the find_theorems `finished` status (clone of
-        _wait_for_state_output, but with the longer FIND_THEOREMS_OUTPUT_GRACE).
-        Returns the buffered output, or None if the server stays active but never
-        reports finished within that grace."""
-        start = time.time()
-        while True:
-            try:
-                return await asyncio.wait_for(
-                    asyncio.shield(future), timeout=self.PROGRESS_CHECK_INTERVAL,
-                )
-            except asyncio.TimeoutError:
-                if future.done():
-                    return future.result()
-                self._check_server_health(self.STALL_TIMEOUT)
-                elapsed = time.time() - start
-                process_alive = (
-                    self.process is not None
-                    and self.process.returncode is None
-                )
-                if elapsed > self.FIND_THEOREMS_OUTPUT_GRACE and process_alive:
-                    logger.debug(
-                        "No find_theorems finished after %.1fs (server active) at %s",
-                        elapsed, file_path,
-                    )
-                    return None
 
     def _enrich_timeout_error(self, file_path: str) -> IsabelleToolError:
         diags = self.diagnostic_cache.diagnostics.get(file_path, [])
