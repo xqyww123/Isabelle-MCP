@@ -1394,6 +1394,43 @@ class IsabelleLSPClient:
             content = ""
         return (source, rng, content)
 
+    async def get_commands_at_lines(
+        self, file_path: str, lines: list[LSPLine],
+    ) -> dict[int, list[tuple[JsonDict, str]]] | None:
+        """Return, per requested 0-indexed line, the commands overlapping it.
+
+        Each command comes back as its LSP range and its source text; ignored
+        spans (the whitespace and comments between commands) are left out, so a
+        blank line yields an empty list. A command spanning several lines is
+        returned for every line it covers. ``None`` means the server does not
+        hold the file.
+
+        One request answers however many lines are asked about, which is what
+        makes a bulk position-to-state table cost one round trip per file.
+        """
+        doc = self.open_documents.get(file_path)
+        if not doc:
+            raise IsabelleToolError(f"Document not open: {file_path}")
+        result = await self.request("PIDE/commands_at_lines", {
+            "uri": doc.uri, "lines": [int(line) for line in lines],
+        })
+        if not isinstance(result, dict) or not result.get("open"):
+            return None
+        out: dict[int, list[tuple[JsonDict, str]]] = {}
+        for entry in result.get("lines") or []:
+            if not isinstance(entry, dict):
+                continue
+            line = entry.get("line")
+            if not isinstance(line, int):
+                continue
+            commands = []
+            for command in entry.get("commands") or []:
+                rng, source = command.get("range"), command.get("source")
+                if isinstance(rng, dict) and isinstance(source, str):
+                    commands.append((rng, source))
+            out[line] = commands
+        return out
+
     async def get_completions(
         self,
         file_path: str,

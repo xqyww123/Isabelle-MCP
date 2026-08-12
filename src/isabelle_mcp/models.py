@@ -186,6 +186,34 @@ class RunningCommand(BaseModel):
     elapsed_seconds: float = Field(description="Seconds since command started running")
 
 
+class LinePosition(BaseModel):
+    """One position to ask about: a file and a line, no column."""
+
+    file_path: str = Field(description="Absolute path to .thy file")
+    line: int = Field(description="Line number (1-indexed)")
+
+
+class CommandStatusPosition(BaseModel):
+    """One command covering a queried line, in a breakdown."""
+
+    state: str = Field(description="The command's state, in the fixed vocabulary")
+    text: str = Field(description="The command's first line, truncated")
+
+
+class CommandStatusLine(BaseModel):
+    """The answer for one queried position.
+
+    ``commands`` is empty when one state speaks for the whole line, which is the
+    usual case; it holds the per-command breakdown only when they disagree, and
+    then ``state`` is empty.
+    """
+
+    file_path: str = Field(description="Absolute path to the file, as asked")
+    line: int = Field(description="Line number (1-indexed), as asked")
+    state: str = Field(default="", description="The shared state, when there is one")
+    commands: list[CommandStatusPosition] = Field(default_factory=list)
+
+
 @dataclass
 class FileSnapshot:
     """Per-file problem snapshot for an evaluation result.

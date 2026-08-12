@@ -355,20 +355,36 @@ class ProcessingTracker:
         A tracker that has never received a decoration reports ``NOT_EVALUATED``:
         nothing has been processed, which is exactly what the caller must act on.
         """
+        return self.range_state(line, line)[0]
+
+    def range_state(self, start_line: int, end_line: int) -> tuple[str, float]:
+        """State of the 0-indexed inclusive span ``[start_line, end_line]``, and
+        for ``RUNNING`` the seconds it has been running.
+
+        Same precedence and freshness rules as :meth:`position_state`, which is
+        the one-line case of this; see its docstring for why the order is what it
+        is. A span overlapping several decorations is called by the least-finished
+        one, which is the honest answer for a whole command as much as for a line.
+
+        The elapsed time is 0.0 for every state but ``RUNNING``.
+        """
         for sl, _, el, _ in self._unprocessed:
-            if sl <= line <= el:
-                return NOT_EVALUATED
+            if _ranges_overlap(sl, el, start_line, end_line):
+                return (NOT_EVALUATED, 0.0)
         if not self._initialized:
-            return NOT_EVALUATED
+            return (NOT_EVALUATED, 0.0)
         if _grace_remaining() > 0.0:
-            return UNKNOWN
-        for sl, _, el, _ in self._running:
-            if sl <= line <= el:
-                return RUNNING
+            return (UNKNOWN, 0.0)
+        now = _time.monotonic()
+        for r in self._running:
+            sl, _, el, _ = r
+            if _ranges_overlap(sl, el, start_line, end_line):
+                onset = self._running_onset.get(r)
+                return (RUNNING, 0.0 if onset is None else max(0.0, now - onset))
         for sl, _, el, _ in self._canceled:
-            if sl <= line <= el:
-                return CANCELLED
-        return PROCESSED
+            if _ranges_overlap(sl, el, start_line, end_line):
+                return (CANCELLED, 0.0)
+        return (PROCESSED, 0.0)
 
     def get_running_ranges(self) -> list[tuple[int, int, int, int]]:
         """Return a snapshot of currently-running ranges (0-indexed)."""

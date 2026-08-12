@@ -1,42 +1,48 @@
 # Query-Tool Upgrade: Evaluation Target and Position-Explicit Queries
 
-Status: **stages 1–3 are done; stages 4–6 are not.** All of part A (§4) has
-landed in Python with unit tests — the evaluation lifecycle handle, the
-position-state helper, the rewritten guard, the evaluation-result layout, the
-footer, the plurals, and the result model's target file. Two deliberate
-exceptions: `isabelle_command_status` (§4.5) ships in stage 4, because its
-command enumeration must run server-side; and the two caret-moving query tools
-keep the blanket refusal until part B, as §4.4 requires. Part B's ML half (§5.2,
-§5.3, §5.4) has landed in the prelude and has been exercised against a live
-prover; its Scala and Python halves have not.
+Status: **stages 1–4 are done; stages 5 and 6 are not.** All of part A (§4) has
+landed, `isabelle_command_status` included. Part B's prover half and adapter half
+are in — the prelude answers three protocol commands, the jar correlates and
+renders their replies, and both have been exercised against a live prover. What
+is left is the Python half: the two caret-moving tools still take the caret
+route and still carry the blanket refusal §4.4 requires.
 
-**Nothing is open.** The sentence for the `no_context` status — the case stage 3
-discovered — was drafted and approved after stage 3 measured it, and is in §5.3
-with the rest. Stage 4 needs no further sign-off to begin.
+**One thing is open, and stage 5 must close it before it renders anything:** the
+approved sentence for the `undefined` status blames a file change, and stage 4
+measured a second way to reach it that is not a file change (see §5.3's cancel
+note). It needs a fresh sign-off.
 
-**Start here:** §6 stage 4 — the Scala adapter and the jar rebuild. Every design
-decision this document records has been through review; where a section says
-"decided" or "approved", it is not an invitation to reconsider. All agent-facing
-wording in this document is approved text — changing any of it needs a fresh
-sign-off.
+**Start here:** §6 stage 5 — rewire the Python client and release the last two
+tools. Every design decision this document records has been through review; where
+a section says "decided" or "approved", it is not an invitation to reconsider.
+All agent-facing wording in this document is approved text — changing any of it
+needs a fresh sign-off.
 
-### What stage 4 must know before it writes a line
+### What stage 5 must know before it writes a line
 
-Stages 1–3 shipped in three commits — `97391fd` (part A, plus the fixes an
+Stages 1–4 shipped in five commits: `97391fd` (part A, plus the fixes an
 adversarial review of it found), `41e8c84` (`file:line` everywhere, and the
-running-vs-forked correction), and the prelude commit. The working tree is clean
-of this work.
+running-vs-forked correction), `2ce2683` (the prelude), `dd67579` (the
+`no_context` wording), and the adapter commit. The working tree is clean of this
+work.
 
-The **ML↔Scala contract stage 4 must implement is §5.1's "The reply, exactly"**.
-The prelude answers with a status word and a payload and never with a sentence,
-because ML cannot map a command to a line (fact 2 below) and every approved
-reply names a `file:line`. Rendering the nine statuses into the §5.3 sentences
-is stage 4's job; all eleven sentences, `no_context` included, are approved and
-sit in §5.3.
+**The contract stage 5 consumes is §5.1's "The reply, exactly".** Two LSP
+requests, `PIDE/proof_state_at_position` and `PIDE/find_theorems_at_position`,
+each answering `{status, comment, forked, content}`; one notification,
+`PIDE/query_cancel`. The client supplies the correlation token and the deadline.
+Rendering the eleven statuses into the §5.3 sentences is Python's job — that is
+where the file and the line are known, and where the wording is unit-tested.
 
-`mcp_prelude_version` is now `"2"`. §8's version check compares against it.
+**Pass `resolve_caret`'s position, not column 0.** Column 0 of an indented line
+sits inside the ignored span before the command, and the server's resolution
+skips backward from there onto the *previous* command; `goal.py` and
+`command_output.py` already call `resolve_caret`, and its rule — the line's last
+non-blank character — is what makes a line resolve to its own command.
 
-Six facts, all measured, that the prelude depends on and that the Scala side
+`mcp_prelude_version` is `"2"`, and the jar now refuses to serve a prover whose
+prelude says anything else.
+
+Six facts, all measured, that the prelude depends on and that both other sides
 must respect:
 
 1. **Command ids are negative.** They are allocated by the JVM side, whose
@@ -1643,8 +1649,7 @@ stage 3):
   work runs as a print, so it cannot be used to manufacture a slow command. Use
   `ML ‹…›`, whose eval really does run the code.
 
-**Stage 4 — the Scala adapter and the jar rebuild. The query half is done and
-measured; `isabelle_command_status`'s Python half is not.** `src/query.scala`
+**Stage 4 — the Scala adapter and the jar rebuild. Done.** `src/query.scala`
 holds `Query` (the status vocabulary and the reply record) and `Query_Handler`
 (the id→consumer table, taken atomically so a reply, a cancel, a timeout and the
 shutdown drain cannot answer one LSP request twice). `language_server.scala`
@@ -1674,6 +1679,20 @@ predecessor. Stage 5 must pass `resolve_caret`'s position, exactly as
 
 **The version gate was tested by breaking it**: with the prelude renumbered to
 `"9"` against a jar that speaks `"2"`, startup refuses with both numbers named.
+
+`isabelle_command_status` shipped with it, in
+`tools/command_status.py` (the state vocabulary, the answer, and the layout),
+`models.py` (`LinePosition`, `CommandStatusLine`, `CommandStatusPosition`),
+`lsp_client.get_commands_at_lines`, and `server.py` with `footer=True`. Its
+per-command state comes from `ProcessingTracker.range_state`, which is
+`position_state` generalised from a line to a span and additionally returns how
+long a running command has been running; `position_state` is now the one-line
+case of it, so the precedence and freshness rules exist once. Eleven unit tests
+in `tests/test_command_status.py`, two more in `tests/test_processing.py`. Live
+against a running prover it answered `processed`, `running for 26s`,
+`not evaluated`, `no command` and `file not open` for one call spanning two
+files. `evaluation._relativize` became `relativize` so the new tool could reuse
+the path-display rule rather than copy it.
 
 Also ships
 `isabelle_command_status` and its server-side command enumeration (§4.5), and

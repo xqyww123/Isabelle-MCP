@@ -32,14 +32,17 @@ from isabelle_mcp.models import (
     FindTheoremsResult,
     GoalState,
     HoverInfo,
+    LinePosition,
     LocalOccurrencesResult,
     SessionInfo,
 )
 from isabelle_mcp.tools import (
     command_output,
+    command_status,
     declaration_location,
     find_theorems,
     format_command_output,
+    format_command_status,
     goal,
     hover_info,
     local_occurrences,
@@ -634,6 +637,35 @@ async def isabelle_command_output(
     )
     return ToolResult(
         content=[TextContent(type="text", text=format_command_output(result, line))],
+    )
+
+
+@mcp.tool(output_schema=None)
+async def isabelle_command_status(positions: list[LinePosition]) -> ToolResult:
+    """Ask what state the command(s) covering each of several lines are in.
+
+    Answers one line per requested position, in the order asked, with one of:
+    `processed`, `running for Ns`, `not evaluated`,
+    `cancelled, re-evaluate to get a result`, `unknown, retry in a few seconds`,
+    `no command`, `file not open`.
+
+    A line may hold several commands — `lemma foo: "P" by auto` is two. When they
+    agree the shared state is reported; only when they differ is a per-command
+    breakdown printed. A command spanning several lines is reported for every line
+    it covers, so asking about a line in the middle of a proof reports that proof's
+    command.
+
+    Args:
+        positions: The positions to ask about, each a file_path and a 1-indexed line.
+    """
+    client = await _ensure_lsp_started(footer=True)
+    result = await command_status(client, positions)
+    return ToolResult(
+        content=[
+            TextContent(
+                type="text", text=format_command_status(result, client.project_root),
+            ),
+        ],
     )
 
 

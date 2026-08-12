@@ -261,7 +261,7 @@ def _is_evaluation_complete(
 def _target_sentence(
     template: str, target: str, line: int, root: str | None,
 ) -> str:
-    return template.format(target=_relativize(target, root), line=int(line))
+    return template.format(target=relativize(target, root), line=int(line))
 
 
 def _still_running_sentence(running_commands: list[RunningCommand]) -> str:
@@ -1212,7 +1212,7 @@ async def check_evaluation_guard(
             if evaluation_state.active:
                 raise IsabelleToolError(
                     CARET_BUSY_REFUSAL.format(
-                        target=_relativize(
+                        target=relativize(
                             evaluation_state.file_path, client.project_root,
                         ),
                         target_line=int(evaluation_state.destination_line),
@@ -1223,7 +1223,7 @@ async def check_evaluation_guard(
 
     if state == PROCESSED:
         return None
-    rel = _relativize(file_path, client.project_root)
+    rel = relativize(file_path, client.project_root)
     if state == RUNNING:
         return RUNNING_NOTE.format(file=rel, line=int(line))
     if state == CANCELLED:
@@ -1249,7 +1249,7 @@ async def check_evaluation_guard(
                 template.format(
                     file=rel,
                     line=int(line),
-                    target=_relativize(
+                    target=relativize(
                         evaluation_state.file_path, client.project_root,
                     ),
                     target_line=int(evaluation_state.destination_line),
@@ -1266,7 +1266,7 @@ async def check_evaluation_guard(
 # Rendering
 # ---------------------------------------------------------------------------
 
-def _relativize(path: str, root: str | None) -> str:
+def relativize(path: str, root: str | None) -> str:
     real = os.path.realpath(path)
     if root is None:
         return real
@@ -1314,7 +1314,7 @@ def _format_file_snapshot(
     root: str | None,
     running_commands: list[RunningCommand] | None = None,
 ) -> str:
-    name = _relativize(fs.file_path, root)
+    name = relativize(fs.file_path, root)
     if fs.lined:
         rows = []
         # `running` is the one row carrying something a line range cannot say —

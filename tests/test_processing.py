@@ -241,3 +241,26 @@ async def test_canceled_decoration_is_no_longer_discarded():
         {"type": "background_canceled", "content": [{"range": [4, 0, 4, 9]}]},
     ])
     assert parsed == {"background_canceled": [(4, 0, 4, 9)]}
+
+
+# --------------------------------------------------------------------------
+# range_state — the same answer for a whole command, plus how long it has run
+# --------------------------------------------------------------------------
+
+async def test_range_state_is_the_span_generalisation_of_position_state():
+    t = await _tracker(unprocessed=[(10, 0, 12, 0)])
+    # A command spanning 8-11 overlaps the unprocessed span, so it is not
+    # evaluated, even though its first line is clear.
+    assert t.range_state(8, 11)[0] == processing.NOT_EVALUATED
+    assert t.position_state(8) == processing.PROCESSED
+    assert t.range_state(0, 3)[0] == processing.PROCESSED
+
+
+async def test_range_state_reports_how_long_a_command_has_been_running():
+    t = await _tracker(running=[(5, 0, 5, 0)])
+    state, elapsed = t.range_state(5, 5)
+    assert state == processing.RUNNING
+    # The onset is stamped when the decoration arrives, so this is small but real.
+    assert elapsed >= 0.0
+    # Every other state carries no duration.
+    assert t.range_state(9, 9) == (processing.PROCESSED, 0.0)
