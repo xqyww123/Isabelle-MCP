@@ -9,17 +9,49 @@ command enumeration must run server-side; and the two caret-moving query tools
 keep the blanket refusal until part B, as §4.4 requires. Part B (§5) is
 unstarted.
 
-One thing is still open, and stage 3 is where it is first needed: the
-agent-facing messages of §5.3 (the nine outcome replies), the cancelled-query
-reply, and the failure text of `PIDE/query_cancel`. Draft those and get sign-off
-before writing the classification.
+**Nothing is open.** The agent-facing messages part B owes — the §5.3 replies,
+the cancelled-query reply, and `PIDE/query_cancel`'s failure text — are drafted,
+approved and written into §5.3. Stage 3 needs no further sign-off to begin.
 
-**Start here:** §6 stage 3 — the ML prelude. Before writing it, draft the
-agent-facing messages part B still owes (below) and get them signed off; stage 3
-is where the first of them is needed. Every design decision this document records has been through
-review; where a section says "decided" or "approved", it is not an invitation to
-reconsider. All agent-facing wording in this document is approved text —
-changing any of it needs a fresh sign-off.
+**Start here:** §6 stage 3 — the ML prelude. Every design decision this document
+records has been through review; where a section says "decided" or "approved",
+it is not an invitation to reconsider. All agent-facing wording in this document
+is approved text — changing any of it needs a fresh sign-off.
+
+### What stage 3 must know before it writes a line
+
+Stage 1 and stage 2 shipped in two commits — `97391fd` (part A, plus the fixes
+an adversarial review of it found) and `41e8c84` (`file:line` everywhere, and
+the running-vs-forked correction). The working tree is clean of this work.
+
+Six facts, all measured, that the prelude depends on:
+
+1. **Command ids are negative.** They are allocated by the JVM side, whose
+   counter ticks backwards (`counter.scala`, `document_id.scala`). A probe that
+   scans positive ids finds nothing, forever.
+2. **ML cannot map a position to a command.** A command's `Toplevel.pos_of`
+   carries no absolute line, and the public `DOCUMENT` signature exposes only
+   `command_exec: state -> node -> id -> exec option`. The Scala-resolves-the-id
+   split of §5.1 is forced by the API.
+3. **`command_exec` raises for an unknown id** (`Undefined command entry: N`),
+   it does not return `NONE`. Wrap it, per §5.2 step 3 — and this is not a rare
+   path: any edit to a file re-creates every command id in it (§3.10).
+4. **A command still executing has no state to read.** `eval_result_state`
+   forces a lazy value and gives `Fail "Unfinished lazy"` until the transition
+   completes. §5.3 rules that this is refused, not worked around.
+5. **`Pretty.string_of` output carries markup.** Strip it with
+   `XML.content_of (YXML.parse_body ...)`; `YXML.content_of` does not exist in
+   ML. §5.4 governs the real rendering.
+6. **The exec id is the discriminator**, not the command id: an id can survive
+   an imported-theory edit with a fresh exec underneath it (§3.10).
+
+Two working notes on the prelude itself. It is compiled by the raw Poly/ML
+compiler, and `isabelle ML_process -l HOL -f FILE` type-checks a candidate in
+exactly that context without touching the installed component — use it before
+every install, because a prelude that fails to compile is **fatal to every
+prover start on the machine**, not just this session's. And the probe vehicle
+§9 describes (a file-triggered read-only observer thread) is the cheapest way to
+measure anything else on the ML side: no Scala change, no jar rebuild.
 
 Companion research notes: [`CARET_AND_POSITION_RESEARCH.md`](CARET_AND_POSITION_RESEARCH.md)
 (caret/perspective semantics, overlays, where the proof state comes from). This
@@ -997,6 +1029,13 @@ does not expose:
 The real names are `isabelle_evaluation_status` and `isabelle_cancel_evaluation`.
 **Explicitly deferred**: this is to be discussed as its own topic after the plan
 in this document is executed, not folded into it.
+
+*Stage 1 left exactly one of them.* Three of those four strings were rewritten
+out of existence by stage 1 (`_in_progress_message` is gone, and the guard's
+refusals are new text using the prefixed names). What remains is
+`evaluate_to`'s "an evaluation is already in progress" error — search for
+`Call cancel_evaluation to cancel`. Everything written since uses the prefixed
+form, so the deferred topic is now a one-line fix plus the decision about it.
 
 **An unused fast path exists.** `PIDE/decoration_request` →
 `force_decorations` (`vscode_resources.scala:367-373`) pushes decorations
