@@ -11,6 +11,7 @@ sources = \
   src/mcp_main.scala \
   src/pretty_text_panel.scala \
   src/preview_panel.scala \
+  src/query.scala \
   src/state_panel.scala \
   src/vscode_model.scala \
   src/vscode_rendering.scala \

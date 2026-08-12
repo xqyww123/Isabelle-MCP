@@ -742,6 +742,109 @@ object LSP {
   }
 
 
+  /* position-explicit queries
+
+     The client supplies both the correlation token and the deadline: the token
+     because it is what a later query_cancel names, and the deadline because the
+     client is where the waiting actually happens, and two timeout policies in two
+     places would be one too many. */
+
+  sealed case class Query_Params(
+    token: String,
+    node_pos: Line.Node_Position,
+    timeout: Double,
+    args: List[String] = Nil)
+
+  private def query_params(params: JSON.T, args: List[String] = Nil): Option[Query_Params] =
+    for {
+      token <- JSON.string(params, "token")
+      case TextDocumentPosition(node_pos) <- Some(params)
+      timeout <- JSON.double(params, "timeout")
+    } yield Query_Params(token, node_pos, timeout, args)
+
+  // Every query answers with the same four fields, whichever tool asked.
+  def query_reply(
+    id: Id,
+    status: String,
+    comment: Boolean,
+    forked: Boolean,
+    content: String
+  ): JSON.T =
+    ResponseMessage(id, Some(
+      JSON.Object(
+        "status" -> status,
+        "comment" -> comment,
+        "forked" -> forked,
+        "content" -> content)))
+
+  object Proof_State_At_Position {
+    def unapply(json: JSON.T): Option[(Id, Query_Params)] =
+      json match {
+        case RequestMessage(id, "PIDE/proof_state_at_position", Some(params)) =>
+          query_params(params).map((id, _))
+        case _ => None
+      }
+  }
+
+  // limit/allow_dups/query keep the order and the meaning Find_Theorems_Request
+  // gives them, including allow_dups' inversion in the prover.
+  object Find_Theorems_At_Position {
+    def unapply(json: JSON.T): Option[(Id, Query_Params)] =
+      json match {
+        case RequestMessage(id, "PIDE/find_theorems_at_position", Some(params)) =>
+          for {
+            query <- JSON.string(params, "query")
+            limit <- JSON.string(params, "limit")
+            allow_dups <- JSON.string(params, "allow_dups")
+            result <- query_params(params, List(limit, allow_dups, query))
+          } yield (id, result)
+        case _ => None
+      }
+  }
+
+  object Query_Cancel {
+    def unapply(json: JSON.T): Option[String] =
+      json match {
+        case Notification("PIDE/query_cancel", Some(params)) => JSON.string(params, "token")
+        case _ => None
+      }
+  }
+
+
+  /* the commands overlapping each of several lines of one file */
+
+  object Commands_At_Lines {
+    def unapply(json: JSON.T): Option[(Id, JFile, List[Int])] =
+      json match {
+        case RequestMessage(id, "PIDE/commands_at_lines", Some(params)) =>
+          for {
+            uri <- JSON.string(params, "uri") if Url.is_wellformed_file(uri)
+            lines <- JSON.list(params, "lines", JSON.Value.Int.unapply)
+          } yield (id, Url.absolute_file(uri), lines)
+        case _ => None
+      }
+
+    def reply(id: Id, result: Option[List[(Int, List[(Line.Range, String)])]]): JSON.T = {
+      val res =
+        result match {
+          case None => JSON.Object("open" -> false)
+          case Some(lines) =>
+            JSON.Object(
+              "open" -> true,
+              "lines" ->
+                lines.map({ case (line, commands) =>
+                  JSON.Object(
+                    "line" -> line,
+                    "commands" ->
+                      commands.map({ case (range, source) =>
+                        JSON.Object("range" -> Range(range), "source" -> source) }))
+                }))
+        }
+      ResponseMessage(id, Some(res))
+    }
+  }
+
+
   /* preview */
 
   object Preview_Request {

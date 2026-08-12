@@ -1299,11 +1299,39 @@ and `forked` (serve it with the corresponding note), `undefined`, `unfinished`,
 `interrupted`, `no_proof_state`, `no_context`, `failed`, `cancelled`, `crashed`.
 
 **ML sends no English and no position.** Every approved reply in §5.3 names a
-`file:line`, and ML has no line to name (§3.9's fact 2), so the sentences are
-rendered Scala-side from the status word. `failed` is the one status carrying
-prover text, and its surrounding sentence differs between the two tools —
-"Reading the proof state at …" is wrong for a find_theorems query — so the
-adapter renders per tool, not per status alone.
+`file:line`, and ML has no line to name (§3.9's fact 2), so the status word
+travels and the sentence is rendered from it.
+
+**The sentence is rendered in Python.** An earlier draft of this paragraph said
+Scala; that was wrong, and stage 4 corrected it while wiring the two together.
+Every other agent-facing string in this project lives in Python, where it is
+unit-tested character-for-character in the style of `TestCompleteMessage` and can
+be changed without rebuilding the jar; Python also already formats `file:line`
+everywhere, and the two tools that differ in wording — "Reading the proof state
+at …" is wrong for a find_theorems query — are two separate Python modules. So
+the LSP reply carries four fields and no prose: `status`, `comment`, `forked`,
+and `content` (the rendered HTML when the status is `ok`, the prover's error text
+when it is `failed`, empty otherwise).
+
+**Two statuses exist that the prelude never sends**, because only this side can
+observe them: `no_command`, when the position resolves to no command at all, and
+`timeout`. Both are in `Query` alongside the prelude's nine.
+
+**The client supplies the correlation token and the deadline**, in the request.
+The token because that is what a later `PIDE/query_cancel` names; the deadline
+because the client is where the waiting actually happens, and §5.2's "no
+prover-side timeout" and §6's "a per-request timeout so a lost reply cannot hang
+the LSP request" are only compatible if there is exactly one policy and the
+client owns it. On expiry the Scala side sends `Isabelle_MCP.cancel_query` and
+answers `timeout`.
+
+**Stage 4 made the `comment` note unreachable, deliberately.**
+`Document.Snapshot.current_command` skips backward over ignored commands, so the
+command it returns is never an ignored one and the prelude's `comment` flag never
+comes back set. That is the better behaviour — asking on a blank line inside a
+proof should answer with the enclosing proof's state, which is what jEdit does —
+and the flag stays in both halves because it is correct, costs nothing, and would
+be needed by any future caller that resolves positions differently.
 
 **`no_context` is a tenth row of §5.3 that stage 3 found.** `Toplevel.context_of`
 fails at the pristine toplevel, which is exactly where `end` leaves you, so a
@@ -1600,10 +1628,14 @@ stage 3):
   while `Command.eval_running` holds, and `Execution.discontinue` makes that
   false for all of them — but it means `undefined`'s approved sentence ("a file
   changed while this query was in flight") describes a cancel imprecisely.
-  **Stage 4 must decide** whether a cancelled evaluation reaches this reply at
-  all: §4.3's guard judges by decoration, and a command that finished before the
-  cancel is painted processed, so it plausibly does. If it does, the sentence
-  needs a fresh sign-off.
+  **Measured in stage 4: it does reach it.** After cancelling an evaluation
+  mid-file, `isabelle_command_output` at a line that had finished *before* the
+  cancel is served normally — the guard sees processed decoration, and that
+  tool reads the snapshot's markup rather than the execution version. So
+  `isabelle_goal` at the same line will pass the same guard and get `undefined`
+  from the prelude, and the approved sentence would tell the agent a file
+  changed and to retry, when nothing changed and retrying cannot help. **The
+  sentence needs a fresh sign-off before stage 5 renders it.**
 - **`Execution.snapshot` does detect outstanding forked work** — a `by` whose
   proof was still running reported three tasks. It rode along with no reply
   here, because a `by` has no proof state to serve it with.
@@ -1611,7 +1643,39 @@ stage 3):
   work runs as a print, so it cannot be used to manufacture a slow command. Use
   `ML ‹…›`, whose eval really does run the code.
 
-**Stage 4 — the Scala adapter and the jar rebuild.** Also ships
+**Stage 4 — the Scala adapter and the jar rebuild. The query half is done and
+measured; `isabelle_command_status`'s Python half is not.** `src/query.scala`
+holds `Query` (the status vocabulary and the reply record) and `Query_Handler`
+(the id→consumer table, taken atomically so a reply, a cancel, a timeout and the
+shutdown drain cannot answer one LSP request twice). `language_server.scala`
+holds the three request handlers, the command enumeration, and the version gate;
+`lsp.scala` holds the four new messages. The jar was rebuilt by the §7 recipe of
+`COMPONENT_INSTALL_PLAN.md` and `scripts/check_component.py` passes with 15
+declared sources.
+
+Measured against a live prover, on a theory with a three-step `apply` proof:
+every line answered with its own command's state — `lemma` one subgoal,
+`apply (induct x)` two, the first `apply simp` one, the second none — and
+`definition`, `done`, `by` and `end` answered `no_proof_state`, find_theorems at
+an `apply` answered `ok` with its hits, find_theorems at `end` answered
+`no_context`, a line past the end of the file answered `no_command`, a
+`query_cancel` for a token nobody registered was a silent no-op, and
+`commands_at_lines` returned exactly the commands on each requested line and
+nothing for a blank one. The HTML carries the `state_message` and
+`writeln_message` classes the Python parsers key on.
+
+**The column matters, and the repository already had the rule.**
+`utils.isabelle_tokens.resolve_caret` anchors on the line's **last non-blank
+character**, because column 0 of an indented line sits inside the ignored span
+that precedes the command, and `current_command` skips backward from there onto
+the *previous* command. A first probe run asked at column 0 and got every line's
+predecessor. Stage 5 must pass `resolve_caret`'s position, exactly as
+`goal.py` and `command_output.py` already do.
+
+**The version gate was tested by breaking it**: with the prelude renumbered to
+`"9"` against a jar that speaks `"2"`, startup refuses with both numbers named.
+
+Also ships
 `isabelle_command_status` and its server-side command enumeration (§4.5), and
 the third LSP message `PIDE/query_cancel` (§5.1); handlers must not block the
 language server's loop (§5.1). A protocol handler with a

@@ -20,12 +20,23 @@ import scala.annotation.tailrec
 
 
 object Language_Server {
+  /* The prelude version this jar was built against.
+
+     ML/mcp_prelude.ML is not listed in build.props sources, so it is absent from the jar's
+     recorded hashes and nothing else would notice an edited, stale or reverted prelude.
+     That was tolerable while the two sides shared only a cancel command; they now share
+     three query commands and a reply format, and a skew there is a request that hangs with
+     no correlatable trace.  Bump this whenever mcp_prelude.ML's protocol changes. */
+
+  val prelude_version = "2"
+
   /* proof that the injected ML prelude is live
 
      An undefined protocol command is NOT fatal in ML -- the protocol loop downgrades it to a
      system message and carries on (isabelle_process.ML) -- so without this probe a prover
      without the prelude would happily accept every cancel request and cancel nothing.
-     Isabelle_MCP.ping answers with an isabelle_mcp_pong protocol message. */
+     Isabelle_MCP.ping answers with an isabelle_mcp_pong protocol message carrying the
+     prelude's version. */
 
   class Prelude_Handler extends Session.Protocol_Handler {
     private val pong = Future.promise[String]
@@ -38,14 +49,14 @@ object Language_Server {
     override def functions: Session.Protocol_Functions =
       List("isabelle_mcp_pong" -> handle_pong)
 
-    def await_pong(timeout: Time): Boolean = {
+    def await_pong(timeout: Time): Option[String] = {
       val step = Time.seconds(0.05)
       var waited = Time.zero
       while (!pong.is_finished && waited < timeout) {
         step.sleep()
         waited += step
       }
-      pong.is_finished
+      if (pong.is_finished) Some(pong.join) else None
     }
   }
 
@@ -399,6 +410,7 @@ class Language_Server(
 
       val prelude_handler = new Language_Server.Prelude_Handler
       session.init_protocol_handler(prelude_handler)
+      session.init_protocol_handler(query_handler)
       session.raw_output_messages += raw_output_capture
 
       try {
@@ -412,9 +424,18 @@ class Language_Server(
           use_prelude = List(File.standard_path(prelude))).await_startup()
 
         session.protocol_command("Isabelle_MCP.ping")
-        if (!prelude_handler.await_pong(Time.seconds(10))) {
-          error("The ML prelude did not answer: cancellation would silently do nothing." +
-            "\nPrelude: " + prelude + startup_details)
+        prelude_handler.await_pong(Time.seconds(10)) match {
+          case None =>
+            error("The ML prelude did not answer: cancellation would silently do nothing." +
+              "\nPrelude: " + prelude + startup_details)
+          case Some(version) if version != Language_Server.prelude_version =>
+            error("The ML prelude is version " + quote(version) + ", but this build of " +
+              "Isabelle-MCP speaks version " + quote(Language_Server.prelude_version) + "." +
+              "\nThey share three query commands and a reply format, so serving with a skew" +
+              " between them would hang requests rather than fail them." +
+              "\nPrelude: " + prelude +
+              "\nReinstall the Isabelle-MCP component so that both halves come from one build.")
+          case Some(_) =>
         }
 
         reply_ok(
@@ -694,11 +715,10 @@ class Language_Server(
     channel.write(LSP.Output_At_Position.reply(id, result))
   }
 
-  // Render query-operation output (e.g. find_theorems) to browser HTML, the same
-  // way output_at_position renders a command's results, so the client can reuse the
-  // same HTML parsing. Lives here (not in VSCode_Find_Theorems) for access to
-  // `session`/`store`.
-  def render_query_html(messages: XML.Body): String = {
+  // Render XML to browser HTML, the same way output_at_position renders a command's
+  // results, so the client can reuse the same HTML parsing. Lives here (not in
+  // VSCode_Find_Theorems) for access to `session`/`store`.
+  def render_html(body: XML.Body): String = {
     val node_context =
       new Browser_Info.Node_Context {
         override def make_ref(props: Properties.T, body: XML.Body): Option[XML.Elem] =
@@ -710,7 +730,116 @@ class Language_Server(
           } yield HTML.link(uri.toString + "#" + def_line, body)
       }
     val elements = Browser_Info.extra_elements.copy(entity = Markup.Elements.full)
-    HTML.source(node_context.make_html(elements, Pretty.separate(messages))).toString
+    HTML.source(node_context.make_html(elements, body)).toString
+  }
+
+  // Query-operation output (e.g. find_theorems) is separated but NOT formatted: its
+  // own layout is already in the strings, and a second Pretty pass rewraps the item
+  // list into something the client's parser does not recognise.
+  def render_query_html(messages: XML.Body): String = render_html(Pretty.separate(messages))
+
+
+  /* position-explicit queries (docs/archive/QUERY_TOOLS_UPGRADE.md section 5)
+
+     These handlers must not block.  The main loop below reads one message, handles it
+     inline, and only then reads the next, so waiting for the prover here would queue
+     every later request behind this one -- including the theory_status that the client's
+     evaluation poll depends on, and cancel_execution.  And these queries are meant to be
+     usable DURING an evaluation, so that collision is the normal case, not an edge one.
+     So: resolve, register, send, return.  The response is written later, from the
+     protocol handler's callback or from the timer, whichever takes the request first. */
+
+  private val query_handler = new Query_Handler
+
+  private def query_command(node_pos: Line.Node_Position): Option[(String, String)] =
+    for {
+      (rendering, offset) <- rendering_offset(node_pos)
+      command <- rendering.snapshot.current_command(rendering.model.node_name, offset)
+    } yield (rendering.model.node_name.node, command.id.toString)
+
+  private def query_messages(result: Query.Result): XML.Body =
+    for (case XML.Elem(markup, body) <- Symbol.decode_yxml_failsafe(result.text))
+      yield Protocol.make_message(body, markup.name)
+
+  private def query_at_position(
+    id: LSP.Id,
+    params: LSP.Query_Params,
+    command: String,
+    content: Query.Result => String
+  ): Unit = {
+    def respond(result: Query.Result): Unit =
+      channel.write(
+        LSP.query_reply(id, result.status, result.comment, result.forked,
+          if (result.status == Query.OK) content(result) else result.text))
+
+    query_command(params.node_pos) match {
+      case None => respond(Query.Result(Query.NO_COMMAND))
+      case Some((node_name, command_id)) =>
+        val token = params.token
+        val timer =
+          Event_Timer.request(Time.now() + Time.seconds(params.timeout)) {
+            for (respond_timeout <- query_handler.take(token)) {
+              session.protocol_command("Isabelle_MCP.cancel_query", XML.string(token))
+              respond_timeout(Query.Result(Query.TIMEOUT))
+            }
+          }
+        query_handler.register(token, result => { timer.cancel(); respond(result) })
+        session.protocol_command_args(command,
+          (token :: node_name :: command_id :: params.args).map(XML.string))
+    }
+  }
+
+  def proof_state_at_position(id: LSP.Id, params: LSP.Query_Params): Unit =
+    query_at_position(id, params, "Isabelle_MCP.proof_state", result =>
+      render_html(
+        Pretty.formatted(Pretty.separate(query_messages(result)),
+          margin = resources.message_margin, metric = Symbol.Metric)))
+
+  def find_theorems_at_position(id: LSP.Id, params: LSP.Query_Params): Unit =
+    query_at_position(id, params, "Isabelle_MCP.find_theorems", result =>
+      render_query_html(query_messages(result)))
+
+  /* Fire-and-forget, on an exit path by which the client already holds its result or its
+     error: a cancel for an unknown or already-finished token is a silent no-op on both
+     sides, and taking the entry here is what stops a late prover reply from writing a
+     second response for an LSP request that has already been answered. */
+  def query_cancel(token: String): Unit = {
+    query_handler.take(token)
+    session.protocol_command("Isabelle_MCP.cancel_query", XML.string(token))
+  }
+
+
+  /* the commands overlapping each of several lines of one file
+
+     Walking the file with repeated PIDE/command_at_position cannot do this: the gap
+     between any two commands is its own ignored span, that request answers None for an
+     ignored command, and None carries no range, so the walk stalls at every boundary. */
+
+  def commands_at_lines(id: LSP.Id, file: JFile, lines: List[Int]): Unit = {
+    val result =
+      for (rendering <- resources.get_rendering(file)) yield {
+        val doc = rendering.model.content.doc
+        val node = rendering.snapshot.node
+        for (line <- lines) yield {
+          val commands =
+            (for {
+              text <- doc.lines.lift(line).map(_.text)
+              start <- doc.offset(Line.Position(line))
+            } yield {
+              val stop = start + text.length
+              node.command_iterator(start)
+                .takeWhile({ case (_, command_start) => command_start < stop })
+                .collect({
+                  case (command, command_start) if !command.is_ignored =>
+                    val range = Text.Range(command_start, command_start + command.length)
+                    (doc.range(range), Symbol.decode(command.source))
+                })
+                .toList
+            }) getOrElse Nil
+          (line, commands)
+        }
+      }
+    channel.write(LSP.Commands_At_Lines.reply(id, result))
   }
 
   def symbols(id: LSP.Id): Unit = {
@@ -772,6 +901,10 @@ class Language_Server(
           case LSP.Symbols(id) => symbols(id)
           case LSP.Find_Theorems_Request(token, args) => find_theorems.request(token, args)
           case LSP.Find_Theorems_Cancel(token) => find_theorems.cancel(token)
+          case LSP.Proof_State_At_Position(id, params) => proof_state_at_position(id, params)
+          case LSP.Find_Theorems_At_Position(id, params) => find_theorems_at_position(id, params)
+          case LSP.Query_Cancel(token) => query_cancel(token)
+          case LSP.Commands_At_Lines(id, file, lines) => commands_at_lines(id, file, lines)
           case _ => if (!LSP.ResponseMessage.is_empty(json)) log("### IGNORED")
         }
       }
