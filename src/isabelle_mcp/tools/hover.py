@@ -39,8 +39,9 @@ async def hover_info(
     if line < 1:
         raise IsabelleToolError(f"line must be >= 1, got {line}")
 
-    await client.open_document(file_path)
-
+    # NOT opened here: the guard decides whether opening is allowed. A didOpen
+    # globally invalidates decoration freshness, so it must not happen while an
+    # evaluation is outstanding; on the paths that may open, evaluate_to does it.
     guard = await check_evaluation_guard(client, file_path, line)
     if isinstance(guard, EvaluationView):
         raise IsabelleToolError(format_evaluation_result(guard, client.project_root))
@@ -100,7 +101,14 @@ async def hover_info(
                 LSPCharacter(diag_end.get("character", 0)),
             )
             diagnostics_at_line.append(DiagnosticMessage(
-                severity=severity_int_to_string(diag.get("severity", 1)),
+                # Isabelle sends no severity at all: the severity map keys on
+                # markup names the message has already been renamed away from,
+                # so the field is simply absent. Defaulting it to "error" labels
+                # every attached legacy warning an error, so leave it unset.
+                severity=(
+                    severity_int_to_string(diag["severity"])
+                    if diag.get("severity") is not None else None
+                ),
                 message=diag.get("message", ""),
                 line=diag_mcp_line, column=diag_mcp_col,
                 end_line=diag_end_line, end_column=diag_end_col,

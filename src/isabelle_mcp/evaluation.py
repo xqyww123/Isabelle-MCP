@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import anyio
 import asyncio
-import io
 import logging
 import os
 import time
@@ -27,12 +26,22 @@ from isabelle_mcp.models import (
     RunningCommand,
     TheoryStatus,
 )
-from isabelle_mcp.processing import _grace_remaining, clip_line_range, note_edit_sent
+from isabelle_mcp.processing import (
+    CANCELLED,
+    NOT_EVALUATED,
+    PROCESSED,
+    RUNNING,
+    UNKNOWN,
+    _grace_remaining,
+    clip_line_range,
+    note_edit_sent,
+)
 from isabelle_mcp.utils import (
     IsabelleToolError,
     LSPCharacter,
     LSPLine,
     MCPLine,
+    plural,
     resolve_caret,
 )
 
@@ -56,6 +65,73 @@ _LONG_EVAL_RESTAT_INTERVAL: float = 3.0
 # re-delivered cancel so every auto-opened doc is actually closed (not orphaned), but
 # bounded so a stalled stdin.drain() cannot hang an already-cancelled request.
 _CLOSE_TIMEOUT: float = 5.0
+
+# One sentence for every way a run is stopped by someone else — the agent's own
+# cancel and a session teardown alike. Shared so evaluate_to and
+# cancel_evaluation cannot drift apart.
+CANCELLED_MESSAGE = "Evaluation cancelled."
+
+# Position state judged with the document itself missing — the one answer the
+# decoration cache cannot give, so it lives here rather than in `processing`.
+FILE_NOT_OPEN = "file_not_open"
+
+# A running command is worth naming individually only once it has been running
+# this long; below it, it is ordinary progress and not something to act on. One
+# constant, shared by the evaluation result and the footer, so the two can never
+# disagree about which commands are worth mentioning.
+RUNNING_REPORT_THRESHOLD: float = 10.0
+
+# The evaluation target, said the same way everywhere: these are both the leading
+# sentence of an evaluation result and the footer's main sentence.
+TOWARDS_SENTENCE = "Evaluating towards {target}:{line}."
+ARRIVED_SENTENCE = "Evaluation has arrived at {target}:{line}."
+COMPLETED_SENTENCE = "Evaluation has completed up to {target}:{line}."
+
+CHECK_PROGRESS_CALL = "Call isabelle_evaluation_status to check progress."
+FOOTER_DETAILS_CALL = "Call isabelle_evaluation_status for details."
+
+# ---- Agent-facing guard text -------------------------------------------------
+# Every string an agent can see when a query is refused or served with a caveat.
+# Kept together so the vocabulary stays consistent and reviewable.
+
+RUNNING_NOTE = (
+    "This line is still being executed (forked proof). Output may be incomplete."
+)
+
+INTERRUPTED_NOTE = (
+    "The evaluation of the command at line {line} was interrupted; "
+    "its output may be incomplete."
+)
+
+# "a file", not "this file": the distrust comes from a GLOBAL edit clock, so the
+# change that armed it may have been to a different file.
+UNKNOWN_POSITION_MESSAGE = (
+    "Cannot tell whether {file} line {line} has been evaluated: a file changed a "
+    "moment ago, so the processing state is not yet trustworthy. Retry in a few "
+    "seconds."
+)
+
+NOT_EVALUATED_REFUSAL = (
+    "{file} line {line} has not been evaluated yet. "
+    "Evaluating towards {target}:{target_line}. "
+    "Call isabelle_evaluation_status to check progress."
+)
+
+# The two caret-moving query tools stay blocked for as long as they read through
+# the global caret: the evaluation drives that same caret and there is no
+# arbitration between the two writers. Part B removes the dependence, and with it
+# this refusal.
+CARET_BUSY_REFUSAL = (
+    "This query cannot run while an evaluation is in progress. "
+    "Evaluating towards {target}:{target_line}. "
+    "Call isabelle_evaluation_status to check progress."
+)
+
+NOT_OPEN_REFUSAL = (
+    "{file} has not been opened yet, and opening it would disturb the evaluation "
+    "in progress. Evaluating towards {target}:{target_line}. "
+    "Call isabelle_evaluation_status to check progress."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -181,45 +257,80 @@ def _is_evaluation_complete(
     ) and _prefix_quiet(file_path, dest_line, client)
 
 
-def _complete_message(
+def _target_sentence(
+    template: str, target: str, line: int, root: str | None,
+) -> str:
+    return template.format(target=_relativize(target, root), line=int(line))
+
+
+def _still_running_sentence(running_commands: list[RunningCommand]) -> str:
+    """``1 command is still running.`` / ``2 commands are still running.``"""
+    n = len(running_commands)
+    return f"{plural(n, 'command')} {'is' if n == 1 else 'are'} still running."
+
+
+def _activity_sentences(
+    running_commands: list[RunningCommand], n_failed: int,
+) -> list[str]:
+    """What the prover is doing, in whole sentences.
+
+    Callers pass ``n_failed = 0`` when no evaluation is outstanding. An error
+    decoration persists until the file is edited and re-evaluated, so reporting
+    it while nothing is under evaluation would repeat the same count on every
+    call and train the agent to stop reading; while an evaluation IS outstanding
+    the same count is progress information about that evaluation.
+    """
+    sentences = []
+    n_slow = sum(
+        1 for c in running_commands
+        if c.elapsed_seconds >= RUNNING_REPORT_THRESHOLD
+    )
+    if n_slow:
+        verb = "has" if n_slow == 1 else "have"
+        sentences.append(
+            f"{plural(n_slow, 'command')} {verb} been running for over "
+            f"{int(RUNNING_REPORT_THRESHOLD)}s.",
+        )
+    if n_failed:
+        sentences.append(f"{plural(n_failed, 'command')} failed.")
+    return sentences
+
+
+def _arrival_message(
+    target: str,
     dest: int,
     running_commands: list[RunningCommand],
     files: list[FileSnapshot],
+    root: str | None,
 ) -> str:
-    """Message for a reached destination, honest about leftover running/failed work.
+    """Leading sentence for a run whose frontier reached the destination.
 
-    The destination line is reached, but the command at/after it may still be
-    running (e.g. a stuck tactic) and earlier commands may have failed (errors do
-    not halt checking). Surface those counts instead of a bare "complete" so the
-    agent knows whether to keep watching or cancel.
+    Reaching the destination is not the same as being done: the command at or
+    after it may still be running (a stuck tactic), and earlier commands may have
+    failed — errors do not halt checking. The counts themselves are NOT repeated
+    here; they are below, per line, in the file sections.
     """
-    n_running = len(running_commands)
     n_failed = sum(fs.error_count for fs in files)
-    if n_running == 0 and n_failed == 0:
-        return f"Evaluation complete, arrived at line {dest}."
-    return (
-        f"Evaluation arrived at line {dest} with {n_running} statement(s) still "
-        f"running and {n_failed} statement(s) failed."
-    )
-
-
-def _in_progress_message(running_commands: list[RunningCommand]) -> str:
-    if running_commands:
-        parts = []
-        for cmd in running_commands[:5]:
-            text_preview = cmd.text[:60] + ("..." if len(cmd.text) > 60 else "")
-            parts.append(
-                f"  {cmd.file_path}:{cmd.start_line}"
-                f" ({cmd.elapsed_seconds:.0f}s) {text_preview}"
-            )
-        header = f"{len(running_commands)} command(s) running"
-        return f"{header}. Call evaluation_status to check progress.\n" + "\n".join(parts)
-    return "Evaluation in progress. Call evaluation_status to check progress."
+    if not running_commands and not n_failed:
+        return _target_sentence(COMPLETED_SENTENCE, target, dest, root)
+    return _target_sentence(ARRIVED_SENTENCE, target, dest, root)
 
 
 # ---------------------------------------------------------------------------
 # EvaluationState
 # ---------------------------------------------------------------------------
+
+@dataclass(eq=False)
+class Evaluation:
+    """One evaluation run. The object reference is its identity.
+
+    ``outcome`` records WHY the run ended, which the shared ``active`` boolean
+    cannot: a cancel, a session teardown and an ``evaluation_status`` call that
+    observed the run *succeed* all merely clear that flag.
+    """
+
+    outcome: str = ""          # "" | "complete" | "cancelled"
+
 
 @dataclass
 class EvaluationState:
@@ -227,18 +338,39 @@ class EvaluationState:
     file_path: str = ""
     destination_line: MCPLine = MCPLine(1)
     auto_opened_files: set[str] = field(default_factory=set)
+    current: Evaluation | None = None
 
-    def start(self, file_path: str, destination_line: MCPLine) -> None:
+    def start(self, file_path: str, destination_line: MCPLine) -> Evaluation:
         self.active = True
         self.file_path = file_path
         self.destination_line = destination_line
         self.auto_opened_files = set()
+        self.current = Evaluation()
+        return self.current
+
+    def owns(self, evaluation: Evaluation) -> bool:
+        """Whether *evaluation* is still the run this state describes.
+
+        ``current`` is deliberately never reset: a run that ended with no
+        successor must still recognise itself as the owner and run its cleanup.
+        Only a later ``start()`` takes ownership away.
+        """
+        return self.current is evaluation
+
+    def _stamp(self, outcome: str) -> None:
+        # Write-once: a later cancel of a lingering fork must not rewrite a
+        # finished run's story.
+        cur = self.current
+        if cur is not None and not cur.outcome:
+            cur.outcome = outcome
 
     def complete(self) -> None:
         self.active = False
+        self._stamp("complete")
 
     def cancel(self) -> None:
         self.active = False
+        self._stamp("cancelled")
 
 
 evaluation_state = EvaluationState()
@@ -484,14 +616,42 @@ async def _cleanup_auto_opened(
     # orphan the not-yet-closed docs — a later start() wipes the set, leaking them on
     # the server). The shield is bounded by _CLOSE_TIMEOUT so a stalled stdin.drain()
     # can never hang an already-cancelled request. Discard each path after its attempt.
-    for path in list(state.auto_opened_files):
+    #
+    # Bind the set OBJECT once: start() rebinds the attribute to a fresh set, so a
+    # cleanup overlapping a newly started run would otherwise discard from the new
+    # run's set.
+    opened = state.auto_opened_files
+    for path in list(opened):
         try:
             with anyio.move_on_after(_CLOSE_TIMEOUT, shield=True):
                 await client.close_document(path)
         except Exception:
             logger.warning("Failed to close auto-opened file %s", path, exc_info=True)
         finally:
-            state.auto_opened_files.discard(path)
+            opened.discard(path)
+
+
+async def _finish_if_owner(
+    client: IsabelleLSPClient, evaluation: Evaluation, outcome: str,
+) -> bool:
+    """End *evaluation* — flag, outcome stamp and cleanup — if it still owns the state.
+
+    Only the run that started this state may end it. Without the ownership test a
+    finishing run closes the auto-opened documents of a *later* run that started
+    while it was waiting (evaluate_to holds no lock across the wait).
+
+    The test and the flag flip are synchronous with no await between them, so
+    _cleanup_auto_opened's atomicity guarantee and the "reset first, then close"
+    cancellation discipline are preserved.
+    """
+    if not evaluation_state.owns(evaluation):
+        return False
+    if outcome == "complete":
+        evaluation_state.complete()
+    else:
+        evaluation_state.cancel()
+    await _cleanup_auto_opened(client, evaluation_state)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -503,13 +663,23 @@ async def _evaluation_wait_loop(
     file_path: str,
     dest_line: MCPLine,
     state: EvaluationState,
+    evaluation: Evaluation,
     timeout: float,
 ) -> tuple[str, list[TheoryStatus], list[RunningCommand]]:
     deadline = time.monotonic() + timeout
     last_restat = time.monotonic()
+    theories: list[TheoryStatus] = []
     while True:
-        if not state.active:
-            return "cancelled", [], []
+        if evaluation.outcome or not state.active:
+            # Someone else ended this run. Report the recorded reason rather than
+            # guessing, and carry out what we last saw instead of empty lists,
+            # which would render the file sections as "no theories at all".
+            # get_all_running_commands is a synchronous read of local state.
+            return (
+                evaluation.outcome or "cancelled",
+                theories,
+                client.get_all_running_commands(),
+            )
         now = time.monotonic()
         if now - last_restat >= _LONG_EVAL_RESTAT_INTERVAL:
             last_restat = now
@@ -574,7 +744,7 @@ async def evaluate_to(
         dest_line = LSPLine(caret_line).to_mcp()
         lsp_char = LSPCharacter(caret_char)
 
-        evaluation_state.start(file_path, dest_line)
+        evaluation = evaluation_state.start(file_path, dest_line)
 
     try:
         # No freshness invalidation here: every edit-send path calls
@@ -583,11 +753,14 @@ async def evaluate_to(
         # (see note_edit_sent's docstring).
         await client.set_caret(file_path, dest_line.to_lsp(), lsp_char)
         status, theories, running_commands = await _evaluation_wait_loop(
-            client, file_path, dest_line, evaluation_state,
+            client, file_path, dest_line, evaluation_state, evaluation,
             HEAP_POLL_INTERVAL if heap_warning else EVAL_POLL_INTERVAL,
         )
 
-        if heap_warning and status != "complete" and evaluation_state.active:
+        # Own the state and carry no outcome stamp ⇒ still active: complete() and
+        # cancel() are the only writers of the flag and both stamp.
+        if (heap_warning and status != "complete"
+                and not evaluation.outcome and evaluation_state.owns(evaluation)):
             # The miss may be only the post-edit grace gate (a concurrent edit
             # re-armed it inside the short heap budget) — an unmodified precompiled
             # file replays instantly once the gate opens. Re-check past the gate
@@ -595,45 +768,69 @@ async def evaluate_to(
             grace = _grace_remaining()
             if grace > 0:
                 status, theories, running_commands = await _evaluation_wait_loop(
-                    client, file_path, dest_line, evaluation_state, grace + 0.2,
+                    client, file_path, dest_line, evaluation_state, evaluation,
+                    grace + 0.2,
                 )
     except BaseException:
         # CancelledError is a BaseException (the old ``except Exception`` missed it)
         # and anyio re-delivers it at EVERY checkpoint, so it can fire on either
-        # wait-loop await. Reset synchronously FIRST (no checkpoint → always runs),
-        # then close the detached snapshot — _cleanup_auto_opened shields each close so
-        # it completes despite the re-delivered cancel and cannot hang (bounded by
-        # _CLOSE_TIMEOUT). Mirrors isabelle_launch's cancellation cleanup.
-        evaluation_state.cancel()
-        await _cleanup_auto_opened(client, evaluation_state)
+        # wait-loop await. _finish_if_owner resets synchronously FIRST — awaiting a
+        # coroutine is not itself a checkpoint, so its ownership test and flag flip
+        # always run — then closes the detached snapshot; _cleanup_auto_opened
+        # shields each close so it completes despite the re-delivered cancel and
+        # cannot hang (bounded by _CLOSE_TIMEOUT). Mirrors isabelle_launch's
+        # cancellation cleanup.
+        await _finish_if_owner(client, evaluation, "cancelled")
         raise
 
     dest = int(dest_line)
+    # The stamp is authoritative. ``status`` is what the loop saw; the stamp is
+    # what actually happened, including a terminal transition that landed inside
+    # an iteration's awaits (the loop samples ``active`` only at the top).
+    if evaluation.outcome:
+        status = evaluation.outcome
     auto_opened = set(evaluation_state.auto_opened_files)
     # Build the snapshot BEFORE cleanup closes the auto-opened deps (which would
     # drop their decoration trackers).
     files = _snapshot_files(client, file_path, theories, auto_opened, dest_line)
-    if heap_warning and status != "complete":
+    if evaluation.outcome == "cancelled":
+        # Stopped by isabelle_cancel_evaluation or by a session teardown. Say only
+        # that; naming any other cause (a heap divergence, a timeout) would
+        # fabricate one. The cleanup repeats because a dependency may have been
+        # auto-opened after the canceller's own cleanup ran.
+        await _finish_if_owner(client, evaluation, "cancelled")
+        message = CANCELLED_MESSAGE
+    elif heap_warning and status != "complete":
         # The file differs from its precompiled copy, so PIDE will never
         # reprocess it — abandon the evaluation instead of leaving it pending.
-        evaluation_state.cancel()
-        await _cleanup_auto_opened(client, evaluation_state)
+        await _finish_if_owner(client, evaluation, "cancelled")
         status = "cancelled"
         message = (
             "Evaluation abandoned: the file differs from its precompiled copy "
             "and Isabelle will never reprocess it. Do not retry or poll."
         )
     else:
-        message = (
-            _complete_message(dest, running_commands, files)
-            if status == "complete"
-            else _in_progress_message(running_commands)
-        )
         if status == "complete":
-            evaluation_state.complete()
-            await _cleanup_auto_opened(client, evaluation_state)
+            message = _arrival_message(
+                file_path, dest, running_commands, files, client.project_root,
+            )
+        elif _frontier_reached(file_path, dest_line, client, theories):
+            # The frontier passed the destination but the prefix is not quiet yet
+            # (a trailing fork). isabelle_evaluation_status and the footer both
+            # call that "arrived"; saying "evaluating towards" here would have two
+            # tools contradict each other about the same instant.
+            message = _target_sentence(
+                ARRIVED_SENTENCE, file_path, dest, client.project_root,
+            )
+        else:
+            message = _target_sentence(
+                TOWARDS_SENTENCE, file_path, dest, client.project_root,
+            )
+        if status == "complete":
+            await _finish_if_owner(client, evaluation, "complete")
     return EvaluationView(
         status=status,
+        target_file=file_path,
         destination_line=dest,
         message=message,
         files=files,
@@ -689,16 +886,36 @@ async def evaluation_status(
         await _cleanup_auto_opened(client, evaluation_state)
         return EvaluationView(
             status="complete",
+            target_file=target,
             destination_line=dest,
-            message=_complete_message(dest, running_commands, files),
+            message=_arrival_message(
+                target, dest, running_commands, files, client.project_root,
+            ),
             files=files,
             running_commands=running_commands,
         )
 
+    if not evaluation_state.active:
+        # No evaluation is outstanding; what is left is a fork still settling, or
+        # work the agent did not start (a re-evaluation triggered by a save).
+        # There is no target to name, so name only the activity — and without the
+        # footer's 10s threshold, which exists to keep an ambient line quiet. This
+        # tool's whole job is to report status, so it says something either way.
+        # No call to action either: this IS the tool one would be pointed at.
+        message = _still_running_sentence(running_commands)
+    elif _frontier_reached(target, evaluation_state.destination_line, client, theories):
+        message = _target_sentence(
+            ARRIVED_SENTENCE, target, dest, client.project_root,
+        )
+    else:
+        message = _target_sentence(
+            TOWARDS_SENTENCE, target, dest, client.project_root,
+        )
     return EvaluationView(
         status="in_progress",
+        target_file=target if evaluation_state.active else None,
         destination_line=dest,
-        message=_in_progress_message(running_commands),
+        message=message,
         files=files,
         running_commands=running_commands,
     )
@@ -809,14 +1026,161 @@ async def cancel_evaluation(
         return EvaluationView(
             status="cancelled",
             destination_line=dest,
-            message="Evaluation cancelled.",
+            message=CANCELLED_MESSAGE,
         )
+
+
+def position_state(
+    client: IsabelleLSPClient, file_path: str, line: MCPLine,
+) -> str:
+    """State of the command(s) at *line*: one of the :mod:`processing` constants
+    or ``FILE_NOT_OPEN``. Pure local computation — no request, no I/O.
+
+    The open check comes first because a decoration tracker can outlive its
+    document: closing drops the client's caches, but nothing guarantees the
+    order, and reporting a closed file's stale cache as ``processed`` would let
+    a query be served from a document the server no longer holds for us.
+    """
+    if client.open_documents.get(file_path) is None:
+        return FILE_NOT_OPEN
+    tracker = client.get_processing_tracker(file_path)
+    if tracker is None:
+        return NOT_EVALUATED
+    return tracker.position_state(int(line.to_lsp()))
+
+
+async def _settled_position_state(
+    client: IsabelleLSPClient, file_path: str, line: MCPLine,
+) -> str:
+    """:func:`position_state`, but ``unknown`` is waited out rather than returned.
+
+    ``unknown`` means only that an edit landed within the last
+    ``DECORATION_GRACE`` seconds, so the cache cannot be trusted yet. Refusing on
+    it would be unhelpful (the agent can do nothing but retry) and re-evaluating
+    on it would be wasteful (the line may have finished minutes ago), so the
+    guard simply waits the window out — at most two seconds — and asks again.
+    The tracker's own wait wakes at expiry, or earlier if the line is reached.
+    """
+    async with _evaluation_state_lock:
+        state = position_state(client, file_path, line)
+    if state != UNKNOWN:
+        return state
+
+    tracker = client.get_processing_tracker(file_path)
+    grace = _grace_remaining()
+    if tracker is not None and grace > 0:
+        await tracker.wait_until_line_reached_bounded(
+            line.to_lsp(),
+            timeout=grace + 0.1,
+            health_check=lambda: client._check_server_health(client.STALL_TIMEOUT),
+        )
+    async with _evaluation_state_lock:
+        return position_state(client, file_path, line)
+
+
+def _failed_count(client: IsabelleLSPClient) -> int:
+    """Failed commands across every open document, counted the way the file
+    sections count them: the line-deduped union of the two error channels."""
+    total = 0
+    for path in list(client.open_documents):
+        tracker = client.get_processing_tracker(path)
+        if tracker is None:
+            continue
+        # Clipped to the current content, exactly as the file sections clip: a
+        # tracker outliving a file shrink must not contribute phantom failures.
+        doc = client.open_documents.get(path)
+        n_lines = (doc.content.count("\n") + 1) if doc else None
+        total += len(_merge_spans(
+            _line_spans(tracker.get_overview_error_ranges(), n_lines)
+            + _line_spans(tracker.get_bad_ranges(), n_lines),
+        ))
+    return total
+
+
+async def evaluation_footer(client: IsabelleLSPClient) -> str:
+    """Ambient context for a query-tool result: what the server is working
+    toward, and what the prover is doing around it. Empty when there is nothing
+    to say.
+
+    Everything here is a read of the local decoration cache — no request, no
+    round trip — with **one** exception: when the local view says the target is
+    reached with nothing running and nothing failed, the verdict "complete" also
+    requires every recursively imported theory to be done, which only
+    ``theory_status`` knows. That check therefore runs exactly once per
+    evaluation, and ends it.
+
+    That transition is not a display concern that happens to mutate: observing
+    completion is a state change the server has to make somewhere, and today
+    only ``isabelle_evaluation_status`` makes it — so an evaluation that
+    finished quietly kept every query tool blocked until someone polled.
+    """
+    running = client.get_all_running_commands()
+    if not evaluation_state.active:
+        # No target to name. The main sentence is dropped rather than paired with
+        # a contradicting one: "Nothing is under evaluation." followed by
+        # "2 commands have been running…" argues with itself. The call to action
+        # stays: the agent is being told work is running, so it needs somewhere
+        # to look.
+        return " ".join(_footer_activity(running, 0))
+
+    # Capture the handle HERE, with the target it belongs to and before any
+    # await. Re-reading `current` at finish time would make _finish_if_owner's
+    # ownership test a tautology, and the round trip below is exactly the window
+    # in which another run can take over — a footer computed for one run would
+    # then stamp its successor "complete".
+    evaluation = evaluation_state.current
+    target = evaluation_state.file_path
+    dest = evaluation_state.destination_line
+    root = client.project_root
+    towards = _target_sentence(TOWARDS_SENTENCE, target, int(dest), root)
+
+    if position_state(client, target, dest) == UNKNOWN:
+        # A file changed a moment ago. Say the target and nothing else: the counts
+        # would come from the same cache that is not trusted for the position.
+        return towards
+
+    tracker = client.get_processing_tracker(target)
+    if tracker is None or not tracker.line_reached(dest.to_lsp()):
+        return " ".join([towards, *_footer_activity(running, _failed_count(client))])
+
+    if not running and not _failed_count(client):
+        theories = [
+            _parse_theory_status(t) for t in await client.request_theory_status()
+        ]
+        if _is_evaluation_complete(target, dest, client, theories):
+            # Under the lock, like every other terminal transition: the stamp, the
+            # flag and the cleanup of the auto-opened dependencies travel together.
+            async with _evaluation_state_lock:
+                if evaluation is not None:
+                    await _finish_if_owner(client, evaluation, "complete")
+            return _target_sentence(COMPLETED_SENTENCE, target, int(dest), root)
+
+    return " ".join([
+        _target_sentence(ARRIVED_SENTENCE, target, int(dest), root),
+        *_footer_activity(running, _failed_count(client)),
+    ])
+
+
+def _footer_activity(
+    running: list[RunningCommand], n_failed: int,
+) -> list[str]:
+    """The footer's suffix sentences, with the call to action that earns them.
+
+    *n_failed* is 0 when no evaluation is outstanding: the failure count belongs
+    to a run, and an error decoration outlives every run that produced it.
+    """
+    sentences = _activity_sentences(running, n_failed)
+    if sentences:
+        sentences.append(FOOTER_DETAILS_CALL)
+    return sentences
 
 
 async def check_evaluation_guard(
     client: IsabelleLSPClient,
     file_path: str,
     line: MCPLine,
+    *,
+    moves_caret: bool = False,
 ) -> "EvaluationView | str | None":
     """Ensure *line* has been evaluated; raise, warn, or auto-start evaluation.
 
@@ -824,26 +1188,73 @@ async def check_evaluation_guard(
     it does not start the prover; the session must first be launched via
     ``isabelle_launch``.)
 
+    The decision is made about the REQUESTED POSITION, not about the global
+    evaluation flag: a position that is already processed is served even while an
+    evaluation is outstanding elsewhere. The four position-explicit query tools
+    move no caret, so serving them competes with the evaluation for nothing.
+
+    *moves_caret* marks the two callers for which that is not true — the
+    proof-state half of ``isabelle_goal`` and ``isabelle_find_theorems``, which
+    read through the global caret the evaluation is steering. They keep the
+    blanket refusal until part B makes them position-explicit.
+
     Returns:
       - ``None``: line is fully processed, caller can proceed.
-      - ``str``: line is running (forked proof), caller can proceed but
-        should set ``result.note`` to this warning string.
+      - ``str``: line is running (forked proof) or was interrupted; the caller can
+        proceed but should set ``result.note`` to this warning string.
       - ``EvaluationView``: auto-evaluation started but didn't complete; the caller
         renders it (``format_evaluation_result``) and raises it.
-    Raises :class:`IsabelleToolError` if another evaluation is running.
+    Raises :class:`IsabelleToolError` when the position cannot be served.
     """
+    if moves_caret:
+        async with _evaluation_state_lock:
+            if evaluation_state.active:
+                raise IsabelleToolError(
+                    CARET_BUSY_REFUSAL.format(
+                        target=_relativize(
+                            evaluation_state.file_path, client.project_root,
+                        ),
+                        target_line=int(evaluation_state.destination_line),
+                    ),
+                )
+
+    state = await _settled_position_state(client, file_path, line)
+
+    if state == PROCESSED:
+        return None
+    if state == RUNNING:
+        return RUNNING_NOTE
+    if state == CANCELLED:
+        return INTERRUPTED_NOTE.format(line=int(line))
+    if state == UNKNOWN:
+        # Still inside the grace window after waiting it out — a further edit
+        # landed. Do not auto-start (that would relocate the caret on a guess)
+        # and do not claim the line was not reached (it may have finished long
+        # ago); say only what is true.
+        raise IsabelleToolError(
+            UNKNOWN_POSITION_MESSAGE.format(
+                file=_relativize(file_path, client.project_root), line=int(line),
+            ),
+        )
+
+    # NOT_EVALUATED or FILE_NOT_OPEN: work is needed. Only one evaluation may be
+    # outstanding at a time, so either start one or explain who has it.
     async with _evaluation_state_lock:
         if evaluation_state.active:
-            raise IsabelleToolError(
-                "Evaluation in progress. "
-                "Call evaluation_status to check progress.",
+            template = (
+                NOT_OPEN_REFUSAL if state == FILE_NOT_OPEN
+                else NOT_EVALUATED_REFUSAL
             )
-
-        tracker = client.get_processing_tracker(file_path)
-        if tracker is not None and tracker.line_reached(line.to_lsp()):
-            if tracker.line_running(line.to_lsp()):
-                return "This line is still being executed (forked proof). Output may be incomplete."
-            return None
+            raise IsabelleToolError(
+                template.format(
+                    file=_relativize(file_path, client.project_root),
+                    line=int(line),
+                    target=_relativize(
+                        evaluation_state.file_path, client.project_root,
+                    ),
+                    target_line=int(evaluation_state.destination_line),
+                ),
+            )
 
     result = await evaluate_to(client, file_path, int(line))
     if result.status == "complete":
@@ -870,7 +1281,21 @@ def _relativize(path: str, root: str | None) -> str:
 
 
 def _fmt_spans(spans: list[tuple[int, int]]) -> str:
-    return ", ".join(f"{s}" if s == e else f"{s}-{e}" for s, e in spans)
+    """``line 45`` / ``lines 45-47`` / ``lines 45, 88-90``.
+
+    The unit word is not decoration: without it ``warnings: 12`` reads as
+    "12 warnings" rather than "a warning on line 12".
+    """
+    body = ", ".join(f"{s}" if s == e else f"{s}-{e}" for s, e in spans)
+    single = len(spans) == 1 and spans[0][0] == spans[0][1]
+    return f"{'line' if single else 'lines'} {body}"
+
+
+def _snippet(text: str) -> str:
+    """First line of a range's text, truncated. Need not be a whole command: the
+    error rows are a line-deduped union of two markup kinds."""
+    first = text.split("\n", 1)[0].strip()
+    return (first[:60] + "...") if len(first) > 60 else first
 
 
 def _count_bits(fs: FileSnapshot) -> str:
@@ -884,18 +1309,38 @@ def _count_bits(fs: FileSnapshot) -> str:
     return ", ".join(parts)
 
 
-def _format_file_snapshot(fs: FileSnapshot, root: str | None) -> str:
+def _format_file_snapshot(
+    fs: FileSnapshot,
+    root: str | None,
+    running_commands: list[RunningCommand] | None = None,
+) -> str:
     name = _relativize(fs.file_path, root)
     if fs.lined:
         rows = []
+        # `running` is the one row carrying something a line range cannot say —
+        # how long the command has been at it — so it, and only it, nests. The
+        # nested lines drop the file name: they belong to this section already.
+        if fs.running:
+            slow = sorted(
+                (c for c in (running_commands or [])
+                 if c.elapsed_seconds >= RUNNING_REPORT_THRESHOLD),
+                key=lambda c: c.start_line,
+            )
+            if slow:
+                rows.append("  running:")
+                rows.extend(
+                    f"    line {c.start_line} ({c.elapsed_seconds:.0f}s)"
+                    f" {_snippet(c.text)}"
+                    for c in slow
+                )
+            else:
+                rows.append(f"  running: {_fmt_spans(fs.running)}")
+        if fs.pending:
+            rows.append(f"  pending: {_fmt_spans(fs.pending)}")
         if fs.errors:
             rows.append(f"  errors: {_fmt_spans(fs.errors)}")
         if fs.warnings:
             rows.append(f"  warnings: {_fmt_spans(fs.warnings)}")
-        if fs.running:
-            rows.append(f"  running: {_fmt_spans(fs.running)}")
-        if fs.pending:
-            rows.append(f"  pending: {_fmt_spans(fs.pending)}")
         if not rows:
             return f"{name}: clean"
         return f"{name}:\n" + "\n".join(rows)
@@ -908,15 +1353,41 @@ def _format_file_snapshot(fs: FileSnapshot, root: str | None) -> str:
     return f"{name}: {_count_bits(fs)} (no line info)"
 
 
-def format_evaluation_result(view: EvaluationView, root: str | None = None) -> str:
-    """Render an EvaluationView as the agent-facing plain-text snapshot."""
+def _worth_watching(view: EvaluationView) -> bool:
+    """Whether there is anything to come back for: a command past the reporting
+    threshold, or a failure. Nothing else justifies telling the agent to poll."""
+    if any(
+        c.elapsed_seconds >= RUNNING_REPORT_THRESHOLD for c in view.running_commands
+    ):
+        return True
+    return any(fs.error_count for fs in view.files)
+
+
+def format_evaluation_result(
+    view: EvaluationView,
+    root: str | None = None,
+    *,
+    call_to_action: bool = True,
+) -> str:
+    """Render an EvaluationView as the agent-facing plain-text snapshot.
+
+    *call_to_action* is False for ``isabelle_evaluation_status``: it is the tool
+    being called, so pointing at it is a self-reference with no next step in it.
+    """
     if view.status == "no_evaluation":
         return view.message or "No evaluation in progress."
-    buf = io.StringIO()
+    running_by_file: dict[str, list[RunningCommand]] = {}
+    for cmd in view.running_commands:
+        running_by_file.setdefault(cmd.file_path, []).append(cmd)
+    blocks: list[str] = []
     if view.heap_warning:
-        buf.write("⚠️ " + view.heap_warning + "\n\n")
-    buf.write(view.message.rstrip("\n") if view.message else view.status)
-    for fs in view.files:
-        buf.write("\n\n")
-        buf.write(_format_file_snapshot(fs, root))
-    return buf.getvalue()
+        blocks.append("⚠️ " + view.heap_warning)
+    if view.message:
+        blocks.append(view.message.rstrip("\n"))
+    blocks.extend(
+        _format_file_snapshot(fs, root, running_by_file.get(fs.file_path, []))
+        for fs in view.files
+    )
+    if call_to_action and _worth_watching(view):
+        blocks.append(CHECK_PROGRESS_CALL)
+    return "\n\n".join(blocks)

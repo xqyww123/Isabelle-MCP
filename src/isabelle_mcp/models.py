@@ -58,7 +58,11 @@ class LocalOccurrencesResult(BaseModel):
 
 
 class DiagnosticMessage(BaseModel):
-    severity: str = Field(description="error | warning | information | hint")
+    severity: str | None = Field(
+        default=None,
+        description="error | warning | information | hint; absent when Isabelle "
+                    "did not report one, which is the usual case",
+    )
     message: str = Field(description="Diagnostic message text")
     line: int = Field(description="Line number (1-indexed)", ge=1)
     column: int = Field(description="Column number (1-indexed)", ge=1)
@@ -220,6 +224,9 @@ class EvaluationView:
     """
 
     status: str  # complete | in_progress | no_evaluation | cancelled
+    # The evaluation target: the file and line the run is advancing toward. None
+    # when no evaluation is outstanding (a lingering fork has no target).
+    target_file: str | None = None
     destination_line: int | None = None
     message: str = ""
     files: list[FileSnapshot] = field(default_factory=list)

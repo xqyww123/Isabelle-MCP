@@ -50,6 +50,16 @@ class IsabelleToolError(ToolError):
     """
 
 
+def plural(n: int, noun: str) -> str:
+    """``1 command`` / ``2 commands``.
+
+    Agent-facing text never writes ``command(s)``: the count is known at the
+    moment the message is built, so the parenthesis only makes the reader do
+    work the server could have done.
+    """
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
 def check_pide_response(response: object, operation: str, *, allow_none: bool = False) -> object:
     if response is None and not allow_none:
         raise IsabelleToolError(f"PIDE timeout during {operation}")

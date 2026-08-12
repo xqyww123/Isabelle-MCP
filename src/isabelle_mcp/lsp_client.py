@@ -29,6 +29,7 @@ from isabelle_mcp.utils import (
     LSPLine,
     file_path_to_uri,
     parse_goals_from_html,
+    plural,
     set_symbols_text,
     uri_to_file_path,
 )
@@ -1635,7 +1636,7 @@ class IsabelleLSPClient:
                 summary += f" (+{len(errors) - 3} more)"
             return IsabelleToolError(
                 f"Timed out waiting for proof state. "
-                f"File has {len(errors)} error(s): {summary}"
+                f"File has {plural(len(errors), 'error')}: {summary}"
             )
         if not diags:
             return IsabelleToolError(

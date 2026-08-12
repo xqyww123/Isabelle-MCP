@@ -80,10 +80,40 @@ class TestConcurrency:
 
 
 class TestEvaluationGuard:
+    """The guard decides about the REQUESTED POSITION, not about the global flag."""
+
     @pytest.mark.asyncio
-    async def test_query_during_evaluation_fails(self, mock_lsp_client, temp_theory_file):
+    async def test_processed_position_is_served_during_an_evaluation(
+        self, mock_lsp_client, temp_theory_file,
+    ):
+        await mock_lsp_client.open_document(temp_theory_file)  # tracker: all processed
+        mock_lsp_client.hover_response = {"contents": "42"}
         evaluation_state.start(temp_theory_file, MCPLine(100))
-        with pytest.raises(IsabelleToolError, match="Evaluation in progress"):
+        result = await hover_info(mock_lsp_client, temp_theory_file, MCPLine(5), "my_const")
+        assert len(result.results) >= 1
+
+    @pytest.mark.asyncio
+    async def test_unevaluated_position_is_refused_and_names_the_target(
+        self, mock_lsp_client, temp_theory_file,
+    ):
+        from tests.conftest import MockProcessingTracker
+
+        await mock_lsp_client.open_document(temp_theory_file)
+        mock_lsp_client._processing_trackers[temp_theory_file] = MockProcessingTracker(
+            all_processed=False,
+        )
+        evaluation_state.start(temp_theory_file, MCPLine(100))
+        with pytest.raises(IsabelleToolError, match="has not been evaluated yet") as exc:
+            await hover_info(mock_lsp_client, temp_theory_file, MCPLine(5), "my_const")
+        assert "line 5" in str(exc.value)
+        assert "Test.thy:100" in str(exc.value)          # the evaluation target
+
+    @pytest.mark.asyncio
+    async def test_unopened_file_is_refused_during_an_evaluation(
+        self, mock_lsp_client, temp_theory_file,
+    ):
+        evaluation_state.start(temp_theory_file, MCPLine(100))
+        with pytest.raises(IsabelleToolError, match="has not been opened yet"):
             await hover_info(mock_lsp_client, temp_theory_file, MCPLine(5), "my_const")
 
 

@@ -170,3 +170,74 @@ def test_read_grace_env_parsing(monkeypatch):
     assert processing._read_grace() == 0.7
     monkeypatch.delenv("ISABELLE_MCP_DECORATION_GRACE")
     assert processing._read_grace() == 2.0
+
+
+# --------------------------------------------------------------------------
+# position_state — the definite answer line_reached cannot give
+# --------------------------------------------------------------------------
+
+async def _tracker(**ranges) -> ProcessingTracker:
+    tracker = ProcessingTracker()
+    await tracker.update({
+        "background_unprocessed1": ranges.get("unprocessed", []),
+        "background_running1": ranges.get("running", []),
+        "background_canceled": ranges.get("canceled", []),
+    })
+    return tracker
+
+
+async def test_position_state_never_evaluated_tracker():
+    # No decoration has ever arrived: nothing is processed, which is what the
+    # caller must act on — not "unknown".
+    assert ProcessingTracker().position_state(5) == processing.NOT_EVALUATED
+
+
+async def test_position_state_reports_each_decoration():
+    t = await _tracker(unprocessed=[(3, 0, 7, 0)])
+    assert t.position_state(5) == processing.NOT_EVALUATED
+    assert t.position_state(9) == processing.PROCESSED
+
+    t = await _tracker(running=[(3, 0, 7, 0)])
+    assert t.position_state(5) == processing.RUNNING
+
+    t = await _tracker(canceled=[(3, 0, 7, 0)])
+    assert t.position_state(5) == processing.CANCELLED
+
+
+async def test_position_state_follows_isabelle_precedence():
+    # One line covering several commands: the least-finished one names the line,
+    # which is the order rendering.scala:515-518 itself uses.
+    t = await _tracker(
+        unprocessed=[(5, 0, 5, 0)], running=[(5, 0, 5, 0)], canceled=[(5, 0, 5, 0)],
+    )
+    assert t.position_state(5) == processing.NOT_EVALUATED
+    t = await _tracker(running=[(5, 0, 5, 0)], canceled=[(5, 0, 5, 0)])
+    assert t.position_state(5) == processing.RUNNING
+
+
+async def test_position_state_is_unknown_inside_the_grace_window():
+    t = await _tracker()
+    assert t.position_state(5) == processing.PROCESSED
+    note_edit_sent()
+    # The cache may still describe the pre-edit document, and nothing covers the
+    # line to prove otherwise.
+    assert t.position_state(5) == processing.UNKNOWN
+    await asyncio.sleep(_GRACE + 0.05)
+    assert t.position_state(5) == processing.PROCESSED
+
+
+async def test_position_state_stays_definite_inside_the_grace_window():
+    # A stale cache can only over-report work as unfinished, so a range covering
+    # the line is still trustworthy — only its ABSENCE is not.
+    t = await _tracker(unprocessed=[(5, 0, 5, 0)])
+    note_edit_sent()
+    assert t.position_state(5) == processing.NOT_EVALUATED
+
+
+async def test_canceled_decoration_is_no_longer_discarded():
+    # background_canceled used to be absent from _TRACKED_TYPES, so an
+    # interrupted command answered "processed".
+    parsed = processing.parse_decoration_ranges([
+        {"type": "background_canceled", "content": [{"range": [4, 0, 4, 9]}]},
+    ])
+    assert parsed == {"background_canceled": [(4, 0, 4, 9)]}

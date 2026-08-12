@@ -411,3 +411,141 @@ class TestSessionManagement:
             result = await isabelle_terminate()
         client.shutdown.assert_not_awaited()
         assert "No Isabelle session" in result.content[0].text
+
+
+class TestFooterPlumbing:
+    """The footer is computed at tool entry and appended at tool exit; those are
+    two different frames of the same call, so it travels in a ContextVar."""
+
+    @pytest.mark.asyncio
+    async def test_footer_set_during_the_call_is_appended_after_it(self):
+        from fastmcp.tools.tool import ToolResult
+        from mcp.types import TextContent
+
+        from isabelle_mcp.server import UnicodeWarningMiddleware, _pending_footer
+
+        async def call_next(_ctx):
+            # What _ensure_lsp_started(footer=True) does, one frame deeper.
+            _pending_footer.set("Evaluating towards Foo.thy:20.")
+            return ToolResult(content=[TextContent(type="text", text="the answer")])
+
+        result = await UnicodeWarningMiddleware().on_call_tool(None, call_next)
+        assert [c.text for c in result.content] == [
+            "the answer", "Evaluating towards Foo.thy:20.",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_footer_from_an_earlier_call_is_not_reused(self):
+        from fastmcp.tools.tool import ToolResult
+        from mcp.types import TextContent
+
+        from isabelle_mcp.server import UnicodeWarningMiddleware, _pending_footer
+
+        _pending_footer.set("stale footer from a previous call")
+
+        async def call_next(_ctx):
+            return ToolResult(content=[TextContent(type="text", text="the answer")])
+
+        result = await UnicodeWarningMiddleware().on_call_tool(None, call_next)
+        assert [c.text for c in result.content] == ["the answer"]
+
+    @pytest.mark.asyncio
+    async def test_only_the_tools_that_display_it_compute_it(self, mock_lsp_client):
+        """A computation that a tool does not display must not run on its path:
+        it can end an evaluation, and isabelle_evaluation_status would then
+        report "No evaluation in progress." instead of the completion."""
+        from unittest.mock import AsyncMock, patch
+
+        from isabelle_mcp import server
+
+        calls = []
+        with patch.object(server, "_lsp_client", mock_lsp_client), \
+                patch.object(server, "resync_and_check_freshness", new_callable=AsyncMock), \
+                patch.object(server, "evaluation_footer", new_callable=AsyncMock) as footer:
+            mock_lsp_client.process = object()
+            footer.side_effect = lambda c: calls.append(1) or "the footer"
+
+            await server._ensure_lsp_started()
+            assert calls == [] and server._pending_footer.get() == ""
+
+            await server._ensure_lsp_started(footer=True)
+            assert calls == [1] and server._pending_footer.get() == "the footer"
+        server._pending_footer.set("")
+
+
+class TestFooterScope:
+    """§4.2 constraint 1: the footer is computed only by the tools that show it.
+
+    The helper-level test above pins _ensure_lsp_started's own behaviour; this one
+    pins the call sites, so dropping `footer=True` from a query tool — or adding it
+    to isabelle_evaluation_status, the case the constraint was written to
+    prevent — reds here."""
+
+    @pytest.mark.asyncio
+    async def test_which_tools_ask_for_a_footer(self, temp_theory_file, mock_lsp_client):
+        import contextlib
+
+        from isabelle_mcp import server
+
+        seen: dict[str, bool] = {}
+
+        def spy(name):
+            async def _ensure(*, footer: bool = False):
+                seen[name] = footer
+                return mock_lsp_client
+            return _ensure
+
+        line, sym = 5, "my_const"
+        calls = {
+            "isabelle_hover": lambda: server.isabelle_hover(temp_theory_file, line, sym),
+            "isabelle_definition": lambda: server.isabelle_definition(temp_theory_file, line, sym),
+            "isabelle_local_occurrences": lambda: server.isabelle_local_occurrences(temp_theory_file, line, sym),
+            "isabelle_goal": lambda: server.isabelle_goal(temp_theory_file, line),
+            "isabelle_find_theorems": lambda: server.isabelle_find_theorems(temp_theory_file, line),
+            "isabelle_command_output": lambda: server.isabelle_command_output(temp_theory_file, line),
+            "isabelle_evaluate_to": lambda: server.isabelle_evaluate_to(temp_theory_file, line),
+            "isabelle_evaluation_status": lambda: server.isabelle_evaluation_status(),
+            "isabelle_cancel_evaluation": lambda: server.isabelle_cancel_evaluation(),
+            "isabelle_session_info": lambda: server.isabelle_session_info(),
+        }
+        for name, call in calls.items():
+            with patch.object(server, "_ensure_lsp_started", spy(name)), \
+                    contextlib.suppress(Exception):
+                await call()
+
+        assert seen["isabelle_hover"] is True
+        assert seen["isabelle_definition"] is True
+        assert seen["isabelle_local_occurrences"] is True
+        assert seen["isabelle_goal"] is True
+        assert seen["isabelle_find_theorems"] is True
+        assert seen["isabelle_command_output"] is True
+        # These three state the same facts in their own bodies, and computing the
+        # footer here would let isabelle_evaluation_status answer "No evaluation
+        # in progress." instead of reporting the completion it just observed.
+        assert seen["isabelle_evaluate_to"] is False
+        assert seen["isabelle_evaluation_status"] is False
+        assert seen["isabelle_cancel_evaluation"] is False
+        assert seen["isabelle_session_info"] is False
+
+    @pytest.mark.asyncio
+    async def test_unicode_warning_comes_before_the_footer(self):
+        """§4.2: a rare, actionable warning must not be buried under a constant
+        line the agent learns to skim."""
+        from fastmcp.tools.tool import ToolResult
+        from mcp.types import TextContent
+
+        from isabelle_mcp import unicode_guard
+        from isabelle_mcp.server import UnicodeWarningMiddleware, _pending_footer
+
+        unicode_guard.drain_warnings()          # start from a clean queue
+        unicode_guard.record_warning("/p/A.thy", "- A.thy: 3 glyphs rewritten")
+
+        async def call_next(_ctx):
+            _pending_footer.set("Evaluating towards A.thy:20.")
+            return ToolResult(content=[TextContent(type="text", text="the answer")])
+
+        result = await UnicodeWarningMiddleware().on_call_tool(None, call_next)
+        texts = [c.text for c in result.content]
+        assert texts[0] == "the answer"
+        assert texts[1].startswith("⚠️ NON-ASCII DETECTED")
+        assert texts[2] == "Evaluating towards A.thy:20."

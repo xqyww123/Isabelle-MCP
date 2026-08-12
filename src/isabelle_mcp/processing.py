@@ -74,9 +74,18 @@ def _grace_remaining() -> float:
     return max(0.0, DECORATION_GRACE - (_time.monotonic() - _last_edit_sent))
 
 _TRACKED_TYPES = frozenset({
-    "background_unprocessed1", "background_running1",
+    "background_unprocessed1", "background_running1", "background_canceled",
     "background_bad", "text_overview_error", "text_overview_warning",
 })
+
+# The state of the command(s) covering one position, judged from the decoration
+# cache alone. Fixed vocabulary — the agent-facing words of isabelle_command_status
+# are rendered from these and must not acquire a second meaning anywhere.
+PROCESSED = "processed"
+RUNNING = "running"
+NOT_EVALUATED = "not_evaluated"
+CANCELLED = "cancelled"
+UNKNOWN = "unknown"
 
 
 def parse_decoration_ranges(entries: list[dict]) -> dict[str, list[tuple[int, int, int, int]]]:
@@ -143,6 +152,11 @@ class ProcessingTracker:
         self._bad: list[tuple[int, int, int, int]] = []
         self._overview_error: list[tuple[int, int, int, int]] = []
         self._overview_warning: list[tuple[int, int, int, int]] = []
+        # background_canceled — commands whose execution was interrupted
+        # (Markup.CANCELED, i.e. Isabelle's own "canceled" spelling). Read only by
+        # position_state: such a command also carries `failed`, so the per-file
+        # snapshot already counts and locates it via _bad/_overview_error.
+        self._canceled: list[tuple[int, int, int, int]] = []
         self._initialized: bool = False
         self._condition: asyncio.Condition = asyncio.Condition()
 
@@ -163,6 +177,8 @@ class ProcessingTracker:
             # touches _unprocessed/_running). An emptied type arrives as
             # ``content:[]`` → key present with empty list → cleared. This
             # full-replace is how a fixed error/warning/sorry disappears.
+            if "background_canceled" in parsed:
+                self._canceled = parsed["background_canceled"]
             if "background_bad" in parsed:
                 self._bad = parsed["background_bad"]
             if "text_overview_error" in parsed:
@@ -306,6 +322,54 @@ class ProcessingTracker:
                 return True
         return False
 
+    def position_state(self, line: int) -> str:
+        """State of the command(s) covering *line* (0-indexed): one of the five
+        module constants.
+
+        This is the definite answer :meth:`line_reached` cannot give: that method
+        collapses "not processed yet" and "the cache is not trustworthy" into a
+        single ``False``, so a caller acting on it re-evaluates lines that were
+        finished long ago.
+
+        The order of the tests is Isabelle's own precedence
+        (``rendering.scala:515-518``): unprocessed, then running, then canceled.
+        The three background colours are computed from one command status, so at a
+        given offset they are mutually exclusive; the order only decides what a
+        line covering SEVERAL commands is called, and there the least-finished
+        command is the honest answer.
+
+        Freshness is checked before the running and canceled scans, and that
+        placement is load-bearing. Inside the post-edit grace window the cache may
+        still describe the PRE-edit document; the familiar "a stale cache can only
+        over-report work as unfinished" argument makes that safe only for a caller
+        whose response is *do more work*. ``RUNNING`` and ``CANCELLED`` are
+        SERVED — a caller acts on them by answering the query — and relative to
+        the edited document the honest answer is that the line has not run yet.
+        (The server would answer such a query from the last assigned version:
+        ``output_at_position`` carries no ``is_outdated`` guard.)
+
+        ``NOT_EVALUATED`` keeps the old conservative meaning, so the unprocessed
+        scan may stay in front: an edit can only un-process a line, and the caller
+        responds by evaluating it.
+
+        A tracker that has never received a decoration reports ``NOT_EVALUATED``:
+        nothing has been processed, which is exactly what the caller must act on.
+        """
+        for sl, _, el, _ in self._unprocessed:
+            if sl <= line <= el:
+                return NOT_EVALUATED
+        if not self._initialized:
+            return NOT_EVALUATED
+        if _grace_remaining() > 0.0:
+            return UNKNOWN
+        for sl, _, el, _ in self._running:
+            if sl <= line <= el:
+                return RUNNING
+        for sl, _, el, _ in self._canceled:
+            if sl <= line <= el:
+                return CANCELLED
+        return PROCESSED
+
     def get_running_ranges(self) -> list[tuple[int, int, int, int]]:
         """Return a snapshot of currently-running ranges (0-indexed)."""
         return list(self._running)
@@ -320,6 +384,10 @@ class ProcessingTracker:
     def get_unprocessed_ranges(self) -> list[tuple[int, int, int, int]]:
         """Return a snapshot of unprocessed ranges (0-indexed)."""
         return list(self._unprocessed)
+
+    def get_canceled_ranges(self) -> list[tuple[int, int, int, int]]:
+        """Return a snapshot of background_canceled ranges (interrupted), 0-indexed."""
+        return list(self._canceled)
 
     def get_bad_ranges(self) -> list[tuple[int, int, int, int]]:
         """Return a snapshot of background_bad ranges (failed/killed/sorry), 0-indexed."""
@@ -340,6 +408,7 @@ class ProcessingTracker:
             self._running.clear()
             self._running_onset.clear()
             self._bad.clear()
+            self._canceled.clear()
             self._overview_error.clear()
             self._overview_warning.clear()
             self._initialized = False

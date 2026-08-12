@@ -28,6 +28,7 @@ import os
 import tempfile
 from collections import Counter
 
+from isabelle_mcp.utils.core import plural
 from isabelle_mcp.utils.isabelle_symbols import ascii_of_unicode
 
 logger = logging.getLogger(__name__)
@@ -86,8 +87,8 @@ def sanitize_read(path: str) -> tuple[str, str | None]:
             if _replace_if_unchanged(path, converted, expected=content):
                 _last_nonascii_sig.pop(path, None)
                 logger.info(
-                    "Rewrote %s in Isabelle ASCII (%d glyph(s) converted)",
-                    path, sum(replaced.values()),
+                    "Rewrote %s in Isabelle ASCII (%s converted)",
+                    path, plural(sum(replaced.values()), "glyph"),
                 )
                 return converted, _rewritten_bullet(path, replaced, bom_stripped)
         except OSError as e:

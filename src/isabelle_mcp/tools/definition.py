@@ -23,8 +23,9 @@ async def declaration_location(
     if line < 1:
         raise IsabelleToolError(f"line must be >= 1, got {line}")
 
-    await client.open_document(file_path)
-
+    # NOT opened here: the guard decides whether opening is allowed. A didOpen
+    # globally invalidates decoration freshness, so it must not happen while an
+    # evaluation is outstanding; on the paths that may open, evaluate_to does it.
     guard = await check_evaluation_guard(client, file_path, line)
     if isinstance(guard, EvaluationView):
         raise IsabelleToolError(format_evaluation_result(guard, client.project_root))

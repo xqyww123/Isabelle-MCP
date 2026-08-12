@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import contextvars
 import logging
 import os
 from collections.abc import AsyncGenerator
@@ -17,6 +18,7 @@ from isabelle_mcp.evaluation import (
     _evaluation_state_lock,
     cancel_evaluation,
     evaluate_to,
+    evaluation_footer,
     evaluation_status,
     format_evaluation_result,
     resync_and_check_freshness,
@@ -101,19 +103,34 @@ mcp = FastMCP(
 )
 
 
+# The evaluation footer of the call in flight, computed in _ensure_lsp_started
+# and appended by the middleware once the tool has produced its result. A
+# ContextVar, not a module global: tool calls can overlap, and a footer belongs
+# to the call that computed it. Set only by the tools that display it.
+_pending_footer: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "isabelle_mcp_pending_footer", default="",
+)
+
+
 class UnicodeWarningMiddleware(Middleware):
-    """Append queued unicode-conversion warnings to the next tool response.
+    """Append queued unicode-conversion warnings and the evaluation footer to the
+    tool response.
 
     The unicode guard (``unicode_guard.sanitize_read``) runs on the push paths
     and queues a warning per affected file; this middleware drains the queue
     after each successful tool call and appends the warning — with the
     instruction to emit Isabelle ASCII — as an extra text block. On a tool
     error the queue is left intact for the next call.
+
+    The footer goes last, below the warning: it is a fixed-format line the agent
+    learns to skim, and burying a rare, actionable warning underneath a constant
+    one would be worse than the reverse.
     """
 
     async def on_call_tool(
         self, context: MiddlewareContext, call_next: CallNext,
     ) -> ToolResult:
+        _pending_footer.set("")
         result = await call_next(context)
         # Task-augmented calls (SEP-1686) return CreateTaskResult, which has no
         # content list — leave the queue for the next regular call.
@@ -124,13 +141,18 @@ class UnicodeWarningMiddleware(Middleware):
             result.content = [
                 *result.content, TextContent(type="text", text=warning),
             ]
+        footer = _pending_footer.get()
+        if footer:
+            result.content = [
+                *result.content, TextContent(type="text", text=footer),
+            ]
         return result
 
 
 mcp.add_middleware(UnicodeWarningMiddleware())
 
 
-async def _ensure_lsp_started() -> IsabelleLSPClient:
+async def _ensure_lsp_started(*, footer: bool = False) -> IsabelleLSPClient:
     if _lsp_client is None:
         raise IsabelleToolError("LSP client not initialized")
     if _lsp_client.process is None:
@@ -142,6 +164,17 @@ async def _ensure_lsp_started() -> IsabelleLSPClient:
     # changed ones) + Layer 3 (wait out the server's debounce if a dependency just
     # changed). Catches anything the event-driven watcher missed.
     await resync_and_check_freshness(_lsp_client)
+    if footer:
+        # Only the tools that DISPLAY the footer compute it. The computation can
+        # end an evaluation (see evaluation_footer), and a tool that does not show
+        # the result has no business making that transition on its own path —
+        # isabelle_evaluation_status would then answer "No evaluation in
+        # progress." instead of reporting the completion it just observed.
+        #
+        # This also fixes the footer's place in the order: it runs before the
+        # guard, so a query about a still-unprocessed position auto-starts a new
+        # evaluation rather than being refused by a flag that is no longer true.
+        _pending_footer.set(await evaluation_footer(_lsp_client))
     return _lsp_client
 
 
@@ -200,9 +233,9 @@ def _heap_unbuilt_error(
     if require_unfinished and not client.unfinished_sessions:
         return None
     names = ", ".join(client.unfinished_sessions) \
-        or "some session(s) in the dependency chain"
+        or "some sessions in the dependency chain"
     return IsabelleToolError(
-        f"Heap image(s) cannot be verified as up-to-date "
+        f"Heap images cannot be verified as up-to-date "
         f"(outdated, missing, or no build record) for: {names}. "
         f"Rebuild first ({client.build_hint()}) and call "
         f"isabelle_launch again — the MCP server never builds sessions itself."
@@ -400,7 +433,11 @@ async def isabelle_evaluation_status() -> ToolResult:
     client = await _ensure_lsp_started()
     view = await evaluation_status(client)
     return ToolResult(content=[TextContent(
-        type="text", text=format_evaluation_result(view, client.project_root),
+        # No "call isabelle_evaluation_status" here: this IS that tool.
+        type="text",
+        text=format_evaluation_result(
+            view, client.project_root, call_to_action=False,
+        ),
     )])
 
 
@@ -437,7 +474,8 @@ async def isabelle_hover(file_path: str, line: int, symbol: str) -> HoverInfo:
         symbol: Symbol text to look up (e.g. "Suc", "my_const", "⟹")
     """
     return await hover_info(
-        await _ensure_lsp_started(), os.path.realpath(file_path), MCPLine(line), symbol,
+        await _ensure_lsp_started(footer=True), os.path.realpath(file_path),
+        MCPLine(line), symbol,
     )
 
 
@@ -457,7 +495,8 @@ async def isabelle_definition(file_path: str, line: int, symbol: str) -> Declara
         symbol: Symbol text to look up (e.g. "my_const", "List.map")
     """
     return await declaration_location(
-        await _ensure_lsp_started(), os.path.realpath(file_path), MCPLine(line), symbol,
+        await _ensure_lsp_started(footer=True), os.path.realpath(file_path),
+        MCPLine(line), symbol,
     )
 
 
@@ -482,7 +521,8 @@ async def isabelle_local_occurrences(file_path: str, line: int, symbol: str) -> 
         symbol: Symbol text to look up (e.g. "my_const", "add_one"), ASCII or Unicode.
     """
     return await local_occurrences(
-        await _ensure_lsp_started(), os.path.realpath(file_path), MCPLine(line), symbol,
+        await _ensure_lsp_started(footer=True), os.path.realpath(file_path),
+        MCPLine(line), symbol,
     )
 
 
@@ -503,7 +543,7 @@ async def isabelle_goal(
             Without it, the command at the end of the line is used.
     """
     file_path = os.path.realpath(file_path)
-    lsp = await _ensure_lsp_started()
+    lsp = await _ensure_lsp_started(footer=True)
     return await goal(lsp, file_path, MCPLine(line), after_text)
 
 
@@ -560,7 +600,7 @@ async def isabelle_find_theorems(
         allow_duplicates: Keep alpha-equivalent duplicates (default removes them).
     """
     file_path = os.path.realpath(file_path)
-    lsp = await _ensure_lsp_started()
+    lsp = await _ensure_lsp_started(footer=True)
     return await find_theorems(
         lsp, file_path, MCPLine(line), after_text,
         names=names, exclude_names=exclude_names,
@@ -589,7 +629,8 @@ async def isabelle_command_output(
             Without it, the command at the end of the line is used.
     """
     result = await command_output(
-        await _ensure_lsp_started(), os.path.realpath(file_path), MCPLine(line), after_text,
+        await _ensure_lsp_started(footer=True), os.path.realpath(file_path),
+        MCPLine(line), after_text,
     )
     return ToolResult(
         content=[TextContent(type="text", text=format_command_output(result, line))],

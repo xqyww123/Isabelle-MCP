@@ -66,10 +66,12 @@ class MockProcessingTracker:
     def __init__(
         self, *, all_processed: bool = True,
         frontier: bool | None = None, quiet: bool | None = None,
+        state: str | None = None,
     ):
         self._all_processed = all_processed
         self._frontier = all_processed if frontier is None else frontier
         self._quiet = all_processed if quiet is None else quiet
+        self._state = state
 
     def range_processed(self, start_line: LSPLine, end_line: LSPLine) -> bool:
         return self._quiet
@@ -79,6 +81,21 @@ class MockProcessingTracker:
 
     def line_running(self, line: int) -> bool:
         return False
+
+    def position_state(self, line):
+        """Mirror ProcessingTracker.position_state from this stub's frontier/running.
+
+        *state* forces an answer outright, so a tool-level test can reach the
+        outcomes this stub cannot model — `unknown` (inside the post-edit grace
+        window) and `cancelled` (an interrupted command)."""
+        from isabelle_mcp import processing
+        if self._state is not None:
+            return self._state
+        if not self._frontier:
+            return processing.NOT_EVALUATED
+        if self.line_running(line):
+            return processing.RUNNING
+        return processing.PROCESSED
 
     @property
     def all_processed(self) -> bool:

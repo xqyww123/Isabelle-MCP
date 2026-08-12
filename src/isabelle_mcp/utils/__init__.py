@@ -8,6 +8,7 @@ from isabelle_mcp.utils.core import (
     file_path_to_uri,
     lsp_to_mcp_position,
     mcp_to_lsp_position,
+    plural,
     uri_to_file_path,
     validate_position,
 )
@@ -47,6 +48,7 @@ __all__ = [
     "symbol_explode",
     "lsp_to_mcp_position",
     "mcp_to_lsp_position",
+    "plural",
     "uri_to_file_path",
     "validate_position",
     "extract_symbol_at_position",

@@ -76,6 +76,7 @@ class TestDefinitionTool:
 
     @pytest.mark.asyncio
     async def test_beyond_file_end(self, mock_lsp_client, temp_theory_file):
+        await mock_lsp_client.open_document(temp_theory_file)
         mock_lsp_client.definition_response = None
         result = await declaration_location(mock_lsp_client, temp_theory_file, MCPLine(1000), "x")
         assert result.symbol == "x"
@@ -98,8 +99,9 @@ class TestDefinitionTool:
 
     @pytest.mark.asyncio
     async def test_evaluation_guard_blocks(self, mock_lsp_client, temp_theory_file):
+        # Not open, so the guard may not open it while an evaluation is outstanding.
         evaluation_state.start(temp_theory_file, MCPLine(100))
-        with pytest.raises(IsabelleToolError, match="Evaluation in progress"):
+        with pytest.raises(IsabelleToolError, match="has not been opened yet"):
             await declaration_location(mock_lsp_client, temp_theory_file, MCPLine(5), "my_const")
 
     @pytest.mark.asyncio

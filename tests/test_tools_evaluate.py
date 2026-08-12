@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from isabelle_mcp import evaluation as ev
@@ -10,7 +12,7 @@ from isabelle_mcp.evaluation import (
     resync_changed_open_documents_locked,
     sync_file_locked,
 )
-from isabelle_mcp.evaluation import _complete_message
+from isabelle_mcp.evaluation import _arrival_message
 from isabelle_mcp.models import EvaluationView, FileSnapshot, RunningCommand
 from isabelle_mcp.processing import ProcessingTracker, parse_decoration_ranges
 from isabelle_mcp.utils import IsabelleToolError, MCPLine
@@ -20,11 +22,12 @@ class MockProcessingTracker:
     """Configurable tracker stub exposing the decoration getters the snapshot reads."""
 
     def __init__(self, *, all_processed=True, frontier=None, quiet=None,
-                 bad=None, overview_error=None,
+                 bad=None, overview_error=None, state=None,
                  overview_warning=None, running=None, unprocessed=None):
         self._all_processed = all_processed
         self._frontier = all_processed if frontier is None else frontier
         self._quiet = all_processed if quiet is None else quiet
+        self._state = state
         self._bad = bad or []
         self._oerr = overview_error or []
         self._owarn = overview_warning or []
@@ -39,6 +42,17 @@ class MockProcessingTracker:
 
     def line_running(self, line):
         return False
+
+    def position_state(self, line):
+        """Mirror ProcessingTracker.position_state; *state* forces an answer."""
+        from isabelle_mcp import processing
+        if self._state is not None:
+            return self._state
+        if not self._frontier:
+            return processing.NOT_EVALUATED
+        if self.line_running(line):
+            return processing.RUNNING
+        return processing.PROCESSED
 
     @property
     def all_processed(self):
@@ -103,7 +117,9 @@ class TestEvaluateTo:
         result = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
         assert result.status == "in_progress"
         assert result.destination_line == 5
-        assert "evaluation_status" in result.message
+        assert result.message == (
+            f"Evaluating towards {temp_theory_file}:5."
+        )
 
     @pytest.mark.asyncio
     async def test_while_active_fails(self, temp_theory_file, mock_lsp_client):
@@ -247,7 +263,9 @@ class TestEvaluationStatus:
         fs = _file(r2, temp_theory_file)
         assert fs is not None and fs.errors == [(8, 8)]
         assert fs.state == "problems"
-        assert "0 statement(s) still running and 1 statement(s) failed" in r2.message
+        # The failure is reported by the file section above, with its line number;
+        # the sentence names the target and does not repeat the count.
+        assert r2.message == f"Evaluation has arrived at {temp_theory_file}:9."
 
 
 class TestCancelEvaluation:
@@ -403,7 +421,7 @@ class TestSnapshotCategorization:
         assert fs.pending == [] and fs.state == "clean"
 
 
-class TestCompleteMessage:
+class TestLeadingSentence:
     def _run(self, line, text="apply simp"):
         return RunningCommand(
             file_path="/proj/Foo.thy", start_line=line, end_line=line,
@@ -417,29 +435,35 @@ class TestCompleteMessage:
             error_count=error_count,
         )
 
-    def test_clean_complete(self):
-        assert _complete_message(11, [], [self._fs()]) == (
-            "Evaluation complete, arrived at line 11."
+    def test_nothing_left(self):
+        assert _arrival_message("/proj/Foo.thy", 11, [], [self._fs()], "/proj") == (
+            "Evaluation has completed up to Foo.thy:11."
         )
 
-    def test_running_only(self):
-        msg = _complete_message(11, [self._run(11)], [self._fs()])
-        assert msg == (
-            "Evaluation arrived at line 11 with 1 statement(s) still running "
-            "and 0 statement(s) failed."
+    def test_still_running(self):
+        msg = _arrival_message(
+            "/proj/Foo.thy", 11, [self._run(11)], [self._fs()], "/proj",
         )
+        assert msg == "Evaluation has arrived at Foo.thy:11."
 
-    def test_failed_only(self):
-        msg = _complete_message(11, [], [self._fs(error_count=2)])
-        assert msg == (
-            "Evaluation arrived at line 11 with 0 statement(s) still running "
-            "and 2 statement(s) failed."
+    def test_failed(self):
+        msg = _arrival_message(
+            "/proj/Foo.thy", 11, [], [self._fs(error_count=2)], "/proj",
         )
+        assert msg == "Evaluation has arrived at Foo.thy:11."
 
-    def test_running_and_failed_sum_across_files(self):
+    def test_the_counts_are_not_repeated_in_the_sentence(self):
+        # They are below, per line, in the file sections.
         files = [self._fs(error_count=1), self._fs(error_count=2)]
-        msg = _complete_message(11, [self._run(11), self._run(11)], files)
-        assert "2 statement(s) still running and 3 statement(s) failed" in msg
+        msg = _arrival_message(
+            "/proj/Foo.thy", 11, [self._run(11), self._run(11)], files, "/proj",
+        )
+        assert "2" not in msg and "3" not in msg
+
+    def test_absolute_path_without_a_project_root(self):
+        assert _arrival_message("/proj/Foo.thy", 11, [], [self._fs()], None) == (
+            "Evaluation has completed up to /proj/Foo.thy:11."
+        )
 
 
 class TestRendering:
@@ -456,7 +480,7 @@ class TestRendering:
         )
         rel = format_evaluation_result(view, "/proj")
         assert "Foo.thy:" in rel
-        assert "errors: 5, 9-11" in rel
+        assert "errors: lines 5, 9-11" in rel
         assert "Bar.thy: clean" in rel
         absolute = format_evaluation_result(view, None)
         assert "/proj/Foo.thy:" in absolute
@@ -473,8 +497,61 @@ class TestRendering:
                                 pending=[(7, 9)], pending_count=1)],
         )
         out = format_evaluation_result(view, "/proj")
-        assert "pending: 7-9" in out
+        assert "pending: lines 7-9" in out
         assert "Foo.thy: clean" not in out
+
+
+class TestResultLayout:
+    """§4.6: detail nests under the row it belongs to, so nothing is said twice."""
+
+    def _view(self, elapsed, **fs_kwargs):
+        return EvaluationView(
+            status="in_progress", target_file="/proj/Foo.thy", destination_line=20,
+            message="Evaluating towards Foo.thy:20.",
+            files=[FileSnapshot("/proj/Foo.thy", lined=True, state="in_progress",
+                                running=[(8, 8)], running_count=1, **fs_kwargs)],
+            running_commands=[RunningCommand(
+                file_path="/proj/Foo.thy", start_line=8, end_line=8,
+                text="by (auto simp: field_simps)", elapsed_seconds=elapsed,
+            )],
+        )
+
+    def test_slow_command_nests_with_its_elapsed_time(self):
+        out = format_evaluation_result(self._view(14.0), "/proj")
+        assert "  running:\n    line 8 (14s) by (auto simp: field_simps)" in out
+
+    def test_young_command_shows_the_range_alone(self):
+        # Below the threshold it is ordinary progress, not something to act on.
+        out = format_evaluation_result(self._view(3.0), "/proj")
+        assert "  running: line 8" in out
+        assert "(3s)" not in out
+
+    def test_line_spans_carry_a_unit_word(self):
+        # "warnings: 12" reads as "12 warnings"; "warnings: line 12" cannot.
+        view = EvaluationView(
+            status="in_progress", destination_line=20,
+            files=[FileSnapshot("/proj/Foo.thy", lined=True, state="problems",
+                                errors=[(45, 45)], warnings=[(9, 11), (20, 20)],
+                                error_count=1, warning_count=2)],
+        )
+        out = format_evaluation_result(view, "/proj")
+        assert "errors: line 45" in out
+        assert "warnings: lines 9-11, 20" in out
+
+    def test_call_to_action_only_when_there_is_something_to_watch(self):
+        call = "Call isabelle_evaluation_status to check progress."
+
+        assert format_evaluation_result(self._view(14.0), "/proj").endswith(call)
+        assert call not in format_evaluation_result(self._view(3.0), "/proj")
+        # A failure is also worth watching, however briefly it has been running.
+        with_error = self._view(3.0, errors=[(4, 4)], error_count=1)
+        assert format_evaluation_result(with_error, "/proj").endswith(call)
+
+    def test_evaluation_status_does_not_point_at_itself(self):
+        out = format_evaluation_result(
+            self._view(14.0), "/proj", call_to_action=False,
+        )
+        assert "Call isabelle_evaluation_status" not in out
 
 
 class TestDecorationClear:
@@ -542,7 +619,7 @@ class TestCancelSafety:
     ):
         import asyncio
 
-        async def fake_loop(client, file_path, dest_line, state, timeout):
+        async def fake_loop(client, file_path, dest_line, state, evaluation, timeout):
             state.auto_opened_files.add("/tmp/Dep_cancel.thy")
             raise asyncio.CancelledError()
 
@@ -559,7 +636,7 @@ class TestCancelSafety:
     ):
         import asyncio
 
-        async def fake_loop(client, file_path, dest_line, state, timeout):
+        async def fake_loop(client, file_path, dest_line, state, evaluation, timeout):
             state.auto_opened_files.add("/tmp/Dep_complete.thy")
             return "complete", [], []
 
@@ -590,7 +667,7 @@ class TestCancelSafety:
 
         calls = []
 
-        async def fake_loop(client, file_path, dest_line, state, timeout):
+        async def fake_loop(client, file_path, dest_line, state, evaluation, timeout):
             calls.append(1)
             if len(calls) == 1:
                 return "in_progress", [], []
@@ -756,3 +833,526 @@ class TestDependencyEditStamp:
         wait = await ev._dependency_freshness_wait(mock_lsp_client)
         assert processing._grace_remaining() > 0.0            # clock bumped
         assert wait > 0.0                                     # debounce wait requested
+
+
+class TestEvaluationLifecycle:
+    """§4.8: only the run that started this state may end it, and the outcome
+    belongs to the run that was ended.
+
+    Every test here reds on the pre-handle code, where a single boolean carried
+    both facts: a completed run was reported as "in progress", and a finished
+    run's tail closed a newer run's auto-opened documents."""
+
+    def test_start_mints_a_fresh_handle_and_owns_it(self, temp_theory_file):
+        first = evaluation_state.start(temp_theory_file, MCPLine(5))
+        assert evaluation_state.owns(first)
+        second = evaluation_state.start(temp_theory_file, MCPLine(5))
+        assert first is not second
+        assert evaluation_state.owns(second)
+        assert not evaluation_state.owns(first)
+
+    def test_complete_and_cancel_stamp_the_outcome(self, temp_theory_file):
+        run = evaluation_state.start(temp_theory_file, MCPLine(5))
+        evaluation_state.complete()
+        assert run.outcome == "complete"
+        assert evaluation_state.active is False
+
+        run = evaluation_state.start(temp_theory_file, MCPLine(5))
+        evaluation_state.cancel()
+        assert run.outcome == "cancelled"
+
+    def test_stamp_is_write_once(self, temp_theory_file):
+        # A later cancel of a lingering fork must not rewrite a finished run's story.
+        run = evaluation_state.start(temp_theory_file, MCPLine(5))
+        evaluation_state.complete()
+        evaluation_state.cancel()
+        assert run.outcome == "complete"
+
+    @pytest.mark.asyncio
+    async def test_finish_if_owner_is_a_noop_for_a_superseded_run(
+        self, temp_theory_file, mock_lsp_client,
+    ):
+        first = evaluation_state.start(temp_theory_file, MCPLine(5))
+        second = evaluation_state.start(temp_theory_file, MCPLine(5))
+        evaluation_state.auto_opened_files.add("/tmp/Dep_second.thy")
+
+        assert await ev._finish_if_owner(mock_lsp_client, first, "complete") is False
+        # The second run's flag and its auto-opened set are untouched.
+        assert evaluation_state.active is True
+        assert evaluation_state.auto_opened_files == {"/tmp/Dep_second.thy"}
+        assert second.outcome == ""
+        evaluation_state.auto_opened_files = set()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_discards_from_the_set_it_bound(
+        self, temp_theory_file, mock_lsp_client,
+    ):
+        """_cleanup_auto_opened must not discard from a newer run's set.
+
+        The close await is where a concurrent evaluate_to gets to run; start()
+        rebinds the attribute to a fresh set there."""
+        evaluation_state.start(temp_theory_file, MCPLine(5))
+        old_set = evaluation_state.auto_opened_files
+        old_set.add("/tmp/Dep_old.thy")
+
+        async def close_then_restart(path):
+            evaluation_state.start(temp_theory_file, MCPLine(5))
+            evaluation_state.auto_opened_files.add("/tmp/Dep_new.thy")
+
+        mock_lsp_client.close_document = close_then_restart
+        await ev._cleanup_auto_opened(mock_lsp_client, evaluation_state)
+
+        assert old_set == set()                                        # ours drained
+        assert evaluation_state.auto_opened_files == {"/tmp/Dep_new.thy"}  # theirs kept
+        evaluation_state.auto_opened_files = set()
+
+    @pytest.mark.asyncio
+    async def test_wait_loop_reports_the_recorded_outcome(
+        self, temp_theory_file, mock_lsp_client,
+    ):
+        """A concurrent evaluation_status observing completion clears the flag;
+        the loop must say "complete", not guess "cancelled"."""
+        run = evaluation_state.start(temp_theory_file, MCPLine(5))
+        evaluation_state.complete()
+        status, theories, running = await ev._evaluation_wait_loop(
+            mock_lsp_client, temp_theory_file, MCPLine(5),
+            evaluation_state, run, 1.0,
+        )
+        assert status == "complete"
+
+    @pytest.mark.asyncio
+    async def test_wait_loop_carries_out_the_running_commands(
+        self, temp_theory_file, mock_lsp_client,
+    ):
+        run = evaluation_state.start(temp_theory_file, MCPLine(5))
+        evaluation_state.cancel()
+        cmd = RunningCommand(
+            file_path=temp_theory_file, start_line=3, end_line=3,
+            text="by auto", elapsed_seconds=12.0,
+        )
+        mock_lsp_client.get_all_running_commands = lambda: [cmd]
+        status, theories, running = await ev._evaluation_wait_loop(
+            mock_lsp_client, temp_theory_file, MCPLine(5),
+            evaluation_state, run, 1.0,
+        )
+        assert status == "cancelled"
+        assert running == [cmd]
+
+    @pytest.mark.asyncio
+    async def test_evaluate_to_reports_a_concurrent_completion_as_complete(
+        self, temp_theory_file, mock_lsp_client, monkeypatch,
+    ):
+        """The defect this fix exists for: evaluation_status observes the run
+        succeed, and evaluate_to used to answer "Evaluation in progress."."""
+
+        async def fake_loop(client, file_path, dest_line, state, evaluation, timeout):
+            state.complete()                       # what evaluation_status does
+            return "cancelled", [], []             # what the old loop guessed
+
+        monkeypatch.setattr(ev, "_evaluation_wait_loop", fake_loop)
+        view = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
+        assert view.status == "complete"
+        assert view.message == f"Evaluation has completed up to {temp_theory_file}:5."
+        assert "in progress" not in view.message
+
+    @pytest.mark.asyncio
+    async def test_evaluate_to_reports_a_concurrent_cancel_as_cancelled(
+        self, temp_theory_file, mock_lsp_client, monkeypatch,
+    ):
+        async def fake_loop(client, file_path, dest_line, state, evaluation, timeout):
+            state.cancel()
+            return "in_progress", [], []
+
+        monkeypatch.setattr(ev, "_evaluation_wait_loop", fake_loop)
+        view = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
+        assert view.status == "cancelled"
+        assert view.message == ev.CANCELLED_MESSAGE
+        assert evaluation_state.active is False
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_heap_run_does_not_claim_the_heap_stopped_it(
+        self, temp_theory_file, mock_lsp_client, monkeypatch,
+    ):
+        """Demotion (§4.8): "Evaluation abandoned: the file differs…" names a
+        cause, so it may only be said when the run stopped on its own."""
+        import os
+
+        mock_lsp_client.heap_sources = {os.path.realpath(temp_theory_file)}
+
+        async def fake_loop(client, file_path, dest_line, state, evaluation, timeout):
+            state.cancel()
+            return "in_progress", [], []
+
+        monkeypatch.setattr(ev, "_evaluation_wait_loop", fake_loop)
+        view = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
+        assert view.status == "cancelled"
+        assert view.message == ev.CANCELLED_MESSAGE
+
+    @pytest.mark.asyncio
+    async def test_a_finished_run_does_not_close_a_newer_runs_documents(
+        self, temp_theory_file, mock_lsp_client, monkeypatch,
+    ):
+        """Defect 2: evaluate_to holds no lock across the wait, so a second run
+        can start before the first one's tail runs."""
+        closed = []
+
+        async def fake_loop(client, file_path, dest_line, state, evaluation, timeout):
+            # A second evaluation starts while we were waiting.
+            state.start(file_path, dest_line)
+            state.auto_opened_files.add("/tmp/Dep_of_run_two.thy")
+            return "complete", [], []
+
+        async def rec_close(path):
+            closed.append(path)
+
+        monkeypatch.setattr(ev, "_evaluation_wait_loop", fake_loop)
+        mock_lsp_client.close_document = rec_close
+        await evaluate_to(mock_lsp_client, temp_theory_file, 5)
+
+        assert closed == []                        # run two's document survives
+        assert evaluation_state.active is True     # run two is still in flight
+        assert evaluation_state.auto_opened_files == {"/tmp/Dep_of_run_two.thy"}
+        evaluation_state.auto_opened_files = set()
+
+
+class TestGuardPositionDecision:
+    """§4.3: the guard judges the requested position, and waits out an
+    untrustworthy cache instead of guessing in either direction."""
+
+    @pytest.mark.asyncio
+    async def test_unknown_is_waited_out_then_served(
+        self, mock_lsp_client, temp_theory_file, monkeypatch,
+    ):
+        from isabelle_mcp import processing
+
+        monkeypatch.setattr(processing, "DECORATION_GRACE", 0.3)
+        await mock_lsp_client.open_document(temp_theory_file)
+        tracker = ProcessingTracker()
+        await tracker.update(
+            {"background_unprocessed1": [], "background_running1": []},
+        )
+        mock_lsp_client._processing_trackers[temp_theory_file] = tracker
+        processing.note_edit_sent()          # cache is untrustworthy right now
+
+        assert tracker.position_state(4) == processing.UNKNOWN
+        carets = []
+        mock_lsp_client.set_caret = (
+            lambda *a, **k: carets.append(a) or asyncio.sleep(0)
+        )
+        # Neither a refusal nor a re-evaluation: wait the window out and answer.
+        assert await ev.check_evaluation_guard(
+            mock_lsp_client, temp_theory_file, MCPLine(5),
+        ) is None
+        # The old guard also ended at None — but by running a whole evaluate_to,
+        # which moves the caret. That is the behaviour this clause removes.
+        assert carets == []
+        assert evaluation_state.active is False
+
+    @pytest.mark.asyncio
+    async def test_stale_running_range_in_the_grace_window_is_not_served(
+        self, mock_lsp_client, temp_theory_file, monkeypatch,
+    ):
+        """The agent edits a line the prover is executing, then queries it.
+
+        A `running` range from before the edit describes a command that no longer
+        exists. Serving it hands back pre-edit output with a note claiming a fork
+        is still executing; the freshness test has to come first."""
+        from isabelle_mcp import processing
+
+        monkeypatch.setattr(processing, "DECORATION_GRACE", 100.0)
+        await mock_lsp_client.open_document(temp_theory_file)
+        tracker = ProcessingTracker()
+        await tracker.update({
+            "background_unprocessed1": [], "background_running1": [(4, 0, 4, 20)],
+            "background_canceled": [],
+        })
+        mock_lsp_client._processing_trackers[temp_theory_file] = tracker
+        processing.note_edit_sent()          # the edit the agent just made
+
+        assert tracker.position_state(4) == processing.UNKNOWN
+        assert tracker.position_state(4) != processing.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_stale_canceled_range_in_the_grace_window_is_not_served(
+        self, mock_lsp_client, temp_theory_file, monkeypatch,
+    ):
+        from isabelle_mcp import processing
+
+        monkeypatch.setattr(processing, "DECORATION_GRACE", 100.0)
+        tracker = ProcessingTracker()
+        await tracker.update({
+            "background_unprocessed1": [], "background_running1": [],
+            "background_canceled": [(4, 0, 4, 20)],
+        })
+        processing.note_edit_sent()
+        assert tracker.position_state(4) == processing.UNKNOWN
+
+    @pytest.mark.asyncio
+    async def test_unprocessed_stays_definite_in_the_grace_window(
+        self, mock_lsp_client, temp_theory_file, monkeypatch,
+    ):
+        """The one scan that may stay in front: an edit can only un-process a
+        line, and the caller's response to NOT_EVALUATED is to evaluate it."""
+        from isabelle_mcp import processing
+
+        monkeypatch.setattr(processing, "DECORATION_GRACE", 100.0)
+        tracker = ProcessingTracker()
+        await tracker.update({"background_unprocessed1": [(4, 0, 4, 20)]})
+        processing.note_edit_sent()
+        assert tracker.position_state(4) == processing.NOT_EVALUATED
+
+    @pytest.mark.asyncio
+    async def test_interrupted_position_is_served_with_a_note(
+        self, mock_lsp_client, temp_theory_file,
+    ):
+        await mock_lsp_client.open_document(temp_theory_file)
+        tracker = ProcessingTracker()
+        await tracker.update({
+            "background_unprocessed1": [], "background_running1": [],
+            "background_canceled": [(4, 0, 4, 20)],
+        })
+        mock_lsp_client._processing_trackers[temp_theory_file] = tracker
+
+        note = await ev.check_evaluation_guard(
+            mock_lsp_client, temp_theory_file, MCPLine(5),
+        )
+        assert note == (
+            "The evaluation of the command at line 5 was interrupted; "
+            "its output may be incomplete."
+        )
+
+    @pytest.mark.asyncio
+    async def test_still_unknown_after_the_wait_is_refused_not_evaluated(
+        self, mock_lsp_client, temp_theory_file, monkeypatch,
+    ):
+        from isabelle_mcp import processing
+
+        class AlwaysUnknown:
+            def position_state(self, line):
+                return processing.UNKNOWN
+
+            async def wait_until_line_reached_bounded(self, *a, **k):
+                return False
+
+        await mock_lsp_client.open_document(temp_theory_file)
+        mock_lsp_client._processing_trackers[temp_theory_file] = AlwaysUnknown()
+        monkeypatch.setattr(ev, "_grace_remaining", lambda: 0.05)
+
+        with pytest.raises(IsabelleToolError, match="Cannot tell whether") as exc:
+            await ev.check_evaluation_guard(
+                mock_lsp_client, temp_theory_file, MCPLine(5),
+            )
+        # Must not claim the line was not reached, and must not auto-start.
+        assert "not been evaluated" not in str(exc.value)
+        assert evaluation_state.active is False
+
+    @pytest.mark.asyncio
+    async def test_caret_moving_tools_stay_blocked(
+        self, mock_lsp_client, temp_theory_file,
+    ):
+        """§4.4: releasing these two would put two writers on the global caret
+        with no arbitration. Part B removes the dependence; until then the
+        blanket refusal IS the mutual exclusion."""
+        await mock_lsp_client.open_document(temp_theory_file)   # processed
+        evaluation_state.start(temp_theory_file, MCPLine(100))
+
+        # The same position is served for a position-explicit tool ...
+        assert await ev.check_evaluation_guard(
+            mock_lsp_client, temp_theory_file, MCPLine(5),
+        ) is None
+        # ... and refused for a caret-moving one.
+        with pytest.raises(IsabelleToolError, match="cannot run while an evaluation"):
+            await ev.check_evaluation_guard(
+                mock_lsp_client, temp_theory_file, MCPLine(5), moves_caret=True,
+            )
+
+
+class TestTargetOnTheResultModel:
+    """§1: the result model carried a destination line and no target file at all."""
+
+    @pytest.mark.asyncio
+    async def test_evaluate_to_names_the_target_file(
+        self, temp_theory_file, mock_lsp_client,
+    ):
+        view = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
+        assert view.target_file == temp_theory_file
+        assert view.destination_line == 5
+
+    @pytest.mark.asyncio
+    async def test_status_drops_the_target_once_no_run_owns_it(
+        self, temp_theory_file, mock_lsp_client,
+    ):
+        # A lingering fork has no target: the evaluation that had one is over.
+        cmd = RunningCommand(
+            file_path=temp_theory_file, start_line=5, end_line=5,
+            text="by auto", elapsed_seconds=3.0,
+        )
+        await mock_lsp_client.open_document(temp_theory_file)
+        mock_lsp_client.get_all_running_commands = lambda: [cmd]
+        evaluation_state.start(temp_theory_file, MCPLine(5))
+        evaluation_state.complete()
+        view = await evaluation_status(mock_lsp_client)
+        assert view.target_file is None
+        assert view.message == "1 command is still running."
+
+
+class TestPluralWording:
+    """§4.2 bans `command(s)`; the branch that matters is the one above 1."""
+
+    def test_two_running_and_two_failed(self):
+        cmds = [
+            RunningCommand(file_path="/p/A.thy", start_line=i, end_line=i,
+                           text="by auto", elapsed_seconds=42.0)
+            for i in (3, 8)
+        ]
+        assert ev._activity_sentences(cmds, 2) == [
+            "2 commands have been running for over 10s.",
+            "2 commands failed.",
+        ]
+
+    def test_one_of_each(self):
+        cmd = RunningCommand(file_path="/p/A.thy", start_line=3, end_line=3,
+                             text="by auto", elapsed_seconds=42.0)
+        assert ev._activity_sentences([cmd], 1) == [
+            "1 command has been running for over 10s.",
+            "1 command failed.",
+        ]
+
+    def test_still_running_sentence_agrees_with_its_verb(self):
+        cmd = RunningCommand(file_path="/p/A.thy", start_line=3, end_line=3,
+                             text="by auto", elapsed_seconds=1.0)
+        assert ev._still_running_sentence([cmd]) == "1 command is still running."
+        assert ev._still_running_sentence([cmd, cmd]) == "2 commands are still running."
+
+    def test_line_span_unit_word_pluralises(self):
+        assert ev._fmt_spans([(5, 5)]) == "line 5"
+        assert ev._fmt_spans([(5, 7)]) == "lines 5-7"
+        assert ev._fmt_spans([(5, 5), (9, 9)]) == "lines 5, 9"
+
+
+class TestEvaluationFooter:
+    """§4.2: one line of ambient context on every query-tool result."""
+
+    async def _client(self, mock_lsp_client, temp_theory_file, **ranges):
+        await mock_lsp_client.open_document(temp_theory_file)
+        tracker = ProcessingTracker()
+        await tracker.update({
+            "background_unprocessed1": ranges.get("unprocessed", []),
+            "background_running1": ranges.get("running", []),
+            "background_bad": ranges.get("bad", []),
+        })
+        mock_lsp_client._processing_trackers[temp_theory_file] = tracker
+        return mock_lsp_client
+
+    def _slow(self, path):
+        return RunningCommand(
+            file_path=path, start_line=8, end_line=8,
+            text="by auto", elapsed_seconds=14.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_nothing_outstanding_and_nothing_running_says_nothing(
+        self, mock_lsp_client, temp_theory_file,
+    ):
+        client = await self._client(mock_lsp_client, temp_theory_file)
+        assert await ev.evaluation_footer(client) == ""
+
+    @pytest.mark.asyncio
+    async def test_nothing_outstanding_but_work_running_drops_the_main_sentence(
+        self, mock_lsp_client, temp_theory_file,
+    ):
+        # "Nothing is under evaluation." + "1 command has been running…" would
+        # argue with itself, so only the activity is reported. Failures are not:
+        # an error decoration persists and would repeat on every call forever.
+        client = await self._client(
+            mock_lsp_client, temp_theory_file, bad=[(4, 0, 4, 9)],
+        )
+        client.get_all_running_commands = lambda: [self._slow(temp_theory_file)]
+        assert await ev.evaluation_footer(client) == (
+            "1 command has been running for over 10s. "
+            "Call isabelle_evaluation_status for details."
+        )
+
+    @pytest.mark.asyncio
+    async def test_target_not_reached(self, mock_lsp_client, temp_theory_file):
+        client = await self._client(
+            mock_lsp_client, temp_theory_file,
+            unprocessed=[(5, 0, 30, 0)], bad=[(3, 0, 3, 9)],
+        )
+        client.get_all_running_commands = lambda: [self._slow(temp_theory_file)]
+        evaluation_state.start(temp_theory_file, MCPLine(20))
+        assert await ev.evaluation_footer(client) == (
+            f"Evaluating towards {temp_theory_file}:20. "
+            "1 command has been running for over 10s. 1 command failed. "
+            "Call isabelle_evaluation_status for details."
+        )
+
+    @pytest.mark.asyncio
+    async def test_stale_cache_reports_the_target_and_no_counts(
+        self, mock_lsp_client, temp_theory_file, monkeypatch,
+    ):
+        from isabelle_mcp import processing
+
+        client = await self._client(mock_lsp_client, temp_theory_file)
+        client.get_all_running_commands = lambda: [self._slow(temp_theory_file)]
+        evaluation_state.start(temp_theory_file, MCPLine(20))
+        monkeypatch.setattr(processing, "DECORATION_GRACE", 100.0)
+        processing.note_edit_sent()
+        # The counts would come from the same cache that is not trusted here.
+        assert await ev.evaluation_footer(client) == (
+            f"Evaluating towards {temp_theory_file}:20."
+        )
+
+    @pytest.mark.asyncio
+    async def test_arrived_with_work_left(self, mock_lsp_client, temp_theory_file):
+        client = await self._client(
+            mock_lsp_client, temp_theory_file, running=[(7, 0, 7, 9)],
+        )
+        client.get_all_running_commands = lambda: [self._slow(temp_theory_file)]
+        evaluation_state.start(temp_theory_file, MCPLine(5))
+        assert await ev.evaluation_footer(client) == (
+            f"Evaluation has arrived at {temp_theory_file}:5. "
+            "1 command has been running for over 10s. "
+            "Call isabelle_evaluation_status for details."
+        )
+
+    @pytest.mark.asyncio
+    async def test_completion_is_observed_and_ends_the_evaluation(
+        self, mock_lsp_client, temp_theory_file,
+    ):
+        """The one case that costs a request — and the only place a quietly
+        finished evaluation is noticed without anyone polling."""
+        client = await self._client(mock_lsp_client, temp_theory_file)
+        run = evaluation_state.start(temp_theory_file, MCPLine(5))
+        evaluation_state.auto_opened_files.add("/tmp/Dep_footer.thy")
+
+        assert await ev.evaluation_footer(client) == (
+            f"Evaluation has completed up to {temp_theory_file}:5."
+        )
+        assert evaluation_state.active is False
+        assert run.outcome == "complete"
+        # The flag flip and the cleanup travel together, as at every other site.
+        assert evaluation_state.auto_opened_files == set()
+
+    @pytest.mark.asyncio
+    async def test_the_footer_never_opens_a_document(
+        self, mock_lsp_client, temp_theory_file,
+    ):
+        """It must not go through _build_status_snapshot, which auto-opens
+        failed theories as a side effect."""
+        client = await self._client(mock_lsp_client, temp_theory_file)
+        evaluation_state.start(temp_theory_file, MCPLine(5))
+
+        async def fail_theory_status():
+            return [{
+                "node_name": "/tmp/Broken_footer.thy", "theory_name": "Broken",
+                "external": False, "imports": [], "ok": False, "total": 1,
+                "unprocessed": 0, "running": 0, "warned": 0, "failed": 1,
+                "finished": 0, "canceled": False, "consolidated": True,
+                "percentage": 100,
+            }]
+
+        client.request_theory_status = fail_theory_status
+        await ev.evaluation_footer(client)
+        assert "/tmp/Broken_footer.thy" not in client.open_documents
+        assert evaluation_state.auto_opened_files == set()

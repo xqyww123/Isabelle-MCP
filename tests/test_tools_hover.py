@@ -56,6 +56,7 @@ class TestHoverTool:
 
     @pytest.mark.asyncio
     async def test_beyond_file_end(self, mock_lsp_client, temp_theory_file):
+        await mock_lsp_client.open_document(temp_theory_file)
         mock_lsp_client.hover_response = None
         result = await hover_info(mock_lsp_client, temp_theory_file, MCPLine(1000), "x")
         assert result.symbol == "x"
@@ -142,6 +143,8 @@ class TestHoverTool:
         from unittest.mock import AsyncMock, patch
         f = tmp_path / "Note.thy"
         f.write_text("hello world\n")
+        # The guard is patched out below, and the guard is what opens the file.
+        await mock_lsp_client.open_document(str(f))
         mock_lsp_client.hover_response = {"contents": "test"}
         with patch("isabelle_mcp.tools.hover.check_evaluation_guard", new_callable=AsyncMock) as mock_guard:
             mock_guard.return_value = "This line is still being executed (forked proof). Output may be incomplete."
