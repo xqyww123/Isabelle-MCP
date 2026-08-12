@@ -1,34 +1,51 @@
 # Query-Tool Upgrade: Evaluation Target and Position-Explicit Queries
 
-Status: **stages 1 and 2 are done; stages 3–6 are not.** All of part A (§4) has
+Status: **stages 1–3 are done; stages 4–6 are not.** All of part A (§4) has
 landed in Python with unit tests — the evaluation lifecycle handle, the
 position-state helper, the rewritten guard, the evaluation-result layout, the
 footer, the plurals, and the result model's target file. Two deliberate
 exceptions: `isabelle_command_status` (§4.5) ships in stage 4, because its
 command enumeration must run server-side; and the two caret-moving query tools
-keep the blanket refusal until part B, as §4.4 requires. Part B (§5) is
-unstarted.
+keep the blanket refusal until part B, as §4.4 requires. Part B's ML half (§5.2,
+§5.3, §5.4) has landed in the prelude and has been exercised against a live
+prover; its Scala and Python halves have not.
 
-**Nothing is open.** The agent-facing messages part B owes — the §5.3 replies,
-the cancelled-query reply, and `PIDE/query_cancel`'s failure text — are drafted,
-approved and written into §5.3. Stage 3 needs no further sign-off to begin.
+**One thing is open, and it belongs to stage 4:** the sentence for the
+`no_context` status (§5.3) is not drafted, because stage 3 discovered the case
+and stage 3 writes no agent-facing English. Everything else part B owes is
+drafted, approved and written into §5.3.
 
-**Start here:** §6 stage 3 — the ML prelude. Every design decision this document
-records has been through review; where a section says "decided" or "approved",
-it is not an invitation to reconsider. All agent-facing wording in this document
-is approved text — changing any of it needs a fresh sign-off.
+**Start here:** §6 stage 4 — the Scala adapter and the jar rebuild. Every design
+decision this document records has been through review; where a section says
+"decided" or "approved", it is not an invitation to reconsider. All agent-facing
+wording in this document is approved text — changing any of it needs a fresh
+sign-off.
 
-### What stage 3 must know before it writes a line
+### What stage 4 must know before it writes a line
 
-Stage 1 and stage 2 shipped in two commits — `97391fd` (part A, plus the fixes
-an adversarial review of it found) and `41e8c84` (`file:line` everywhere, and
-the running-vs-forked correction). The working tree is clean of this work.
+Stages 1–3 shipped in three commits — `97391fd` (part A, plus the fixes an
+adversarial review of it found), `41e8c84` (`file:line` everywhere, and the
+running-vs-forked correction), and the prelude commit. The working tree is clean
+of this work.
 
-Six facts, all measured, that the prelude depends on:
+The **ML↔Scala contract stage 4 must implement is §5.1's "The reply, exactly"**.
+The prelude answers with a status word and a payload and never with a sentence,
+because ML cannot map a command to a line (fact 2 below) and every approved
+reply names a `file:line`. Rendering the nine statuses into the §5.3 sentences
+is stage 4's job, and the `no_context` sentence must be approved before it is
+written.
+
+`mcp_prelude_version` is now `"2"`. §8's version check compares against it.
+
+Six facts, all measured, that the prelude depends on and that the Scala side
+must respect:
 
 1. **Command ids are negative.** They are allocated by the JVM side, whose
    counter ticks backwards (`counter.scala`, `document_id.scala`). A probe that
-   scans positive ids finds nothing, forever.
+   scans positive ids finds nothing, forever. They travel as Java decimals
+   (`-1`): `Document_ID.parse` rejects ML's own `string_of_int` rendering of a
+   negative number (`~1`) with `Bad integer`, which is how stage 3's first probe
+   run failed.
 2. **ML cannot map a position to a command.** A command's `Toplevel.pos_of`
    carries no absolute line, and the public `DOCUMENT` signature exposes only
    `command_exec: state -> node -> id -> exec option`. The Scala-resolves-the-id
@@ -51,7 +68,12 @@ exactly that context without touching the installed component — use it before
 every install, because a prelude that fails to compile is **fatal to every
 prover start on the machine**, not just this session's. And the probe vehicle
 §9 describes (a file-triggered read-only observer thread) is the cheapest way to
-measure anything else on the ML side: no Scala change, no jar rebuild.
+measure anything else on the ML side: no Scala change, no jar rebuild. Stage 3
+extended that vehicle to drive the new protocol commands themselves, by teeing
+`Private_Output.protocol_message_fn` — swallowing the replies whose `function`
+is `isabelle_mcp_query_result`, which no jar yet handles, and forwarding
+everything else untouched. That tee is the way to exercise the prelude end to
+end before the Scala side exists.
 
 Companion research notes: [`CARET_AND_POSITION_RESEARCH.md`](CARET_AND_POSITION_RESEARCH.md)
 (caret/perspective semantics, overlays, where the proof state comes from). This
@@ -1258,6 +1280,41 @@ entry is removed when the task replies, so the table cannot leak.
 No overlay, no perspective change, no caret movement, and **no document update
 at all**.
 
+**The reply, exactly.** Settled while stage 3 wrote the prelude, and now the
+contract the Scala adapter must decode. One protocol message per request, one
+chunk per message:
+
+```
+properties  ("function", "isabelle_mcp_query_result")   (*must be first*)
+            ("id", <request id>)
+            ("status", <one of the nine words below>)
+            ("comment", "true")   (*present only when status = ok*)
+            ("forked", "true")    (*present only when status = ok*)
+chunk       status = ok      the markup-wrapped result strings of §5.4
+            status = failed  the error text, one string
+            otherwise        empty
+```
+
+The nine statuses, and the §5.3 row each renders as: `ok` (serve it), `comment`
+and `forked` (serve it with the corresponding note), `undefined`, `unfinished`,
+`interrupted`, `no_proof_state`, `no_context`, `failed`, `cancelled`, `crashed`.
+
+**ML sends no English and no position.** Every approved reply in §5.3 names a
+`file:line`, and ML has no line to name (§3.9's fact 2), so the sentences are
+rendered Scala-side from the status word. `failed` is the one status carrying
+prover text, and its surrounding sentence differs between the two tools —
+"Reading the proof state at …" is wrong for a find_theorems query — so the
+adapter renders per tool, not per status alone.
+
+**`no_context` is a tenth row of §5.3 that stage 3 found.** `Toplevel.context_of`
+fails at the pristine toplevel, which is exactly where `end` leaves you, so a
+find_theorems query aimed at a theory's final `end` has no search context at
+all. `isabelle_goal` never sees it: at that command `Toplevel.is_proof` is
+already false and the reply is `no_proof_state`. Measured, not deduced: the
+stage-3 probe asked at `end` and got `no_context` back. **Its agent-facing
+sentence is the one piece of part B's wording still unapproved** — stage 4 must
+draft it and get it signed off before rendering it.
+
 ### 5.2 The ML side, and the discipline it must follow
 
 Split by thread, deliberately:
@@ -1312,11 +1369,23 @@ No prover-side timeout is introduced. The client already bounds its own wait
 many.
 
 `Isabelle_MCP.cancel_query` looks the id up in the group table and calls
-`Future.cancel_group`; the forked body's capture then turns the interrupt into a
-"cancelled" reply. This is **parity work, not a new capability**: cancellation
-exists today via overlay removal, and `Execution.cancel` cannot reach a task
-forked from a protocol command (§3.9, §5.2 step 5), so without this the move
-would lose it.
+`Future.cancel_group`. This is **parity work, not a new capability**:
+cancellation exists today via overlay removal, and `Execution.cancel` cannot
+reach a task forked from a protocol command (§3.9, §5.2 step 5), so without this
+the move would lose it.
+
+**Removing the table entry is the permission to reply, and stage 3 implemented
+it that way.** An earlier reading of step 7 had the forked body's own capture
+turn the interrupt into the "cancelled" reply. That leaves a hole: when a cancel
+arrives before the task is dequeued, `Future.forks` never enters the job body at
+all — `future_job` substitutes an interrupt result without running `e`
+(`future.ML:441-455`) — so nothing replies and the request hangs until the
+client's timeout. So every reply path goes through one atomic take-and-reply on
+the id→group table: the worker takes the entry when it finishes, and
+`Isabelle_MCP.cancel_query` takes it when it cancels, and whoever loses that race
+stays silent. Exactly one reply per request, on every path, including the one
+where the work never started. The table entry is also created before anything
+that can raise, so a malformed request is still answered against its own id.
 
 ### 5.3 Failure modes that must be classified, not inherited
 
@@ -1333,6 +1402,7 @@ design.
 | Exception escaping eval | `eval_result_state` re-raises it into the handler | error reply carrying the message |
 | **Ignored span** (comment/whitespace) | finishes successfully, state is the **predecessor's** (`outer_syntax.ML:271`, `toplevel.ML:419`) | serve the state, noting that the position is a comment and the state is the preceding command's — orientation for a mis-aimed position, not a safety measure |
 | Not a proof state | `Toplevel.is_proof` false; `pretty_state` returns `[]` (`toplevel.ML:237-242`) | "no proof state here" — a definite answer, not a timeout |
+| **No context at all** (find_theorems only) | `Toplevel.context_of` raises, which is where `end` leaves the state | status `no_context`; sentence to be drafted and approved in stage 4 (§5.1) |
 | Command has background work | `Execution.snapshot [Command.eval_exec_id eval] <> []` (the test `document.ML:727-736` uses) | serve the state, noting that forked work may still fail |
 
 **A failed command is deliberately NOT a special case.** When a command fails,
@@ -1499,12 +1569,45 @@ the `position_state` block in `tests/test_processing.py`.
 works, and it survives the perturbation the evaluation itself causes. The overlay
 fallback of `CARET_AND_POSITION_RESEARCH.md` §2 is not needed.
 
-**Stage 3 — the ML prelude (no jar rebuild, §7).** The three protocol commands,
-the id→group table, the reply helper, and the §5.3 classification. Plain SML: no
-antiquotations, no cartouches, and nothing that can raise at load time. Also fix
-the incorrect comment at `mcp_prelude.ML:63-66` and record there that
-`Output.protocol_message` raises before `init_protocol` installs the real
-handler.
+**Stage 3 — the ML prelude. Done, and exercised against a live prover.** The
+three protocol commands (`Isabelle_MCP.proof_state`, `.find_theorems`,
+`.cancel_query`), the id→group table, the reply helper, and the §5.3
+classification are in `ML/mcp_prelude.ML`; the version string is now `"2"`. The
+comment at the foot of the file was wrong about why the startup banner uses
+`TextIO.print` — `Output.system_message` is *not* dropped at `--use` time,
+`init_channels` has already pointed it at physical stdout — and now records the
+real constraint, that `Output.protocol_message` raises `Protocol_Message` until
+`Isabelle_Process.init` installs the channel.
+
+What the live run measured, beyond the classification itself (§9, probe run of
+stage 3):
+
+- **Every gap between two commands is its own ignored command.** A 20-line
+  theory yields 20 commands, half of them ignored spans covering the whitespace
+  and comments between the real ones. So the `comment` note is not exotic: any
+  position that does not land inside a command's own span gets it. §5.3's
+  approved sentence already says "comment or blank line", which is what this is.
+  In practice stage 4's `Document.Snapshot.current_command` skips backward over
+  them first, so the note should stay rare.
+- **A running command makes every later command in the file `unfinished` too**,
+  which is what the §4.3 guard already assumes.
+- **After `isabelle_cancel_evaluation`, the cancelled node keeps almost nothing.**
+  Not one finished command of a 14-command node survived except the `theory`
+  header: the read answers `undefined`, never `interrupted`. That follows from
+  §3.10's mechanism — entries are carried into the new execution version only
+  while `Command.eval_running` holds, and `Execution.discontinue` makes that
+  false for all of them — but it means `undefined`'s approved sentence ("a file
+  changed while this query was in flight") describes a cancel imprecisely.
+  **Stage 4 must decide** whether a cancelled evaluation reaches this reply at
+  all: §4.3's guard judges by decoration, and a command that finished before the
+  cancel is painted processed, so it plausibly does. If it does, the sentence
+  needs a fresh sign-off.
+- **`Execution.snapshot` does detect outstanding forked work** — a `by` whose
+  proof was still running reported three tasks. It rode along with no reply
+  here, because a `by` has no proof state to serve it with.
+- **`ML_command` is a diagnostic command**: its eval finishes at once and the
+  work runs as a print, so it cannot be used to manufacture a slow command. Use
+  `ML ‹…›`, whose eval really does run the code.
 
 **Stage 4 — the Scala adapter and the jar rebuild.** Also ships
 `isabelle_command_status` and its server-side command enumeration (§4.5), and
@@ -1652,11 +1755,36 @@ to `ML/mcp_prelude.ML`, triggered by a file, scanning negative ids through
 the prelude is compiled in. Remove it afterwards — a prelude that fails to
 compile is fatal to every prover start on the machine.
 
-3. **Each surviving row of §5.3** — construct an interrupted command, an ignored
-   span, a non-proof command, and a command with forked work still running;
-   confirm the reply is the classified one. (A failed command is no longer a
-   special case; confirm only that it returns the pre-command state, as every
-   Isabelle front-end does.)
+**Stage 3's run: most of probe 3, measured early.** Writing the prelude made the
+classification cheap to test, so it was tested rather than assumed. The vehicle
+is probe 2's observer thread, extended to call `Protocol_Command.run` on the new
+commands and to tee `Private_Output.protocol_message_fn` so the replies could be
+read without a jar that handles them. Against a live `HOL` prover and a
+hand-built theory:
+
+| asked at | status |
+|---|---|
+| `lemma`, `apply`, `apply`, `apply` | `ok`, with the same subgoals the file's proof shows |
+| the whitespace and comments between commands | `ok` plus the `comment` note, carrying the preceding command's state |
+| `theory`, `definition`, `done`, `by`, `end` | `no_proof_state` |
+| find_theorems at `apply` | `ok`, twelve hits, five displayed |
+| find_theorems at `end` | `no_context` (the new row, §5.1) |
+| a command whose evaluation had not finished | `unfinished`, and so was every command after it |
+| a command id that does not exist, and an unknown node | `undefined` |
+| two arguments instead of three | `failed`, "bad arguments" |
+| find_theorems with the unparsable query `(((` | `failed`, carrying the outer-syntax error |
+| `cancel_query` for an id nobody registered | silent, no crash, no reply |
+
+Three statuses are still unmeasured and stay with probe 3 in stage 6:
+`interrupted`, `cancelled`, and `crashed`. `interrupted` in particular resisted
+construction — cancelling an evaluation destroys the node's finished commands
+outright, so the read answers `undefined` instead (§6 stage 3 records this, and
+what stage 4 must decide about it).
+
+3. **The three §5.3 rows stage 3 could not construct** — an interrupted command,
+   a cancelled query, and the last-resort crash reply; confirm the reply is the
+   classified one. Also confirm that a failed command returns the pre-command
+   state, as every Isabelle front-end does — it is no longer a special case.
 4. **Rendering equality** — the new path's final text against today's, for a
    multi-subgoal state and for a find_theorems result with many items (the
    `item`-class trap of §3.5 must show up as a test, not as a surprise).
