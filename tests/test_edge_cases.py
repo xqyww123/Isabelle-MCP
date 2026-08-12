@@ -105,7 +105,7 @@ class TestEvaluationGuard:
         evaluation_state.start(temp_theory_file, MCPLine(100))
         with pytest.raises(IsabelleToolError, match="has not been evaluated yet") as exc:
             await hover_info(mock_lsp_client, temp_theory_file, MCPLine(5), "my_const")
-        assert "line 5" in str(exc.value)
+        assert "Test.thy:5" in str(exc.value)
         assert "Test.thy:100" in str(exc.value)          # the evaluation target
 
     @pytest.mark.asyncio

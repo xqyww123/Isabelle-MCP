@@ -95,24 +95,25 @@ FOOTER_DETAILS_CALL = "Call isabelle_evaluation_status for details."
 # Kept together so the vocabulary stays consistent and reviewable.
 
 RUNNING_NOTE = (
-    "This line is still being executed (forked proof). Output may be incomplete."
+    "The command at {file}:{line} is still being executed; "
+    "its output may be incomplete."
 )
 
 INTERRUPTED_NOTE = (
-    "The evaluation of the command at line {line} was interrupted; "
+    "The evaluation of the command at {file}:{line} was interrupted; "
     "its output may be incomplete."
 )
 
 # "a file", not "this file": the distrust comes from a GLOBAL edit clock, so the
 # change that armed it may have been to a different file.
 UNKNOWN_POSITION_MESSAGE = (
-    "Cannot tell whether {file} line {line} has been evaluated: a file changed a "
+    "Cannot tell whether {file}:{line} has been evaluated: a file changed a "
     "moment ago, so the processing state is not yet trustworthy. Retry in a few "
     "seconds."
 )
 
 NOT_EVALUATED_REFUSAL = (
-    "{file} line {line} has not been evaluated yet. "
+    "{file}:{line} has not been evaluated yet. "
     "Evaluating towards {target}:{target_line}. "
     "Call isabelle_evaluation_status to check progress."
 )
@@ -1200,7 +1201,7 @@ async def check_evaluation_guard(
 
     Returns:
       - ``None``: line is fully processed, caller can proceed.
-      - ``str``: line is running (forked proof) or was interrupted; the caller can
+      - ``str``: the command there is still executing, or was interrupted; the caller can
         proceed but should set ``result.note`` to this warning string.
       - ``EvaluationView``: auto-evaluation started but didn't complete; the caller
         renders it (``format_evaluation_result``) and raises it.
@@ -1222,19 +1223,18 @@ async def check_evaluation_guard(
 
     if state == PROCESSED:
         return None
+    rel = _relativize(file_path, client.project_root)
     if state == RUNNING:
-        return RUNNING_NOTE
+        return RUNNING_NOTE.format(file=rel, line=int(line))
     if state == CANCELLED:
-        return INTERRUPTED_NOTE.format(line=int(line))
+        return INTERRUPTED_NOTE.format(file=rel, line=int(line))
     if state == UNKNOWN:
         # Still inside the grace window after waiting it out — a further edit
         # landed. Do not auto-start (that would relocate the caret on a guess)
         # and do not claim the line was not reached (it may have finished long
         # ago); say only what is true.
         raise IsabelleToolError(
-            UNKNOWN_POSITION_MESSAGE.format(
-                file=_relativize(file_path, client.project_root), line=int(line),
-            ),
+            UNKNOWN_POSITION_MESSAGE.format(file=rel, line=int(line)),
         )
 
     # NOT_EVALUATED or FILE_NOT_OPEN: work is needed. Only one evaluation may be
@@ -1247,7 +1247,7 @@ async def check_evaluation_guard(
             )
             raise IsabelleToolError(
                 template.format(
-                    file=_relativize(file_path, client.project_root),
+                    file=rel,
                     line=int(line),
                     target=_relativize(
                         evaluation_state.file_path, client.project_root,

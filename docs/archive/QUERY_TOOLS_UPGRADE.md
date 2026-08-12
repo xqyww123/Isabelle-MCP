@@ -515,8 +515,19 @@ unconditionally. It becomes:
 
 1. If the requested position is **processed and the decoration cache is fresh**,
    and the file is **already open**, serve it — regardless of `active`.
-2. If the position is processed but still running (a forked proof), serve it
-   with the existing incomplete-output note (unchanged behaviour).
+2. If the position is processed but still running, serve it with the
+   incomplete-output note (unchanged behaviour).
+
+   *Not "a forked proof" — measured.* `background_running1` is painted when
+   `is_running`, i.e. `runs != 0` (`document_status.scala:240`): the command's own
+   transition is executing. A command whose proof was FORKED has `runs == 0` and
+   `forks != 0`, which `is_unprocessed` (`:239`) claims, so it paints
+   `background_unprocessed1` instead. The two cases differ in what is available:
+   a running transition has no state after it at all (`eval_result_state` gives
+   `Fail "Unfinished lazy"`, §5.3), while a command with an outstanding fork has
+   a final state and only an undecided verdict. Decoration cannot tell "never
+   started" from "fork outstanding"; only the direct read can
+   (`eval_finished` plus `Execution.snapshot`).
 3. If the position is not yet processed and no evaluation is outstanding,
    auto-start one (unchanged behaviour, `evaluation.py:848`).
 4. If the position is not yet processed and an evaluation **is** outstanding,
@@ -575,7 +586,7 @@ must never be phrased as "not reached yet" (which may be false for a line that
 finished minutes ago). Approved wording:
 
 ```
-Cannot tell whether MyTheory.thy line 42 has been evaluated: a file changed a
+Cannot tell whether MyTheory.thy:42 has been evaluated: a file changed a
 moment ago, so the processing state is not yet trustworthy. Retry in a few
 seconds.
 ```
@@ -599,8 +610,8 @@ explicit note** rather than refuse — the output exists and is useful for
 deciding what to re-run, it is only incomplete. Approved note:
 
 ```
-The evaluation of the command at line 42 was interrupted; its output may be
-incomplete.
+The evaluation of the command at MyTheory.thy:42 was interrupted; its output
+may be incomplete.
 ```
 
 **Measured, and narrower than the paragraph above claims.** `Markup.CANCELED`
@@ -621,6 +632,28 @@ reporting an erroring command as `processed` is correct (it finished; its output
 is what the agent wants). `force_interrupt` compounds it by appending a space to
 line 0 right after the cancel, which invalidates the whole node and re-creates
 the cancelled command.
+
+**The three refusals, approved.** Positions render as `file:line`, relative to
+the project root, the same form the footer uses.
+
+```
+MyTheory.thy:42 has not been evaluated yet. Evaluating towards Other.thy:120. Call isabelle_evaluation_status to check progress.
+
+MyTheory.thy has not been opened yet, and opening it would disturb the evaluation in progress. Evaluating towards Other.thy:120. Call isabelle_evaluation_status to check progress.
+
+This query cannot run while an evaluation is in progress. Evaluating towards Other.thy:120. Call isabelle_evaluation_status to check progress.
+```
+
+The third is the blanket refusal §4.4 keeps for the two caret-moving tools. It
+names no position because the position is not why it is refused, and it says
+nothing about the caret: the agent has no other exposure to that concept, so
+naming it would explain a mechanism it cannot act on. It disappears with part B.
+
+The running note is likewise `file:line`:
+
+```
+The command at MyTheory.thy:42 is still being executed; its output may be incomplete.
+```
 
 *Rule 5 cannot fire as the code stands, and the open must move.* All six query
 tools call `client.open_document(file_path)` on the line immediately **before**
@@ -669,14 +702,14 @@ is simply reported; only when they **differ** is the per-command breakdown
 printed, because that is the only case where one state cannot speak for the line.
 
 ```
-MyTheory.thy line 42 — processed
-MyTheory.thy line 43 — 2 commands, states differ
+MyTheory.thy:42 — processed
+MyTheory.thy:43 — 2 commands, states differ
   processed        have "P x" by blast
   running for 12s  by auto
-MyTheory.thy line 88 — running for 31s
-MyTheory.thy line 80 — not evaluated
-Other.thy line 7 — unknown, retry in a few seconds
-Missing.thy line 3 — file not open
+MyTheory.thy:88 — running for 31s
+MyTheory.thy:80 — not evaluated
+Other.thy:7 — unknown, retry in a few seconds
+Missing.thy:3 — file not open
 ```
 
 Text, not a structured model: the result is a position-to-state table that is
@@ -910,8 +943,44 @@ to external, it does not remove it (`vscode_resources.scala:196-201`), so the
 server goes on publishing diagnostics for a closed document while decorations
 are cleared. The client drops its caches on close (`lsp_client.py:1126-1128`), so
 a late publish would silently repopulate `diagnostic_cache` for a file with no
-`open_documents` entry. No test or log confirms this fires in practice; treat it
-as a latent inconsistency to guard rather than a known bug.
+`open_documents` entry.
+
+**Measured, and the guard was rejected on the evidence — do not add it.** The
+late publish is real but does not follow from the close itself: a bare
+`close_document` produced no publish in 100+ seconds. What produces one is
+editing the closed file on disk, which the server's own File_Watcher picks up
+through `sync_models` for external models. And that publish is not stale — it is
+the server's current rendering of the re-read file, fresher than anything the
+client held.
+
+The obvious guard (ignore a publish whose file is not in `open_documents`) was
+measured and costs more than it buys:
+
+- The cache entry for a dependency is **load-bearing**. Every dependency theory
+  with a problem publishes before it is ever opened
+  (`publish_full` computes diagnostics regardless of `node_visible`,
+  `vscode_model.scala:212-217`), and that entry is why the evaluation's
+  auto-open of a failed dependency (`evaluation.py`, `_build_status_snapshot`)
+  returns instantly. With the guard, no publish follows the didOpen either —
+  `change_model` reuses a model whose `published_diagnostics` already match, so
+  `flush_output` emits nothing — and `wait_for_first_diagnostics` burns its full
+  timeout: a deterministic **+2 s per auto-opened failed dependency**, inside the
+  evaluation's own poll budget.
+- `_enrich_timeout_error` would then take its `if not diags` branch and tell the
+  agent "No diagnostics received — file may not have been processed" about a file
+  that was processed and did report errors.
+
+Path keying and registration order were both checked and are *not* hazards:
+published URIs re-print the client's own `st.models` key, and `open_document`
+registers the document before it awaits the didOpen, with no checkpoint between.
+
+The cache's actual contract is coherent: *the server's most recently published
+diagnostics for a file, whether or not the client currently holds it open*. The
+one genuine defect left is narrow — a stale entry surviving into a later re-open,
+where `isabelle_hover` could show it against content the server has not caught up
+with, the same window any open document has between a didChange and the next
+publish. If that is ever worth closing, close it at the **reader** (have hover
+ignore an entry older than the document's last didChange), never at the writer.
 
 **Dead branch in the fork.** `Markup.BAD` is not in `diagnostics_elements`, so the
 `Markup.Bad` case at `vscode_rendering.scala:145-146` is unreachable. Harmless;
@@ -1240,6 +1309,54 @@ already been told the line failed by the evaluation result that necessarily
 preceded the query (`errors: line N` in the file section). The same reasoning
 covers `isabelle_find_theorems` at a failed command: it searches the genuine
 context of that point, which is what the agent wants.
+
+**The replies, approved.** Positions render as `file:line`, the same form
+everywhere else. The first four are raised as errors; the next two are served
+with the state and a note; the rest cover cancellation, a crash and a timeout.
+
+```
+The command at MyTheory.thy:42 is no longer part of the current document: a file changed while this query was in flight. Retry.
+
+The command at MyTheory.thy:42 has not finished evaluating, so it has no proof state yet. Retry in a few seconds.
+
+The evaluation of the command at MyTheory.thy:42 was interrupted, so it has no proof state. Evaluate the file again to get one.
+
+Reading the proof state at MyTheory.thy:42 failed: {message}
+
+MyTheory.thy:42 is a comment or blank line; this is the proof state after the command before it.
+
+The command at MyTheory.thy:42 is not a proof operation, so there is no proof state here.
+
+This command forked work that is still running, so a failure may still surface at MyTheory.thy:42.
+
+The query was cancelled.
+
+The prover could not answer this query and could not say why.
+
+The prover did not answer this query within {n}s.
+```
+
+Notes on three of them, decided:
+
+- **"is not a proof operation"** is a *definite* answer, replacing today's timeout
+  heuristic (§2 goal 4). It belongs to `isabelle_goal` only: at a non-proof
+  command `isabelle_find_theorems` still searches the genuine context of that
+  point, which is what the agent wants.
+- **The forked-work note** says the state is usable and the command's verdict is
+  not yet in — a forked proof that later fails surfaces its error at that line.
+  It is rare in practice because the guard, judging by decoration, refuses that
+  position first (`forks != 0, runs == 0` paints `background_unprocessed1`, §4.3
+  rule 2). It is kept because it is correct, not because it is common.
+- **`PIDE/query_cancel`'s own failure** (`Cancelling the query failed: {message}`)
+  goes to the log, not to the agent: the cancel is fire-and-forget on an exit
+  path, by which point the agent already holds its result or its error.
+
+**No proof state is served for a command whose transition is still running, and
+that is not a policy.** `eval_result_state` forces a lazy value that does not
+exist until the command completes (`Fail "Unfinished lazy"`, row 3 above). The
+only thing that could be served instead is the *preceding* command's state —
+what jEdit's State panel shows — and answering a question the agent did not ask
+is worse than refusing. Decided: refuse.
 
 ### 5.4 Rendering, exactly
 

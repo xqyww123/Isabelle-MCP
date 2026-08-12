@@ -1117,8 +1117,8 @@ class TestGuardPositionDecision:
             mock_lsp_client, temp_theory_file, MCPLine(5),
         )
         assert note == (
-            "The evaluation of the command at line 5 was interrupted; "
-            "its output may be incomplete."
+            f"The evaluation of the command at {temp_theory_file}:5 was "
+            "interrupted; its output may be incomplete."
         )
 
     @pytest.mark.asyncio
