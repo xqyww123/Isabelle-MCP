@@ -2,6 +2,7 @@ from isabelle_mcp import query
 from isabelle_mcp.evaluation import (
     check_evaluation_guard,
     format_evaluation_result,
+    last_evaluation_was_cancelled,
     relativize,
 )
 from isabelle_mcp.lsp_client import IsabelleLSPClient
@@ -64,6 +65,7 @@ async def goal(
         raise IsabelleToolError(
             query.message(
                 reply, where, client.QUERY_BACKSTOP, query.PROOF_STATE_MESSAGES,
+                after_cancel=last_evaluation_was_cancelled(),
             )
         )
 

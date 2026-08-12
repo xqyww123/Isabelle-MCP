@@ -10,6 +10,7 @@ from isabelle_mcp import query
 from isabelle_mcp.evaluation import (
     check_evaluation_guard,
     format_evaluation_result,
+    last_evaluation_was_cancelled,
     relativize,
 )
 from isabelle_mcp.lsp_client import IsabelleLSPClient
@@ -116,11 +117,27 @@ def serialize_find_theorems_query(
     return " ".join(fragments), note
 
 
-# find_theorems reaches the same command-state failures isabelle_goal does, and
-# says the same things about them. The dictionary is named so that giving it its
-# own wording later is one substitution, not a rewrite.
+# find_theorems reaches the same command-state failures isabelle_goal does, but
+# says its own thing about them: the agent asked for theorems, and what it lacks
+# is the context to search in, not a proof state.
 FIND_THEOREMS_MESSAGES = {
-    **query.PROOF_STATE_MESSAGES,
+    query.UNDEFINED: (
+        "The prover no longer holds the context of the command at {where}. "
+        "Evaluate the file again to search there."
+    ),
+    query.UNDEFINED_AFTER_CANCEL: (
+        "The prover no longer holds the context of the command at {where} — the "
+        "evaluation was cancelled. Evaluate the file again to search there."
+    ),
+    query.UNFINISHED: (
+        "The command at {where} has not finished evaluating, so there is no "
+        "context to search in yet. Retry in a few seconds."
+    ),
+    query.INTERRUPTED: (
+        "The evaluation of the command at {where} was interrupted, so there is no "
+        "context to search in. Evaluate the file again to search there."
+    ),
+    query.FAILED: "Searching at {where} failed: {message}",
     query.NO_CONTEXT: (
         "There is no theory context at {where}, so there is nothing to search "
         "here. Ask at a line inside the theory."
@@ -201,7 +218,10 @@ async def find_theorems(
         )
     if reply.status != query.OK:
         raise IsabelleToolError(
-            query.message(reply, where, client.QUERY_BACKSTOP, FIND_THEOREMS_MESSAGES)
+            query.message(
+                reply, where, client.QUERY_BACKSTOP, FIND_THEOREMS_MESSAGES,
+                after_cancel=last_evaluation_was_cancelled(),
+            )
         )
 
     # The position resolves to a real command, so command=None here would mean the

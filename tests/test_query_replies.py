@@ -10,6 +10,7 @@ import os
 import pytest
 
 from isabelle_mcp import query
+from isabelle_mcp.evaluation import evaluation_state
 from isabelle_mcp.query import QueryReply
 from isabelle_mcp.tools.find_theorems import find_theorems
 from isabelle_mcp.tools.goal import goal
@@ -34,16 +35,54 @@ async def _goal_raising(client, path, reply):
 
 class TestProofStateReplies:
     @pytest.mark.asyncio
-    async def test_no_stored_state(self, mock_lsp_client, temp_theory_file):
-        # The common way here is a cancelled evaluation, which discards the
-        # finished commands' states; retrying alone cannot help, so the sentence
-        # sends the agent to evaluate again.
+    async def test_no_stored_state_states_the_fact_and_stops(
+        self, mock_lsp_client, temp_theory_file,
+    ):
+        # This status has more than one cause and the prover cannot tell them
+        # apart, so by default the reply does not guess at one.
         assert await _goal_raising(
             mock_lsp_client, temp_theory_file, QueryReply(status=query.UNDEFINED),
         ) == (
-            "The prover no longer holds a proof state for the command at Test.thy:9 — "
-            "the evaluation was cancelled. Evaluate the file again to get one."
+            "The prover no longer holds a proof state for the command at Test.thy:9. "
+            "Evaluate the file again to get one."
         )
+
+    @pytest.mark.asyncio
+    async def test_no_stored_state_names_a_cancel_when_the_client_knows_of_one(
+        self, mock_lsp_client, temp_theory_file,
+    ):
+        # The client remembers how the last evaluation ended, so when it knows,
+        # it says. The instruction is the same either way.
+        # Open it first: an unopened position makes the guard start an
+        # evaluation of its own, and then the cancel is no longer the last thing
+        # that happened — which is exactly the behaviour we want, but not what
+        # this test is about.
+        await mock_lsp_client.open_document(temp_theory_file)
+        evaluation_state.start(temp_theory_file, MCPLine(1))
+        evaluation_state.cancel()
+        try:
+            assert await _goal_raising(
+                mock_lsp_client, temp_theory_file, QueryReply(status=query.UNDEFINED),
+            ) == (
+                "The prover no longer holds a proof state for the command at Test.thy:9 — "
+                "the evaluation was cancelled. Evaluate the file again to get one."
+            )
+        finally:
+            evaluation_state.current = None
+
+    @pytest.mark.asyncio
+    async def test_a_completed_evaluation_is_not_reported_as_a_cancel(
+        self, mock_lsp_client, temp_theory_file,
+    ):
+        await mock_lsp_client.open_document(temp_theory_file)
+        evaluation_state.start(temp_theory_file, MCPLine(1))
+        evaluation_state.complete()
+        try:
+            assert "cancelled" not in await _goal_raising(
+                mock_lsp_client, temp_theory_file, QueryReply(status=query.UNDEFINED),
+            )
+        finally:
+            evaluation_state.current = None
 
     @pytest.mark.asyncio
     async def test_not_finished(self, mock_lsp_client, temp_theory_file):
@@ -180,3 +219,48 @@ class TestFindTheoremsReplies:
         result = await find_theorems(mock_lsp_client, temp_theory_file, MCPLine(9))
         assert result.theorems == []
         assert result.note == "No command at the position; nothing was searched."
+
+    @pytest.mark.asyncio
+    async def test_the_command_state_failures_speak_of_context_not_proof_state(
+        self, mock_lsp_client, temp_theory_file,
+    ):
+        # The agent asked for theorems; what it lacks is somewhere to search.
+        async def raising(reply):
+            mock_lsp_client.find_theorems_reply = reply
+            mock_lsp_client.command_at_position_response = CMD
+            with pytest.raises(IsabelleToolError) as excinfo:
+                await find_theorems(mock_lsp_client, temp_theory_file, MCPLine(9))
+            return str(excinfo.value)
+
+        assert await raising(QueryReply(status=query.UNDEFINED)) == (
+            "The prover no longer holds the context of the command at Test.thy:9. "
+            "Evaluate the file again to search there."
+        )
+        assert await raising(QueryReply(status=query.UNFINISHED)) == (
+            "The command at Test.thy:9 has not finished evaluating, so there is no "
+            "context to search in yet. Retry in a few seconds."
+        )
+        assert await raising(QueryReply(status=query.INTERRUPTED)) == (
+            "The evaluation of the command at Test.thy:9 was interrupted, so there "
+            "is no context to search in. Evaluate the file again to search there."
+        )
+        assert await raising(
+            QueryReply(status=query.FAILED, content="Outer syntax error"),
+        ) == "Searching at Test.thy:9 failed: Outer syntax error"
+
+    @pytest.mark.asyncio
+    async def test_a_cancel_is_named_here_too(self, mock_lsp_client, temp_theory_file):
+        await mock_lsp_client.open_document(temp_theory_file)
+        evaluation_state.start(temp_theory_file, MCPLine(1))
+        evaluation_state.cancel()
+        mock_lsp_client.find_theorems_reply = QueryReply(status=query.UNDEFINED)
+        mock_lsp_client.command_at_position_response = CMD
+        try:
+            with pytest.raises(IsabelleToolError) as excinfo:
+                await find_theorems(mock_lsp_client, temp_theory_file, MCPLine(9))
+            assert str(excinfo.value) == (
+                "The prover no longer holds the context of the command at Test.thy:9 — "
+                "the evaluation was cancelled. Evaluate the file again to search there."
+            )
+        finally:
+            evaluation_state.current = None

@@ -1457,6 +1457,8 @@ The "no theory context" line belongs to `isabelle_find_theorems` alone and was
 approved after stage 3 measured the case; the others were approved before it.
 
 ```
+The prover no longer holds a proof state for the command at MyTheory.thy:42. Evaluate the file again to get one.
+
 The prover no longer holds a proof state for the command at MyTheory.thy:42 — the evaluation was cancelled. Evaluate the file again to get one.
 
 The command at MyTheory.thy:42 has not finished evaluating, so it has no proof state yet. Retry in a few seconds.
@@ -1478,6 +1480,24 @@ The query was cancelled.
 The prover could not answer this query and could not say why.
 
 The prover did not answer this query within {n}s.
+```
+
+**`isabelle_find_theorems` says its own thing about the four command-state
+failures.** The sentences above speak of a proof state, which is a non-sequitur
+when the agent asked for theorems: what it lacks is somewhere to search. Approved
+after stage 5 wired the tool, and living in `tools/find_theorems.py` because they
+belong to that tool alone:
+
+```
+The prover no longer holds the context of the command at MyTheory.thy:42. Evaluate the file again to search there.
+
+The prover no longer holds the context of the command at MyTheory.thy:42 — the evaluation was cancelled. Evaluate the file again to search there.
+
+The command at MyTheory.thy:42 has not finished evaluating, so there is no context to search in yet. Retry in a few seconds.
+
+The evaluation of the command at MyTheory.thy:42 was interrupted, so there is no context to search in. Evaluate the file again to search there.
+
+Searching at MyTheory.thy:42 failed: {message}
 ```
 
 Notes on three of them, decided:
@@ -1644,16 +1664,26 @@ stage 3):
   re-evaluate — the same instruction, in the same words, as the `interrupted`
   reply next to it.
 
-  **What the approved sentence gives up, recorded so it is not rediscovered as a
-  bug.** `undefined` has a second cause: any edit to a file re-creates every
-  command id in it (§3.10), so an edit landing between the adapter's snapshot
-  resolution and the prelude's read produces it too. The sentence names only
-  cancellation. That was weighed and accepted: the guard refuses a position
-  whose decoration is stale or unprocessed, so a query only reaches the read
-  when the file was up to date a moment earlier, leaving a window of
-  milliseconds against a cancel that is reproducible on demand. And the
-  *instruction* is right either way — re-evaluating is what fixes both. Only
-  the stated cause can be wrong, and only in that race.
+  **Then stage 5 wired the tool and disproved the inference.** The measurement
+  above was of `isabelle_command_output`, and the conclusion that
+  `isabelle_goal` would therefore answer `undefined` was a deduction, not an
+  observation. With the tool actually wired, a cancel followed by a query at an
+  already-finished line was tried at 0s, 0.5s and 3s and answered correctly
+  every time. The reason is that cancelling goes through `force_interrupt`,
+  which sends a **synthetic edit** (a space appended to line 0) to trigger a
+  restricted-perspective update. That edit both re-creates the command ids and
+  marks the decoration cache stale, so the guard does not serve the position —
+  it re-evaluates, and the query then succeeds. The two halves move together
+  because the same server updates both.
+
+  **So the cause is not knowable from the status, and the reply no longer
+  asserts one.** `undefined` states the fact and gives the instruction, which is
+  right whatever the cause. But the *client* does know one thing the prover
+  cannot: whether the last evaluation was cancelled
+  (`evaluation.last_evaluation_was_cancelled`, from the write-once outcome on
+  the evaluation handle). When it knows, the reply names the cause; when it does
+  not, it stops at the fact. §5.3 carries both forms, approved. The rendering
+  key for the second is `UNDEFINED_AFTER_CANCEL`, which is not a wire status.
 - **`Execution.snapshot` does detect outstanding forked work** — a `by` whose
   proof was still running reported three tasks. It rode along with no reply
   here, because a `by` has no proof state to serve it with.

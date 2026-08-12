@@ -28,6 +28,13 @@ CRASHED = "crashed"
 NO_COMMAND = "no_command"
 TIMEOUT = "timeout"
 
+# Not a status: a rendering key. UNDEFINED has more than one cause and the prover
+# cannot tell them apart, but the client sometimes can — it remembers whether the
+# last evaluation was cancelled. When it knows, the reply names the cause; when it
+# does not, it states the fact and stops. The instruction is the same either way,
+# so the agent's next move never depends on which one it gets.
+UNDEFINED_AFTER_CANCEL = "undefined_after_cancel"
+
 
 @dataclass(frozen=True)
 class QueryReply:
@@ -61,6 +68,10 @@ FORKED_NOTE = (
 # Sentences for a proof-state query.
 PROOF_STATE_MESSAGES = {
     UNDEFINED: (
+        "The prover no longer holds a proof state for the command at {where}. "
+        "Evaluate the file again to get one."
+    ),
+    UNDEFINED_AFTER_CANCEL: (
         "The prover no longer holds a proof state for the command at {where} — "
         "the evaluation was cancelled. Evaluate the file again to get one."
     ),
@@ -91,19 +102,30 @@ def notes(reply: QueryReply, where: str) -> list[str]:
 
 
 def message(
-    reply: QueryReply, where: str, seconds: float, messages: dict[str, str],
+    reply: QueryReply,
+    where: str,
+    seconds: float,
+    messages: dict[str, str],
+    *,
+    after_cancel: bool = False,
 ) -> str:
     """The sentence for a status that cannot produce a result.
 
     *messages* selects the per-tool wording; the three that do not depend on what
-    was asked for are shared. An unrecognised status is reported as a crash,
-    which is what it is: the prover said something this side does not understand.
+    was asked for are shared. *after_cancel* says the client knows the last
+    evaluation was cancelled, which lets one status name its cause. An
+    unrecognised status is reported as a crash, which is what it is: the prover
+    said something this side does not understand.
     """
     if reply.status == CANCELLED:
         return CANCELLED_MESSAGE
     if reply.status == TIMEOUT:
         return TIMEOUT_MESSAGE.format(seconds=int(seconds))
-    template = messages.get(reply.status)
+    template = None
+    if after_cancel and reply.status == UNDEFINED:
+        template = messages.get(UNDEFINED_AFTER_CANCEL)
+    if template is None:
+        template = messages.get(reply.status)
     if template is None:
         return CRASHED_MESSAGE
     return template.format(where=where, message=reply.content)

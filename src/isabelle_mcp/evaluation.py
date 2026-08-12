@@ -365,6 +365,18 @@ class EvaluationState:
 
 
 evaluation_state = EvaluationState()
+
+
+def last_evaluation_was_cancelled() -> bool:
+    """Whether the most recent evaluation ended by being cancelled.
+
+    ``current`` is never reset, only replaced by a later ``start()``, so this
+    keeps describing the last run for as long as no new one has begun. It is what
+    lets a query reply name the cause of a missing proof state instead of
+    guessing at it.
+    """
+    current = evaluation_state.current
+    return current is not None and current.outcome == "cancelled"
 # Serializes the short evaluation-state transitions (evaluate_to start /
 # cancel / guard) and the document content/version mutations and caret-target
 # resolution that must stay atomic with them. Held only for those transitions —
