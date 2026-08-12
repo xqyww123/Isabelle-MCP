@@ -7,10 +7,9 @@ renders their replies, and both have been exercised against a live prover. What
 is left is the Python half: the two caret-moving tools still take the caret
 route and still carry the blanket refusal §4.4 requires.
 
-**One thing is open, and stage 5 must close it before it renders anything:** the
-approved sentence for the `undefined` status blames a file change, and stage 4
-measured a second way to reach it that is not a file change (see §5.3's cancel
-note). It needs a fresh sign-off.
+**Nothing is open.** The `undefined` sentence was rewritten and approved after
+stage 4 measured that a cancelled evaluation reaches it; §5.3 carries the new
+text and the note on what it deliberately does not say.
 
 **Start here:** §6 stage 5 — rewire the Python client and release the last two
 tools. Every design decision this document records has been through review; where
@@ -1458,7 +1457,7 @@ The "no theory context" line belongs to `isabelle_find_theorems` alone and was
 approved after stage 3 measured the case; the others were approved before it.
 
 ```
-The command at MyTheory.thy:42 is no longer part of the current document: a file changed while this query was in flight. Retry.
+The prover no longer holds a proof state for the command at MyTheory.thy:42 — the evaluation was cancelled. Evaluate the file again to get one.
 
 The command at MyTheory.thy:42 has not finished evaluating, so it has no proof state yet. Retry in a few seconds.
 
@@ -1634,14 +1633,27 @@ stage 3):
   while `Command.eval_running` holds, and `Execution.discontinue` makes that
   false for all of them — but it means `undefined`'s approved sentence ("a file
   changed while this query was in flight") describes a cancel imprecisely.
-  **Measured in stage 4: it does reach it.** After cancelling an evaluation
-  mid-file, `isabelle_command_output` at a line that had finished *before* the
-  cancel is served normally — the guard sees processed decoration, and that
-  tool reads the snapshot's markup rather than the execution version. So
-  `isabelle_goal` at the same line will pass the same guard and get `undefined`
-  from the prelude, and the approved sentence would tell the agent a file
-  changed and to retry, when nothing changed and retrying cannot help. **The
-  sentence needs a fresh sign-off before stage 5 renders it.**
+  **Measured in stage 4: it does reach it, and the sentence was rewritten.**
+  After cancelling an evaluation mid-file, `isabelle_command_output` at a line
+  that had finished *before* the cancel is served normally — the guard sees
+  processed decoration, and that tool reads the snapshot's markup rather than
+  the execution version. So `isabelle_goal` at the same line passes the same
+  guard and gets `undefined`. The old sentence blamed a file change and said
+  "Retry", when nothing had changed and retrying cannot help; §5.3 now carries
+  the approved replacement, which names cancellation and sends the agent to
+  re-evaluate — the same instruction, in the same words, as the `interrupted`
+  reply next to it.
+
+  **What the approved sentence gives up, recorded so it is not rediscovered as a
+  bug.** `undefined` has a second cause: any edit to a file re-creates every
+  command id in it (§3.10), so an edit landing between the adapter's snapshot
+  resolution and the prelude's read produces it too. The sentence names only
+  cancellation. That was weighed and accepted: the guard refuses a position
+  whose decoration is stale or unprocessed, so a query only reaches the read
+  when the file was up to date a moment earlier, leaving a window of
+  milliseconds against a cancel that is reproducible on demand. And the
+  *instruction* is right either way — re-evaluating is what fixes both. Only
+  the stated cause can be wrong, and only in that race.
 - **`Execution.snapshot` does detect outstanding forked work** — a `by` whose
   proof was still running reported three tasks. It rode along with no reply
   here, because a `by` has no proof state to serve it with.
