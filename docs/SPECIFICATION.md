@@ -685,22 +685,27 @@ run rather than waiting for `complete`; and errors do not halt checking.
 
 ### 7.1 Functional Status
 
-1. Current server registers 11 MCP tools.
+1. Current server registers 13 MCP tools.
 2. Standard LSP features (hover, definition, local occurrences) are
    implemented and covered by tests.
-3. PIDE tools use Isabelle2024 native notifications:
-   - `isabelle_goal` uses `PIDE/caret_update`, `PIDE/state_init`,
-     `PIDE/state_output`, and `PIDE/state_exit`.
-   - `isabelle_command_output` uses `PIDE/dynamic_output`.
-4. PIDE tools are best-effort: they may timeout if Isabelle emits no matching
-   notification for the requested position/file.
+3. Every query tool is position-explicit: it names a file and a line, and the
+   server answers about the command there without moving Isabelle's caret.
+   - `isabelle_goal` uses `PIDE/proof_state_at_position`, and
+     `isabelle_find_theorems` uses `PIDE/find_theorems_at_position`; both read
+     the command's state straight out of the prover's document state.
+   - `isabelle_command_output` uses `PIDE/output_at_position`.
+   - `isabelle_command_status` uses `PIDE/commands_at_lines`.
+4. A query that cannot produce a result says why, in one round trip: "this
+   command is not a proof operation", "it has not finished evaluating", and so
+   on. Nothing is concluded from a timeout.
 
 ### 7.2 Interface Consistency
 
 1. Current tool names are `isabelle_launch`, `isabelle_terminate`,
    `isabelle_evaluate_to`, `isabelle_evaluation_status`,
    `isabelle_cancel_evaluation`, `isabelle_hover`, `isabelle_definition`,
-   `isabelle_local_occurrences`, `isabelle_goal`, `isabelle_command_output`, and
+   `isabelle_local_occurrences`, `isabelle_goal`, `isabelle_find_theorems`,
+   `isabelle_command_output`, `isabelle_command_status`, and
    `isabelle_session_info`.
 2. All public tool positions are 1-indexed.
 3. Query tools return Pydantic models rather than bare lists; the three evaluation

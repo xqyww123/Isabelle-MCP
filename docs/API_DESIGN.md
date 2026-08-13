@@ -39,8 +39,10 @@ ARCHITECTURE.md.
 
 | MCP Tool | PIDE Methods | Flow |
 |----------|--------------|------|
-| `isabelle_goal` | `PIDE/caret_update`, `PIDE/state_init`, `PIDE/state_output`, `PIDE/state_exit` | Multi-step async; state id assigned by server |
+| `isabelle_goal` | `PIDE/proof_state_at_position` (ours, position-explicit) | Request-response; the prover reads the command's own state and answers with a status word and the rendered HTML |
+| `isabelle_find_theorems` | `PIDE/find_theorems_at_position` (ours, position-explicit) | As above, in the command's context |
 | `isabelle_command_output` | `PIDE/output_at_position` (ours, position-explicit) | Request-response; returns the enclosing command's source+range and rendered output in one shot |
+| `isabelle_command_status` | `PIDE/commands_at_lines` (ours) | Request-response; the commands overlapping each requested line, for however many lines are asked about |
 
 ### 2.3 Session Management
 
@@ -356,130 +358,61 @@ hover result. The two agent-facing paths to error/warning information are:
 **PIDE Flow:**
 
 ```
-1. Send: PIDE/caret_update
-   {"uri": "file:///...", "line": 41, "character": 0}
-   ← Updates Isabelle's current caret position
+Send: PIDE/proof_state_at_position
+  {"token": "7", "textDocument": {"uri": "file:///..."},
+   "position": {"line": 41, "character": 27}, "timeout": 600.0}
 
-2. Send: PIDE/state_init
-   ← No immediate response. Isabelle creates a state panel internally.
-
-3. Receive: PIDE/state_output
-   {"id": <panel_id>, "content": "<html>...goals...</html>", "auto_update": true}
-
-4. Send: PIDE/state_exit
-   {"id": <panel_id>}
+Receive: the response to that request
+  {"status": "ok", "comment": false, "forked": false,
+   "content": "<html>...goals...</html>"}
 ```
 
-The current implementation opens one temporary state panel per queried position.
-It performs the sequence **once**, at a single caret resolved from the optional
-`after_text` snippet (or the end of the line when `after_text` is omitted) via
-`resolve_caret`. There is no "before/after mode" and no `column` parameter. The
-tool calls `get_command_at_position` (for the enclosing command's source+range) and
-`get_goals_at_position` (for the subgoals after that command), and returns a
-`GoalState(command=CommandSpan|None, subgoals=list[str], note=str|None)`. To compare
-a tactic's before/after effect, query the line before it and the tactic's own line.
+One request, one response. Nothing moves Isabelle's caret, nothing creates a
+panel, and nothing waits on an asynchronous notification — so the query is safe
+while an evaluation is running, and two of them can be in flight at once.
 
-**HTML Output Format (Example):**
-```html
-<html>
-  <body>
-    <div class="state">
-      <h3>proof (prove)</h3>
-      <pre class="goals">
-goal (2 subgoals):
- 1. ⋀x. P x ⟹ Q x
- 2. R y
-      </pre>
-      <div class="context">
-        fix x y
-        assume "A x" "B y"
-      </div>
-    </div>
-  </body>
-</html>
-```
+The position is resolved once from the optional `after_text` snippet (or the
+line's last non-blank character when `after_text` is omitted) via
+`resolve_caret`. That anchor matters: column 0 of an indented line sits inside
+the ignored span before the command, and the server resolves backward from
+there onto the *previous* command.
 
-**Parsing Strategy:**
-```python
-def parse_goals_from_html(html: str) -> List[str]:
-    """Extract goal text from PIDE HTML output"""
-    # Remove HTML tags
-    text = re.sub(r'<[^>]+>', '', html)
+`status` is a word from a fixed vocabulary, not prose: `ok`, `undefined`,
+`unfinished`, `interrupted`, `no_proof_state`, `no_context`, `failed`,
+`cancelled`, `crashed`, plus `no_command` and `timeout`, which only the adapter
+can observe. The sentence each one becomes lives in `isabelle_mcp/query.py`,
+on this side, because the prover cannot name a line and because that is where
+the wording is unit-tested. `comment` and `forked` are notes carried alongside a
+served result rather than instead of it.
 
-    # Handle special cases
-    if "no goals" in text.lower():
-        return []
+`token` is the client's correlation id and what a later `PIDE/query_cancel`
+names; the client sends one on every exit path, including cancellation, so the
+prover stops working on a result nobody will read. `timeout` is a prover-side
+backstop, not the policy — the client's own wait is progress-monitored.
 
-    # Extract goals (simple heuristic: lines starting with digits)
-    goals = []
-    for line in text.split('\n'):
-        line = line.strip()
-        # Match patterns like "1. goal_text" or "⋀x. goal_text"
-        if re.match(r'^\d+\.', line) or re.match(r'^⋀', line):
-            goals.append(line)
-
-    return goals
-```
+**Parsing Strategy:** `parse_goals_from_html` keys on the `subgoal` CSS class
+the server's renderer emits, stripping the leading `1.` numbering. It falls back
+to reading numbered lines out of the plain text when no such span is present,
+and treats "no goals" as an empty list.
 
 **Implementation Notes:**
-1. **Panel ID Management**: `PIDE/state_init` has no client-supplied id.
-   Learn the server-assigned id from the first `PIDE/state_output` and use it
-   for `PIDE/state_exit`.
-2. **Async Coordination**: Use `asyncio.Future` for waiting on `state_output`
-3. **Timeout**: 5-10 seconds max wait for state output
-4. **Single query**: The caret is resolved once from `after_text` (or end of line);
-   there is no before/after double query and no `column` parameter.
-5. **Context Extraction**: Parse `<div class="context">` if available
-6. **Concurrency**: Serialize state queries because `PIDE/state_init` responses
-   are matched by the next state output notification.
+1. **Correlation**: the client allocates the token; the prover echoes it in its
+   reply, and the adapter's table maps it back to the pending LSP request.
+2. **Cancellation**: `PIDE/query_cancel` on every exit path, including
+   `CancelledError`. A cancel for an unknown or finished token is a no-op.
+3. **No heuristics**: "this command has no proof state" is an answer the prover
+   gives. The old grace period — conclude "no goals" from ten seconds of
+   silence — is gone, along with the caret cycle it compensated for.
+4. **Single query**: the position is resolved once from `after_text` (or the
+   line's last non-blank character); there is no before/after double query and
+   no `column` parameter.
 
 **Edge Cases:**
-- No proof state available → return empty goals
-- Timeout waiting for state_output → raise error
-- Panel creation fails → retry once
-- HTML parsing errors → return raw text as single goal
-
-**Code Snippet:**
-```python
-class StatePanelManager:
-    def __init__(self):
-        self.state_lock = asyncio.Lock()
-        self.init_waiters: list[asyncio.Future[tuple[int, str]]] = []
-
-    async def query_position(
-        self,
-        client: IsabelleLSPClient,
-        file_path: str,
-        line: int,
-        column: int,
-    ) -> list[str]:
-        """Query goals at one LSP position."""
-        uri = file_path_to_uri(file_path)
-
-        async with self.state_lock:
-            future = asyncio.Future()
-            self.init_waiters.append(future)
-            panel_id = None
-
-            try:
-                await client.notify("PIDE/caret_update", {
-                    "uri": uri,
-                    "line": line - 1,
-                    "character": column,
-                })
-                await client.notify("PIDE/state_init", {})
-
-                panel_id, html_output = await asyncio.wait_for(future, timeout=5.0)
-                return parse_goals_from_html(html_output)
-            finally:
-                if panel_id is not None:
-                    await client.notify("PIDE/state_exit", {"id": panel_id})
-
-    def handle_state_output(self, panel_id: int, html_content: str):
-        """Called by LSP client when PIDE/state_output received"""
-        if self.init_waiters:
-            self.init_waiters.pop(0).set_result((panel_id, html_content))
-```
+- Not a proof operation → an empty goal list plus a note saying so.
+- No command at the position → `no_command`; the result carries no command.
+- The command has not finished, was interrupted, or its state is no longer held
+  → an error naming the position and what to do about it.
+- HTML parsing errors → return raw text as a single goal.
 
 ---
 
@@ -509,12 +442,11 @@ which the MCP layer renders to a plain-text `ToolResult` (`format_command_output
    no notification matching, no caret movement.
 2. **No command at the position** (blank line, comment, or past the last command)
    → `command=None`, empty `messages`.
-3. The legacy `PIDE/dynamic_output` push path still exists in the client
-   (`get_dynamic_output`) but is not used by this tool.
-4. `isabelle_command_output` probes a small set of caret columns on the line:
-   first non-space character, end of the command token, the following
-   character, then column 0. This matches Isabelle output that appears only
-   when the caret is inside a command body.
+3. The prover still runs its `Dynamic_Output` panel and pushes
+   `PIDE/dynamic_output` on every caret move, but the client no longer reads it.
+   That is why the server is still started with `vscode_html_output=true`: the
+   plain-text branch of that panel is broken upstream, and leaving it enabled
+   would put errors on the wire for output nobody consumes.
 5. Parse HTML to extract message type and text. Isabelle2024 commonly emits
    message spans such as `writeln_message`, `error_message`, and
    `state_message`; older/simple examples may use `writeln`, `warning`, or

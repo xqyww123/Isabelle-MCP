@@ -229,11 +229,9 @@ class IsabelleLSPClient:
     async def get_diagnostics(self, file_path: str):
         """Get cached diagnostics for file"""
 
-    async def create_state_panel(self, file_path: str, line: int, column: int):
-        """Create PIDE state panel and return goals"""
-
-    async def get_dynamic_output(self, file_path: str, line: int):
-        """Get command output from dynamic output cache"""
+    async def query_at_position(self, method: str, file_path: str,
+                                line: int, character: int, extra=None):
+        """Ask the prover about the command at a position; return its reply"""
 
     async def request_preview(self, file_path: str):
         """Request document preview"""
@@ -352,53 +350,63 @@ async def _read_loop(self):
 
 ---
 
-### 2.4 PIDE State Panel Management
+### 2.4 Position-Explicit Queries
 
-**Challenge:** PIDE state panels are asynchronous. Isabelle2024 defines
-`PIDE/state_init` as a notification with no parameters; the server assigns the
-state panel id and reports it in the next `PIDE/state_output` notification.
-The client must update the caret, initialize a panel, learn the server id from
-`state_output`, and use that id for `PIDE/state_exit`.
+**Challenge:** the proof state and `find_theorems` used to be read through
+Isabelle's *global caret*: move the caret, open a state panel, wait for an
+asynchronous `state_output` notification, destroy the panel. Three things
+followed from that. The caret is global, so every such query had to be
+serialized behind a lock; an evaluation steers the same caret, so a query could
+not run while one was in progress; and a command with no proof state produced no
+notification at all, so "there is nothing here" could only be inferred from
+silence — a ten-second grace period that was indistinguishable from a slow
+prover.
 
-**Solution:** State machine for panel lifecycle
+**Solution:** ask the prover directly about a command, and take an answer.
+
+An ML prelude injected at prover startup defines protocol commands that resolve
+a node name and a command id in the document state, read that command's own
+`Toplevel.state`, and reply with a status word and the rendered result. The
+Scala adapter resolves the position to a command id, correlates the reply, and
+answers the LSP request. Nothing moves the caret, nothing creates a panel, and
+nothing waits on a notification.
 
 ```python
-class StatePanelManager:
-    def __init__(self):
-        self.state_lock = asyncio.Lock()
-        self.init_waiters: List[asyncio.Future[tuple[int, str]]] = []
-
-    async def query_position(self, client, file_path, line, character):
-        """Query proof goals at one LSP position."""
-        async with self.state_lock:
-            future = asyncio.Future()
-            self.init_waiters.append(future)
-            panel_id = None
-
-            try:
-                await client.notify("PIDE/caret_update", {
-                    "uri": file_path_to_uri(file_path),
-                    "line": line,
-                    "character": character,
-                })
-                await client.notify("PIDE/state_init", {})
-                panel_id, html = await asyncio.wait_for(future, timeout=5.0)
-                return parse_goals_from_html(html)
-            finally:
-                if panel_id is not None:
-                    await client.notify("PIDE/state_exit", {"id": panel_id})
-
-    def handle_state_output(self, panel_id: int, output: str):
-        """Handle PIDE/state_output notification"""
-        if self.init_waiters:
-            self.init_waiters.pop(0).set_result((panel_id, output))
-
-    def _parse_goals(self, html_output: str) -> List[str]:
-        """Parse goals from HTML output"""
-        # Strip HTML tags, extract goal text
-        # Handle "no goals" case
-        pass
+async def query_at_position(self, method, file_path, line, character, extra=None):
+    """One request, one response — safe during an evaluation."""
+    self._query_seq += 1
+    token = str(self._query_seq)
+    params = {
+        "token": token,
+        "textDocument": {"uri": self.open_documents[file_path].uri},
+        "position": {"line": line, "character": character},
+        "timeout": self.QUERY_BACKSTOP,
+    }
+    params.update(extra or {})
+    try:
+        result = await self.request(method, params)
+    finally:
+        # On every exit path, including CancelledError: the prover must not keep
+        # working on a result nobody will read.
+        await self.notify("PIDE/query_cancel", {"token": token})
+    return QueryReply(status=result["status"], comment=result.get("comment", False),
+                      forked=result.get("forked", False), content=result.get("content", ""))
 ```
+
+**What the status words are for.** The prover cannot map a command back to a
+line, and every agent-facing sentence names one, so the prover sends a word and
+this side renders the sentence (`isabelle_mcp/query.py`). That also keeps the
+wording unit-tested and changeable without rebuilding the jar. "This command is
+not a proof operation" is now a definite answer rather than a timeout.
+
+**Consequences.** There is no query lock: the queries are position-explicit, so
+two can be in flight at once and any of them may run while an evaluation is
+outstanding. Whether a *particular* position can be served is decided by the
+evaluation guard, from the decoration cache, per position — not by a global
+"an evaluation is running" flag.
+
+The design, and the measurements behind it, are in
+`docs/archive/QUERY_TOOLS_UPGRADE.md` §5.
 
 ---
 
@@ -612,11 +620,10 @@ AI Agent calls isabelle_goal(file, line)
          ├─→ resolve_caret(after_text or end-of-line) → (caret_line, caret_char)
          ├─→ get_command_at_position → CommandSpan
          │
-         ├─→ Create state panel (single query at the resolved caret)
+         ├─→ Send PIDE/proof_state_at_position (one request, one response)
          │   │
-         │   ├─→ Send PIDE/caret_update + PIDE/state_init
-         │   ├─→ Wait for PIDE/state_output → subgoals
-         │   └─→ Send PIDE/state_exit
+         │   └─→ status ≠ ok: raise the sentence for that status, or serve
+         │       with a note (no proof state here / forked work still running)
          │
          ├─→ Parse subgoals from HTML
          │
@@ -740,42 +747,49 @@ All `IsabelleToolError` exceptions are caught by FastMCP and returned as error r
   (`wait_for_processing` / `wait_for_processing_bounded`), not a fixed delay
 - Return `processing_complete` flag in diagnostics
 
-### 7.3 State Panel Management
+### 7.3 Position-Explicit Queries
 
-**Design:** Create-use-destroy per query. Each `get_goals_at_position` call
-creates a fresh panel via `PIDE/state_init`, waits for `PIDE/state_output`,
-then immediately destroys the panel via `PIDE/state_exit`. No pooling or reuse.
+**Design:** one request, one response. `isabelle_goal` and
+`isabelle_find_theorems` send `PIDE/proof_state_at_position` /
+`PIDE/find_theorems_at_position` with the file, the position and a correlation
+token; the prover resolves the command in its document state, reads that
+command's own `Toplevel.state`, and answers.
 
-**Why no pooling:** Idle panels subscribe to `Session.Caret_Focus` and
-`Session.Commands_Changed`. Every caret move triggers `auto_update()` on
-ALL alive panels, causing unnecessary overlay insertions and ghost
-`state_output` notifications. Panel creation cost is negligible (~1 overlay
-round-trip), so create-and-destroy is both simpler and more efficient.
+**Why not the state panel.** Isabelle's state panel reads the **global caret**
+to decide which command to query, and there is no way to bind a panel to a
+position atomically. That forced three things, all of which are gone:
 
-**Global caret serialization (known design defect):**
-The Isabelle state panel reads the **global caret** (`resources.get_caret()`)
-to determine which command to query. There is no way to bind a panel to a
-specific position atomically. Concurrent caret moves would cause panels to
-return goals for the wrong position.
+1. **Serialization.** Every query held a caret lock for the whole
+   caret-update → panel-init → await-output → panel-exit cycle. A query that
+   triggered slow theory processing blocked every other query, potentially for
+   minutes.
+2. **Mutual exclusion with evaluation.** An evaluation steers the same caret, so
+   these two tools were refused outright while one was in progress.
+3. **Silence as a signal.** Terminal proof commands (`by`, `done`, `qed`)
+   produce empty `print_state` output, and `state_panel.scala` checks
+   `body.nonEmpty` before sending anything — so no notification was ever sent.
+   The client concluded "no goals" from ten seconds of silence, which is
+   indistinguishable from a slow prover.
 
-Therefore `_caret_lock` is held for the **entire query-response cycle**
-(caret_update → sleep → state_init → wait for state_output → state_exit).
-All goal and dynamic_output queries are fully serialized. If one query
-triggers slow theory processing (session loading, long import chain), it
-blocks all other queries for the duration — potentially minutes.
+**What replaces them.** The queries name a position, so they need no lock and
+compete with an evaluation for nothing; whether a *particular* position can be
+served is decided per position from the decoration cache by the evaluation
+guard. And "this command is not a proof operation" is a status word the prover
+sends, in the same round trip as everything else.
 
-Possible future mitigations:
-1. Extend `isabelle mcp_server` to support position-bound state queries
-2. Insert `print_state_query` overlays directly (requires command IDs not
-   exposed by the LSP protocol)
-3. Spawn separate `mcp_server` processes for parallel queries
+**Cancellation.** The client sends `PIDE/query_cancel` with the token on every
+exit path, including `CancelledError`. Both sides treat a cancel for an unknown
+or already-finished token as a no-op, and on both sides taking the request out
+of its table is the permission to answer it — so exactly one reply goes out per
+request even when a cancel, a timeout and the reply itself race.
 
-**Empty proof state detection:**
-Terminal proof commands (`by`, `done`, `qed`) produce empty `print_state`
-output. Isabelle's `state_panel.scala` checks `body.nonEmpty` before sending
-`state_output` — for these commands, no notification is ever sent. The client
-detects this via `STATE_OUTPUT_GRACE` (default 10s): if the server process is
-alive but no `state_output` arrives within the grace period, return `[]`.
+**Prelude/jar version gate.** The ML prelude and the Scala adapter now share
+three protocol commands and a reply format, and the prelude is not covered by
+the jar's recorded source hashes. The prelude reports its version in the startup
+ping and the server refuses to serve on a mismatch, because the failure it
+guards against is a request that hangs with no correlatable trace.
+
+Design, rationale and measurements: `docs/archive/QUERY_TOOLS_UPGRADE.md` §5.
 
 ---
 
@@ -883,7 +897,7 @@ Custom Isabelle syntax parser for `isabelle_file_outline`:
 - No need for full semantic analysis
 - Regex-based or simple parser
 
-### 10.3 Progress Monitoring & Empty State Detection (Implemented)
+### 10.3 Progress Monitoring (Implemented)
 
 **Progress Monitoring (replaces fixed timeouts):**
 `_wait_with_progress(future, stall_timeout)` polls every `PROGRESS_CHECK_INTERVAL` (5s):
@@ -891,20 +905,16 @@ Custom Isabelle syntax parser for `isabelle_file_outline`:
 - If `process.returncode` is set → raise (Isabelle crashed)
 - If no server message for `STALL_TIMEOUT` (120s) → raise (Isabelle stalled)
 
-All async PIDE methods (`request`, `get_goals_at_position`,
-`get_dynamic_output`, `request_preview`) use progress monitoring instead of
-fixed timeouts. Only lifecycle methods (`initialize`, `shutdown`) retain hard
-deadlines.
+All async PIDE methods (`request`, `query_at_position`, `request_preview`) use
+progress monitoring instead of fixed timeouts. Only lifecycle methods
+(`initialize`, `shutdown`) retain hard deadlines.
 
-**Empty Proof State Detection:**
-`_wait_for_state_output` extends progress monitoring with grace-period logic.
-Terminal proof commands produce no `state_output` (see §7.3). After
-`STATE_OUTPUT_GRACE` (10s) with the Isabelle process still alive, the wait
-returns `None` → `get_goals_at_position` returns `[]`.
-
-**Serialized Caret Access:**
-`_caret_lock` covers the full query lifecycle. See §7.3 for rationale and
-known limitations.
+**No empty-state heuristic, and no caret lock.** Both existed to work around the
+state panel and went with it (§7.3): a command with no proof state now says so,
+and a position-explicit query needs no exclusive access to anything. The one
+deadline the queries carry is `QUERY_BACKSTOP`, sent to the prover so a reply
+that never comes stops holding a table entry and an ML task; it is not the
+client's waiting policy.
 
 ---
 
@@ -975,24 +985,25 @@ MCP Server
    │ get_command_at_position → CommandSpan (enclosing command source+range)
    │
    ▼
-State Panel Manager
-   │ PIDE: {"method": "PIDE/caret_update",
-   │        "params": {"line": 41, "character": <caret_char>}}
-   │ PIDE: {"method": "PIDE/state_init"}
+LSP Client
+   │ PIDE: {"method": "PIDE/proof_state_at_position",
+   │        "params": {"token": "7", "position": {"line": 41,
+   │                   "character": <caret_char>}, "timeout": 600.0}}
    │
    ▼
 isabelle mcp_server
-   │ Update caret to line start
-   │ Create state panel with server-assigned id
-   │ Query PIDE for proof state
+   │ Resolve the position to a command id in the current snapshot
+   │ Isabelle_MCP.proof_state: read that command's own Toplevel.state
+   │ Render it, and answer the request
    │
-   │ PIDE: {"method": "PIDE/state_output",
-   │        "params": {"id": 1, "content": "<html>goal (2 subgoals): ...</html>"}}
+   │ ← {"status": "ok", "comment": false, "forked": false,
+   │    "content": "<html>goal (2 subgoals): ...</html>"}
    ▼
-State Panel Manager
-   │ Receive state_output and learn panel id = 1
-   │ PIDE: {"method": "PIDE/state_exit", "params": {"id": "<panel_id>"}}
+LSP Client
+   │ PIDE: {"method": "PIDE/query_cancel", "params": {"token": "7"}}
+   │        (fire-and-forget, on every exit path)
    │
+   │ status ≠ ok → the sentence for that status (query.py)
    │ Parse subgoals from HTML (one entry per open subgoal; "no goals" → [])
    │
    │ Return: GoalState(command=CommandSpan(...), subgoals=["P x"], note=None)

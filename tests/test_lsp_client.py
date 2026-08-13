@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from isabelle_mcp.lsp_client import DocumentState, IsabelleLSPClient
-from isabelle_mcp.utils import IsabelleToolError, LSPCharacter, LSPLine, MCPLine
+from isabelle_mcp.utils import IsabelleToolError, LSPLine, MCPLine
 
 
 @pytest.fixture(autouse=True)
@@ -514,19 +514,6 @@ class TestIsabelleLSPClient:
         assert await client._read_message() == {}
 
     @pytest.mark.asyncio
-    async def test_handle_dynamic_output(self):
-        client = IsabelleLSPClient()
-        future = asyncio.get_running_loop().create_future()
-        key = ("/tmp/Test.thy", 3, 0)
-        client._dynamic_output_waiters.append((key, future))
-
-        client._handle_dynamic_output({"content": "<div class='writeln'>ok</div>"})
-
-        assert future.done()
-        assert future.result() == "<div class='writeln'>ok</div>"
-        assert client._dynamic_output_cache_by_position[key] == "<div class='writeln'>ok</div>"
-
-    @pytest.mark.asyncio
     async def test_query_at_position_is_one_request_and_a_cancel(self):
         # No caret update, no panel, no sleep: one request carrying the token and
         # the backstop, and a cancel naming the same token on the way out.
@@ -586,74 +573,6 @@ class TestIsabelleLSPClient:
         # The prover reads allow_dups inverted: only the exact string "false"
         # removes duplicates.
         assert params["allow_dups"] == "false"
-
-    @pytest.mark.asyncio
-    async def test_dynamic_output_timeout_no_stale_data(self):
-        client = IsabelleLSPClient()
-        client.notify = AsyncMock()
-        client.PROGRESS_CHECK_INTERVAL = 0.01
-        client.diagnostic_cache.last_update["/tmp/Test.thy"] = time.time() - 10.0
-        client._dynamic_output_cache_by_position[("/tmp/Other.thy", 1, 0)] = "old"
-
-        result = await client.get_dynamic_output("/tmp/Test.thy", LSPLine(1))
-        assert result == ""
-
-    @pytest.mark.asyncio
-    async def test_dynamic_output_queries_are_serialized(self):
-        client = IsabelleLSPClient()
-        first_notify_entered = asyncio.Event()
-        release_first = asyncio.Event()
-        calls = []
-
-        async def fake_notify(method, params):
-            calls.append((method, params))
-            if params.get("line") == 1:
-                first_notify_entered.set()
-                await release_first.wait()
-                client._handle_dynamic_output({"content": "first"})
-            elif params.get("line") == 2:
-                client._handle_dynamic_output({"content": "second"})
-
-        client.notify = AsyncMock(side_effect=fake_notify)
-
-        first = asyncio.create_task(client.get_dynamic_output("/tmp/Test.thy", LSPLine(1)))
-        await asyncio.wait_for(first_notify_entered.wait(), timeout=1)
-
-        second = asyncio.create_task(client.get_dynamic_output("/tmp/Test.thy", LSPLine(2)))
-        await asyncio.sleep(0)
-        assert [call[1]["line"] for call in calls if "line" in call[1]] == [1]
-
-        release_first.set()
-        assert await first == "first"
-        assert await second == "second"
-        assert [call[1]["line"] for call in calls if "line" in call[1]] == [1, 2]
-
-    async def test_fail_pending_waiters_fails_and_clears_all_waiters(self):
-        # async (not sync + get_event_loop): pytest-asyncio >= 1.x clears the
-        # event loop after every async test, so a later sync get_event_loop()
-        # raises "There is no current event loop" on Python 3.12+.
-        client = IsabelleLSPClient()
-        loop = asyncio.get_running_loop()
-        request_future = loop.create_future()
-        dynamic_future = loop.create_future()
-        preview_future = loop.create_future()
-
-        client.pending_requests[1] = request_future
-        client._dynamic_output_waiters.append((("/tmp/Test.thy", 1, 0), dynamic_future))
-        client._dynamic_output_cache_by_position[("/tmp/Test.thy", 1, 0)] = "stale"
-        client._preview_waiters[("file:///tmp/Test.thy", 0)] = preview_future
-
-        exc = IsabelleToolError("transport failed")
-        client._fail_pending_waiters(exc)
-
-        for future in (request_future, dynamic_future, preview_future):
-            assert future.done()
-            assert future.exception() is exc
-        assert client.pending_requests == {}
-        assert client._dynamic_output_waiters == []
-        assert client._dynamic_output_cache_by_position == {}
-        assert client._preview_waiters == {}
-
 
 def _mock_process_client() -> IsabelleLSPClient:
     client = IsabelleLSPClient()

@@ -3,7 +3,7 @@
 [![PyPI](https://img.shields.io/pypi/v/isabelle-mcp)](https://pypi.org/project/isabelle-mcp/)
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.12-blue)](https://pypi.org/project/isabelle-mcp/)
 [![CI](https://github.com/xqyww123/Isabelle-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/xqyww123/Isabelle-MCP/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![License: LGPL-2.1-or-later](https://img.shields.io/badge/license-LGPL--2.1--or--later-blue)](LICENSE)
 
 MCP server that lets AI agents (Claude Code, Codex, …) drive the Isabelle
 theorem prover through its LSP/PIDE commands — fully autonomously, with no
@@ -23,9 +23,9 @@ AI ↔ Isabelle, no-human-in-the-loop model.
 
 > ⚠️ **One agent per server instance.** This server holds a single Isabelle
 > session with global mutable state — one set of open documents, one
-> caret/perspective, and one evaluation in flight at a time. It is
+> perspective, and one evaluation in flight at a time. It is
 > **single-threaded and not concurrency-safe**: pointing multiple agents at one
-> instance, or interleaving concurrent requests, corrupts the evaluation/caret/
+> instance, or interleaving concurrent requests, corrupts the evaluation and
 > document state with catastrophic, hard-to-debug results. The server runs over
 > **stdio**, so each agent already gets its own dedicated server process (and its
 > own `isabelle mcp_server`) — just don't share one or drive it concurrently.
@@ -84,11 +84,17 @@ For Claude Desktop, register manually instead
 | `isabelle_goal` | **Proof goals** — omit after_text for before/after diff |
 | `isabelle_find_theorems` | Search the theorem database in the context at a position (Isabelle's `find_theorems`): by name, pattern, intro/elim/dest, solves, simp |
 | `isabelle_command_output` | Prover output messages |
+| `isabelle_command_status` | What state the command(s) covering each of several lines are in |
 | `isabelle_session_info` | Current session info |
 
 All positions are **1-indexed**. File paths must be **absolute**.
 
-PIDE tools (goal, command_output) are best-effort wrappers around async PIDE notifications and may time out.
+Every query tool names a file and a line, and the prover answers about the
+command there without moving its caret — so a query can run while an evaluation
+is in progress, and it may only be refused for the position it asked about, not
+because the session is busy. A query that cannot produce a result says why
+("this command is not a proof operation", "it has not finished evaluating");
+nothing is concluded from a timeout.
 
 ## Development
 
@@ -111,4 +117,9 @@ models.py         Pydantic output models
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Copyright © 2024-2026 Qiyuan Xu.
+
+This project is free software: you can redistribute it and/or modify it under
+the terms of the GNU Lesser General Public License as published by the Free
+Software Foundation, either version 2.1 of the License, or (at your option) any
+later version. See [LICENSE](LICENSE) for the full text.

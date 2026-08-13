@@ -9,7 +9,6 @@ import re
 import shlex
 import signal
 import subprocess
-import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
@@ -30,7 +29,6 @@ from isabelle_mcp.utils import (
     LSPCharacter,
     LSPLine,
     file_path_to_uri,
-    plural,
     set_symbols_text,
     uri_to_file_path,
 )
@@ -259,18 +257,11 @@ class IsabelleLSPClient:
         # The server File_Watcher's debounce; refreshed from options at start().
         self.vscode_load_delay: float = 0.5
 
-        # Caret lock: dynamic_output still reads through the global Isabelle
-        # caret, so its query cycle stays serialized. The proof-state and
-        # find_theorems queries no longer touch the caret at all.
-        self._caret_lock = asyncio.Lock()
-
         # Correlation token for position-explicit queries: monotonic, and what a
         # PIDE/query_cancel names.
         self._query_seq: int = 0
 
         # PIDE dynamic output
-        self._dynamic_output_waiters: list[tuple[tuple[str, int, int], asyncio.Future[str]]] = []
-        self._dynamic_output_cache_by_position: dict[tuple[str, int, int], str] = {}
 
         # PIDE preview
         self._preview_lock = asyncio.Lock()
@@ -362,10 +353,11 @@ class IsabelleLSPClient:
         # Isabelle2025 routes the state/dynamic panels through Pretty_Text_Panel, which
         # by default emits plain text + decorations — but that path is broken upstream
         # (`decorations.map(_.json)` eta-expands `Decoration.json(file)` into a lambda →
-        # "Bad JSON value", so the panel silently emits nothing). Force the HTML branch.
-        # The proof-state and find_theorems queries no longer go through that panel at
-        # all — they render server-side — so this now only covers dynamic output.
-        # The option does not exist pre-2025 (passing it aborts the server), so gate it.
+        # "Bad JSON value"). No tool consumes those panels any more, but the server still
+        # RUNS Dynamic_Output and pushes on every caret move (force_interrupt makes one),
+        # so leaving the broken branch enabled would put errors on the wire for output
+        # nobody reads. The option does not exist pre-2025 (passing it aborts the
+        # server), so gate it.
         if (isabelle_year() or 0) >= 2025:
             cmd += ["-o", "vscode_html_output=true"]
         for d in self.session_dirs:
@@ -619,8 +611,6 @@ class IsabelleLSPClient:
         self.diagnostic_cache.diagnostics.clear()
         self.diagnostic_cache.last_update.clear()
         self._first_diagnostic_event.clear()
-        self._dynamic_output_waiters.clear()
-        self._dynamic_output_cache_by_position.clear()
         self._preview_waiters.clear()
         self._processing_trackers.clear()
 
@@ -833,8 +823,6 @@ class IsabelleLSPClient:
                 event.set()
         elif method == "PIDE/decoration":
             await self._handle_decoration(params)
-        elif method == "PIDE/dynamic_output":
-            self._handle_dynamic_output(params)
         elif method == "PIDE/preview_response":
             self._handle_preview_response(params)
         elif method in ("window/logMessage", "window/showMessage"):
@@ -896,17 +884,6 @@ class IsabelleLSPClient:
             self._processing_trackers[file_path] = tracker
         await tracker.update(parsed)
 
-    def _handle_dynamic_output(self, params: Any) -> None:
-        if not isinstance(params, dict):
-            return
-        html = str(params.get("content", ""))
-        waiters = self._dynamic_output_waiters
-        self._dynamic_output_waiters = []
-        for key, future in waiters:
-            self._dynamic_output_cache_by_position[key] = html
-            if not future.done():
-                future.set_result(html)
-
     def _handle_preview_response(self, params: Any) -> None:
         if not isinstance(params, dict):
             return
@@ -921,7 +898,6 @@ class IsabelleLSPClient:
     def _all_waiters(self) -> list[asyncio.Future]:
         futures: list[asyncio.Future] = []
         futures.extend(self.pending_requests.values())
-        futures.extend(future for _, future in self._dynamic_output_waiters)
         futures.extend(self._preview_waiters.values())
         return futures
 
@@ -930,8 +906,6 @@ class IsabelleLSPClient:
             if not future.done():
                 future.set_exception(exc)
         self.pending_requests.clear()
-        self._dynamic_output_waiters.clear()
-        self._dynamic_output_cache_by_position.clear()
         self._preview_waiters.clear()
 
     # ── High-level document methods ─────────────────────────────────────
@@ -1485,65 +1459,6 @@ class IsabelleLSPClient:
             "PIDE/find_theorems_at_position", file_path, line, character,
             {"query": query_text, "limit": limit, "allow_dups": allow_dups},
         )
-
-    def _enrich_timeout_error(self, file_path: str) -> IsabelleToolError:
-        diags = self.diagnostic_cache.diagnostics.get(file_path, [])
-        errors = [
-            d.get("message", "")
-            for d in diags
-            if isinstance(d, dict) and d.get("severity") in (1, 2)
-        ]
-        if errors:
-            summary = "; ".join(errors[:3])
-            if len(errors) > 3:
-                summary += f" (+{len(errors) - 3} more)"
-            return IsabelleToolError(
-                f"Timed out waiting for proof state. "
-                f"File has {plural(len(errors), 'error')}: {summary}"
-            )
-        if not diags:
-            return IsabelleToolError(
-                "Timed out waiting for proof state. "
-                "No diagnostics received — file may not have been processed."
-            )
-        return IsabelleToolError("Timed out waiting for proof state.")
-
-    async def get_dynamic_output(
-        self, file_path: str, line: LSPLine, character: int = 0,
-    ) -> str:
-        """Get dynamic output at position (progress-monitored).
-
-        Holds the caret lock for the duration since dynamic output depends
-        on the current caret position (unlike state panels which bind an
-        overlay to a specific command). Returns cached/empty output once the
-        file appears fully processed with no output at this position.
-        """
-        uri = file_path_to_uri(file_path)
-        key = (file_path, line, character)
-
-        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
-        waiter = (key, future)
-
-        try:
-            async with self._caret_lock:
-                self._dynamic_output_waiters.append(waiter)
-                await self.notify("PIDE/caret_update", {
-                    "uri": uri, "line": line, "character": character,
-                })
-                while True:
-                    try:
-                        return await asyncio.wait_for(
-                            asyncio.shield(future), timeout=self.PROGRESS_CHECK_INTERVAL,
-                        )
-                    except asyncio.TimeoutError:
-                        if future.done():
-                            return future.result()
-                        self._check_server_health(self.STALL_TIMEOUT)
-                        if self.diagnostics_settled(file_path, settle_time=3.0):
-                            return self._dynamic_output_cache_by_position.get(key, "")
-        finally:
-            with contextlib.suppress(ValueError):
-                self._dynamic_output_waiters.remove(waiter)
 
     async def request_preview(
         self, file_path: str, column: int = 0,

@@ -165,7 +165,6 @@ class MockLSPClient:
         self.find_theorems_html = ""
         # Whatever QUERY_BACKSTOP the real client would report in a timeout message.
         self.QUERY_BACKSTOP = 600.0
-        self.dynamic_output_response = ""
         self.command_at_position_response: tuple[str, dict[str, Any]] | None = None
         self.output_at_position_response: tuple[str, dict[str, Any], str] | None = None
 
@@ -300,9 +299,6 @@ class MockLSPClient:
         self, file_path: str, line: LSPLine, character: LSPCharacter,
     ) -> tuple[str, dict[str, Any]] | None:
         return self.command_at_position_response
-
-    async def get_dynamic_output(self, file_path: str, line: LSPLine, character: int = 0) -> str:
-        return self.dynamic_output_response
 
     async def get_output_at_position(
         self, file_path: str, line: LSPLine, character: LSPCharacter,
