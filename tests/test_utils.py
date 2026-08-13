@@ -290,3 +290,44 @@ class TestGetLineFromFile:
         long_line = "x" * 10000
         f.write_text(f"{long_line}\n")
         assert get_line_from_file(str(f), MCPLine(1)) == long_line
+
+
+class TestModelToYaml:
+    """The one serializer behind every model-shaped tool result."""
+
+    def _goal(self, **kw):
+        from isabelle_mcp.models import GoalState
+        return GoalState(**kw)
+
+    def test_unicode_survives_verbatim(self):
+        # Isabelle output is full of symbols; \uXXXX escapes would be unreadable.
+        from isabelle_mcp.utils.formatters import model_to_yaml
+        text = model_to_yaml(self._goal(subgoals=["∀x y. x ≤ y ⟶ x ≤ y + 1"]))
+        assert "⟶" in text and "≤" in text
+        assert "\\u" not in text and "\\U" not in text
+
+    def test_none_fields_are_dropped_but_empty_lists_stay(self):
+        # subgoals: [] means "proof finished here" and must remain visible;
+        # command/note being None is absence, not a key with null.
+        import yaml as yaml_module
+
+        from isabelle_mcp.utils.formatters import model_to_yaml
+        text = model_to_yaml(self._goal(subgoals=[]))
+        data = yaml_module.safe_load(text)
+        assert data == {"subgoals": []}
+        assert "null" not in text
+
+    def test_long_statements_are_not_folded(self):
+        # PyYAML's default width would wrap long theorem statements across
+        # lines; a statement must stay one scalar on one line.
+        from isabelle_mcp.utils.formatters import model_to_yaml
+        long_goal = "P " + "x " * 200 + "= Q"
+        text = model_to_yaml(self._goal(subgoals=[long_goal]))
+        lines = [ln for ln in text.splitlines() if "P x" in ln]
+        assert len(lines) == 1
+
+    def test_keys_keep_declaration_order(self):
+        from isabelle_mcp.models import SessionInfo
+        from isabelle_mcp.utils.formatters import model_to_yaml
+        text = model_to_yaml(SessionInfo(current_session="HOL", version="Isabelle2025-2"))
+        assert text.index("current_session") < text.index("version")

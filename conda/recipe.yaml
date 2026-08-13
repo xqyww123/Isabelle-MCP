@@ -72,12 +72,13 @@ requirements:
     # LSP server and registers a component into $ISABELLE_HOME_USER, so it is useless
     # without the distribution.  Bounded to the series its Scala component is built for.
     - isabelle >=2025.2,<2025.3
-    # The five pyproject dependencies.  Unlike isabelle-rpc's, every one of these has the
+    # The six pyproject dependencies.  Unlike isabelle-rpc's, every one of these has the
     # SAME name on conda-forge as on PyPI -- checked, not assumed.
     - beautifulsoup4 >=4.12.0
     - fastmcp >=3.2,<4
     - mcp >=1.0.0
     - pydantic >=2.0.0
+    - pyyaml >=6.0
     - watchdog >=3.0.0
 
 tests:
@@ -94,5 +95,5 @@ about:
     client can evaluate theories, inspect proof state, and query the library.  Ships a
     prebuilt Isabelle Scala component as package data and registers it with Isabelle at
     run time.
-  license: BSD-3-Clause
+  license: LGPL-2.1-or-later
   repository: https://github.com/xqyww123/Isabelle-MCP

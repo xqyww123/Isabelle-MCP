@@ -5,9 +5,32 @@ import re
 from html.parser import HTMLParser
 from typing import Any
 
+import yaml
 from bs4 import BeautifulSoup, NavigableString
+from pydantic import BaseModel
 
 from isabelle_mcp.utils.core import IsabelleToolError, LSPCharacter, LSPLine, MCPColumn, MCPLine
+
+
+def model_to_yaml(model: BaseModel) -> str:
+    """Render a result model as YAML text for the MCP boundary.
+
+    The one shared serializer for every tool that presents a model as text.
+    ``allow_unicode=True`` is load-bearing: Isabelle output is full of symbols
+    (⟹, ⋀, ≤) and the default escapes them into ``\\uXXXX`` codes no agent can
+    read. ``None`` fields are dropped (absence over ``key: null``); empty lists
+    stay, since e.g. ``subgoals: []`` means "proof finished here". Keys keep
+    declaration order; the huge width stops PyYAML folding long theorem
+    statements across lines.
+    """
+    data = model.model_dump(mode="json", exclude_none=True)
+    return yaml.safe_dump(
+        data,
+        allow_unicode=True,
+        sort_keys=False,
+        default_flow_style=False,
+        width=2**20,
+    ).rstrip("\n")
 
 
 def _pide_html_to_text(el: Any) -> str:

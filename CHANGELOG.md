@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **The seven model-shaped tools now answer with YAML text instead of JSON
+  structured output.** `isabelle_launch`, `isabelle_session_info`,
+  `isabelle_hover`, `isabelle_definition`, `isabelle_local_occurrences`,
+  `isabelle_goal` and `isabelle_find_theorems` drop their output schemas and
+  render their result models as YAML — Unicode kept verbatim
+  (`allow_unicode`), `None` fields omitted, key order preserved, long
+  statements never folded across lines. One serializer
+  (`utils/formatters.model_to_yaml`) behind all of them; the tool functions
+  still return their models internally. The six narrative tools are unchanged.
+  New runtime dependency: `pyyaml`.
+
 - **`isabelle_goal` and `isabelle_find_theorems` now work while an evaluation is
   running.** Both used to be refused outright for as long as one was in flight,
   and the reason was mechanical: they read the proof state through Isabelle's

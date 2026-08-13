@@ -13,6 +13,7 @@ from fastmcp import FastMCP
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools.tool import ToolResult
 from mcp.types import TextContent
+from pydantic import BaseModel
 
 from isabelle_mcp.evaluation import (
     _evaluation_state_lock,
@@ -27,15 +28,7 @@ from isabelle_mcp.evaluation import (
 from isabelle_mcp.file_watcher import FileWatcher
 from isabelle_mcp.instructions import get_instructions
 from isabelle_mcp.lsp_client import IsabelleLSPClient
-from isabelle_mcp.models import (
-    DeclarationLocation,
-    FindTheoremsResult,
-    GoalState,
-    HoverInfo,
-    LinePosition,
-    LocalOccurrencesResult,
-    SessionInfo,
-)
+from isabelle_mcp.models import LinePosition
 from isabelle_mcp.tools import (
     command_output,
     command_status,
@@ -50,6 +43,7 @@ from isabelle_mcp.tools import (
 )
 from isabelle_mcp.unicode_guard import drain_warnings
 from isabelle_mcp.utils import IsabelleToolError, MCPLine
+from isabelle_mcp.utils.formatters import model_to_yaml
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -153,6 +147,18 @@ class UnicodeWarningMiddleware(Middleware):
 
 
 mcp.add_middleware(UnicodeWarningMiddleware())
+
+
+def _yaml_result(model: BaseModel) -> ToolResult:
+    """The MCP boundary for model-shaped results: one YAML text block.
+
+    The tool functions keep returning their models internally (unit tests
+    assert on fields); only the presentation is text — same convention as the
+    narrative tools, so agents read one format everywhere.
+    """
+    return ToolResult(
+        content=[TextContent(type="text", text=model_to_yaml(model))],
+    )
 
 
 async def _ensure_lsp_started(*, footer: bool = False) -> IsabelleLSPClient:
@@ -270,10 +276,10 @@ def _startup_failure_error(
 # ── Session management ────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(output_schema=None)
 async def isabelle_launch(
     session: str = "Main", session_dirs: list[str] | None = None,
-) -> SessionInfo:
+) -> ToolResult:
     """Start (or restart) the Isabelle prover with the given session/logic.
 
     **Must be called before any evaluation or query tool** — the prover does not
@@ -311,7 +317,7 @@ async def isabelle_launch(
         if _lsp_client.process is not None:
             alive = _lsp_client.process.returncode is None
             if alive and _lsp_client.logic == session:
-                return await session_info(_lsp_client)
+                return _yaml_result(await session_info(_lsp_client))
             # Switching sessions — or recovering from a crashed server (the
             # process object lingers with a returncode): tear down, start anew.
             await _lsp_client.shutdown()
@@ -371,7 +377,7 @@ async def isabelle_launch(
                 await _lsp_client.reap()
             _lsp_client.process = None
             raise
-        return await session_info(_lsp_client)
+        return _yaml_result(await session_info(_lsp_client))
 
 
 @mcp.tool(output_schema=None)
@@ -461,8 +467,8 @@ async def isabelle_cancel_evaluation() -> ToolResult:
 # ── Query tools (require prior evaluation) ────────────────────────────
 
 
-@mcp.tool()
-async def isabelle_hover(file_path: str, line: int, symbol: str) -> HoverInfo:
+@mcp.tool(output_schema=None)
+async def isabelle_hover(file_path: str, line: int, symbol: str) -> ToolResult:
     """Get type and documentation for a symbol on a line.
 
     Finds all occurrences of the symbol on the line (up to 10), queries each,
@@ -476,14 +482,14 @@ async def isabelle_hover(file_path: str, line: int, symbol: str) -> HoverInfo:
         line: Line number (1-indexed)
         symbol: Symbol text to look up (e.g. "Suc", "my_const", "⟹")
     """
-    return await hover_info(
+    return _yaml_result(await hover_info(
         await _ensure_lsp_started(footer=True), os.path.realpath(file_path),
         MCPLine(line), symbol,
-    )
+    ))
 
 
-@mcp.tool()
-async def isabelle_definition(file_path: str, line: int, symbol: str) -> DeclarationLocation:
+@mcp.tool(output_schema=None)
+async def isabelle_definition(file_path: str, line: int, symbol: str) -> ToolResult:
     """Find where a symbol is defined.
 
     Finds all occurrences of the symbol on the line (up to 10), queries each,
@@ -497,14 +503,14 @@ async def isabelle_definition(file_path: str, line: int, symbol: str) -> Declara
         line: Line number (1-indexed)
         symbol: Symbol text to look up (e.g. "my_const", "List.map")
     """
-    return await declaration_location(
+    return _yaml_result(await declaration_location(
         await _ensure_lsp_started(footer=True), os.path.realpath(file_path),
         MCPLine(line), symbol,
-    )
+    ))
 
 
-@mcp.tool()
-async def isabelle_local_occurrences(file_path: str, line: int, symbol: str) -> LocalOccurrencesResult:
+@mcp.tool(output_schema=None)
+async def isabelle_local_occurrences(file_path: str, line: int, symbol: str) -> ToolResult:
     """Find every occurrence of a *locally-defined* entity within this file.
 
     Given a symbol on a line, resolves the entity there and returns all places it
@@ -523,16 +529,16 @@ async def isabelle_local_occurrences(file_path: str, line: int, symbol: str) -> 
         line: Line number (1-indexed)
         symbol: Symbol text to look up (e.g. "my_const", "add_one"), ASCII or Unicode.
     """
-    return await local_occurrences(
+    return _yaml_result(await local_occurrences(
         await _ensure_lsp_started(footer=True), os.path.realpath(file_path),
         MCPLine(line), symbol,
-    )
+    ))
 
 
-@mcp.tool()
+@mcp.tool(output_schema=None)
 async def isabelle_goal(
     file_path: str, line: int, after_text: str | None = None,
-) -> GoalState:
+) -> ToolResult:
     """Get the Isar command at a position and the proof state after it executes.
 
     Returns the command enclosing the position — its full source text and range —
@@ -547,10 +553,10 @@ async def isabelle_goal(
     """
     file_path = os.path.realpath(file_path)
     lsp = await _ensure_lsp_started(footer=True)
-    return await goal(lsp, file_path, MCPLine(line), after_text)
+    return _yaml_result(await goal(lsp, file_path, MCPLine(line), after_text))
 
 
-@mcp.tool()
+@mcp.tool(output_schema=None)
 async def isabelle_find_theorems(
     file_path: str,
     line: int,
@@ -567,7 +573,7 @@ async def isabelle_find_theorems(
     exclude_simp: list[str] | None = None,
     limit: int | None = None,
     allow_duplicates: bool = False,
-) -> FindTheoremsResult:
+) -> ToolResult:
     """Search the theorem database, like Isabelle's ``find_theorems``.
 
     The search runs in the proof/theory context at the given position (resolved
@@ -604,14 +610,14 @@ async def isabelle_find_theorems(
     """
     file_path = os.path.realpath(file_path)
     lsp = await _ensure_lsp_started(footer=True)
-    return await find_theorems(
+    return _yaml_result(await find_theorems(
         lsp, file_path, MCPLine(line), after_text,
         names=names, exclude_names=exclude_names,
         intro=intro, elim=elim, dest=dest, solves=solves,
         patterns=patterns, exclude_patterns=exclude_patterns,
         simp=simp, exclude_simp=exclude_simp,
         limit=limit, allow_duplicates=allow_duplicates,
-    )
+    ))
 
 
 @mcp.tool(output_schema=None)
@@ -669,10 +675,10 @@ async def isabelle_command_status(positions: list[LinePosition]) -> ToolResult:
     )
 
 
-@mcp.tool()
-async def isabelle_session_info() -> SessionInfo:
+@mcp.tool(output_schema=None)
+async def isabelle_session_info() -> ToolResult:
     """Get information about current Isabelle session."""
-    return await session_info(await _ensure_lsp_started())
+    return _yaml_result(await session_info(await _ensure_lsp_started()))
 
 
 def main() -> None:

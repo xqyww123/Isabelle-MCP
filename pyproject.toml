@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "MCP server bridging AI agents with the Isabelle proof assistant via its LSP/PIDE interface"
 readme = "README.md"
 requires-python = ">=3.12"
-license = "MIT"
+license = "LGPL-2.1-or-later"
 license-files = ["LICENSE"]
 authors = [
     {name = "Qiyuan Xu", email = "xqyww123@gmail.com"}
@@ -31,6 +31,7 @@ dependencies = [
     "fastmcp>=3.2,<4",
     "mcp>=1.0.0",
     "pydantic>=2.0.0",
+    "pyyaml>=6.0",
     "watchdog>=3.0.0",
 ]
 

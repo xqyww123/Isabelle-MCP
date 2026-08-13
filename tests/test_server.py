@@ -3,6 +3,7 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import yaml
 
 from isabelle_mcp.server import (
     isabelle_cancel_evaluation,
@@ -23,30 +24,35 @@ def _patch_ensure(mock_client):
     return patch('isabelle_mcp.server._ensure_lsp_started', new_callable=AsyncMock, return_value=mock_client)
 
 
+def _yaml(result):
+    """The model-shaped tools answer with one YAML text block; parse it back."""
+    return yaml.safe_load(result.content[0].text)
+
+
 class TestMCPServerTools:
     @pytest.mark.asyncio
     async def test_hover(self, temp_theory_file, mock_lsp_client):
         mock_lsp_client.hover_response = {"contents": "test"}
         with _patch_ensure(mock_lsp_client):
-            result = await isabelle_hover(temp_theory_file, 5, "my_const")
-        assert len(result.results) >= 1
-        assert result.results[0].info == "test"
-        assert result.symbol == "my_const"
+            data = _yaml(await isabelle_hover(temp_theory_file, 5, "my_const"))
+        assert len(data["results"]) >= 1
+        assert data["results"][0]["info"] == "test"
+        assert data["symbol"] == "my_const"
 
     @pytest.mark.asyncio
     async def test_definition(self, temp_theory_file, mock_lsp_client):
         mock_lsp_client.definition_response = []
         with _patch_ensure(mock_lsp_client):
-            result = await isabelle_definition(temp_theory_file, 8, "my_const")
-        assert result.locations == []
-        assert result.symbol == "my_const"
+            data = _yaml(await isabelle_definition(temp_theory_file, 8, "my_const"))
+        assert data["locations"] == []
+        assert data["symbol"] == "my_const"
 
     @pytest.mark.asyncio
     async def test_local_occurrences(self, temp_theory_file, mock_lsp_client):
         mock_lsp_client.highlights_response = []
         with _patch_ensure(mock_lsp_client):
-            result = await isabelle_local_occurrences(temp_theory_file, 8, "my_const")
-        assert result.occurrences == []
+            data = _yaml(await isabelle_local_occurrences(temp_theory_file, 8, "my_const"))
+        assert data["occurrences"] == []
 
     @pytest.mark.asyncio
     async def test_goal_without_after_text(self, temp_theory_file, mock_lsp_client):
@@ -54,10 +60,10 @@ class TestMCPServerTools:
             "by simp", {"start": {"line": 8, "character": 2}, "end": {"line": 8, "character": 9}},
         )
         with _patch_ensure(mock_lsp_client):
-            result = await isabelle_goal(temp_theory_file, 9)
-        assert result.subgoals == []
-        assert result.command is not None
-        assert result.command.text == "by simp"
+            data = _yaml(await isabelle_goal(temp_theory_file, 9))
+        assert data["subgoals"] == []
+        assert data["command"] is not None
+        assert data["command"]["text"] == "by simp"
 
     @pytest.mark.asyncio
     async def test_goal_with_after_text(self, temp_theory_file, mock_lsp_client):
@@ -66,9 +72,9 @@ class TestMCPServerTools:
             "by simp", {"start": {"line": 8, "character": 2}, "end": {"line": 8, "character": 9}},
         )
         with _patch_ensure(mock_lsp_client):
-            result = await isabelle_goal(temp_theory_file, 9, after_text="by")
-        assert result.subgoals == []
-        assert result.command is not None
+            data = _yaml(await isabelle_goal(temp_theory_file, 9, after_text="by"))
+        assert data["subgoals"] == []
+        assert data["command"] is not None
 
     @pytest.mark.asyncio
     async def test_command_output(self, temp_theory_file, mock_lsp_client):
@@ -81,7 +87,7 @@ class TestMCPServerTools:
     async def test_session_info(self, mock_lsp_client):
         with _patch_ensure(mock_lsp_client):
             result = await isabelle_session_info()
-        assert result.current_session == "HOL"
+        assert _yaml(result)["current_session"] == "HOL"
 
     @pytest.mark.asyncio
     async def test_evaluate_to(self, temp_theory_file, mock_lsp_client):
@@ -240,8 +246,8 @@ class TestSessionManagement:
         client.shutdown.assert_not_awaited()
         assert client.logic == "HOL"
         assert client.session_dirs == ["/root"]
-        assert result.current_session == "HOL"
-        assert result.version == "Isabelle2024"
+        assert _yaml(result)["current_session"] == "HOL"
+        assert _yaml(result)["version"] == "Isabelle2024"
 
     def test_default_session_dirs_with_root(self, tmp_path):
         import os
@@ -281,7 +287,7 @@ class TestSessionManagement:
             result = await isabelle_launch("HOL")
         client.start.assert_not_awaited()
         client.shutdown.assert_not_awaited()
-        assert result.current_session == "HOL"
+        assert _yaml(result)["current_session"] == "HOL"
 
     @pytest.mark.asyncio
     async def test_launch_switches_session_restarts(self):
@@ -352,7 +358,7 @@ class TestSessionManagement:
             result = await isabelle_launch("Foo")
         client.start.assert_awaited_once()
         client.kill.assert_not_called()
-        assert result.version == "Isabelle2024"
+        assert _yaml(result)["version"] == "Isabelle2024"
 
     @pytest.mark.asyncio
     async def test_launch_start_failure_cleans_up(self):
@@ -422,7 +428,12 @@ class TestFooterPlumbing:
         from fastmcp.tools.tool import ToolResult
         from mcp.types import TextContent
 
+        from isabelle_mcp import unicode_guard
         from isabelle_mcp.server import UnicodeWarningMiddleware, _pending_footer
+
+        # The warning queue is module-global; an integration test run in the
+        # same process (isabelle on PATH) may have left a queued warning.
+        unicode_guard.drain_warnings()
 
         async def call_next(_ctx):
             # What _ensure_lsp_started(footer=True) does, one frame deeper.
@@ -439,8 +450,10 @@ class TestFooterPlumbing:
         from fastmcp.tools.tool import ToolResult
         from mcp.types import TextContent
 
+        from isabelle_mcp import unicode_guard
         from isabelle_mcp.server import UnicodeWarningMiddleware, _pending_footer
 
+        unicode_guard.drain_warnings()          # start from a clean queue
         _pending_footer.set("stale footer from a previous call")
 
         async def call_next(_ctx):
