@@ -129,8 +129,13 @@ class TestEvaluateTo:
         await evaluate_to(mock_lsp_client, temp_theory_file, 5)
         assert evaluation_state.active
 
-        with pytest.raises(IsabelleToolError, match="already in progress"):
+        with pytest.raises(IsabelleToolError) as excinfo:
             await evaluate_to(mock_lsp_client, temp_theory_file, 10)
+        # The refusal names the one thing that unblocks the agent, and why.
+        assert str(excinfo.value) == (
+            "An evaluation is already in progress. Call cancel_evaluation to "
+            "cancel so you can request another evaluation."
+        )
 
     @pytest.mark.asyncio
     async def test_reports_error_lines_from_decoration(self, temp_theory_file, mock_lsp_client):

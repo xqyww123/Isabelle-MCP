@@ -1060,12 +1060,21 @@ The real names are `isabelle_evaluation_status` and `isabelle_cancel_evaluation`
 **Explicitly deferred**: this is to be discussed as its own topic after the plan
 in this document is executed, not folded into it.
 
-*Stage 1 left exactly one of them.* Three of those four strings were rewritten
-out of existence by stage 1 (`_in_progress_message` is gone, and the guard's
-refusals are new text using the prefixed names). What remains is
-`evaluate_to`'s "an evaluation is already in progress" error — search for
-`Call cancel_evaluation to cancel`. Everything written since uses the prefixed
-form, so the deferred topic is now a one-line fix plus the decision about it.
+*One of them survives, and it was rewritten for a different reason.* Three of
+the four strings were rewritten out of existence by stage 1
+(`_in_progress_message` is gone, and the guard's refusals are new text using the
+prefixed names). The fourth, `evaluate_to`'s "an evaluation is already in
+progress" error, was reworded afterwards to say what unblocks the agent rather
+than offer two calls without saying which helps:
+
+```
+An evaluation is already in progress. Call cancel_evaluation to cancel so you can request another evaluation.
+```
+
+That is approved text and pinned by a character-for-character test. It still
+names `cancel_evaluation` unprefixed — the real tool is
+`isabelle_cancel_evaluation` — so the deferred topic is now this one word, in
+this one string, and nothing else.
 
 **An unused fast path exists.** `PIDE/decoration_request` →
 `force_decorations` (`vscode_resources.scala:367-373`) pushes decorations

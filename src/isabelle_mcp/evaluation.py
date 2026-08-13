@@ -726,8 +726,8 @@ async def evaluate_to(
         if evaluation_state.active:
             raise IsabelleToolError(
                 "An evaluation is already in progress. "
-                "Call cancel_evaluation to cancel, "
-                "or evaluation_status to check progress.",
+                "Call cancel_evaluation to cancel so you can request "
+                "another evaluation.",
             )
 
         await client.open_document(file_path)
