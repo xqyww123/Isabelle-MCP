@@ -1,5 +1,53 @@
 # Changelog
 
+## Unreleased
+
+- **`isabelle_goal` and `isabelle_find_theorems` now work while an evaluation is
+  running.** Both used to be refused outright for as long as one was in flight,
+  and the reason was mechanical: they read the proof state through Isabelle's
+  *global caret*, which the evaluation is also steering, and there is no
+  arbitration between two writers of one caret.
+
+  They no longer touch the caret. An ML prelude injected into the prover defines
+  protocol commands that resolve a command in the document state and read that
+  command's own state directly; the Scala side resolves the position to a command
+  and correlates the reply. One request, one response, no overlay, no document
+  update. The rendered output is byte-for-byte what the state panel produced.
+
+- **A command with no proof state now says so, in one round trip.** The old path
+  concluded "no goals" from ten seconds of silence — `by`, `done` and `qed`
+  produce no state output at all, and neither does a slow prover. The reply is
+  now `The command at MyTheory.thy:42 is not a proof operation, so there is no
+  proof state here.` The whole unit suite runs in half the time it did, because
+  that grace period is gone from it too.
+
+- Every other way a query can fail to produce a result now has its own answer
+  rather than a timeout: the command has not finished evaluating, its evaluation
+  was interrupted, the prover no longer holds its state, there is no theory
+  context to search at all (which is where `end` leaves you), and so on. Each
+  names the position it is about.
+
+- New tool: **`isabelle_command_status`** — ask what state the command(s)
+  covering each of several lines are in, in bulk, instead of discovering it by
+  tripping over a refusal. One line per requested position: `processed`,
+  `running for Ns`, `not evaluated`, `cancelled, re-evaluate to get a result`,
+  `unknown, retry in a few seconds`, `no command`, `file not open`. A line may
+  hold several commands — `lemma foo: "P" by auto` is two — and when they
+  disagree the per-command breakdown is printed.
+
+- Every query tool now carries a footer naming the evaluation in flight, if any,
+  so a query answered mid-evaluation says what else is happening.
+
+- The evaluation result says which file and line it was evaluating towards, and
+  a stopped evaluation says why it stopped rather than reporting the last thing
+  it saw.
+
+- The Isabelle-MCP component's ML prelude and its jar now check each other's
+  version at startup and refuse to serve on a mismatch. They share three protocol
+  commands and a reply format, and the prelude is not covered by the jar's
+  recorded source hashes, so a skew between them would otherwise be a request
+  that hangs with no trace.
+
 ## 0.3.0
 
 - **Isabelle-MCP no longer requires a patched Isabelle.** It ships its own Isabelle

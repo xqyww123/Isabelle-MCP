@@ -1,45 +1,49 @@
 # Query-Tool Upgrade: Evaluation Target and Position-Explicit Queries
 
-Status: **stages 1–4 are done; stages 5 and 6 are not.** All of part A (§4) has
-landed, `isabelle_command_status` included. Part B's prover half and adapter half
-are in — the prelude answers three protocol commands, the jar correlates and
-renders their replies, and both have been exercised against a live prover. What
-is left is the Python half: the two caret-moving tools still take the caret
-route and still carry the blanket refusal §4.4 requires.
+Status: **all six stages are done.** Every query tool is position-explicit and
+answers while an evaluation is running; a query that cannot produce a result says
+why instead of timing out; `isabelle_command_status` ships; the ML prelude, the
+jar and the Python client all agree and check each other's version. Probes 1–7
+have passed, nine integration tests cover the §5.3 table end to end, and the
+tree, the tests and the docs are consistent with each other.
 
-**Nothing is open.** The `undefined` sentence was rewritten and approved after
-stage 4 measured that a cancelled evaluation reaches it; §5.3 carries the new
-text and the note on what it deliberately does not say.
+**Nothing is open.** What remains are the tickets §4.7 records, each of which
+deserves its own change rather than a corner of this one.
 
-**Start here:** §6 stage 5 — rewire the Python client and release the last two
-tools. Every design decision this document records has been through review; where
-a section says "decided" or "approved", it is not an invitation to reconsider.
-All agent-facing wording in this document is approved text — changing any of it
-needs a fresh sign-off.
+**Read this document as history, not as a plan.** Every design decision it
+records has been through review; where a section says "decided" or "approved",
+it is not an invitation to reconsider. All agent-facing wording in it is approved
+text — changing any of it needs a fresh sign-off.
 
-### What stage 5 must know before it writes a line
+### What anyone touching this again must know
 
-Stages 1–4 shipped in five commits: `97391fd` (part A, plus the fixes an
+The work shipped in these commits: `97391fd` (part A, plus the fixes an
 adversarial review of it found), `41e8c84` (`file:line` everywhere, and the
-running-vs-forked correction), `2ce2683` (the prelude), `dd67579` (the
-`no_context` wording), and the adapter commit. The working tree is clean of this
-work.
+running-vs-forked correction), `2ce2683` (the prelude), `dd67579` and `600e10d`
+(wording), `3de6c43` (the Scala adapter), `3464790` (`isabelle_command_status`),
+`979ae62` (releasing the last two tools), `3a75849` (the instructions),
+`dd2884b` (dead code and docs), and the stage-6 commit.
 
-**The contract stage 5 consumes is §5.1's "The reply, exactly".** Two LSP
-requests, `PIDE/proof_state_at_position` and `PIDE/find_theorems_at_position`,
-each answering `{status, comment, forked, content}`; one notification,
+**The contract is §5.1's "The reply, exactly".** Two LSP requests,
+`PIDE/proof_state_at_position` and `PIDE/find_theorems_at_position`, each
+answering `{status, comment, forked, content}`; one notification,
 `PIDE/query_cancel`. The client supplies the correlation token and the deadline.
-Rendering the eleven statuses into the §5.3 sentences is Python's job — that is
-where the file and the line are known, and where the wording is unit-tested.
+The sentence each status becomes is rendered in Python — that is where the file
+and the line are known, and where the wording is unit-tested.
 
 **Pass `resolve_caret`'s position, not column 0.** Column 0 of an indented line
 sits inside the ignored span before the command, and the server's resolution
-skips backward from there onto the *previous* command; `goal.py` and
-`command_output.py` already call `resolve_caret`, and its rule — the line's last
-non-blank character — is what makes a line resolve to its own command.
+skips backward from there onto the *previous* command; `resolve_caret`'s rule —
+the line's last non-blank character — is what makes a line resolve to its own
+command.
 
-`mcp_prelude_version` is `"2"`, and the jar now refuses to serve a prover whose
-prelude says anything else.
+**Taking a request out of its table is the permission to answer it**, on both
+sides. Stage 6 found the one place that took without answering, and it orphaned
+an LSP request. If you add a fourth way for a query to end, it must take the
+entry and reply.
+
+`mcp_prelude_version` is `"2"`, and the jar refuses to serve a prover whose
+prelude says anything else. Bump both together.
 
 Six facts, all measured, that the prelude depends on and that both other sides
 must respect:
@@ -1755,10 +1759,23 @@ check of §8. Rebuild via the copy-with-`no_build`-removed recipe and pass
 the two caret cycles with the new requests; delete the 0.15 s sleep and the
 `STATE_OUTPUT_GRACE` heuristic; extend §4.3's guard to all six tools.
 
-**Stage 6 — the remaining probes, integration tests, docs.** Probes 3–7 of §9;
-integration tests for proof state and find_theorems during an active evaluation,
-for each surviving row of the §5.3 table, for a cancelled query and a lost reply;
-`README.md`, `instructions.py`, `CHANGELOG.md`.
+**Stage 6 — the remaining probes, integration tests, docs. Done.** Probes 3–7
+all passed (§9), and probe 3 found a real defect on the way: a `query_cancel`
+for a query still in flight orphaned its LSP request. Nine integration tests in
+`tests/integration/test_query_tools_e2e.py` cover both tools answering during an
+active evaluation, each step of a proof reporting its own state, and the
+`no_proof_state`, `no_context`, `no_command`, `unfinished`, `interrupted`,
+`cancelled` and `timeout` rows of §5.3, plus the Unicode round trip. They use
+two theories against one prover — one evaluable to its last line, one containing
+a command that runs for ninety seconds — which is also what keeps the suite to
+93 seconds.
+
+`README.md`, `instructions.py` and `CHANGELOG.md` are updated. So are
+`SPECIFICATION.md`, `API_DESIGN.md` and `ARCHITECTURE.md`, which this plan had
+not listed: all three described `isabelle_goal` as the caret cycle, with worked
+examples and two diagrams. The dead code that cycle left behind — the caret
+lock, `get_dynamic_output`, `_enrich_timeout_error` and the dynamic-output
+waiter machinery — is deleted, 178 lines.
 
 ## 7. Cost
 
@@ -1909,20 +1926,52 @@ outright, so the read answers `undefined` instead (§6 stage 3 records this, and
 what stage 4 must decide about it).
 
 3. **The three §5.3 rows stage 3 could not construct** — an interrupted command,
-   a cancelled query, and the last-resort crash reply; confirm the reply is the
-   classified one. Also confirm that a failed command returns the pre-command
-   state, as every Isabelle front-end does — it is no longer a special case.
-4. **Rendering equality** — the new path's final text against today's, for a
-   multi-subgoal state and for a find_theorems result with many items (the
-   `item`-class trap of §3.5 must show up as a test, not as a surprise).
-5. **Forked-task behaviour** — that a forked protocol-command task can read the
-   captured document state safely, that urgent priority actually beats a busy
-   document, that cancellation via our own group reaches the body, and that the
-   timeout fires and replies.
-6. **Symbol decoding** — a state containing Unicode-heavy notation, end to end,
-   confirming no `\<…>` leaks (§3.5).
-7. **The status line's cost** — that computing it per call adds no measurable
-   latency, since it is on every tool path.
+   a cancelled query, and the last-resort crash reply.
+
+   **Interrupted: passed** (measured). Stage 5 had failed to construct it because
+   `cancel_evaluation` goes through `force_interrupt`, whose synthetic edit
+   re-creates every command id — leaving the entry *gone* rather than
+   interrupted. Cancelling execution alone skips that edit: the running `ML`
+   command then answers `interrupted` (at 0.5s and again at 3s), and every
+   command that had finished before the cancel still answers `ok`. That is the
+   §5.3 row exactly, and the reason the tool-level path shows `undefined`
+   instead is the edit, not the cancel.
+
+   **Cancelled: passed, after fixing a defect it exposed.** A `query_cancel` for
+   a query still in flight took the request out of the adapter's table and never
+   answered it, so the LSP request hung forever. The client only ever cancels
+   after its request has returned, so the hole was invisible in normal use — the
+   probe found it by cancelling a live query. Fixed: whoever takes the request
+   out of the table owes it a reply, on that side as much as in the prelude. The
+   status now comes back `cancelled` within the round trip.
+
+   **Crashed: not constructed, and not worth constructing.** It is the
+   last-resort reply for a status this side does not recognise or an error
+   formatter that itself fails — reachable only by fault injection. The Python
+   half is unit-tested
+   (`test_a_status_this_side_does_not_know_is_reported_as_a_crash`); the Scala
+   half is the shutdown drain.
+4. **Rendering equality: passed, byte for byte.** The state panel and the
+   find_theorems query operation still exist server-side — only the client
+   stopped using them — so both were driven over raw LSP and diffed against the
+   new path. A two-subgoal state (3503 bytes), a one-subgoal state (1744), a
+   finished proof (246) and a find_theorems result with 1371 hits and 40
+   displayed (43376) all came back **identical**, not merely equivalent. The
+   `item`-class trap of §3.5 is therefore not a trap: not applying
+   `Pretty.formatted` to find_theorems is what keeps it identical.
+5. **Forked-task behaviour: passed.** With three sleeping proofs occupying
+   workers and the evaluation reporting lines 6, 9 and 12 all running, a proof
+   state query answered in **0.04s** — urgent priority does beat a busy
+   document, decisively. The prover-side backstop fires and replies: a query
+   sent with `timeout: 0.5` came back `timeout` after 0.5s. Cancellation via our
+   own group reaches the body, which is what the `cancelled` result of probe 3
+   demonstrates.
+6. **Symbol decoding: passed.** A goal stated with `\<forall>`, `\<le>` and
+   `\<longrightarrow>` comes back as `∀x y. x ≤ y ⟶ x ≤ y + 1`, with no
+   `\<…>` anywhere in the parsed subgoals.
+7. **The footer's cost: passed.** `evaluation_footer` takes a median of
+   0.059 ms and at worst 0.42 ms, against tool calls measured in tens of
+   milliseconds. It reads local state and issues no request, which is why.
 
 ## 10. Out of scope
 

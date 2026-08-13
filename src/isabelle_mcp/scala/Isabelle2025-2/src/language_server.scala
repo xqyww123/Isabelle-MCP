@@ -799,12 +799,14 @@ class Language_Server(
     query_at_position(id, params, "Isabelle_MCP.find_theorems", result =>
       render_query_html(query_messages(result)))
 
-  /* Fire-and-forget, on an exit path by which the client already holds its result or its
-     error: a cancel for an unknown or already-finished token is a silent no-op on both
-     sides, and taking the entry here is what stops a late prover reply from writing a
-     second response for an LSP request that has already been answered. */
+  /* A cancel for an unknown or already-finished token is a silent no-op on both sides.
+     For one still in flight, taking the entry here is what stops the prover's own
+     "cancelled" reply from writing a second response later -- so this must ANSWER the
+     request it just took, or that request never gets a response at all. The client
+     sends its cancel after its request has returned, so in practice the entry is
+     already gone; a client that cancels a live query is what this branch is for. */
   def query_cancel(token: String): Unit = {
-    query_handler.take(token)
+    for (respond <- query_handler.take(token)) respond(Query.Result(Query.CANCELLED))
     session.protocol_command("Isabelle_MCP.cancel_query", XML.string(token))
   }
 
