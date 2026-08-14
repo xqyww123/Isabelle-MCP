@@ -155,11 +155,14 @@ def _corrected(bp):
     return (end["line"], end["character"])
 
 
-async def _toggle(client, path, serial, state):
+async def _toggle(client, path, serial, state, *, timeout=30.0):
+    """Acknowledged toggle: absolute semantics, prover-truth write; the reply
+    carries the previous value in `was` when status is ok."""
     return await client.request(
         "PIDE/debugger_toggle_breakpoint",
-        {"uri": "file://" + path, "serial": serial, "state": state},
-        timeout=30.0,
+        {"uri": "file://" + path, "serial": serial, "state": state,
+         "token": f"toggle-{serial}-{state}", "timeout": timeout},
+        timeout=timeout + 30.0,
     )
 
 
@@ -175,7 +178,7 @@ async def _enable_site_at(client, path, line_1indexed, character_0indexed):
     )
     serial = matches[0]["serial"]
     reply = await _toggle(client, path, serial, True)
-    assert reply.get("ok") is True, f"toggle failed: {reply}"
+    assert reply.get("status") == "ok", f"toggle failed: {reply}"
     return serial
 
 
@@ -426,6 +429,45 @@ async def test_r3_wrapper_envelope_and_containment(prover):
     assert await _wait_settled(client)
 
 
+# ── R4: the acknowledged toggle ────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_r4_acknowledged_toggle(prover):
+    client, path = prover
+    assert await _evaluate_through(client, path, DEFINER_END)
+
+    bps = await _breakpoints(client, path)
+    serial = next(bp["serial"] for bp in bps
+                  if _corrected(bp) == (VAL_XS - 1, 4))
+
+    # First arming acknowledges with the previous value False.
+    reply = await _toggle(client, path, serial, True)
+    assert reply == {"status": "ok", "was": False}, reply
+    # Absolute semantics: re-arming is idempotent and reports was=True.
+    reply = await _toggle(client, path, serial, True)
+    assert reply == {"status": "ok", "was": True}, reply
+    # Disarming reports was=True; disarming again, was=False.
+    reply = await _toggle(client, path, serial, False)
+    assert reply == {"status": "ok", "was": True}, reply
+    reply = await _toggle(client, path, serial, False)
+    assert reply == {"status": "ok", "was": False}, reply
+
+    # A serial the file's markup does not know is refused before the prover.
+    reply = await _toggle(client, path, 999999999, True)
+    assert reply == {"status": "unknown_breakpoint"}, reply
+
+    # The acknowledged write is the real breakpoint ref: arm and it hits.
+    reply = await _toggle(client, path, serial, True)
+    assert reply == {"status": "ok", "was": False}, reply
+    await evaluate_to(client, path, -1)
+    thread = await _wait_for_hit(client)
+    await client.request(
+        "PIDE/debugger_input", {"thread": thread, "verbs": ["continue"]},
+        timeout=30.0)
+    assert await _wait_all_resumed(client), "the thread never resumed"
+    assert await _wait_settled(client)
+
+
 # ── Probe 11bis: locals through the eval verb (gates the locals design) ────
 
 @pytest.mark.asyncio
@@ -653,8 +695,8 @@ async def test_probe6_recompilation_invalidates_serials_and_rearming_works(prove
     assert old_serial not in serials, (
         "whole-document sync was expected to mint fresh serials")
     reply = await _toggle(client, path, old_serial, True)
-    assert reply.get("ok") is False, (
-        f"toggling a stale serial must error: {reply}")
+    assert reply == {"status": "unknown_breakpoint"}, (
+        f"toggling a stale serial must be refused: {reply}")
 
     # Motion 1 is the recovery on the edited file: edit, evaluate to the
     # definer, arm the NEW serial, evaluate onward — the caller hits.

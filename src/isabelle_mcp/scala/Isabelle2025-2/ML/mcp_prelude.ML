@@ -461,6 +461,33 @@ val _ =
       end);
 
 
+(* Acknowledged breakpoint toggle (design section 7.1): absolute semantics, so a retry is
+   idempotent.  Inline on the protocol thread -- resolving the command and flipping one ref
+   is cheap -- so the "cancelled" status is unreachable here and not advertised.  The reply
+   chunk carries the PREVIOUS value: only an "ok" acknowledgement may record an arming on
+   the client side.  The breakpoint ref lives in the ML environment data of the defining
+   command's presentation context; a serial that context does not know answers
+   unknown_breakpoint. *)
+
+val _ =
+  mcp_define "Isabelle_MCP.toggle_breakpoint"
+    (fn id => fn _ => fn args =>
+      (case args of
+        [_, node_name, command_id, serial, state] =>
+          (case mcp_resolve (Document.state ()) node_name (Document_ID.parse command_id) of
+            MCP_Bad bad => mcp_bad id bad
+          | MCP_State (st, _) =>
+              (case ML_Env.get_breakpoint (Context.Proof (Toplevel.presentation_context st))
+                  (Value.parse_int serial) of
+                NONE => mcp_finish id "unknown_breakpoint" [] []
+              | SOME (b, _) =>
+                  let val was = ! b in
+                    (b := Value.parse_bool state;
+                     mcp_finish id "ok" [] (XML.blob [Value.print_bool was]))
+                  end))
+      | _ => mcp_bad id ("failed", "Isabelle_MCP.toggle_breakpoint: bad arguments")));
+
+
 (* At --use time there is no message channel yet, so nothing can go out over the protocol:
    Output.protocol_message is still protocol_message_undefined and RAISES Protocol_Message
    (output.ML:96, :112), and Isabelle_Process.init installs the real one only afterwards

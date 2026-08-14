@@ -63,6 +63,14 @@ object Debugger_Adapter {
   val ABORTING = "aborting"            // flag command sent once; outcome arrives via the
                                        // evaluation's own reply (client retries, 4.13)
 
+  /* toggle statuses raised before the prover is asked; the prover-side vocabulary is the
+     query one (ok/undefined/unfinished/interrupted/failed/crashed) plus
+     unknown_breakpoint, which it answers when the serial is not in the resolved command's
+     context -- dual meaning with the Scala-side markup miss, noted in design 7.1 */
+  val FILE_NOT_OPEN = "file_not_open"
+  val OUTDATED = "outdated"
+  val UNKNOWN_BREAKPOINT = "unknown_breakpoint"
+
   /* The Scala backstop runs this much behind the prover-side deadline, which is the
      mechanism that is supposed to fire; the backstop is the backstop. */
   val BACKSTOP_MARGIN: Double = 30.0
@@ -272,25 +280,48 @@ class Debugger_Adapter(server: Language_Server) {
     channel.write(LSP.Debugger_Breakpoints.reply(id, result))
   }
 
-  def toggle_breakpoint(id: LSP.Id, file: JFile, serial: Long, state: Boolean): Unit = {
+  /* Acknowledged toggle (design section 7.1): the write happens prover-side, on the real
+     breakpoint ref, and the reply carries the PREVIOUS value -- session.debugger's
+     write-only mirror is bypassed entirely.  The async pattern is query_at_position's:
+     register the token in the server's shared Query_Handler (a second handler instance
+     would throw at init on the duplicate function registration), arm a timer for the
+     client-chosen timeout, send, return.  A timeout leaves the write possibly applied;
+     absolute semantics make the client's retry idempotent, and only an "ok" may record
+     an arming client-side. */
+
+  def toggle_breakpoint(
+    id: LSP.Id,
+    file: JFile,
+    serial: Long,
+    state: Boolean,
+    token: String,
+    timeout: Double
+  ): Unit = {
     ensure_init()
-    def reply(error: String): Unit =
-      channel.write(LSP.Debugger_Toggle_Breakpoint.reply(id, error))
+    def reply(status: String, was: Option[Boolean] = None): Unit =
+      channel.write(LSP.Debugger_Toggle_Breakpoint.reply(id, status, was))
 
     server.resources.get_rendering(file) match {
-      case None => reply("file is not open in the prover")
+      case None => reply(FILE_NOT_OPEN)
       case Some(rendering) =>
-        if (rendering.snapshot.is_outdated) reply("document snapshot is outdated")
+        if (rendering.snapshot.is_outdated) reply(OUTDATED)
         else {
           rendering.breakpoints(rendering.model.content.text_range)
             .collectFirst({ case Text.Info(_, (command, s)) if s == serial => command }) match {
-            case None => reply("unknown breakpoint serial " + serial)
+            case None => reply(UNKNOWN_BREAKPOINT)
             case Some(command) =>
-              // state is absolute; the prover's own command is a toggle
-              if (session.debugger.breakpoint_state(serial) != state) {
-                session.debugger.toggle_breakpoint(command, serial)
-              }
-              reply("")
+              def respond(result: Query.Result): Unit =
+                reply(result.status,
+                  if (result.status == Query.OK) Value.Boolean.unapply(result.text) else None)
+              val timer =
+                Event_Timer.request(Time.now() + Time.seconds(timeout)) {
+                  for (respond_timeout <- server.query_handler.take(token))
+                    respond_timeout(Query.Result(Query.TIMEOUT))
+                }
+              server.query_handler.register(token, result => { timer.cancel(); respond(result) })
+              session.protocol_command_args("Isabelle_MCP.toggle_breakpoint",
+                List(token, rendering.model.node_name.node, command.id.toString,
+                  serial.toString, state.toString).map(XML.string))
           }
         }
     }

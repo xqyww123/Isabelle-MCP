@@ -754,7 +754,7 @@ class Language_Server(
      So: resolve, register, send, return.  The response is written later, from the
      protocol handler's callback or from the timer, whichever takes the request first. */
 
-  private val query_handler = new Query_Handler
+  private[mcp] val query_handler = new Query_Handler
 
   private def query_command(node_pos: Line.Node_Position): Option[(String, String)] =
     for {
@@ -914,8 +914,8 @@ class Language_Server(
           case LSP.Commands_At_Lines(id, file, lines) => commands_at_lines(id, file, lines)
           case LSP.Debugger_Breakpoints(id, file, range) =>
             debugger_adapter.breakpoints(id, file, range)
-          case LSP.Debugger_Toggle_Breakpoint(id, file, serial, state) =>
-            debugger_adapter.toggle_breakpoint(id, file, serial, state)
+          case LSP.Debugger_Toggle_Breakpoint(id, file, serial, state, token, timeout) =>
+            debugger_adapter.toggle_breakpoint(id, file, serial, state, token, timeout)
           case LSP.Debugger_Eval(id, params) => debugger_adapter.eval(id, params)
           case LSP.Debugger_Print_Vals(id, params) => debugger_adapter.print_vals(id, params)
           case LSP.Debugger_Abort(id, thread, token) => debugger_adapter.abort(id, thread, token)

@@ -995,21 +995,22 @@ object LSP {
   }
 
   object Debugger_Toggle_Breakpoint {
-    def unapply(json: JSON.T): Option[(Id, JFile, Long, Boolean)] =
+    def unapply(json: JSON.T): Option[(Id, JFile, Long, Boolean, String, Double)] =
       json match {
         case RequestMessage(id, "PIDE/debugger_toggle_breakpoint", Some(params)) =>
           for {
             uri <- JSON.string(params, "uri") if Url.is_wellformed_file(uri)
             serial <- JSON.long(params, "serial")
             state <- JSON.bool(params, "state")
-          } yield (id, Url.absolute_file(uri), serial, state)
+            token <- JSON.string(params, "token")
+            timeout <- JSON.double(params, "timeout")
+          } yield (id, Url.absolute_file(uri), serial, state, token, timeout)
         case _ => None
       }
 
-    def reply(id: Id, error: String): JSON.T =
+    def reply(id: Id, status: String, was: Option[Boolean]): JSON.T =
       ResponseMessage(id, Some(
-        if (error.isEmpty) JSON.Object("ok" -> true)
-        else JSON.Object("ok" -> false, "error" -> error)))
+        JSON.Object("status" -> status) ++ JSON.optional("was" -> was)))
   }
 
   sealed case class Debugger_Eval_Params(
