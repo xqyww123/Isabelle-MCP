@@ -64,6 +64,8 @@ object VSCode_Rendering {
 
   private val hyperlink_elements =
     Markup.Elements(Markup.ENTITY, Markup.PATH, Markup.POSITION)
+
+  private val breakpoint_elements = Markup.Elements(Markup.ML_BREAKPOINT)
 }
 
 class VSCode_Rendering(snapshot: Document.Snapshot, val model: VSCode_Model)
@@ -287,6 +289,23 @@ extends Rendering(snapshot, model.session.resources.options, model.session) {
       case Position.Item_Def_Id(id, range) => hyperlink_command(id, range)
       case _ => None
     }
+
+  /* ML breakpoints (mirrors jedit_rendering.scala's breakpoint lookup, over a range):
+     every breakable site's markup in the range, as found -- single-symbol ranges, no
+     shift correction here (that is client-side, DEBUGGER_DESIGN.md section 3.3) */
+
+  def breakpoints(range: Text.Range): List[Text.Info[(Command, Long)]] =
+    if (snapshot.is_outdated) Nil
+    else
+      snapshot.select(range, VSCode_Rendering.breakpoint_elements, command_states =>
+        {
+          case Text.Info(_, Protocol.ML_Breakpoint(breakpoint)) =>
+            command_states match {
+              case st :: _ => Some((st.command, breakpoint))
+              case _ => None
+            }
+          case _ => None
+        })
 
   def hyperlinks(range: Text.Range): List[Line.Node_Range] =
     snapshot.cumulate[List[Line.Node_Range]](

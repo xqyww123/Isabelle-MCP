@@ -5,6 +5,7 @@ requirements = \
   env:ISABELLE_SCALA_JAR
 sources = \
   src/channel.scala \
+  src/debugger.scala \
   src/dynamic_output.scala \
   src/language_server.scala \
   src/lsp.scala \

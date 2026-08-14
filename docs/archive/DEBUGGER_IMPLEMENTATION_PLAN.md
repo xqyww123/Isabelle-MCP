@@ -17,12 +17,17 @@ sources, restart the REPL/server rather than rebuilding heaps.
 
 Done: Phase Y (commit `c1feaa1`); the specification rewrite plus two full
 adversarial review rounds and a targeted third pass on the post-review
-decisions, all folded (commits `14dc54c` and successors). The design is
-settled; **the next action is Phase A below.** All review rounds have
-reported and been folded; no reviewer is outstanding. The one design element
-still gated on measurement is the `PolyML` re-exposure for the locals
-printer (probe 11bis — its fallback is stated in spec §4.10 and must be
-decided before Phase C if the probe fails).
+decisions, all folded (commits `14dc54c` and successors); **Phase A itself**
+— the Scala requests, the prelude wrapper with the `PolyML` re-exposure and
+the locals printer, the `lsp_client.py` notification branches, a rebuilt jar
+passing `check_component.py`, and the probes as integration tests
+(`tests/integration/test_debugger_probes.py`, 7 tests, all green in one run;
+unit suite 495 green). Probe results and the discoveries they forced are in
+"Phase A probe results (2026-08-14)" below — **read that section before
+Phase B/C: two design assumptions were refuted by measurement** (the
+`ML_write_global` correction, folded into spec §4.10; and whole-document
+sync killing every serial on any edit, which invalidates spec §2.2's
+motion 2 and awaits a design decision).
 
 Concrete pointers a fresh context needs:
 
@@ -215,6 +220,109 @@ Refinement probes (wording, bounds, bookkeeping logic):
     caret-move probe of the shelving record in its surviving form — no tool
     moves the caret during a hit any more, but background resyncs still edit
     the document.)
+
+## Phase A probe results (2026-08-14)
+
+All probes ran against the real prover (`tests/integration/test_debugger_probes.py`;
+`PATH=…/contrib/Isabelle2025-2/bin:$PATH pytest tests/integration/test_debugger_probes.py -m integration`).
+7 tests, all green in one process run (179 s). What they measured:
+
+**Gate 1 — confirmed as designed.** `ML_breakpoint` markup is retrievable
+through `PIDE/debugger_breakpoints`; every range is a single symbol; the
+one-symbol shift of spec §3.3 is real (an indented statement's range covers
+the last indentation space; a column-1 statement's range covers the previous
+line's newline, crossing lines); top-level `val`/`fun` declarations have no
+sites; inner lambdas contribute extra sites on the same line (e.g. the body
+of `fn i => i + n` — the anchor-snippet machinery must expect several sites
+per line as the norm).
+
+**Gate 2 — confirmed.** An enabled site stops the thread; the
+`debugger_state` arrives through the `all_messages` consumer and is forwarded.
+
+**Gate 3 — confirmed, twice on the same thread.** An allocating runaway under
+a 5 s envelope ends in an `Isabelle_MCP.debug_eval: TIMEOUT` error message
+with the thread still parked and answering; the second round proves the
+explicit `private_interrupts` re-arm. The allocation-free worst case was not
+measured (separate refinement, spec §7.4 keeps the stated limit).
+
+**Probe 11bis — the locals design holds, with one correction.** The
+`PolyML` re-exposure works only after forcing `ML_write_global` back to true
+(it is FALSE in theory `ML_Bootstrap`'s final context — the design doc's
+"still true there" was refuted; spec §4.10 updated, prelude does
+`Config.put_generic ML_Env.ML_write_global true` for the one compilation).
+Locals through the eval verb match stock `print_vals` byte for byte after
+the unit-echo strip. The per-value 5 s bound fires (`<printing timed out>`
+while the rest print), and the outer deadline still cuts through a slow
+value (3 s outer < 5 s per-value ends the whole listing as TIMEOUT). Note:
+a 2e6-node raw term printed in well under 5 s — depth pruning is effective
+on raw terms, so the slow-value scenario was manufactured with a printer
+installed via the re-exposed `addPrettyPrinter` (`ML_system_pp` is a no-op
+stub in user theory ML; the re-exposure is ALSO the only way user code can
+install a raw printer — noted, not a goal).
+
+**Probe 4 — confirmed.** Exactly one `debugger_state` per input, after the
+output; a zero-output eval is an empty success. (The adapter emits the state
+notification BEFORE the completion reply so the client's thread map is
+current when a request returns — ordering chosen after a race surfaced.)
+
+**Probe 6 — REFUTES spec §2.2 motion 2 under the current client.** Any disk
+edit reaches the prover as a whole-document `didChange`, and the Scala model
+turns range-less text into remove-all + insert-all (`Text.Edit.replace` in
+`PIDE/text.scala` is not a minimal diff). Consequence, measured: after ANY
+edit to the file, every command is re-created, the definer recompiles, every
+breakpoint serial dies, the fresh sites come back unarmed, and the re-run
+caller runs through the previously-armed site without stopping. Toggling the
+old serial errors (`unknown breakpoint serial`). Motion 1 on the edited file
+(evaluate to definer, arm the new serial, evaluate onward) is the working
+recovery and is verified. **Design decision needed before Phase C**: either
+the client learns to send range-based `didChange` (restoring PIDE edit
+granularity and motion 2), or spec §2.2/§5 are retaught around
+"any edit disarms the whole file". The registry's demote-and-notify model
+already fits the second reality (`code not found` on every old serial).
+
+**Probe 7 — confirmed.** Cancellation sweeps the parked thread out of the
+hit table (`threads=[]`); the pre-cancel serial afterwards answers
+"document snapshot is outdated" (the synthetic edit leaves the snapshot
+outdated until a re-evaluation).
+
+**Probe 9 — the stepping caveat is real.** Stepping works (`step` from
+`val xs` stops again inside instrumented code, frame labels like
+`probe_target(1)xs-(1)`). After stepping off the end the thread can stop
+again without any armed breakpoint (observed inside the same function's
+inner lambda after the loop momentarily saw the thread absent — the
+empty-state/new-state race is real, and the thread-local stepping flag is
+cleared only by `continue`). Sending `continue` recovers, exactly as spec
+§4.12's anomaly wording assumes.
+
+**Probe 10 — measured.** During a hit the theory reports plain
+`running: 1, percentage: 68, ok: true` — nothing marks "paused"; the
+"paused at a breakpoint" wording of `isabelle_evaluation_status` must come
+entirely from our own hit table.
+
+**Probe 13 — measured.** Hit-stack frame positions carry only
+`offset`/`end_offset`/`id` properties (no `file`/`line`); the `id` is a
+command/exec id, so file:line resolution needs a Scala-side snapshot lookup
+(Phase C/D work; the notification schema already forwards the raw
+properties).
+
+**Probe 14 — measured.** An edit while a thread is parked (whole-document
+sync of an append at the very end) retires the hit: the parked thread is
+released and the thread map empties. Matches the hit-retirement trigger
+"edit-superseded execution" in spec §6.1.
+
+**Probe 5 and probe 12** — the registration-ordering negative arm (variant
+jar) and the `all_messages` consumer-cost measurement were NOT run; the
+permanent residue of probe 5 (dispatcher-side check-register-send) is in the
+adapter, and no consumer-cost symptom appeared during the runs. Both remain
+open as refinements, not gates.
+
+**Test-harness findings worth keeping:** the probes bypass the MCP tool
+layer, so disk edits must be pushed explicitly
+(`client.resync_changed_open_documents()`) — without it nothing reaches the
+prover and a probe can "pass" on a stale document (this produced a
+false-positive motion-2 result in the first draft); and the evaluation
+bookkeeping is module-global, so the fixture resets `ev.evaluation_state`
+per test.
 
 ## Phase B — Python protocol layer
 

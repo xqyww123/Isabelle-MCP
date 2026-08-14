@@ -270,6 +270,16 @@ class IsabelleLSPClient:
         # PIDE processing status (from PIDE/decoration)
         self._processing_trackers: dict[str, ProcessingTracker] = {}
 
+        # ML debugger (PIDE/debugger_state, PIDE/debugger_output). The state
+        # notification always carries the FULL current thread map — a thread's
+        # absence means it resumed — so debugger_threads is a plain replace.
+        # The histories keep every raw notification for the wait helper and the
+        # Phase A probes; Phase C consumes them into hit reports and notices.
+        self.debugger_threads: dict[str, list[dict[str, Any]]] = {}
+        self.debugger_state_history: list[dict[str, Any]] = []
+        self.debugger_output_history: list[dict[str, Any]] = []
+        self._debugger_event = asyncio.Event()
+
         # Server activity tracking for progress monitoring
         self._last_server_activity: float = 0.0
 
@@ -825,6 +835,10 @@ class IsabelleLSPClient:
             await self._handle_decoration(params)
         elif method == "PIDE/preview_response":
             self._handle_preview_response(params)
+        elif method == "PIDE/debugger_state":
+            self._handle_debugger_state(params)
+        elif method == "PIDE/debugger_output":
+            self._handle_debugger_output(params)
         elif method in ("window/logMessage", "window/showMessage"):
             self._surface_server_message(params)
 
@@ -883,6 +897,48 @@ class IsabelleLSPClient:
             tracker = ProcessingTracker()
             self._processing_trackers[file_path] = tracker
         await tracker.update(parsed)
+
+    def _handle_debugger_state(self, params: Any) -> None:
+        if not isinstance(params, dict):
+            return
+        entries = params.get("threads")
+        if not isinstance(entries, list):
+            return
+        threads: dict[str, list[dict[str, Any]]] = {}
+        for entry in entries:
+            if isinstance(entry, dict) and isinstance(entry.get("thread"), str):
+                stack = entry.get("stack")
+                threads[entry["thread"]] = stack if isinstance(stack, list) else []
+        self.debugger_threads = threads
+        self.debugger_state_history.append(params)
+        self._debugger_event.set()
+
+    def _handle_debugger_output(self, params: Any) -> None:
+        if not isinstance(params, dict):
+            return
+        self.debugger_output_history.append(params)
+        self._debugger_event.set()
+
+    async def wait_debugger_event(
+        self, predicate: Any, timeout: float = 60.0
+    ) -> bool:
+        """Wait until predicate(self) is true, re-checking on every debugger
+        notification. Waits generously by default (probe policy: >= 60s before
+        concluding a negative). Returns False on timeout."""
+        deadline = time.time() + timeout
+        while True:
+            if predicate(self):
+                return True
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False
+            self._debugger_event.clear()
+            if predicate(self):  # re-check: a notification may have landed meanwhile
+                return True
+            try:
+                await asyncio.wait_for(self._debugger_event.wait(), timeout=remaining)
+            except TimeoutError:
+                return False
 
     def _handle_preview_response(self, params: Any) -> None:
         if not isinstance(params, dict):

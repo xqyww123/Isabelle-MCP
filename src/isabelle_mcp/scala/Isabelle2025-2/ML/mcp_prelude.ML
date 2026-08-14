@@ -14,7 +14,7 @@
     See docs/CANCELLATION.md for the full design and its validation.
 *)
 
-val mcp_prelude_version = "2";
+val mcp_prelude_version = "3";
 
 
 (* Global cancellation of all document execution, using only the PUBLIC Isabelle/ML API,
@@ -235,6 +235,205 @@ val _ =
         (case mcp_take id of
           NONE => ()
         | SOME group => (Future.cancel_group group; mcp_reply id "cancelled" [] []))
+      end);
+
+
+(* ML debugger support (docs/archive/DEBUGGER_DESIGN.md sections 4.10 and 7.3).
+
+   Reaching PolyML.DebuggerInterface needs one extra step: the raw global namespace this file
+   compiles in carries only the four-entry PolyML stub that ML_Bootstrap.thy installs during
+   Pure's bootstrap.  The full binding survives in exactly one place -- theory ML_Bootstrap's
+   own ML environment.  ML_write_global is FALSE in that theory's final context (measured
+   2026-08-14; the design doc had assumed true), so the config is forced back to true for
+   this one compilation: reads then resolve PolyML to the surviving full structure, and the
+   write of "structure Isabelle_MCP_PolyML = PolyML" lands in the raw global namespace,
+   where the rest of this file can see it.
+
+   A failure here is FATAL to the prover (--use semantics), which is deliberate: a heap where
+   the re-exposure does not work must fail loudly at startup, not degrade into a debugger
+   whose locals printer cannot compile.  Probe 11bis pins this on every launchable heap. *)
+
+val _ =
+  Context.setmp_generic_context
+    (SOME (Context.Theory (Thy_Info.get_theory "ML_Bootstrap")
+      |> Config.put_generic ML_Env.ML_write_global true))
+    (fn () =>
+      ML_Context.eval ML_Compiler.flags Position.none
+        (ML_Lex.read "structure Isabelle_MCP_PolyML = PolyML")) ();
+
+
+(* The eval wrapper.  Everything the Python side sends to Debugger.eval is embedded in
+   Isabelle_MCP.debug_eval (Time.fromSeconds N) (fn () => <expression>), which
+
+     1. registers the running thread, keyed by the debugger's own thread-name string,
+        BEFORE the expression runs -- a runaway thread no longer reads its input queue, so
+        anything sent later would queue forever.  The abort flag lives inside this entry:
+        created with it, dead with it, so a stale abort can never touch a later evaluation.
+     2. enforces the deadline as a raw Event_Timer interrupt, physical time, UNSCALED --
+        Timeout.apply would multiply by timeout_scale and drift from the Scala backstop.
+     3. watches the abort flag, set by the Isabelle_MCP.debug_abort protocol command.
+
+   Both the deadline and the abort arrive as thread interrupts; ONE outermost classifier
+   decides what leaves the wrapper: deadline expired or abort set -> ordinary Fail (the
+   debugger's error_wrapper prints it and the thread STAYS at the breakpoint); anything
+   else -> re-raised, so a genuine cancellation still kills the command.  Ties break toward
+   the ordinary exception; that swallows a coalesced genuine cancellation, safely: cancelled
+   Future groups are retried by the scheduler every cycle, so the swallowed cancellation is
+   re-delivered at the debugger loop's next input wait.
+
+   The body runs under explicit private_interrupts: Poly/ML's asynchronous interrupt is
+   delivered only once and nothing in the debugger loop re-arms it; setting the attribute
+   re-arms delivery, else the second runaway on the same thread would be unkillable.
+
+   Every exit path drains pending interrupts (expose_interrupt_result) and classifies the
+   drained result by the same rule -- an undrained late interrupt would be delivered at the
+   loop's next input wait, outside any wrapper, and kill the command after a successful
+   evaluation; but a genuine cancellation arriving just after the body completes must still
+   be re-raised, not eaten into a success. *)
+
+structure Isabelle_MCP =
+struct
+
+type debug_eval_entry =
+  {abort: bool Unsynchronized.ref, thread: Isabelle_Thread.T, deadline: Time.time};
+
+val debug_evals =
+  Synchronized.var "Isabelle_MCP.debug_evals" (Symtab.empty: debug_eval_entry Symtab.table);
+
+fun debug_eval timeout body =
+  Thread_Attributes.with_attributes Thread_Attributes.no_interrupts (fn _ =>
+    let
+      val self = Isabelle_Thread.self ();
+      val thread_name = Isabelle_Thread.print self;
+      val abort = Unsynchronized.ref false;
+      val deadline = Time.+ (Time.now (), timeout);
+      val _ =
+        Synchronized.change debug_evals
+          (Symtab.update (thread_name, {abort = abort, thread = self, deadline = deadline}));
+      val request =
+        Event_Timer.request {physical = true} deadline
+          (fn () => Isabelle_Thread.interrupt_thread self);
+      fun ours () = ! abort orelse Time.>= (Time.now (), deadline);
+      fun fail () =
+        raise Fail
+          (if ! abort then "Isabelle_MCP.debug_eval: ABORTED"
+           else "Isabelle_MCP.debug_eval: TIMEOUT");
+      val result =
+        Exn.capture_body (fn () =>
+          Thread_Attributes.with_attributes Thread_Attributes.private_interrupts
+            (fn _ => body ()));
+      val _ = Event_Timer.cancel request;
+      (* deregistration: the same Synchronized var the abort sender mutates under, so the
+         two are mutually excluded -- after this line no abort interrupt can be sent *)
+      val _ = Synchronized.change debug_evals (Symtab.delete_safe thread_name);
+      val drained = Isabelle_Thread.expose_interrupt_result ();
+    in
+      (case result of
+        Exn.Exn exn =>
+          if Exn.is_interrupt exn then
+            (if ours () then fail () else Exn.reraise exn)
+          else
+            (case drained of
+              Exn.Exn drained_exn =>
+                if ours () then Exn.reraise exn else Exn.reraise drained_exn
+            | Exn.Res _ => Exn.reraise exn)
+      | Exn.Res res =>
+          (case drained of
+            Exn.Exn drained_exn => if ours () then res else Exn.reraise drained_exn
+          | Exn.Res _ => res))
+    end);
+
+
+(* The locals printer (design section 4.10): all local variables of one stack frame, through
+   the same primitives the stock print_vals verb uses -- debugState on the stopped thread is
+   the loop-entry capture, since the evaluation running this code is uninstrumented -- but
+   called per value inside OUR envelope, which is what makes a per-value bound possible at
+   all.  No system printer is replaced or reinstalled.
+
+   Each value gets its own 5 s bound as a raw Event_Timer plus elapsed checks against the one
+   envelope, never a nested Timeout.apply: a nested inner timer that fires can drain the
+   outer deadline's pending interrupt and swallow it, leaving the outer guard fictitious.
+   A value that cannot print in time renders as "<printing timed out>" (no type -- type
+   layout can itself be slow) while the rest still print; the outer deadline and abort take
+   precedence over the per-value verdict on every path. *)
+
+val debug_locals_value_bound = Time.fromSeconds 5;
+
+fun debug_locals frame_index =
+  let
+    val self = Isabelle_Thread.self ();
+    val thread_name = Isabelle_Thread.print self;
+    fun outer_ours () =
+      (case Symtab.lookup (Synchronized.value debug_evals) thread_name of
+        NONE => false
+      | SOME {abort, deadline, ...} => ! abort orelse Time.>= (Time.now (), deadline));
+    val stack =
+      Isabelle_MCP_PolyML.DebuggerInterface.debugState
+        (Isabelle_Thread.get_thread self);
+    val _ =
+      if frame_index < 0 orelse frame_index >= length stack then
+        raise Fail ("Isabelle_MCP.debug_locals: no stack frame " ^ string_of_int frame_index)
+      else ();
+    val st = List.nth (stack, frame_index);
+    val space = Isabelle_MCP_PolyML.DebuggerInterface.debugNameSpace st;
+    val depth = FixedInt.fromInt (ML_Print_Depth.get_print_depth ());
+    fun print_value (name, v) =
+      Thread_Attributes.with_attributes Thread_Attributes.no_interrupts (fn atts =>
+        let
+          val value_deadline = Time.+ (Time.now (), debug_locals_value_bound);
+          val request =
+            Event_Timer.request {physical = true} value_deadline
+              (fn () => Isabelle_Thread.interrupt_thread self);
+          val result =
+            Exn.capture_body (fn () =>
+              Thread_Attributes.with_attributes atts (fn _ =>
+                Pretty.from_ML
+                  (Isabelle_MCP_PolyML.NameSpace.Values.printWithType
+                    (v, depth, SOME space))));
+          val was_timeout = not (Event_Timer.cancel request);
+          val drained = Isabelle_Thread.expose_interrupt_result ();
+          fun timed_out () = Pretty.str ("val " ^ name ^ " = <printing timed out>");
+        in
+          (case result of
+            Exn.Res p =>
+              (case drained of
+                Exn.Res _ => p
+              | Exn.Exn drained_exn =>
+                  if outer_ours () then Exn.reraise drained_exn
+                  else if was_timeout then p   (*the per-value timer's own late interrupt*)
+                  else Exn.reraise drained_exn)  (*genuine cancellation*)
+          | Exn.Exn exn =>
+              if not (Exn.is_interrupt exn) then Exn.reraise exn  (*printer error*)
+              else if outer_ours () then Exn.reraise exn  (*outer deadline/abort: escalate*)
+              else if was_timeout orelse Time.>= (Time.now (), value_deadline) then timed_out ()
+              else Exn.reraise exn)            (*genuine cancellation*)
+        end);
+  in
+    #allVal (Isabelle_MCP_PolyML.DebuggerInterface.debugLocalNameSpace st) ()
+    |> sort_by #1
+    |> map (fn (name, v) => Pretty.item [print_value (name, v)])
+    |> Pretty.chunks |> Pretty.string_of |> Debugger.writeln_message
+  end;
+
+end;
+
+
+(* On-demand abort of the evaluation running at a breakpoint: sets the flag inside the
+   thread's registration entry and interrupts the thread.  Runs under the same Synchronized
+   var as deregistration, so it can never interrupt a thread whose evaluation has already
+   returned.  Unknown thread or no outstanding evaluation: a silent no-op (the Scala side
+   answers from its own pending table). *)
+
+val _ =
+  Protocol_Command.define "Isabelle_MCP.debug_abort"
+    (fn args =>
+      let val thread_name = (case args of arg :: _ => arg | [] => "") in
+        Synchronized.change Isabelle_MCP.debug_evals (fn tab =>
+          ((case Symtab.lookup tab thread_name of
+             NONE => ()
+           | SOME {abort, thread, ...} =>
+               (abort := true; Isabelle_Thread.interrupt_thread thread));
+           tab))
       end);
 
 

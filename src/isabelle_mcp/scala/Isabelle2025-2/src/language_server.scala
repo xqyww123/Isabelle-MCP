@@ -25,10 +25,11 @@ object Language_Server {
      ML/mcp_prelude.ML is not listed in build.props sources, so it is absent from the jar's
      recorded hashes and nothing else would notice an edited, stale or reverted prelude.
      That was tolerable while the two sides shared only a cancel command; they now share
-     three query commands and a reply format, and a skew there is a request that hangs with
-     no correlatable trace.  Bump this whenever mcp_prelude.ML's protocol changes. */
+     the query commands, the debugger eval wrapper and a reply format, and a skew there is
+     a request that hangs with no correlatable trace.  Bump this whenever mcp_prelude.ML's
+     protocol changes. */
 
-  val prelude_version = "2"
+  val prelude_version = "3"
 
   /* proof that the injected ML prelude is live
 
@@ -215,6 +216,7 @@ class Language_Server(
 
   private val sledgehammer = new VSCode_Sledgehammer(server)
   private val find_theorems = new VSCode_Find_Theorems(server)
+  private val debugger_adapter = new Debugger_Adapter(server)
 
   def rendering_offset(node_pos: Line.Node_Position): Option[(VSCode_Rendering, Text.Offset)] =
     for {
@@ -411,6 +413,7 @@ class Language_Server(
       val prelude_handler = new Language_Server.Prelude_Handler
       session.init_protocol_handler(prelude_handler)
       session.init_protocol_handler(query_handler)
+      debugger_adapter.init()
       session.raw_output_messages += raw_output_capture
 
       try {
@@ -431,8 +434,9 @@ class Language_Server(
           case Some(version) if version != Language_Server.prelude_version =>
             error("The ML prelude is version " + quote(version) + ", but this build of " +
               "Isabelle-MCP speaks version " + quote(Language_Server.prelude_version) + "." +
-              "\nThey share three query commands and a reply format, so serving with a skew" +
-              " between them would hang requests rather than fail them." +
+              "\nThey share the query commands, the debugger eval wrapper and a reply" +
+              " format, so serving with a skew between them would hang requests rather" +
+              " than fail them." +
               "\nPrelude: " + prelude +
               "\nReinstall the Isabelle-MCP component so that both halves come from one build.")
           case Some(_) =>
@@ -465,6 +469,7 @@ class Language_Server(
         delay_preview.revoke()
         sledgehammer.exit()
         find_theorems.exit()
+        debugger_adapter.exit()
 
         val result = session.stop()
         if (result.ok) reply("")
@@ -907,6 +912,14 @@ class Language_Server(
           case LSP.Find_Theorems_At_Position(id, params) => find_theorems_at_position(id, params)
           case LSP.Query_Cancel(token) => query_cancel(token)
           case LSP.Commands_At_Lines(id, file, lines) => commands_at_lines(id, file, lines)
+          case LSP.Debugger_Breakpoints(id, file, range) =>
+            debugger_adapter.breakpoints(id, file, range)
+          case LSP.Debugger_Toggle_Breakpoint(id, file, serial, state) =>
+            debugger_adapter.toggle_breakpoint(id, file, serial, state)
+          case LSP.Debugger_Eval(id, params) => debugger_adapter.eval(id, params)
+          case LSP.Debugger_Print_Vals(id, params) => debugger_adapter.print_vals(id, params)
+          case LSP.Debugger_Abort(id, thread, token) => debugger_adapter.abort(id, thread, token)
+          case LSP.Debugger_Input(id, thread, verbs) => debugger_adapter.input(id, thread, verbs)
           case _ => if (!LSP.ResponseMessage.is_empty(json)) log("### IGNORED")
         }
       }

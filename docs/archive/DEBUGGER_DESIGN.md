@@ -663,20 +663,27 @@ and it is what makes the `timeout` parameter real: under the `print_vals`
 verb the printing runs in the debugger loop's own code, where nothing of
 ours can enforce anything.
 
-**Reaching `PolyML.DebuggerInterface` needs one extra step (probe).** The
-raw global namespace every heap inherits carries only a four-entry `PolyML`
-stub — `ML_Bootstrap.thy` shadows the original during Pure's bootstrap. The
-full binding survives in exactly one place: theory `ML_Bootstrap`'s own
-Isabelle/ML environment (`structure PolyML = PolyML` in its first ML block,
-and `ML_write_global` is still true there). The prelude therefore, once at
-load time, compiles `structure Isabelle_MCP_PolyML = PolyML` under
+**Reaching `PolyML.DebuggerInterface` needs one extra step (probed
+2026-08-14, works with one correction).** The raw global namespace every
+heap inherits carries only a four-entry `PolyML` stub — `ML_Bootstrap.thy`
+shadows the original during Pure's bootstrap. The full binding survives in
+exactly one place: theory `ML_Bootstrap`'s own Isabelle/ML environment
+(`structure PolyML = PolyML` in its first ML block). The prelude therefore,
+once at load time, compiles `structure Isabelle_MCP_PolyML = PolyML` under
 `Context.Theory (Thy_Info.get_theory "ML_Bootstrap")`, landing the binding
-back in the raw global namespace for the rest of the prelude. ~5 lines,
-version-coupled, and probed (including that the theory resolves at `--use`
-time in every launchable heap). **Fallback if the probe fails**: locals
-revert to the stock `print_vals` verb and the prover-side locals timeout is
-given up — the Scala backstop and the debt fence then govern, and §7.3's
-policy line changes accordingly.
+back in the raw global namespace for the rest of the prelude. **The
+correction (measured against the original claim "`ML_write_global` is still
+true there"): `ML_write_global` is FALSE in that theory's final context**, so
+the write stayed in context tables and the raw namespace saw nothing; the
+prelude forces the config back to true for this one compilation
+(`Config.put_generic ML_Env.ML_write_global true`), after which the write
+lands globally — verified against the HOL heap, and re-verified at every
+debug-enabled server start (the prelude compiles the locals printer against
+the re-exposed structure, and a `--use` failure is fatal and surfaced).
+~7 lines, version-coupled. **Fallback if the re-exposure fails on some
+heap**: locals revert to the stock `print_vals` verb and the prover-side
+locals timeout is given up — the Scala backstop and the debt fence then
+govern, and §7.3's policy line changes accordingly.
 
 Output matches stock `print_vals` **after the adapter strips the eval's
 result echo** (`evaluate {verbose = true}` appends `val it = (): unit` after

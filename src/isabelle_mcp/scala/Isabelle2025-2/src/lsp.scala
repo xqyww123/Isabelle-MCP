@@ -961,4 +961,149 @@ object LSP {
           "character" -> node_pos.pos.column,
           "text" -> text))
   }
+
+
+  /* ML debugger (docs/archive/DEBUGGER_DESIGN.md section 7.1)
+
+     Timeouts are JSON numbers of seconds, chosen by the Python side, as in the query
+     protocol.  Ranges and serials are returned AS FOUND in the markup; the one-symbol
+     shift correction of design section 3.3 is client-side. */
+
+  object Debugger_Breakpoints {
+    def unapply(json: JSON.T): Option[(Id, JFile, Option[Line.Range])] =
+      json match {
+        case RequestMessage(id, "PIDE/debugger_breakpoints", Some(params)) =>
+          for {
+            uri <- JSON.string(params, "uri") if Url.is_wellformed_file(uri)
+          } yield (id, Url.absolute_file(uri), JSON.value(params, "range", Range.unapply))
+        case _ => None
+      }
+
+    def reply(id: Id, result: Option[List[(Line.Range, Long, Boolean)]]): JSON.T = {
+      val res =
+        result match {
+          case None => JSON.Object("open" -> false)
+          case Some(breakpoints) =>
+            JSON.Object(
+              "open" -> true,
+              "breakpoints" ->
+                breakpoints.map({ case (range, serial, state) =>
+                  JSON.Object("range" -> Range(range), "serial" -> serial, "state" -> state) }))
+        }
+      ResponseMessage(id, Some(res))
+    }
+  }
+
+  object Debugger_Toggle_Breakpoint {
+    def unapply(json: JSON.T): Option[(Id, JFile, Long, Boolean)] =
+      json match {
+        case RequestMessage(id, "PIDE/debugger_toggle_breakpoint", Some(params)) =>
+          for {
+            uri <- JSON.string(params, "uri") if Url.is_wellformed_file(uri)
+            serial <- JSON.long(params, "serial")
+            state <- JSON.bool(params, "state")
+          } yield (id, Url.absolute_file(uri), serial, state)
+        case _ => None
+      }
+
+    def reply(id: Id, error: String): JSON.T =
+      ResponseMessage(id, Some(
+        if (error.isEmpty) JSON.Object("ok" -> true)
+        else JSON.Object("ok" -> false, "error" -> error)))
+  }
+
+  sealed case class Debugger_Eval_Params(
+    token: String,
+    thread: String,
+    frame: Int,
+    expr: String,
+    timeout: Double)
+
+  object Debugger_Eval {
+    def unapply(json: JSON.T): Option[(Id, Debugger_Eval_Params)] =
+      json match {
+        case RequestMessage(id, "PIDE/debugger_eval", Some(params)) =>
+          for {
+            token <- JSON.string(params, "token")
+            thread <- JSON.string(params, "thread")
+            frame <- JSON.int(params, "frame")
+            expr <- JSON.string(params, "expr")
+            timeout <- JSON.double(params, "timeout")
+          } yield (id, Debugger_Eval_Params(token, thread, frame, expr, timeout))
+        case _ => None
+      }
+  }
+
+  object Debugger_Print_Vals {
+    def unapply(json: JSON.T): Option[(Id, Debugger_Eval_Params)] =
+      json match {
+        case RequestMessage(id, "PIDE/debugger_print_vals", Some(params)) =>
+          for {
+            token <- JSON.string(params, "token")
+            thread <- JSON.string(params, "thread")
+            frame <- JSON.int(params, "frame")
+            timeout <- JSON.double(params, "timeout")
+          } yield (id, Debugger_Eval_Params(token, thread, frame, "", timeout))
+        case _ => None
+      }
+  }
+
+  // Every eval-shaped request answers with a status and the round trip's messages.
+  def debugger_result_reply(id: Id, status: String, messages: List[(String, String)]): JSON.T =
+    ResponseMessage(id, Some(
+      JSON.Object(
+        "status" -> status,
+        "messages" ->
+          messages.map({ case (kind, text) =>
+            JSON.Object("kind" -> kind, "text" -> text) }))))
+
+  object Debugger_Abort {
+    def unapply(json: JSON.T): Option[(Id, Option[String], Option[String])] =
+      json match {
+        case RequestMessage(id, "PIDE/debugger_abort", Some(params)) =>
+          Some((id, JSON.string(params, "thread"), JSON.string(params, "token")))
+        case _ => None
+      }
+
+    def reply(id: Id, error: String): JSON.T =
+      ResponseMessage(id, Some(
+        if (error.isEmpty) JSON.Object("ok" -> true)
+        else JSON.Object("ok" -> false, "error" -> error)))
+  }
+
+  object Debugger_Input {
+    def unapply(json: JSON.T): Option[(Id, String, List[String])] =
+      json match {
+        case RequestMessage(id, "PIDE/debugger_input", Some(params)) =>
+          for {
+            thread <- JSON.string(params, "thread")
+            verbs <- JSON.list(params, "verbs", JSON.Value.String.unapply)
+          } yield (id, thread, verbs)
+        case _ => None
+      }
+
+    def reply(id: Id): JSON.T =
+      ResponseMessage(id, Some(JSON.Object("ok" -> true)))
+  }
+
+  /* Server -> client: forwarded thread stacks.  A thread's ABSENCE from the array means it
+     resumed; an "empty stack" entry never appears.  Sent after every debugger_state the
+     prover emits, so the client always holds the full current map. */
+
+  object Debugger_State_Notification {
+    def apply(threads: List[JSON.T]): JSON.T =
+      Notification("PIDE/debugger_state", JSON.Object("threads" -> threads))
+  }
+
+  /* Server -> client: spontaneous debugger output not consumed by a pending eval. */
+
+  object Debugger_Output_Notification {
+    def apply(thread: String, messages: List[(String, String)]): JSON.T =
+      Notification("PIDE/debugger_output",
+        JSON.Object(
+          "thread" -> thread,
+          "messages" ->
+            messages.map({ case (kind, text) =>
+              JSON.Object("kind" -> kind, "text" -> text) })))
+  }
 }
