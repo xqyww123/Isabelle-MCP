@@ -334,7 +334,7 @@ async def test_gate2_gate3_and_the_probes_at_a_live_hit(prover):
     # Probe 11: the abort flag.  Nothing evaluating -> refused.
     reply = await client.request(
         "PIDE/debugger_abort", {"thread": thread}, timeout=30.0)
-    assert reply == {"ok": False, "error": "no_evaluation"}, reply
+    assert reply == {"status": "no_evaluation"}, reply
 
     # A slow eval ends early on abort; the thread stays parked.
     eval_task = asyncio.create_task(
@@ -342,7 +342,7 @@ async def test_gate2_gate3_and_the_probes_at_a_live_hit(prover):
     await asyncio.sleep(3.0)
     reply = await client.request(
         "PIDE/debugger_abort", {"thread": thread}, timeout=30.0)
-    assert reply == {"ok": True}, reply
+    assert reply == {"status": "aborting"}, reply
     result = await asyncio.wait_for(eval_task, timeout=60)
     assert result["status"] == "ok"
     assert any("Isabelle_MCP.debug_eval: ABORTED" in t for t in _texts(result)), (

@@ -1065,10 +1065,8 @@ object LSP {
         case _ => None
       }
 
-    def reply(id: Id, error: String): JSON.T =
-      ResponseMessage(id, Some(
-        if (error.isEmpty) JSON.Object("ok" -> true)
-        else JSON.Object("ok" -> false, "error" -> error)))
+    def reply(id: Id, status: String): JSON.T =
+      ResponseMessage(id, Some(JSON.Object("status" -> status)))
   }
 
   object Debugger_Input {

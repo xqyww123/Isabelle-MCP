@@ -32,6 +32,13 @@ prover-side timeout failed, the thread owes one debugger_state: a per-thread
 debt counter eats exactly that many completion signals, output for an indebted
 thread is discarded, and new evaluations on it are refused immediately ("busy")
 until the late debugger_state arrives and clears the debt.
+
+Every mutation of the pending/debt/threads bookkeeping runs on the session
+dispatcher thread: the all_messages consumer, start_eval's check-register-send,
+the backstop callback (its body is posted to the dispatcher; Event_Timer.cancel
+cannot stop an already-fired closure, so the callback re-checks by Pending
+serial before answering), and prover_exit.  No interleaving can steal a reply,
+strand debt, or slip an evaluation past the busy fence.
 */
 
 package isabelle.mcp
@@ -51,11 +58,17 @@ object Debugger_Adapter {
   val CRASHED = "crashed"      // prover exit drained the request
   val BUSY = "busy"            // the thread has an outstanding evaluation or owes a state
 
+  /* abort reply statuses */
+  val NO_EVALUATION = "no_evaluation"  // nothing outstanding and no debt: settled
+  val ABORTING = "aborting"            // flag command sent once; outcome arrives via the
+                                       // evaluation's own reply (client retries, 4.13)
+
   /* The Scala backstop runs this much behind the prover-side deadline, which is the
      mechanism that is supposed to fire; the backstop is the backstop. */
   val BACKSTOP_MARGIN: Double = 30.0
 
   sealed case class Pending(
+    serial: Counter.ID,               // adapter-side identity for the backstop's compare
     token: String,
     respond: (String, List[(String, String)]) => Unit,
     timer: Event_Timer.Request,
@@ -85,6 +98,7 @@ class Debugger_Adapter(server: Language_Server) {
   private val debt = Synchronized(Map.empty[String, Int])          // thread name -> owed states
   private val threads =                                            // thread name -> stack
     Synchronized(Map.empty[String, List[(Properties.T, String)]])
+  private val eval_counter = Counter.make()
 
 
   /* forwarded thread stacks: the full current map after every update */
@@ -131,24 +145,30 @@ class Debugger_Adapter(server: Language_Server) {
     // ordered, so by the time a request returns, the client's thread map is current.
     notify_state()
 
-    pending.change_result(map => (map.get(thread_name), map - thread_name)) match {
-      case Some(p) =>
-        p.timer.cancel()
-        val status = if (stack.nonEmpty) OK else RESUMED
-        val messages = {
-          val all = p.output.reverse
-          if (p.strip_unit_echo) all.filterNot(_._2 == UNIT_ECHO) else all
-        }
-        p.respond(status, messages)
-      case None =>
-        // an owed completion signal from a request the backstop already answered
-        debt.change(map =>
-          map.get(thread_name) match {
-            case Some(n) if n > 1 => map + (thread_name -> (n - 1))
-            case Some(_) => map - thread_name
-            case None => map
-          })
-    }
+    val completed =
+      pending.change_result(map => (map.get(thread_name), map - thread_name)) match {
+        case Some(p) =>
+          p.timer.cancel()
+          val status = if (stack.nonEmpty) OK else RESUMED
+          val messages = {
+            val all = p.output.reverse
+            if (p.strip_unit_echo) all.filterNot(_._2 == UNIT_ECHO) else all
+          }
+          p.respond(status, messages)
+          true
+        case None =>
+          // an owed completion signal from a request the backstop already answered
+          debt.change_result(map =>
+            map.get(thread_name) match {
+              case Some(n) if n > 1 => (true, map + (thread_name -> (n - 1)))
+              case Some(_) => (true, map - thread_name)
+              case None => (false, map)
+            })
+      }
+    // Bound the stock per-thread output buffer, which nothing here ever reads: drop it
+    // after an answered round trip, after a debt payment (the abandoned runaway is the
+    // thread whose buffer most plausibly grows huge), and when the thread resumes.
+    if (completed || stack.isEmpty) session.debugger.clear_output(thread_name)
   }
 
   private def handle_output(thread_name: String, msg: Prover.Protocol_Output): Unit = {
@@ -195,7 +215,10 @@ class Debugger_Adapter(server: Language_Server) {
 
   object Exit_Handler extends Session.Protocol_Handler {
     override def functions: Session.Protocol_Functions = Nil
-    override def exit(exit_state: Document.State): Unit = adapter.prover_exit()
+    // exit arrives on the session manager thread; posting keeps prover_exit behind any
+    // queued state callbacks (a ghost thread entry would otherwise survive the clear)
+    override def exit(exit_state: Document.State): Unit =
+      session.send_dispatcher { adapter.prover_exit() }
   }
 
 
@@ -208,7 +231,7 @@ class Debugger_Adapter(server: Language_Server) {
 
   def exit(): Unit = {
     session.all_messages -= consumer
-    prover_exit()
+    session.send_dispatcher { prover_exit() }
   }
 
   /* Debugger.init is implicit: issued before the first debugger action (idempotent --
@@ -278,16 +301,25 @@ class Debugger_Adapter(server: Language_Server) {
         respond(BUSY, Nil)
       }
       else {
+        val serial = eval_counter()
         val timer =
           Event_Timer.request(Time.now() + Time.seconds(params.timeout + BACKSTOP_MARGIN)) {
-            for (p <- pending.change_result(map => (map.get(thread_name), map - thread_name))) {
-              debt.change(map => map + (thread_name -> (map.getOrElse(thread_name, 0) + 1)))
-              p.respond(TIMEOUT, p.output.reverse)
+            // Runs on the shared Timer thread; the whole body is posted to the dispatcher.
+            // cancel() cannot stop an already-fired closure, so answer only if the entry
+            // is still THIS request (look up, compare the serial, then remove).
+            session.send_dispatcher {
+              pending.value.get(thread_name) match {
+                case Some(p) if p.serial == serial =>
+                  pending.change(_ - thread_name)
+                  debt.change(map => map + (thread_name -> (map.getOrElse(thread_name, 0) + 1)))
+                  p.respond(TIMEOUT, p.output.reverse)
+                case _ =>
+              }
             }
           }
         pending.change(map =>
           map + (thread_name ->
-            Pending(params.token, respond, timer, Nil, strip_unit_echo)))
+            Pending(serial, params.token, respond, timer, Nil, strip_unit_echo)))
         session.debugger.input(thread_name, "eval", params.frame.toString, "false",
           Symbol.encode(""), Symbol.encode(text))
       }
@@ -303,22 +335,26 @@ class Debugger_Adapter(server: Language_Server) {
 
 
   /* on-demand abort of the outstanding evaluation (design section 4.13): sets the
-     prelude-side flag; the evaluation then ends exactly as a deadline expiry does */
+     prelude-side flag; the evaluation then ends exactly as a deadline expiry does.
+     Stateless here: send the flag command once and reply "aborting"; how the evaluation
+     actually ended arrives through its own reply, and the client-side retry loop pins
+     re-sends to that reply.  An indebted thread (its request already answered TIMEOUT
+     by the backstop) is exactly the runaway abort exists for, so debt counts too. */
 
   def abort(id: LSP.Id, thread: Option[String], token: Option[String]): Unit = {
-    def reply(error: String): Unit = channel.write(LSP.Debugger_Abort.reply(id, error))
+    def reply(status: String): Unit = channel.write(LSP.Debugger_Abort.reply(id, status))
 
-    val map = pending.value
     val thread_name =
       thread orElse
-        token.flatMap(t => map.collectFirst({ case (name, p) if p.token == t => name }))
+        token.flatMap(t =>
+          pending.value.collectFirst({ case (name, p) if p.token == t => name }))
     thread_name match {
-      case None => reply("no_evaluation")
+      case None => reply(NO_EVALUATION)
       case Some(name) =>
-        if (!map.contains(name)) reply("no_evaluation")
+        if (!pending.value.contains(name) && !debt.value.contains(name)) reply(NO_EVALUATION)
         else {
           session.protocol_command("Isabelle_MCP.debug_abort", XML.string(name))
-          reply("")
+          reply(ABORTING)
         }
     }
   }
