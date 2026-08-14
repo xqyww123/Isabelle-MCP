@@ -90,13 +90,6 @@ CALLER = 30        # ML block calling probe_target
 SLOW_CALLER = 32   # ML block calling slow_target
 
 
-def envelope(seconds: int, body: str) -> str:
-    """The eval wrapper text of DEBUGGER_DESIGN.md section 7.3."""
-    return (
-        f"Isabelle_MCP.debug_eval (Time.fromSeconds {seconds}) (fn () => ({body}))"
-    )
-
-
 RUNAWAY = "let fun f xs = f (1 :: xs) in f [] end"  # allocating: has safe points
 
 
@@ -202,13 +195,14 @@ async def _wait_all_resumed(client, timeout=60.0):
     )
 
 
-async def _eval_at(client, thread, body_or_text, timeout_s=30.0, *, raw=False,
-                   token="probe", request_timeout=None):
-    text = body_or_text if raw else envelope(int(timeout_s), body_or_text)
+async def _eval_at(client, thread, expr, timeout_s=30.0, *, token="probe",
+                   request_timeout=None):
+    """The bare expression: the Scala side composes the wrapper text and carries
+    the expression as one ML string literal (design section 4.9)."""
     return await client.request(
         "PIDE/debugger_eval",
         {"token": token, "thread": thread, "frame": 0,
-         "expr": text, "timeout": float(timeout_s)},
+         "expr": expr, "timeout": float(timeout_s)},
         timeout=request_timeout or (timeout_s + 60.0),
     )
 
@@ -361,6 +355,77 @@ async def test_gate2_gate3_and_the_probes_at_a_live_hit(prover):
     assert await _wait_settled(client)
 
 
+# ── R3: the self-compiling wrapper — envelope silence and containment ──────
+
+@pytest.mark.asyncio
+async def test_r3_wrapper_envelope_and_containment(prover):
+    client, path = prover
+    assert await _evaluate_through(client, path, DEFINER_END)
+    await _enable_site_at(client, path, VAL_TOTAL, 4)
+    await evaluate_to(client, path, -1)
+    thread = await _wait_for_hit(client)
+
+    # Envelope silence: exactly ONE message — the inner result echo.  The outer
+    # `val _ = ...;` binding flushes an EMPTY writeln under verbose = true, and
+    # only Debugger.writeln_message's empty-message drop keeps it off the wire;
+    # if an Isabelle upgrade breaks that drop, a second message shows up here.
+    result = await _eval_at(client, thread, "1 + 1", timeout_s=30)
+    assert result["status"] == "ok", result
+    assert _texts(result) == ["val it = 2: int"], _texts(result)
+
+    # An empty expression is wire-legal: it compiles to `val it = ( );`.
+    # (The MCP tool layer refuses it before it gets this far — Phase C.)
+    result = await _eval_at(client, thread, "", timeout_s=30)
+    assert result["status"] == "ok", result
+    assert _texts(result) == ["val it = (): unit"], _texts(result)
+
+    # Frame scope: the literal is compiled in the hit frame's scope (n = 4 at
+    # probe_target's `val total` site).
+    result = await _eval_at(client, thread, "n * 100", timeout_s=30)
+    assert result["status"] == "ok", result
+    assert any("val it = 400: int" in t for t in _texts(result)), _texts(result)
+
+    # Literal round trip, quotes and backslashes: the \ddd encoder must not
+    # corrupt them on the way in; the result echo re-escapes them on the way
+    # out.
+    result = await _eval_at(client, thread, r'"x\"y\\z"', timeout_s=30)
+    assert result["status"] == "ok", result
+    joined = "\n".join(_texts(result))
+    assert 'x\\"y\\\\z' in joined, joined
+
+    # Literal round trip, unicode: the Scala side Symbol.encodes the expression
+    # before embedding, exactly what typing α inside a .thy ML block yields —
+    # so the compiled string holds the 8-byte "\<alpha>", not 2-byte UTF-8.
+    result = await _eval_at(client, thread, 'size "α"', timeout_s=30)
+    assert result["status"] == "ok", result
+    assert any("val it = 8: int" in t for t in _texts(result)), _texts(result)
+
+    # Containment: the classic paren-escape now runs INSIDE the protection — a
+    # smuggled runaway declaration still ends as the wrapper's TIMEOUT and the
+    # thread survives.  (Composed client-side, this text escaped debug_eval.)
+    result = await _eval_at(client, thread, f"1); val boom = ({RUNAWAY}",
+                            timeout_s=5, request_timeout=120.0)
+    assert result["status"] == "ok", result
+    assert any("Isabelle_MCP.debug_eval: TIMEOUT" in t for t in _texts(result)), (
+        _texts(result))
+    assert thread in client.debugger_threads
+
+    # A bare declaration fails to parse against the shell's own tokens; the
+    # compile error classifies inside the wrapper and the thread answers again.
+    result = await _eval_at(client, thread, "fun f x = x", timeout_s=30)
+    assert result["status"] == "ok", result
+    assert thread in client.debugger_threads
+    follow = await _eval_at(client, thread, "2 + 2", timeout_s=30)
+    assert follow["status"] == "ok", follow
+    assert any("val it = 4: int" in t for t in _texts(follow)), _texts(follow)
+
+    await client.request(
+        "PIDE/debugger_input", {"thread": thread, "verbs": ["continue"]},
+        timeout=30.0)
+    assert await _wait_all_resumed(client), "the thread never resumed"
+    assert await _wait_settled(client)
+
+
 # ── Probe 11bis: locals through the eval verb (gates the locals design) ────
 
 @pytest.mark.asyncio
@@ -384,7 +449,7 @@ async def test_probe11bis_locals_through_the_eval_verb(prover):
     assert ours["status"] == "ok", ours
     our_texts = _texts(ours)
     assert not any(t == "val it = (): unit" for t in our_texts), (
-        f"the unit echo was not stripped: {our_texts}")
+        f"the `val _` envelope leaked a result echo: {our_texts}")
     listing = "\n".join(our_texts)
     for name in ("n", "xs", "shift"):
         assert f"val {name} =" in listing, f"local {name} missing:\n{listing}"

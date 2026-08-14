@@ -344,6 +344,30 @@ fun debug_eval timeout body =
     end);
 
 
+(* The self-compiling wrapper (design section 4.9): the agent's expression arrives as ONE
+   ML string literal and is compiled INSIDE the protection above, so expression content can
+   neither escape the wrapper nor extend the unprotected pre-registration window -- compile
+   errors, the deadline and the abort flag all classify inside debug_eval.  The explicit
+   "val it = ( ... );" shell echoes the result binding through verbose = true and rejects a
+   bare declaration with a parse error at the shell's own tokens.
+
+   The OUTER text the Scala side composes ("val _ = ...;") binds nothing, and its silence
+   on the wire rests on ONE guard: the debugger's evaluate also runs verbose = true and
+   still flushes a writeln carrying the EMPTY string for the wildcard binding
+   (ml_compiler.ML), which only the empty-message drop in Debugger.writeln_message
+   (debugger.ML) keeps off the wire.  A probe pins that guard. *)
+
+fun debug_eval_string timeout source =
+  debug_eval timeout (fn () =>
+    ML_Context.eval
+      {environment = ML_Env.Isabelle, redirect = false, verbose = true,
+       catch_all = false, debug = SOME false,
+       writeln = Debugger.writeln_message, warning = Debugger.warning_message}
+      Position.none
+      (ML_Lex.read "val it = (" @ ML_Lex.read_source (Input.string source) @
+       ML_Lex.read ");"));
+
+
 (* The locals printer (design section 4.10): all local variables of one stack frame, through
    the same primitives the stock print_vals verb uses -- debugState on the stopped thread is
    the loop-entry capture, since the evaluation running this code is uninstrumented -- but

@@ -72,18 +72,37 @@ object Debugger_Adapter {
     token: String,
     respond: (String, List[(String, String)]) => Unit,
     timer: Event_Timer.Request,
-    output: List[(String, String)],   // (kind, text), reversed
-    strip_unit_echo: Boolean)
+    output: List[(String, String)])   // (kind, text), reversed
 
-  /* The eval verb's txt2 for the locals listing: the prelude's printer under the same
-     envelope as any other evaluation (design section 4.10). */
+  /* Composed eval texts (design sections 4.9-4.10): constant shape.  The "val _" envelope
+     binds nothing and so emits no result echo of its own; the agent's expression travels
+     as ONE ML string literal and is compiled by the prelude INSIDE the wrapper's
+     protection, where its result binding is echoed as "val it = ...". */
+
   def print_vals_text(frame: Int, timeout: Double): String =
-    "Isabelle_MCP.debug_eval (Time.fromSeconds " + math.ceil(timeout).toInt.toString +
-      ") (fn () => Isabelle_MCP.debug_locals " + frame.toString + ")"
+    "val _ = Isabelle_MCP.debug_eval (Time.fromSeconds " + math.ceil(timeout).toInt.toString +
+      ") (fn () => Isabelle_MCP.debug_locals " + frame.toString + ");"
 
-  /* evaluate {verbose = true} appends the eval's own result binding after the listing;
-     the stock print_vals verb emits only the listing, so parity requires dropping it. */
-  val UNIT_ECHO = "val it = (): unit"
+  def eval_text(expr: String, timeout: Double): String =
+    "val _ = Isabelle_MCP.debug_eval_string (Time.fromSeconds " +
+      math.ceil(timeout).toInt.toString + ") " + ml_string_literal(expr) + ";"
+
+  /* The literal encoder: Symbol.encode first (the form the prover-side lexer expects),
+     then each UTF-8 byte as itself when printable ASCII, everything else -- including the
+     two literal metacharacters -- as \ddd, three decimal digits.  The output is pure
+     ASCII, so the Symbol.encode later applied to the whole input text is a no-op on it. */
+  def ml_string_literal(s: String): String = {
+    val bytes = UTF8.bytes(Symbol.encode(s))
+    val result = new StringBuilder(bytes.length + 16)
+    result += '"'
+    for (b <- bytes) {
+      val c = b.toInt & 0xFF
+      if (c >= 32 && c <= 126 && c != '"' && c != '\\') result += c.toChar
+      else result ++= "\\%03d".format(c)
+    }
+    result += '"'
+    result.toString
+  }
 }
 
 class Debugger_Adapter(server: Language_Server) {
@@ -150,11 +169,7 @@ class Debugger_Adapter(server: Language_Server) {
         case Some(p) =>
           p.timer.cancel()
           val status = if (stack.nonEmpty) OK else RESUMED
-          val messages = {
-            val all = p.output.reverse
-            if (p.strip_unit_echo) all.filterNot(_._2 == UNIT_ECHO) else all
-          }
-          p.respond(status, messages)
+          p.respond(status, p.output.reverse)
           true
         case None =>
           // an owed completion signal from a request the backstop already answered
@@ -288,8 +303,7 @@ class Debugger_Adapter(server: Language_Server) {
   private def start_eval(
     id: LSP.Id,
     params: LSP.Debugger_Eval_Params,
-    text: String,
-    strip_unit_echo: Boolean
+    text: String
   ): Unit = {
     ensure_init()
     def respond(status: String, messages: List[(String, String)]): Unit =
@@ -318,8 +332,7 @@ class Debugger_Adapter(server: Language_Server) {
             }
           }
         pending.change(map =>
-          map + (thread_name ->
-            Pending(serial, params.token, respond, timer, Nil, strip_unit_echo)))
+          map + (thread_name -> Pending(serial, params.token, respond, timer, Nil)))
         session.debugger.input(thread_name, "eval", params.frame.toString, "false",
           Symbol.encode(""), Symbol.encode(text))
       }
@@ -327,11 +340,10 @@ class Debugger_Adapter(server: Language_Server) {
   }
 
   def eval(id: LSP.Id, params: LSP.Debugger_Eval_Params): Unit =
-    start_eval(id, params, params.expr, strip_unit_echo = false)
+    start_eval(id, params, eval_text(params.expr, params.timeout))
 
   def print_vals(id: LSP.Id, params: LSP.Debugger_Eval_Params): Unit =
-    start_eval(id, params, print_vals_text(params.frame, params.timeout),
-      strip_unit_echo = true)
+    start_eval(id, params, print_vals_text(params.frame, params.timeout))
 
 
   /* on-demand abort of the outstanding evaluation (design section 4.13): sets the
