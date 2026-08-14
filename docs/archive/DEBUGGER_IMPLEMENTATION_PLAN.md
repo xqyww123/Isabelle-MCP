@@ -25,17 +25,33 @@ passing `check_component.py`, and the probes as integration tests
 unit suite 495 green) — commit `62008cf`. Probe results and the discoveries
 they forced are in "Phase A probe results (2026-08-14)" below.
 
-**Current position: the adversarial code review of `62008cf` is complete,
-every fix was itself adversarially verified, the user approved the whole
-repair round, and the NEXT ACTION is the "Phase A repair round" section
-below — start at its commit sequence.** The full review verdict is archived
-in [`DEBUGGER_REPAIR_REVIEW_VERDICT.md`](DEBUGGER_REPAIR_REVIEW_VERDICT.md).
+**Current position: the Phase A repair round is IMPLEMENTED AND COMMITTED
+(2026-08-14).** Commits, each with a rebuilt jar, `check_component.py`
+green, the full probe file green in one process run, and the unit suite
+green: `da0d043` (R1 dispatcher-confined backstop + R2's Scala abort check
++ R7 clear_output + R8 prover_exit-via-dispatcher), `f62c18f` (R3
+self-compiling wrapper), `fb51934` (R4 acknowledged toggle), `9062072` (R5
+prover-truth listing states; prelude version → "4" both sides), `e55c362`
+(R6 not_stopped refusal), plus the R9 ranged-didChange commit and the R10
+docs commit that follow it in history.  R9 landed `document_diff.py`
+(UTF-16 converter + descending multi-hunk emitter), the `sync_dirty_files`
+integration, the rejected-didChange full-text recovery hook, 17 unit tests
+(500-case property test included), and
+`tests/integration/test_ranged_sync_probes.py` (prefix reuse; multi-hunk
+sync) — probe 6 was rewritten to the new reality in the same commit (a
+downstream edit now PRESERVES armed serials; only an upstream edit
+invalidates).  R11's probes landed incrementally with their items (R2's
+indebted-abort probe included).  Still open from the round: R2's Python
+retry loop ships with the Phase C abort tool.  **The NEXT ACTION is Phase
+B** (Python protocol layer, below).  The repair round's contract remains in
+the "Phase A repair round" section; the full review verdict is archived in
+[`DEBUGGER_REPAIR_REVIEW_VERDICT.md`](DEBUGGER_REPAIR_REVIEW_VERDICT.md).
 
 Concrete pointers a fresh context needs:
 
-- Version gate: `ML/mcp_prelude.ML:17` (`val mcp_prelude_version = "2"`) and
-  `src/language_server.scala:31` (`val prelude_version = "2"`) — bump BOTH to
-  `"3"` with the prelude changes.
+- Version gate: `ML/mcp_prelude.ML` (`val mcp_prelude_version`) and
+  `src/language_server.scala` (`val prelude_version`) — currently `"4"`;
+  bump BOTH together with any prelude change.
 - Jar release recipe: `docs/COMPONENT_INSTALL_PLAN.md` §7 ("Release recipe
   for the jar") — scratch `USER_HOME`, `isabelle scala_build`, copy back,
   `scripts/check_component.py` gate. Never `-f`, never `-c`.
@@ -45,7 +61,8 @@ Concrete pointers a fresh context needs:
   `PATH=…/contrib/Isabelle2025-2/bin:$PATH pytest tests/integration -m integration`
   (a bare `pytest` deselects them via `addopts`).
 - The unit suite must stay green:
-  `PATH=…/bin:$PATH python -m pytest tests/ -q` (516 tests as of Phase Y).
+  `PATH=…/bin:$PATH python -m pytest tests/ -q` (512 passing as of the
+  repair round).
 - Commit on `master` directly (shared working tree; no branches, no stash,
   no `git clean`); push only `origin`, and only when asked.
 

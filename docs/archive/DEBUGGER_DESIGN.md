@@ -594,12 +594,19 @@ Evaluate an Isabelle/ML expression in the scope of a stack frame of a hit:
 the frame's ML name space (including enclosing scopes) is merged into the
 compilation environment, so the frame's local bindings are directly usable.
 Antiquotations work. The evaluation is never itself instrumented. `expr` is a
-single **expression** — declarations fail to compile; a temporary binding is
-written `let val x = … in … end`, and bindings do not survive to the next
-call (each evaluation rebuilds its context and restores it afterwards). *Text
-result*: the evaluation's `writeln`/`warning`/`error` output; an expression
-that raises is a normal, completed round trip whose output is the error
-message (not a tool error).
+single **expression** — a bare declaration fails with a parse error at the
+wrapper's own tokens (the expression is compiled inside `val it = ( … );`,
+§7.3); a temporary binding is written `let val x = … in … end`, and bindings
+do not survive to the next call (each evaluation rebuilds its context and
+restores it afterwards). A paren-balanced "smuggle" such as
+`1); val x = (2` compiles as two declarations — but they run INSIDE the
+wrapper's protection (deadline, abort, classification all apply) and their
+bindings die with the discarded context, so the trick buys nothing. An
+empty or whitespace-only `expr` is refused by the tool layer before the wire
+(it would compile to the well-formed `val it = ( );`). *Text result*: the
+evaluation's `writeln`/`warning`/`error` output; an expression that raises
+is a normal, completed round trip whose output is the error message (not a
+tool error).
 
 ```json
 {
@@ -685,9 +692,11 @@ heap**: locals revert to the stock `print_vals` verb and the prover-side
 locals timeout is given up — the Scala backstop and the debt fence then
 govern, and §7.3's policy line changes accordingly.
 
-Output matches stock `print_vals` **after the adapter strips the eval's
-result echo** (`evaluate {verbose = true}` appends `val it = (): unit` after
-the listing; the stock verb emits only the chunks block).
+Output matches stock `print_vals` byte for byte with no filtering: the
+composed text binds the call as `val _ = …;`, which echoes nothing (§7.3's
+empty-writeln guard), so the listing is the only output — and a genuine
+`val it = (): unit` produced by an agent's own evaluation is legitimate
+output that survives untouched.
 
 The cost of printing is real and unbounded by depth: Isabelle's installed
 printers for its core types build the **complete** pretty tree (full syntax
@@ -785,12 +794,43 @@ timeout: sets the wrapper's abort flag (§7.3); the evaluation ends with an
 ordinary error at its next safe point and **the thread stays at the
 breakpoint, still debuggable**.
 
-*Text result* on success:
+**Mechanism — outcome-based bounded retry (user decision 2026-08-14; the
+Scala side is stateless).** `PIDE/debugger_abort` answers `no_evaluation`
+when the thread has neither a pending evaluation nor an owed state (settled
+— an indebted thread counts as abortable: it is exactly the runaway abort
+exists for), else sends the prelude flag command ONCE and answers `aborting`
+immediately. An abort acknowledged as `aborting` can still be LOST (the
+pre-registration window, §7.3), so the TOOL confirms by outcome and retries:
+
+- send `PIDE/debugger_abort`; wait min(~2 s, the targeted evaluation's own
+  outstanding reply);
+- if that reply arrived, the evaluation ended — report how it ended and stop
+  re-sending. Pinning the retry to the target's own reply structurally
+  closes the wrong-target window: the tool never re-sends after the target
+  settles, and the caller is blocked inside the tool, so no next evaluation
+  can start meanwhile.
+- in the debt case (the backstop already answered that evaluation `timeout`)
+  keep re-sending until the abort reply flips to `no_evaluation` — safe,
+  because the busy fence refuses new evaluations while the debt is owed;
+- bound ~30 s total, then report honestly that the abort was requested
+  repeatedly but the evaluation has not ended (the allocation-free-loop
+  limit; `isabelle_cancel_evaluation` remains the global way out). Never
+  claim delivery that was not observed.
+
+The ML-side silent no-op for an unregistered thread is load-bearing
+staleness protection: re-sending is harmless because the flag lives in the
+registration entry (below). Rejected alternatives, for the record: a
+prover-side pre-abort table (a stale-abort landmine needing token
+threading); a Scala-side retry state machine (its re-sends cross settlement
+boundaries and kill the NEXT evaluation — the ML table is keyed by thread
+name only); a raw interrupt in the window (escapes the error wrapper, kills
+the command, poisons the theory tail).
+
+*Text result* on `aborting` + confirmed settlement:
 > Abort requested. The evaluation on this hit will end with an error at its
 > next safe point; the thread stays at the breakpoint.
 
-When nothing is being evaluated on that hit, it is an **error** (not a
-success text), decided by the Python layer's own outstanding-request state:
+On `no_evaluation` (nothing outstanding), an **error** (not a success text):
 > No evaluation is in progress on this hit — there is nothing to abort.
 
 A retired `hit_id` gets the standard retired-hit error.
@@ -1046,22 +1086,47 @@ copied debugger loop across Isabelle upgrades.)
 Client → server requests (timeouts are JSON numbers of seconds, chosen by the
 Python side, as in the query protocol):
 
-- `PIDE/debugger_breakpoints {uri, range?}` →
-  `{breakpoints: [{range, serial, state}]}` — every breakable site
-  (`ML_breakpoint` markup) in the snapshot range. The server returns ranges
-  and serials; anchor snippets are computed client-side (§3.2, including the
-  one-symbol shift correction of §3.3).
-- `PIDE/debugger_toggle_breakpoint {uri, serial, state}` → `{ok}` or an error
-  (unknown serial / enclosing command not finished). `state` is absolute; the
-  adapter reads the current state and toggles only on difference (§4.6).
+- `PIDE/debugger_breakpoints {uri, range?, token, timeout}` →
+  `{status, open, breakpoints: [{range, serial, state}]}` — every breakable
+  site (`ML_breakpoint` markup) in the snapshot range, with **prover-truth
+  enabled-states**: the listing resolves every serial against the real
+  breakpoint ref in ONE batched round trip (prelude command
+  `Isabelle_MCP.breakpoint_states`), so `state` is JSON `true`/`false`, or
+  the word saying why that site's command could not be resolved (`undefined`
+  / `unfinished` / `interrupted` / `failed` / `unknown_breakpoint`).
+  Top-level `status` is `ok`/`timeout`/`crashed` — the request is async like
+  the queries, so a wedged prover answers `timeout` instead of blocking the
+  main loop. The server returns ranges and serials as found; anchor snippets
+  are computed client-side (§3.2, including the one-symbol shift correction
+  of §3.3).
+- `PIDE/debugger_toggle_breakpoint {uri, serial, state, token, timeout}` →
+  `{status, was?}` — the **acknowledged toggle**: the write happens
+  prover-side on the real breakpoint ref (prelude command
+  `Isabelle_MCP.toggle_breakpoint`, inline on the protocol thread; `state` is
+  absolute, so a retry is idempotent), and an `ok` reply carries `was`, the
+  previous value. Statuses raised before the prover is asked:
+  `file_not_open` / `outdated` / `unknown_breakpoint`; from the prover: the
+  query vocabulary (`undefined` / `unfinished` / `interrupted` / `failed` /
+  `crashed`) plus `unknown_breakpoint` — one word for both a serial the
+  snapshot markup does not know (Scala side) and one the resolved command's
+  context does not know (ML side). Only an `ok` may record an arming
+  client-side; a `timeout` leaves the write possibly applied, which is
+  harmless under absolute semantics and visible in the next listing's prover
+  truth.
 - `PIDE/debugger_eval {token, thread, frame, expr, timeout}` →
-  `{status, content}`; same shape without `expr` for
+  `{status, messages: [{kind, text}]}`; same shape without `expr` for
   `PIDE/debugger_print_vals` — which is **realised through the eval verb**,
   sending a call to the prelude's locals printer under `debug_eval` (§4.10),
-  never the stock `print_vals` verb. Statuses mirror the query protocol's
-  discipline (ok / timeout / resumed / crashed / …); the sentences live in
-  Python.
-- `PIDE/debugger_abort {token|thread}` — sets the abort flag (§7.3).
+  never the stock `print_vals` verb. Statuses: `ok` / `resumed` / `timeout` /
+  `crashed` / `busy` / `not_stopped`. `not_stopped` is a refusal issued
+  before anything is sent — the thread is not stopped — and promises the
+  expression never ran; it is deliberately not `resumed`, which means "input
+  delivered, the expression may have run". The sentences live in Python.
+- `PIDE/debugger_abort {token|thread}` → `{status}`: `no_evaluation`
+  (nothing outstanding and no state owed — the thread is settled) or
+  `aborting` (the flag command was sent once; how the evaluation actually
+  ended arrives through its own reply). Stateless on the Scala side; the
+  confirmation loop is the abort tool's (§4.13).
 - `PIDE/debugger_input {thread, verbs...}` → `{ok}` — resume/step verbs.
 
 Server → client notifications:
@@ -1120,11 +1185,29 @@ cannot be a protocol handler and is keyed thread→stream-until-sentinel).
 
 ### 7.3 The eval wrapper `Isabelle_MCP.debug_eval`
 
-We construct the ML text sent to `Debugger.eval`; the agent's expression is
-embedded in a call to a prelude function:
+We construct the ML text sent to `Debugger.eval`; the agent's expression
+travels as ONE ML string literal (encoded by the Scala side: `Symbol.encode`
+first, then printable ASCII verbatim and every other UTF-8 byte as `\ddd`)
+and is compiled by a prelude function INSIDE the wrapper's protection — the
+composed text is constant-shape, so expression content can neither escape
+the wrapper nor extend the unprotected pre-registration window:
 
 ```sml
-Isabelle_MCP.debug_eval (Time.fromSeconds 180) (fn () => ⟨expression⟩)
+val _ = Isabelle_MCP.debug_eval_string (Time.fromSeconds 180) "⟨literal⟩";
+```
+
+`debug_eval_string` compiles `val it = ( ⟨expression⟩ );` with
+`ML_Context.eval` under `verbose = true`, writing through
+`Debugger.writeln_message`/`warning_message` — so the result binding is
+echoed exactly as the debugger's own evaluate would. The outer `val _`
+envelope binds nothing; its silence on the wire rests on one guard: the
+debugger's evaluate flushes ONE `writeln` carrying the EMPTY string for the
+wildcard binding, and only `Debugger.writeln_message`'s empty-message drop
+keeps it off the wire (a probe pins this). The locals call needs no literal
+and stays a direct call:
+
+```sml
+val _ = Isabelle_MCP.debug_eval (Time.fromSeconds 180) (fn () => Isabelle_MCP.debug_locals 0);
 ```
 
 `debug_eval` does three things in one place:
@@ -1183,10 +1266,15 @@ The wrapper is also the home of the **locals printer** (§4.10): the same
 envelope, the expression being a call to the prelude function that prints a
 frame's variables with per-value 5 s bounds.
 
-One honest boundary: the envelope is assembled by embedding `expr` in ML
-text, so it is a convenience, not a security boundary — a token-unbalanced
-`expr` could in principle escape it. The client runs an ML token-balance
-check on `expr` (reusing the anchor-snippet tokenizer) before embedding.
+The string-literal embedding closes the old escape hole structurally (no
+client-side token-balance check exists any more; see §4.9 for what a
+paren-balanced "smuggle" can still do INSIDE the protection). The honest
+residual window: registration happens inside `debug_eval`, so before it
+there remain the input-queue round trip, a linear lexer scan of the
+constant-shape composed text, and the debugger loop's frame-scope merge —
+an abort landing in that window is acknowledged and lost, which the abort
+tool's retry loop re-covers within one period (§4.13); expression content
+can no longer extend this window.
 
 Two implementation requirements from the adversarial review:
 
@@ -1234,6 +1322,19 @@ Stated honestly in tool descriptions where they bite:
 - The constructed eval text compiles under the frame's merged name space: a
   local *structure* named `Isabelle_MCP` or `Time` in scope at the breakpoint
   would shadow the envelope's names. Vanishingly rare; noted, not defended.
+- **`Isabelle_MCP_PolyML` is globally visible** (accepted, user decision
+  2026-08-14): the §4.10 re-exposure writes the full `PolyML` binding into
+  the raw global namespace for the whole session, so any user ML can reach
+  `Isabelle_MCP_PolyML.DebuggerInterface` etc. Hiding it would be cosmetic —
+  five lines of user ML re-derive the same binding — and the probes rely on
+  it (the deliberately-slow `addPrettyPrinter` printer).
+- The `not_stopped` refusal (§7.1) **narrows** the poisoned-input-queue
+  window, it does not close it: a thread resuming between the check and the
+  prover's dequeue still leaves a queued input that poisons its next stop.
+  The benign inverse — an eval refused although the thread just stopped,
+  because its state has not arrived — cannot bite a client that acts on a
+  received hit notification: the state callback precedes the check on the
+  same dispatcher.
 
 ## 8. Out of scope for v1
 
