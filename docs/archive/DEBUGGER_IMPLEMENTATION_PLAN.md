@@ -13,6 +13,34 @@ prelude and the jar version-check each other, so prelude changes bump
 `mcp_prelude_version` and the Scala constant together; after editing `.ML`
 sources, restart the REPL/server rather than rebuilding heaps.
 
+## Execution status (2026-08-14) and Phase A hand-off
+
+Done: Phase Y (commit `c1feaa1`); the specification rewrite plus two full
+adversarial review rounds and a targeted third pass on the post-review
+decisions, all folded (commits `14dc54c` and successors). The design is
+settled; **the next action is Phase A below.** One loose end may still
+arrive: a background reviewer attacking the `debug_eval` containment and the
+locals rerouting (spec §7.3/§4.10) may deliver late findings — fold any that
+survive scrutiny before or during Phase A.
+
+Concrete pointers a fresh context needs:
+
+- Version gate: `ML/mcp_prelude.ML:17` (`val mcp_prelude_version = "2"`) and
+  `src/language_server.scala:31` (`val prelude_version = "2"`) — bump BOTH to
+  `"3"` with the prelude changes.
+- Jar release recipe: `docs/COMPONENT_INSTALL_PLAN.md` §7 ("Release recipe
+  for the jar") — scratch `USER_HOME`, `isabelle scala_build`, copy back,
+  `scripts/check_component.py` gate. Never `-f`, never `-c`.
+- New Scala source files must be added to
+  `src/isabelle_mcp/scala/Isabelle2025-2/etc/build.props` `sources`.
+- Probe tests run with:
+  `PATH=…/contrib/Isabelle2025-2/bin:$PATH pytest tests/integration -m integration`
+  (a bare `pytest` deselects them via `addopts`).
+- The unit suite must stay green:
+  `PATH=…/bin:$PATH python -m pytest tests/ -q` (516 tests as of Phase Y).
+- Commit on `master` directly (shared working tree; no branches, no stash,
+  no `git clean`); push only `origin`, and only when asked.
+
 ---
 
 ## Phase Y — the YAML output change (precondition) — **done, commit c1feaa1**
@@ -122,7 +150,7 @@ Gates — if 1, 2 or 3 fails, stop and revisit the specification:
    limit, and this probe only fixes the limit's wording — or deletes it, if
    the cut-off does land.
 
-Refinement probes (wording, bounds, reconciliation logic):
+Refinement probes (wording, bounds, bookkeeping logic):
 
 4. **One `debugger_state` per input, always last.** Drive `print_vals`, a
    normal eval, a raising eval, then `continue`; assert exactly one state per
@@ -143,7 +171,7 @@ Refinement probes (wording, bounds, reconciliation logic):
    (§2.2 motion 3). Also confirm motion 2: an edit strictly after the definer
    leaves the breakpoint armed and the re-run caller hits with no re-enable.
 7. **Cancellation's synthetic edit.** After `isabelle_cancel_evaluation`,
-   check whether all serials died (decides the reconcile-after-cancel
+   check whether all serials died (decides the demote-after-cancel
    trigger of spec §5); assert threads left the hit table.
 8. **Query tools under parked workers.** With N threads stopped (N up to the
    worker count), `isabelle_goal` / `isabelle_find_theorems` on processed
@@ -204,8 +232,10 @@ Files: `src/isabelle_mcp/lsp_client.py`, `server.py`, `models.py`,
   `output_schema=None` with formatters in `utils/formatters.py`; notice
   delivery through the existing middleware pattern.
 - `src/isabelle_mcp/instructions.py` — the debugger section teaching hit /
-  frame / breakable site, plus the run-twice consequence and the
-  discovery-first workflow (draft at implementation; user-visible text).
+  frame / breakable site, the three working motions of spec §2.2 (and the
+  one losing move), the manual arming rule of spec §5, the single-expression
+  rule, and the discovery-first workflow (draft at implementation;
+  user-visible text).
 
 ## Phase D — evaluation and cancellation integration
 
@@ -220,8 +250,10 @@ Files: `src/isabelle_mcp/lsp_client.py`, `server.py`, `models.py`,
 - `evaluate_to` refused while any hit is live (the refusal lives in
   `evaluate_to` itself, so the query tools' auto-start inherits it), leading
   with the live hits and consuming their queued notices; plus the
-  forgotten-re-enable warning line of spec §5 when enabled-but-unarmed
-  entries exist in the target file.
+  forgotten-re-enable fence of spec §5 — trigger computed over the target's
+  import closure (excluding `code not found` entries, including armed
+  entries at no-longer-processed positions), delivered both as a result line
+  and as a debugger notice so the guard's auto-start path cannot drop it.
 - Demote-and-notify hooks: on evaluation events, on resync, after relaunch,
   after cancellation (per probe 7). No background arming (spec §5).
 - Cancellation itself unchanged (spec §6.4); hits retired as swept-up, the
@@ -229,7 +261,7 @@ Files: `src/isabelle_mcp/lsp_client.py`, `server.py`, `models.py`,
 
 ## Phase E — tests and documentation
 
-- Unit tests: registry resolution/reconciliation, anchor snippets, sentence
+- Unit tests: registry resolution and demote-and-notify bookkeeping, anchor snippets, sentence
   catalogue — pure Python, no prover.
 - Integration tests beyond the probes: set → hit → locals → eval → continue;
   step modes; enable/disable-all idempotence; the three motions of §2.2

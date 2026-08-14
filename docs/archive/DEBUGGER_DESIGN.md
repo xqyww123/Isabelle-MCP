@@ -60,7 +60,9 @@ consistently in the implementation (code, docstrings, user-facing messages).
   **hit identifier** (`hit_id`); the thread name appears in reports as
   information, never as an input. A step keeps the same hit (a controlled
   resume-and-restop inside it); the hit is retired when the thread resumes via
-  continue, is swept up by cancellation, steps without stopping again, or the
+  continue, is swept up by cancellation, steps without stopping again, has
+  its execution superseded by an edit (PIDE cancels the old execution and the
+  thread is interrupted — the retired-id error names this ending too), or the
   prover goes away — **the hit table is cleared on every prover teardown path**
   (terminate, session switch, crash recovery, relaunch), each hit retired as
   "the prover was terminated". Using a retired id is an error naming how the
@@ -70,9 +72,9 @@ consistently in the implementation (code, docstrings, user-facing messages).
 - **frame** — one entry of a hit's call stack. Frame `0` is the innermost
   frame (where execution stopped).
 - **debugger notice** — a one-line message about an asynchronous debugger
-  event (a breakpoint re-armed, a hit outside a wait, …), buffered by the
-  Python layer and appended to the next tool result (§6.3), under the header
-  `Debugger notices:`.
+  event (a breakpoint demoted to pending, a hit outside a wait, …), buffered
+  by the Python layer and appended to the next tool result (§6.3), under the
+  header `Debugger notices:`.
 
 ## 2. Prerequisites and launch
 
@@ -175,7 +177,7 @@ Breakpoint tools use `line` + optional `at_text`:
   nearest before** the occurrence's first character — "stop before executing
   this code". The backward search is **bounded to the line**: if the line has
   sites but none at or before the anchor, that is an error listing the line's
-  sites (§4.2, message 4), never a silent match on an earlier line.
+  sites (§4.2, message 5), never a silent match on an earlier line.
 - `at_text` omitted: the **first** site on `line`.
 - **Ambiguity is refused only when it matters**: if `at_text` occurs several
   times on the line but every occurrence resolves to the same site, it is
@@ -244,7 +246,9 @@ the loading command's blobs **(probe)**.
 
 Twelve new tools, plus one changed parameter on `isabelle_launch`. Names
 follow the `isabelle_` prefix convention; all `file_path` arguments are
-absolute paths (realpath-normalized as elsewhere).
+absolute paths (realpath-normalized as elsewhere; `isabelle_del_breakpoints`
+additionally accepts the project-root-relative form its listings print,
+§4.3).
 
 **All twelve are text results** (`output_schema=None` plus a formatter in
 `utils/formatters.py`); `models.py` gains nothing. This is distinct from the
@@ -312,6 +316,10 @@ Refusal messages, final wording (each lives in Python, unit-tested verbatim;
    > There is no breakable site at {where} — that line has not been evaluated
    > yet. Breakpoints can only be set on code the prover has already compiled,
    > so evaluate the file first.
+
+   For a `.ML` target the last clause becomes the §3.4 variant ("evaluate the
+   theory that loads it (its `ML_file` command)", naming the theory when
+   known).
 2. Command still running:
    > There is no breakable site at {where} yet — the command there has not
    > finished evaluating. A site can only be used once its command has
@@ -501,26 +509,52 @@ truncated: showing 40 of 137 sites, lines 14-52 — narrow the range (e.g. start
 `enable_all` sets the `enabled` flag of **every** registry entry to true AND
 **arms every entry whose site currently exists** — under the manual arming
 model (§5) this is *the* re-arming action after recompilation, a prover
-relaunch, or a cancellation. Entries that cannot arm stay pending and are
-reported with their reason tags. `disable_all` sets the flag false and
-disarms all armed sites; pending entries keep the flag for when they are
-armed again. Use case for the pair: silence all breakpoints for an
-undisturbed run, then restore them.
+relaunch, or a cancellation. An optional `file_path` parameter scopes both
+the flag and the arming to one file (motion 3 rarely wants week-old
+breakpoints in other files back). Entries that cannot arm stay pending and
+are reported with their reason tags. `disable_all` sets the flag false and
+switches off the sites of all armed entries (the entries stay in the armed
+state — "armed" is about having a live site, the flag is about whether it
+stops); pending entries keep the flag for when they are armed again. Use
+case for the pair: silence all breakpoints for an undisturbed run, then
+restore them.
 
 **Absolute state, not a flip**: calling either twice is idempotent. (The
 prover-side toggle helper is flip-shaped; the adapter realises the absolute
 state as "read the current site state, toggle only if it differs", computing
 the acknowledgement from its own snapshot — never from the distribution's
-Scala-side mirror after a failed toggle: every prover-side toggle failure
-coincides with the serial's death by recompilation, so the registry, not the
-mirror, is what a failed toggle leaves correct.)
+Scala-side mirror after a failed toggle.)
 
-No parameters. *Text result*: counts — entries armed (resp. disarmed), and
-entries pending per reason tag.
+**An entry is recorded armed only on the toggle's positive acknowledgement.**
+On failure it stays pending, tagged by cause: `still evaluating` for the
+enclosing-command-not-finished error (the serial is alive — this failure does
+*not* coincide with serial death; the coincidence claim holds only for the
+unknown-serial error, where recompilation has already minted successors), a
+demotion for unknown-serial, and pending with a wire-failure note when the
+request itself died in flight — the one state the warning fence must never
+vouch for.
+
+*Text result*: the **armed entries listed** (one row each, §4.4's format —
+counts alone would hide that motion 3 just re-armed a forgotten breakpoint
+in an imported library), plus counts of entries pending per reason tag.
 
 ```json
-{"type": "object", "properties": {}, "required": []}
+{
+  "type": "object",
+  "properties": {
+    "file_path": {
+      "type": ["string", "null"],
+      "default": null,
+      "description": "Restrict to breakpoints in this file. Omit for all breakpoints."
+    }
+  },
+  "required": []
+}
 ```
+
+During an active evaluation the call is allowed; it arms what has finished
+compiling, and whether the current run stops at a just-armed site is a race
+(§5) — arm between rounds for deterministic behaviour.
 
 ### 4.8 `isabelle_debug_state`
 
@@ -763,12 +797,13 @@ plus the identity needed to toggle it on the wire.
 
 - **armed** — resolved to a live site; the site's `bool ref` mirrors the
   entry's `enabled` flag.
-- **pending** — no live site right now; the entry arms as soon as one
-  appears. The *reason* — the file has not been evaluated in this prover, the
-  enclosing command is still running, the code was edited away — is carried
-  as a short tag in listings and notices (§4.4), not as a state name: at the
-  moment reconciliation runs, "never evaluated here" and "edited away" are
-  indistinguishable, and the agent acts on the reason sentence anyway.
+- **pending** — no live site right now; the entry arms again on the next
+  explicit enable (§4.6) once a site exists. The *reason* — the file has not
+  been evaluated in this prover, the enclosing command is still running, the
+  code was edited away — is carried as a short tag in listings and notices
+  (§4.4), not as a state name: at the moment of demotion, "not evaluated
+  yet" and "code not found" can be indistinguishable, and the agent acts on
+  the tag anyway.
 
 Entries are only ever created armed (§2.2). `pending` is entered when an
 armed entry's site disappears: the enclosing command was edited and
@@ -785,11 +820,14 @@ re-arming for (the prover starts the next command the instant the compiling
 one finishes, while an arming round trip takes hundreds of milliseconds), it
 would make background runs' behaviour depend on who won, and it puts wire
 operations on paths that race the explicit tools. Under the manual model,
-arming happens between evaluation rounds, with no opponent; the agent's
+arming in the taught workflow happens between evaluation rounds, with no
+opponent (mid-run arming is allowed but racy — see below); the agent's
 workflow is §2.2's three motions.
 
 **Background bookkeeping** (all that remains of reconciliation): observe site
-death — on evaluation events, file resyncs, prover relaunch, and after
+death — on evaluation events, file resyncs, **dependency-blob edits** (`.ML`
+files reach the prover through Isabelle's own file watcher, not ours; their
+stat signatures are already tracked), prover relaunch, and after
 cancellation — demote armed entries to pending, and emit one debugger notice
 per state change (§4.4's tags; a reason-tag change *within* pending also
 emits one, same once-only rule). The bookkeeping never toggles a site. Site
@@ -805,17 +843,49 @@ under that lock, which is what makes §1's projection invariant ("site state
 can be rebuilt from the registry at any time") actually hold.
 
 **The forgotten-re-enable fence.** The cost of the manual model is that a
-forgotten re-enable makes a run miss silently. Therefore `evaluate_to`, when
-enabled-but-unarmed entries exist in the target file, carries a warning line
-in its result:
-> {N} breakpoints in {file} are not armed (their code was recompiled) — this
-> run will not stop at them. Call isabelle_enable_all_breakpoints to arm
-> them.
+forgotten re-enable makes a run miss silently. Therefore `evaluate_to` warns
+when the run cannot stop where the agent thinks it can. The trigger counts,
+over the target's **import closure** (a run re-executes invalidated upstream
+theories too; `.ML` blobs count via their loading theory):
+
+- enabled entries that are pending — except those tagged `code not found`,
+  which have had their arming attempt and failed (a warning that fires on
+  every healthy run stops being read; those entries are §4.4's business);
+- armed entries whose recorded position is no longer processed (`.thy`: the
+  decoration tracker already knows; `.ML`: the blob's stat signature changed
+  since arming) — sites that this very run is about to rebury.
+
+The warning is emitted both as a line in `evaluate_to`'s result and as a
+debugger notice (§6.3), so the query tools' auto-start path — which discards
+a promptly-completed evaluation's view — still delivers it:
+> {N} breakpoints in the files this run executes are not armed — it will not
+> stop at them. Call isabelle_enable_all_breakpoints to arm them.
+
+One structural blind spot, stated honestly: the fence cannot fire on the run
+whose own edit kills the sites — at call time the registry still says armed
+and nothing has recompiled yet. Motion 3's discipline (§2.2) is the only
+protection there; the second trigger bullet narrows the window (an already
+re-synced edit marks the position unprocessed) but does not close it.
+
+**Explicit arming during an active evaluation** is allowed — `set_breakpoint`
+and `enable_all` arm whatever has finished compiling, taking effect for code
+that has not yet run — but whether the *current* run stops at a just-armed
+site is a race between the arming round trip and the run's progress. For
+deterministic behaviour, arm between rounds; that is the taught workflow, and
+it is the workflow, not the system, that has no opponent. (Refusing mid-run
+calls instead would break arming while a hit is live, which motion-adjacent
+workflows need.)
+
+The `enabled` flag's readers, so no simplification pass deletes it: the
+warning trigger above (after `disable_all`, pending entries are
+enabled=false and correctly do not warn — deliberate silence stays quiet)
+and the listings (§4.4's rows, §4.5's `already set but disabled`).
 
 **Registry lifetime.** The registry is cleared when the MCP server process
 restarts (it lives in memory only). It is **retained** across a prover
-relaunch and across a session switch: entries become pending, and arm again
-on the next explicit enable, each transition reported by a debugger notice.
+relaunch and across a session switch: entries become pending (each demotion
+reported by a debugger notice) and arm again on the next explicit enable
+(reported by that tool's own result).
 
 ## 6. Hits and how the agent learns about them
 
@@ -885,15 +955,20 @@ fast with an explicit sentence rather than hanging.**)**
 
 ### 6.2 Hits outside an evaluation wait
 
-A background re-evaluation (triggered by a file save) can hit an enabled
-breakpoint while nothing is waiting. The hit is recorded and surfaced: as a
+A background re-evaluation (triggered by a file save) can hit an armed,
+enabled breakpoint while nothing is waiting. The hit is recorded and surfaced: as a
 debugger notice on the next tool call of any kind, and in
 `isabelle_debug_state` / `isabelle_evaluation_status` at any time.
+
+(A hit is position-identified, not registry-identified: an edit can demote
+the entry while its old execution's thread is still stopped, so
+`isabelle_list_breakpoints` may transiently show `pending` where
+`isabelle_debug_state` shows a live hit. That is coherent, not a bug to fix.)
 
 ### 6.3 Debugger notices
 
 MCP has no server-initiated push channel, so all asynchronous events
-(reconciliation results, hits outside a wait, stray halts, …) are buffered as
+(demotions to pending, hits outside a wait, stray halts, …) are buffered as
 debugger notices and appended to the next tool result, whatever the tool,
 under a `Debugger notices:` header. Delivery reuses the existing
 warning-injection middleware (`UnicodeWarningMiddleware`'s pattern: append as
@@ -909,7 +984,8 @@ of sites. (The 2026-08-11 draft's contrary design rested on the false premise
 that a stopped thread is uninterruptible; the review deleted it.) A thread
 leaves the hit table when it disappears from the prover's pushed debugger
 state; its hits are retired as "swept up by cancellation". After the cancel,
-reconciliation runs (§5). If a release-stopped-threads fallback is ever
+the demote-and-notify bookkeeping runs (§5). If a release-stopped-threads
+fallback is ever
 wanted, Isabelle's own mechanism is `Debugger.exit` (which frees every thread
 idle at a breakpoint), not per-thread resume.
 
