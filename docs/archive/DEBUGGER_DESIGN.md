@@ -1,25 +1,31 @@
 # ML Debugger Support — Design
 
-Status: **draft, superseded in parts, and shelved as of 2026-08-11.** Nothing in
-this document is implemented yet.
+Status: **authoritative specification, rewritten 2026-08-13.** This revision
+folds in everything that accumulated against the 2026-08-11 draft: the ten
+surviving concerns of the adversarial review, the decisions recorded in
+[`DEBUGGER_REVIEW_AND_DECISIONS.md`](DEBUGGER_REVIEW_AND_DECISIONS.md) (§2 and
+§2bis there), and the facts established by the 2026-08-13 source studies of the
+distribution. That file remains the record of *why*; this file is the record of
+*what*. Where the two disagree, this file wins (it is newer). Section numbers
+changed in the rewrite; references like "§6.4" in older documents point at the
+2026-08-11 draft, not at this text.
 
-> **Read [`DEBUGGER_REVIEW_AND_DECISIONS.md`](DEBUGGER_REVIEW_AND_DECISIONS.md)
-> first.** Ten review concerns against this document survived an adversarial
-> review and none of the fixes have been folded in yet. §6.4 in particular rests
-> on a premise now believed false, and §4.10/§4.11's `thread` parameter has been
-> superseded by a stop identifier. That file also records the decisions taken
-> after this draft was written, and why the work is currently shelved.
+Nothing in this document is implemented yet. Load-bearing claims marked
+**(probe)** are source-derived and must be confirmed by the integration-test
+probes of [`DEBUGGER_IMPLEMENTATION_PLAN.md`](DEBUGGER_IMPLEMENTATION_PLAN.md)
+before code is built on them.
 
-This document specifies interactive ML-debugger support for Isabelle-MCP: setting
-breakpoints in Isabelle/ML code, being notified when evaluation stops at a
-breakpoint, inspecting the stopped thread (call stack, local variables,
-arbitrary ML evaluation in a stack frame), and resuming (continue / step).
+This document specifies interactive ML-debugger support for Isabelle-MCP:
+setting breakpoints in Isabelle/ML code, being notified when evaluation stops
+at one, inspecting the stopped thread (call stack, local variables, arbitrary
+ML evaluation in a stack frame), and resuming (continue / step).
 
 The design builds exclusively on machinery that already exists in
 Isabelle2025-2 and in this repository. No patch to the Isabelle distribution is
-required, no session heap is invalidated, and the prover-side ML needs no
-changes (all `Debugger.*` protocol commands are already registered in every
-prover process by `src/Pure/Tools/debugger.ML`).
+required and no session heap is invalidated. The prover-side `Debugger.*`
+protocol commands are already registered in every prover process
+(`src/Pure/Tools/debugger.ML`); our own additions live in the component's ML
+prelude (`mcp_prelude.ML`), which we own.
 
 ---
 
@@ -28,33 +34,45 @@ prover process by `src/Pure/Tools/debugger.ML`).
 These terms are used consistently throughout this document and MUST be used
 consistently in the implementation (code, docstrings, user-facing messages).
 
-- **breakpoint site** — a stopping location inserted by the Poly/ML compiler
+- **breakable site** — a stopping location inserted by the Poly/ML compiler
   into instrumented ML code (one `bool ref` per site, initially `false`).
   Sites exist at statement boundaries chosen by the compiler; the front-end
   cannot create sites, only enable or disable existing ones. Each site is
-  identified on the PIDE wire by a **serial** (an integer assigned at
-  compile time and reported as `ML_breakpoint` markup on the site's source
-  position).
-- **breakpoint** — an entry in the client-side **breakpoint registry** (below):
-  the user's *intent* to stop at a particular source location. A breakpoint is
-  realized by enabling the breakpoint site at that location, and survives
-  recompilation (which destroys and recreates sites) by re-resolution.
+  identified on the PIDE wire by a **serial** (an integer assigned at compile
+  time, reported as `ML_breakpoint` markup). Sites exist only inside function
+  bodies — `let`/nested-`local` declarations and bodies, expression sequences,
+  conditional branches, `while` bodies, `fn`/`case`/`handle` alternatives and
+  `fun` clauses — never on top-level `val`/`fun` declarations, and only in ML
+  compiled while the debugger option was on.
+- **breakpoint** — an entry in the client-side **breakpoint registry**: the
+  user's *intent* to stop at a particular source location. A breakpoint is
+  realized by enabling the breakable site there, and survives recompilation
+  (which destroys and recreates sites) by re-resolution.
 - **breakpoint registry** — the table of breakpoints kept by the Python layer.
   It is the single source of truth; the enabled/disabled state of prover-side
   sites is a projection of it and can be rebuilt from it at any time.
-- **armed / pending / lost** — the three states of a registry entry
-  (see §5).
-- **anchor snippet** — the source text immediately following a breakpoint
-  site, recorded in the registry to identify the site without column numbers
-  and to re-anchor it after edits.
-- **stopped thread** — a prover thread currently halted inside the debugger
-  loop, waiting for debugger input. Identified by its Isabelle thread name
-  (e.g. `Isabelle.worker-17`).
-- **frame** — one entry of a stopped thread's call stack. Frame `0` is the
-  innermost frame (where execution stopped).
-- **debug notice** — a one-line message about a breakpoint state change
-  (armed, re-armed after recompilation, moved, lost, …), buffered by the
-  Python layer and delivered appended to the next tool result (§6.3).
+- **armed / pending** — the two states of a registry entry (§5).
+- **anchor snippet** — source text starting at a site's statement, whole ML
+  tokens, extended until unique within its line (§3.2). Recorded in the
+  registry to identify the site without column numbers and to re-anchor it
+  after edits; printed as `before ‹fold upd args›`.
+- **hit** — one occasion of a thread halting in the debugger. Each hit gets a
+  **hit identifier** (`hit_id`); the thread name appears in reports as
+  information, never as an input. A step keeps the same hit (a controlled
+  resume-and-restop inside it); the hit is retired when the thread resumes via
+  continue, is swept up by cancellation, steps without stopping again, or the
+  prover goes away — **the hit table is cleared on every prover teardown path**
+  (terminate, session switch, crash recovery, relaunch), each hit retired as
+  "the prover was terminated". Using a retired id is an error naming how the
+  hit ended, including that ending. (Thread names restart their counter with
+  each prover process, so hits must never survive their prover: a fresh
+  prover's `worker-3` is not the old one.)
+- **frame** — one entry of a hit's call stack. Frame `0` is the innermost
+  frame (where execution stopped).
+- **debugger notice** — a one-line message about an asynchronous debugger
+  event (a breakpoint re-armed, a hit outside a wait, …), buffered by the
+  Python layer and appended to the next tool result (§6.3), under the header
+  `Debugger notices:`.
 
 ## 2. Prerequisites and launch
 
@@ -63,73 +81,186 @@ consistently in the implementation (code, docstrings, user-facing messages).
 Debugger instrumentation is controlled by the Isabelle system option
 `ML_debugger` (default `false`). When enabled, *newly compiled* ML code —
 `ML ‹…›` blocks, `ML_file`-loaded files, etc. in the theories the agent
-evaluates — is compiled with debug information and breakpoint sites. Code
-already compiled into the session heap is unaffected (and cannot be debugged
-unless the heap itself was built with `ML_debugger=true`, which we do not do).
-`ML_debugger` is not a build-identity option: enabling it does not invalidate
-any existing heap.
+evaluates — is compiled with debug information and breakable sites. Code
+already compiled into the session heap is unaffected. `ML_debugger` is not a
+build-identity option: enabling it invalidates no heap.
 
-Because instrumentation slows down compiled ML and the Isabelle documentation
-warns that instrumenting critical infrastructure may deadlock, debugging is
-**opt-in per session**:
+Because instrumentation slows compiled ML and instrumenting critical
+infrastructure may deadlock, debugging is **opt-in per session**:
 
-- `isabelle_launch` gains a parameter `debug: bool = false`. When true, the
-  server is spawned with an additional `-o ML_debugger=true`.
-- When `debug` was not enabled, every breakpoint/debugger tool fails fast with:
-  `"Debugging is not enabled in this session. Re-launch with debug=true."`
-- There is no way to enable debugging without relaunching (accepted trade-off).
+- `isabelle_launch` gains `debug: bool = false`. When true, the server is
+  spawned with an additional `-o ML_debugger=true`.
+- **`debug` is part of the launch identity.** When the requested session name
+  matches the running one but the `debug` value differs, `isabelle_launch`
+  **errors** — in both directions — telling the agent to call
+  `isabelle_terminate` first and then launch with the wanted `debug` value.
+  No automatic teardown, so a routine launch can never silently kill a running
+  debug session. The error applies only when the running prover would
+  otherwise be reused: a request naming a *different* session already implies
+  a relaunch, and `debug` simply applies to the new prover. (`session_dirs`
+  stays out of the identity check.)
+- `SessionInfo` gains a `debug: bool` field, so every launch/session-info
+  result reports the live state.
+- When `debug` is off, every breakpoint/debugger tool fails fast:
+  `"Debugging is not enabled in this session. Call isabelle_terminate, then
+  isabelle_launch with debug=true."`
 
 `Debugger.init` (installing the prover-side break hook) is **implicit**: the
-Scala server sends it lazily before the first debugger-related action of the
-session (and re-sends on session restart). No init/exit tool is exposed.
+Scala server sends it lazily before the first debugger-related action and
+re-sends it on session restart. No init/exit tool is exposed.
 
-### 2.2 Where breakpoints can exist
+### 2.2 Breakpoints exist only on evaluated code
 
-A location has toggleable breakpoint sites only if all of the following hold
-(consequences of the prover-side mechanism, reported to the user via
-`isabelle_list_breakpoints` simply as presence/absence of sites):
+A location has a usable breakable site only if all of the following hold:
 
-1. the enclosing ML command was compiled while `ML_debugger` was on (i.e. the
-   session was launched with `debug=true` and the command was evaluated in it);
+1. the enclosing ML command was compiled while `ML_debugger` was on;
 2. the command is part of PIDE-visible source (a file under evaluation);
-3. the enclosing command has **finished** evaluating — sites of a command that
-   is still running (or failed) cannot be toggled yet.
+3. the enclosing command has **finished** evaluating — the prover refuses to
+   toggle sites of a running or unevaluated command (`Command.eval_finished`).
 
-## 3. Positions without columns
+`isabelle_set_breakpoint` on a location with no live site is an **error**
+telling the agent what to do (§4.2); no registry entry is created. (The
+former `pending`-on-creation behaviour is removed; `pending` still exists,
+but only as the state an *armed* entry falls back to — §5.)
 
-No tool in this design accepts a column number. Following the repository's
-existing conventions:
+Two consequences the tool descriptions must state:
 
-- `isabelle_hover` / `isabelle_definition` / `isabelle_local_occurrences` use
-  `line` + `symbol` (first/all occurrences of a text on the line);
-- `isabelle_evaluate_to` uses `line` + optional `after_text` snippet, matched
-  on token boundaries, ASCII and Unicode forms equivalent, first occurrence.
+- Hitting a breakpoint requires running the code **twice**: once to compile
+  the sites, once to hit them.
+- The command that compiled a site can never be stopped at by it: arming
+  requires that command to have finished, and by then it has already run.
+  A breakpoint takes effect only for code entered from a command that runs
+  after the compiling command finished.
+
+(The review's fix (4) also asked for this rule in the pending/re-armed
+notices; that clause is superseded by the short-tag decision — notices carry
+only §4.4's tags, and the rule lives in the tool descriptions.)
+
+**The three working motions** — "run twice" read literally (call
+`isabelle_evaluate_to` again on an unchanged file) does nothing, since
+evaluation is frontier-based; what works is taught explicitly (§4 preamble):
+
+1. *Setting a breakpoint for the first time*: evaluate **up to the end of the
+   defining ML block**, set the breakpoint (the site exists and the prover is
+   idle, so it arms on the spot), then evaluate onward — the caller runs for
+   the first time and hits.
+2. *Re-triggering an armed breakpoint*: edit **strictly after** the defining
+   block (a whitespace edit between the definer and the caller suffices) and
+   re-evaluate. The definer's execution is reused, so its sites and the
+   breakpoint survive; only the caller re-runs, and hits.
+3. *After editing the definer or anything upstream of it*: the definer
+   re-executes and its sites die (execution objects are chained — changing
+   anything upstream changes the definer's input state, so even textually
+   unchanged code re-runs). Entries are demoted to pending with a notice.
+   Evaluate up to the end of the defining block, call
+   `isabelle_enable_all_breakpoints` to arm the reborn sites, then evaluate
+   onward.
+
+The one losing move — teach it as such — is editing at or before the definer
+and then evaluating to the end in one go: the sites are reborn disabled and
+nothing arms them mid-run (§5).
+
+## 3. Addressing without columns
+
+No tool accepts or returns a column number, following the repository's
+conventions (`isabelle_hover` uses `line` + `symbol`; `isabelle_evaluate_to`
+uses `line` + `after_text`).
+
+### 3.1 `at_text`
 
 Breakpoint tools use `line` + optional `at_text`:
 
-- `at_text` given: the position that matters is the **first character** of the
-  first occurrence of `at_text` on `line` (occurrence matching is
-  ASCII/Unicode-equivalent, like `after_text` of `isabelle_evaluate_to`; the
-  extent of the snippet only serves to find the occurrence). The chosen site
-  is the one **at or nearest before** that character — "stop before executing
-  this code", so resolution never looks past the snippet's start.
-- `at_text` omitted: the **first** breakpoint site on `line`.
+- `at_text` given: its first occurrence on `line` is located (ASCII and
+  Unicode symbol forms equivalent), and the chosen site is the one **at or
+  nearest before** the occurrence's first character — "stop before executing
+  this code". The backward search is **bounded to the line**: if the line has
+  sites but none at or before the anchor, that is an error listing the line's
+  sites (§4.2, message 4), never a silent match on an earlier line.
+- `at_text` omitted: the **first** site on `line`.
+- **Ambiguity is refused only when it matters**: if `at_text` occurs several
+  times on the line but every occurrence resolves to the same site, it is
+  served; if the occurrences resolve to *different* sites, it is an error
+  listing the line's sites. (Repetition that cannot change the answer —
+  `val c = f x + f x` — is common and must not be rejected; repetition that
+  can — `val a = g x; val b = g x` — must not be resolved silently. This
+  deliberately diverges from the first-occurrence rule of `isabelle_hover`
+  and `isabelle_evaluate_to`: a misplaced breakpoint costs a whole debugging
+  round trip.)
 
-Conversely, tools never *return* raw column numbers as the primary identity of
-a site; a site is always presented as `line` + its anchor snippet (a short
-stretch of the source text starting at the site, computed by the Python layer
-from the site's range and the file content).
+### 3.2 The anchor snippet
+
+Sites are presented as `line` + anchor snippet. The snippet is computed by the
+Python layer from the site's position and the file content:
+
+- It starts at the **statement's first character** and consists of **whole ML
+  tokens**, extended token by token until the text is **unique within its
+  line**. No length cap: a snippet equal to the rest of the line cannot occur
+  twice in that line, so uniqueness is always reached without crossing the
+  line. Uniqueness (not any weaker condition) also guarantees the snippet
+  passes §3.1's ambiguity rule when passed back as `at_text`.
+- In prose it is printed as `before ‹fold upd args›`. The cartouche is a
+  **delimiter, not decoration** — snippets may contain commas, and the
+  cartouche marks exactly the text to copy back as `at_text`. A truncation
+  marker, if ever needed, goes **outside** the cartouche.
+  (Implementation note: ML source may itself contain nested cartouches, and
+  token-boundary truncation could in principle cut inside one.)
+
+### 3.3 Facts about site positions (probe)
+
+From source study of `ml_compiler.ML` and the bundled Poly/ML, pending probe
+confirmation:
+
+- The reported markup position is **shifted one symbol left** of the
+  statement's first character (`ml_compiler.ML:41-50`). It normally lands on
+  whitespace, and on the *newline ending the previous line* when the statement
+  starts in column 1. **Anchor at the markup range's end, not its start** —
+  otherwise column-1 statements yield an empty anchor. (Exception: a site at
+  the chunk's first symbol is not shifted.)
+- Derive the **line** from the corrected position too: PIDE strips position
+  properties when incorporating reports, and the range start would report
+  column-1 statements one line early.
+- The markup carries **no extent** (Isabelle discards Poly/ML's end offset),
+  so the snippet cannot be derived from a statement span; it is tokenised
+  forward by us.
+- Sites inside antiquotation expansions are silently not reported.
+
+### 3.4 `.ML` files
+
+Code in a `.ML` file is compiled by **evaluating the theory whose `ML_file`
+command loads it** — a `.ML` file cannot be evaluated directly (it is a
+dependency blob, never an open document). This must be said wherever a `.ML`
+target is refused: refusal message 1's "evaluate the file first" becomes, for
+`.ML` targets, "evaluate the theory that loads it (its `ML_file` command)",
+naming the theory when the server knows it. Anchor snippets for `.ML` files
+are computed from the file content **as last synced to the prover** (the
+copy that was compiled), not a fresher disk copy. Per-position evaluation
+status exists only for `.thy` documents, so `isabelle_list_breakable_sites`
+on a `.ML` file omits `not_evaluated` ranges; when it finds no sites at all
+it says instead that the loading theory has not been evaluated (or that no
+loading command is known). Site markup for blob-loaded code resolves through
+the loading command's blobs **(probe)**.
 
 ## 4. Tools
 
-Ten new tools, plus one changed parameter on `isabelle_launch`. Names follow
-the existing `isabelle_` prefix convention. All `file_path` arguments are
-absolute paths (realpath-normalized as elsewhere in the server).
+Twelve new tools, plus one changed parameter on `isabelle_launch`. Names
+follow the `isabelle_` prefix convention; all `file_path` arguments are
+absolute paths (realpath-normalized as elsewhere).
 
-Tools that return prose (`ToolResult` text, like the evaluation family) are
-marked *text result*; tools with structured output list their result model.
-Every result — text or structured — additionally carries pending debug notices
-(§6.3).
+**All twelve are text results** (`output_schema=None` plus a formatter in
+`utils/formatters.py`); `models.py` gains nothing. This is distinct from the
+YAML change to the seven pre-existing structured tools (a separate change that
+lands first): those serialise a model, these are formatted prose, and neither
+style is imposed on the other. Every result additionally carries pending
+debugger notices (§6.3).
+
+The MCP server instructions (`instructions.py`) gain a debugger section that
+teaches, once, what an agent cannot be assumed to know — the three concepts
+hit, frame and breakable site; **the three working motions of §2.2** (and the
+one losing move); the manual arming rule of §5 (nothing re-arms in the
+background); and that `isabelle_eval_at_breakpoint` takes a single
+expression, with temporaries written `let val x = … in … end` — so tool
+descriptions and reports stay lean and do not define terms inline. Its text
+is drafted at implementation time.
 
 ### 4.1 `isabelle_launch` (changed)
 
@@ -140,16 +271,15 @@ New parameter appended to the existing schema:
   "debug": {
     "type": "boolean",
     "default": false,
-    "description": "Enable the ML debugger for this session (compiles newly evaluated ML with instrumentation; slows ML compilation/execution). Required for all breakpoint tools."
+    "description": "Enable the ML debugger for this session (compiles newly evaluated ML with instrumentation; slows ML compilation/execution). Required for all breakpoint tools. Changing it requires isabelle_terminate first; launching with the same session name and a different debug value is an error."
   }
 }
 ```
 
 ### 4.2 `isabelle_set_breakpoint`
 
-Register a breakpoint and enable its site (or leave it pending if the site
-does not exist yet, §5). *Text result*: the resolved site (`line`, anchor
-snippet), the entry's state, and — when resolution had to pick among several
+Register a breakpoint and enable its site. *Text result*: the resolved site
+(`line`, anchor snippet), and — when resolution had to pick among several
 sites — the other candidates on the line.
 
 ```json
@@ -163,36 +293,123 @@ sites — the other candidates on the line.
     "line": {
       "type": "integer",
       "minimum": 1,
-      "description": "Line number (1-indexed) of the breakpoint site"
+      "description": "Line number (1-indexed) of the breakable site"
     },
     "at_text": {
       "type": ["string", "null"],
       "default": null,
-      "description": "Optional text snippet on the line. Its first occurrence is located, and the breakpoint site AT or nearest BEFORE the snippet's first character is used (i.e. the anchor is the snippet's start position; execution stops before that code runs). Without at_text, the first site on the line. ASCII and Unicode symbol forms are equivalent."
+      "description": "Optional text snippet on the line. The breakable site at or nearest before its first occurrence is used (execution stops before that code runs). Without at_text, the first site on the line. ASCII and Unicode symbol forms are equivalent."
     }
   },
   "required": ["file_path", "line"]
 }
 ```
 
-### 4.3 `isabelle_del_breakpoint`
+Refusal messages, final wording (each lives in Python, unit-tested verbatim;
+`{where}` is `file:line`):
 
-Remove a breakpoint from the registry and disable its site (if armed). The
-arguments identify the registry entry the same way `isabelle_set_breakpoint`
-created it; `lost` entries can be deleted too. *Text result*: confirmation.
+1. Line not evaluated yet:
+   > There is no breakable site at {where} — that line has not been evaluated
+   > yet. Breakpoints can only be set on code the prover has already compiled,
+   > so evaluate the file first.
+2. Command still running:
+   > There is no breakable site at {where} yet — the command there has not
+   > finished evaluating. A site can only be used once its command has
+   > finished. Retry in a few seconds.
 
-Input schema: identical to `isabelle_set_breakpoint`.
+   When the command is unfinished because its thread is **stopped at a
+   breakpoint**, retrying is useless; the variant is:
+   > There is no breakable site at {where} yet — the command there is stopped
+   > at a breakpoint and has not finished evaluating. Resume it with
+   > isabelle_continue_breakpoint first.
+3. Evaluated, but no site on that line:
+   > The command at {where} has been evaluated, but the compiler placed no
+   > breakable site on that line. Breakable sites exist only inside ML code,
+   > at statement boundaries the compiler chooses. The nearest breakable
+   > sites in this file are:
+   >
+   >       line 14 before ‹fold upd args›
+   >       line 17 before ‹writeln (string_of_int n)›
+   >
+   > Pass one of these as line + at_text.
+
+   The listing shows the nearest 8 sites, 4 each side of the requested line,
+   in source order, with no backfill when one side has fewer. When the file
+   has more sites than shown, the listing ends with the approved pointer:
+   > (12 more breakable sites in this file — use isabelle_list_breakable_sites
+   > to see them.)
+
+   When the whole file has none, the listing and its lead-in are replaced by:
+   > This file has no breakable sites at all — it contains no ML code that
+   > was compiled in this prover.
+4. `at_text` given but **not occurring on the line at all** (message 3 wins
+   whenever the line has no sites, regardless of `at_text`):
+   > ‹{at_text}› does not occur on {where}. The sites on that line are:
+   >
+   >       before ‹fold upd args›
+   >       before ‹Symtab.update tab›
+   >
+   > Pass one of these as at_text, or omit at_text to use the first site on
+   > the line.
+5. `at_text` given but no site at or before it on the line (also used for the
+   ambiguity refusal of §3.1):
+   > There is no breakable site at or before ‹{at_text}› on {where}. The
+   > sites on that line are:
+   >
+   >       before ‹fold upd args›
+   >       before ‹Symtab.update tab›
+   >
+   > Pass one of these as at_text, or omit at_text to use the first site on
+   > the line.
+
+### 4.3 `isabelle_del_breakpoints`
+
+Remove breakpoints from the registry and disable their sites (if armed).
+Takes a **list** (precedent: `isabelle_command_status(positions)`); deleting
+one is a one-element list. Each reference is matched against the **registry**
+— file, recorded line, anchor snippet — never against live sites, so an entry
+with no current site is still deletable. There is no "delete all" tool: list,
+then pass the lot.
+
+**Best-effort semantics**: entries that match are deleted; the result reports
+what did not — `deleted 4; 1 matched no entry: Foo.thy:12 before ‹fold upd
+args› — call isabelle_list_breakpoints for the current entries`. A reference
+matching several entries is skipped and reported, never guessed.
+
+Listings print paths **project-root-relative** (the repository's display
+convention); `isabelle_del_breakpoints` accepts both that form and absolute
+paths (relative ones are joined to the project root and realpath-normalized),
+so a listing row can be passed back verbatim.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "breakpoints": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "properties": {
+          "file_path": {"type": "string"},
+          "line": {"type": "integer", "minimum": 1},
+          "at_text": {
+            "type": ["string", "null"],
+            "default": null,
+            "description": "Anchor snippet of the entry, as shown by isabelle_list_breakpoints. May be omitted when the line has only one entry."
+          }
+        },
+        "required": ["file_path", "line"]
+      }
+    }
+  },
+  "required": ["breakpoints"]
+}
+```
 
 ### 4.4 `isabelle_list_breakpoints`
 
-Two purposes in one tool:
-
-- **Without `file_path`**: list the whole breakpoint registry (every entry
-  with file, line, anchor snippet, enabled flag, state).
-- **With `file_path`** (optionally a line range): additionally list every
-  **available breakpoint site** in that range of the file — this is how the
-  agent discovers where breakpoints *can* be placed — each as `line` + anchor
-  snippet, marked with whether a registry entry is attached to it.
+List the breakpoint registry — nothing else (site discovery is §4.5).
 
 ```json
 {
@@ -201,129 +418,154 @@ Two purposes in one tool:
     "file_path": {
       "type": ["string", "null"],
       "default": null,
-      "description": "Absolute path to a .thy or .ML file. Omit to list only the breakpoint registry."
-    },
-    "start_line": {
-      "type": ["integer", "null"],
-      "minimum": 1,
-      "default": null,
-      "description": "First line (1-indexed) of the range to scan for available sites. Default: whole file."
-    },
-    "end_line": {
-      "type": ["integer", "null"],
-      "minimum": 1,
-      "default": null,
-      "description": "Last line (1-indexed, inclusive) of the range. Default: whole file."
+      "description": "Absolute path; restricts the listing to one file. Omit for the whole registry."
     }
   },
   "required": []
 }
 ```
 
-Structured result model:
+*Text result*, one entry per line, location first:
+
+```
+breakpoints:
+  - Foo.thy:14 before ‹fold upd args›, enabled, armed
+  - Bar.thy:7 before ‹Symtab.update tab›, enabled, pending (not evaluated yet)
+  - Baz.thy:22 before ‹writeln msg›, enabled, pending (still evaluating)
+  - Qux.thy:9 before ‹the_default 0 x›, enabled, pending (code not found — it
+    may have been edited away; delete this breakpoint or set it again)
+```
+
+The parenthesised reasons are **short tags**, not sentences: a prover relaunch
+turns every entry pending at once, and a full sentence per row would repeat a
+dozen times and stop being read. The two self-resolving causes get short tags;
+the one needing a decision (code edited away) stays long because it is rare.
+The same tags are used verbatim in debugger notices — one concept, one
+wording — and the full explanations live once in the tool description.
+
+### 4.5 `isabelle_list_breakable_sites`
+
+List where breakpoints *can* go. This is the discovery tool, and discovery is
+essential: setting a breakpoint where no site exists is an error (§2.2), and
+top-level declarations carry no sites (§1), so the agent cannot work it out
+from the source alone.
 
 ```json
 {
   "type": "object",
   "properties": {
-    "registry": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "file_path": {"type": "string"},
-          "line": {"type": "integer", "description": "Current resolved line (1-indexed); the recorded line for pending/lost entries"},
-          "anchor": {"type": "string", "description": "Anchor snippet: source text starting at the site"},
-          "enabled": {"type": "boolean", "description": "User-intended state (see enable/disable_all)"},
-          "state": {"type": "string", "enum": ["armed", "pending", "lost"]}
-        },
-        "required": ["file_path", "line", "anchor", "enabled", "state"]
-      }
+    "file_path": {
+      "type": "string",
+      "description": "Absolute path to the .thy or .ML file"
     },
-    "available_sites": {
-      "type": ["array", "null"],
-      "description": "Only when file_path was given; null otherwise",
-      "items": {
-        "type": "object",
-        "properties": {
-          "line": {"type": "integer"},
-          "anchor": {"type": "string"},
-          "registered": {"type": "boolean", "description": "Whether a registry entry is attached to this site"}
-        },
-        "required": ["line", "anchor", "registered"]
-      }
+    "start_line": {
+      "type": ["integer", "null"], "minimum": 1, "default": null,
+      "description": "First line (1-indexed) of the range. Default: whole file."
     },
-    "notices": {
-      "type": "array",
-      "items": {"type": "string"},
-      "description": "Pending debug notices (§6.3)"
+    "end_line": {
+      "type": ["integer", "null"], "minimum": 1, "default": null,
+      "description": "Last line (1-indexed, inclusive). Default: whole file."
     }
   },
-  "required": ["registry", "notices"]
+  "required": ["file_path"]
 }
 ```
 
-### 4.5 `isabelle_enable_all_breakpoints` / 4.6 `isabelle_disable_all_breakpoints`
+*Text result*:
 
-Flip the `enabled` flag of **every** registry entry (and push the new state to
-all armed sites). Pending and lost entries keep the flag for when they become
-armed. Use case: temporarily silence all breakpoints for an undisturbed run,
-then restore them. No parameters. *Text result*: counts (how many armed sites
-were toggled, how many entries were pending/lost).
+```
+sites:
+  - line 14 before ‹fold upd args›, already enabled
+  - line 15 before ‹writeln msg›, already set but disabled
+  - line 17 before ‹Symtab.update tab›, breakable
+not_evaluated: lines 20-46, lines 58-73 — evaluate up to those lines to see their sites
+truncated: showing 40 of 137 sites, lines 14-52 — narrow the range (e.g. start_line 53) to see the rest
+```
+
+- The third field is three-valued — `already enabled` / `already set but
+  disabled` / `breakable` — because "a breakpoint is attached" and "it will
+  stop" are different questions (a disable-all leaves entries attached but
+  off). No further identification of the attached breakpoint is needed: a
+  site and the breakpoint on it share file, line and anchor snippet exactly.
+- Sites are reported for the **evaluated part** of the range; line ranges
+  with no sites merely because they are not evaluated yet are named
+  separately (`not_evaluated`), reusing the per-position status machinery of
+  `isabelle_command_status`. An empty `sites:` with a `not_evaluated:` line
+  means "not known yet", never "nothing there".
+- At most **40** sites are shown, in source order; a truncated listing says
+  so and names the line to resume from. `not_evaluated` and `truncated` are
+  omitted entirely when empty.
+
+### 4.6 `isabelle_enable_all_breakpoints` / 4.7 `isabelle_disable_all_breakpoints`
+
+`enable_all` sets the `enabled` flag of **every** registry entry to true AND
+**arms every entry whose site currently exists** — under the manual arming
+model (§5) this is *the* re-arming action after recompilation, a prover
+relaunch, or a cancellation. Entries that cannot arm stay pending and are
+reported with their reason tags. `disable_all` sets the flag false and
+disarms all armed sites; pending entries keep the flag for when they are
+armed again. Use case for the pair: silence all breakpoints for an
+undisturbed run, then restore them.
+
+**Absolute state, not a flip**: calling either twice is idempotent. (The
+prover-side toggle helper is flip-shaped; the adapter realises the absolute
+state as "read the current site state, toggle only if it differs", computing
+the acknowledgement from its own snapshot — never from the distribution's
+Scala-side mirror after a failed toggle: every prover-side toggle failure
+coincides with the serial's death by recompilation, so the registry, not the
+mirror, is what a failed toggle leaves correct.)
+
+No parameters. *Text result*: counts — entries armed (resp. disarmed), and
+entries pending per reason tag.
 
 ```json
 {"type": "object", "properties": {}, "required": []}
 ```
 
-### 4.7 `isabelle_debug_state`
+### 4.8 `isabelle_debug_state`
 
-Report all stopped threads with their call stacks. Callable at any time (also
-returns "no thread is stopped"). *Structured result*:
+Report all live hits with their call stacks. Callable at any time. *Text
+result*; no parameters.
 
-```json
-{
-  "type": "object",
-  "properties": {
-    "stopped_threads": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "thread": {"type": "string", "description": "Isabelle thread name, e.g. \"Isabelle.worker-17\""},
-          "stack": {
-            "type": "array",
-            "description": "Frames from innermost (index 0) outwards",
-            "items": {
-              "type": "object",
-              "properties": {
-                "frame": {"type": "integer", "description": "Frame index, 0 = innermost"},
-                "function": {"type": "string", "description": "ML function name"},
-                "file_path": {"type": ["string", "null"]},
-                "line": {"type": ["integer", "null"], "description": "1-indexed, when the frame maps to visible source"}
-              },
-              "required": ["frame", "function"]
-            }
-          }
-        },
-        "required": ["thread", "stack"]
-      }
-    },
-    "notices": {"type": "array", "items": {"type": "string"}}
-  },
-  "required": ["stopped_threads", "notices"]
-}
+No hits:
+
+```
+No thread is stopped.
 ```
 
-Input schema: no parameters.
+Otherwise one block per hit (no implicit locals fetch here — that is only in
+the hit report, §6.1, and only for frame 0):
 
-### 4.8 `isabelle_eval_at_breakpoint`
+```
+2 hits are live.
 
-Evaluate an arbitrary Isabelle/ML expression in the scope of a stack frame of
-a stopped thread: the frame's ML name space (including enclosing scopes) is
-merged into the evaluation environment, so the frame's local bindings are
-directly usable in the expression. Antiquotations work. The evaluation is
-never itself instrumented (no recursive debugging). *Text result*: the
-evaluation's `writeln`/`warning`/`error` output.
+Hit h1: Foo.thy:14 before ‹fold upd args›, thread Isabelle.worker-3.
+Call stack (innermost first; the number is the frame parameter):
+  frame 0  lookup          Foo.thy:14
+  frame 1  resolve         Foo.thy:52
+  frame 2  Symtab.fold     (library code)
+
+Hit h2: Bar.thy:30 before ‹Symtab.update tab›, thread Isabelle.worker-7.
+Call stack (innermost first; the number is the frame parameter):
+  frame 0  update_all      Bar.thy:30
+```
+
+Frame positions that resolve to visible source are `file:line`; frames of
+code compiled into the heap show `(library code)`. (Which frames resolve, and
+the exact placeholder wording, are refined by probe.)
+
+### 4.9 `isabelle_eval_at_breakpoint`
+
+Evaluate an Isabelle/ML expression in the scope of a stack frame of a hit:
+the frame's ML name space (including enclosing scopes) is merged into the
+compilation environment, so the frame's local bindings are directly usable.
+Antiquotations work. The evaluation is never itself instrumented. `expr` is a
+single **expression** — declarations fail to compile; a temporary binding is
+written `let val x = … in … end`, and bindings do not survive to the next
+call (each evaluation rebuilds its context and restores it afterwards). *Text
+result*: the evaluation's `writeln`/`warning`/`error` output; an expression
+that raises is a normal, completed round trip whose output is the error
+message (not a tool error).
 
 ```json
 {
@@ -331,89 +573,123 @@ evaluation's `writeln`/`warning`/`error` output.
   "properties": {
     "expr": {
       "type": "string",
-      "description": "Isabelle/ML source to evaluate in the frame's scope"
+      "description": "Isabelle/ML expression to evaluate"
     },
-    "thread": {
+    "hit_id": {
       "type": ["string", "null"],
       "default": null,
-      "description": "Thread name as reported by isabelle_debug_state. May be omitted when exactly one thread is stopped; with several stopped threads it is required (the error lists them)."
+      "description": "Identifier of one hit — one occasion of a thread halting in the debugger — as reported by the hit report (e.g. hit_id: \"h1\"). Not a thread name, and not stable across resume: when the thread continues and halts again, that is a new hit with a new id. May be omitted when exactly one hit is live; with several live hits it is required (the error lists them)."
     },
     "frame": {
       "type": "integer",
       "minimum": 0,
       "default": 0,
-      "description": "Stack frame index (0 = innermost)"
+      "description": "Stack frame index, as numbered in the call stack of the hit report (0 = innermost)."
+    },
+    "timeout": {
+      "type": "number",
+      "default": 180,
+      "description": "Seconds before the evaluation is cut off inside the prover. On timeout the expression ends with an error and the thread stays at the breakpoint, still debuggable. A tight allocation-free loop may offer no safe point and then cannot be cut off; isabelle_cancel_evaluation remains the global way out."
     }
   },
   "required": ["expr"]
 }
 ```
 
-Deliberately **not** exposed in v1 (prover supports them; defaults are used):
-strict-SML mode, and the explicit evaluation-context text (`eval`'s first
-argument slot stays empty).
+Using a retired `hit_id` is an error naming how that hit ended. Issuing a
+second evaluation — or a continue or step — on a hit whose previous
+evaluation has not returned is refused immediately with a sentence saying the
+previous evaluation has not returned and naming
+`isabelle_abort_eval_at_breakpoint` as the way to end it (no queueing — a
+queued verb would run at an arbitrary later moment).
 
-### 4.9 `isabelle_locals_at_breakpoint`
+Breakable sites crossed **during** an evaluation at a hit never fire: the
+prover's break hook declines while the thread is debugging. To stop inside a
+callee, resume and trigger it from normal execution. (Stated here and in
+§7.4; the tool description carries one sentence of it.)
+
+Deliberately not exposed in v1 (prover supports them; defaults are used):
+strict-SML mode, and the explicit evaluation-context text.
+
+### 4.10 `isabelle_locals_at_breakpoint`
 
 Print **all local variables** of a stack frame with their types and values
-(prover-side `print_vals`; uses the frame's own bindings, not enclosing
-scopes). This is the cheap first look before reaching for
+(the frame's own bindings, not enclosing scopes). The cheap first look before
 `isabelle_eval_at_breakpoint`. *Text result*.
 
-Input schema: like `isabelle_eval_at_breakpoint` without `expr`:
+**Mechanism** (differs from the stock `print_vals` verb, deliberately): the
+listing is produced by a small prelude function — `PolyML.DebuggerInterface`
+is reachable from the prelude, and `printWithType` at `ML_print_depth` gives
+output identical to stock `print_vals` — invoked **through the eval verb
+under `debug_eval`** (§7.3). This is a stated, ~10-line exception to "no
+debugger logic is reimplemented", and it is what makes the `timeout`
+parameter real: under the `print_vals` verb the printing runs in the debugger
+loop's own code, where nothing of ours can enforce anything.
+
+The cost of printing is real and unbounded by depth: Isabelle's installed
+printers for its core types build the **complete** pretty tree (full syntax
+elaboration of the value) and prune to `ML_print_depth` afterwards — depth
+bounds the output, not the computation. Hence, inside the listing, **each
+variable additionally gets its own 5 s bound**; a value that cannot be
+printed in time renders as `<printing timed out>` (no type — type layout can
+itself be slow) while the rest still print. The 5 s figure is internal
+policy, not a parameter.
+
+Input schema: as §4.9 without `expr` (same `hit_id` and `frame`); `timeout`
+keeps the 180 s default but its description reads:
+> Seconds before the whole listing is cut off inside the prover. Each
+> variable additionally gets a short per-value bound; a value that cannot be
+> printed in time is shown as `<printing timed out>` while the rest still
+> print. The thread stays at the breakpoint either way.
+
+### 4.11 `isabelle_continue_breakpoint`
+
+Resume execution. With `hit_id`, resumes that hit's thread and retires the
+hit; without it, resumes **all** live hits (the common single-hit case just
+works — this is the one tool where omission with several hits means "all",
+not an error). Enabled breakpoints stay enabled — execution stops again at
+the next hit. *Text result*: which hits were resumed.
 
 ```json
 {
   "type": "object",
   "properties": {
-    "thread": {
+    "hit_id": {
       "type": ["string", "null"],
       "default": null,
-      "description": "Thread name; may be omitted when exactly one thread is stopped"
-    },
-    "frame": {
-      "type": "integer",
-      "minimum": 0,
-      "default": 0,
-      "description": "Stack frame index (0 = innermost)"
+      "description": "Hit to resume, as reported by the hit report. Omit to resume all live hits."
     }
   },
   "required": []
 }
 ```
 
-### 4.10 `isabelle_continue_breakpoint`
+### 4.12 `isabelle_step_at_breakpoint`
 
-Resume execution. With `thread` given, resumes that thread; without it,
-resumes **all** stopped threads (the common single-thread case just works).
-Enabled breakpoints stay enabled — execution stops again at the next hit.
-*Text result*: which threads were resumed.
+Single-step a hit's thread. The three modes map onto the prover's stepping
+verbs:
 
-```json
-{
-  "type": "object",
-  "properties": {
-    "thread": {
-      "type": ["string", "null"],
-      "default": null,
-      "description": "Thread name to resume. Omit to resume all stopped threads."
-    }
-  },
-  "required": []
-}
-```
-
-### 4.11 `isabelle_step_at_breakpoint`
-
-Single-step a stopped thread. The three modes map 1:1 onto the prover's
-stepping verbs:
-
-- `step` — run to the next breakpoint site, entering calls;
+- `step` — run to the next breakable site, entering calls;
 - `step_over` — run to the next site at the same or shallower stack depth;
-- `step_out` — run until the current function returns.
+- `step_out` — run to the next site at a shallower stack depth (which may not
+  exist).
 
-After the step the thread stops again and the new state is reported like a
-breakpoint hit (§6). *Text result*: the new innermost position and stack.
+**Two outcomes, both normal.** Stepping only stops inside instrumented code,
+so the tool waits a bounded time and reports either:
+
+- *stopped again*: the same hit at its new position, formatted like a hit
+  report (§6.1); or
+- *did not stop*: "The thread resumed and did not stop again within {N}s —
+  execution left the instrumented region (stepping only stops in ML compiled
+  with debugging in this session)." The hit is then retired. **The wait bound
+  never aborts anything** — a thread that does not stop again is a normal
+  outcome, not a failure.
+
+(Caveat recorded for the implementation: the prover's stepping flag is
+thread-local, set with a bare assignment, and cleared only by a `continue` at
+a later break; a worker can in principle carry it into an unrelated task and
+stop there. Such a stray halt is reported as an anomaly with its own wording,
+and sending `continue` to it clears the flag. Probed.)
 
 ```json
 {
@@ -424,167 +700,424 @@ breakpoint hit (§6). *Text result*: the new innermost position and stack.
       "enum": ["step", "step_over", "step_out"],
       "description": "Stepping mode"
     },
-    "thread": {
+    "hit_id": {
       "type": ["string", "null"],
       "default": null,
-      "description": "Thread name; may be omitted when exactly one thread is stopped"
+      "description": "Hit to step, as reported by the hit report. May be omitted when exactly one hit is live."
     }
   },
   "required": ["mode"]
 }
 ```
 
+### 4.13 `isabelle_abort_eval_at_breakpoint`
+
+End the outstanding evaluation on a hit **now**, without waiting for its
+timeout: sets the wrapper's abort flag (§7.3); the evaluation ends with an
+ordinary error at its next safe point and **the thread stays at the
+breakpoint, still debuggable**.
+
+*Text result* on success:
+> Abort requested. The evaluation on this hit will end with an error at its
+> next safe point; the thread stays at the breakpoint.
+
+When nothing is being evaluated on that hit, it is an **error** (not a
+success text), decided by the Python layer's own outstanding-request state:
+> No evaluation is in progress on this hit — there is nothing to abort.
+
+A retired `hit_id` gets the standard retired-hit error.
+
+The abort flag's lifetime is bound to the per-evaluation registration entry
+(§7.3): it is created with `debug_eval`'s registration and dies with it, and
+setting it is mutually excluded against deregistration — so an abort racing a
+natural completion is either delivered to the still-live evaluation or
+refused with the error above, and can never leak into the next evaluation.
+
+Honest limits (stated in the description): the same safe-point caveat as the
+timeout — a tight allocation-free loop cannot be cut off; and since the
+agent's own eval call blocks, this tool's uses are parallel tool-call clients
+and clearing an evaluation whose prover-side deadline mechanism failed while
+the Scala backstop already answered.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "hit_id": {
+      "type": ["string", "null"],
+      "default": null,
+      "description": "Hit whose outstanding evaluation to abort, as reported by the hit report. May be omitted when exactly one hit is live."
+    }
+  },
+  "required": []
+}
+```
+
 ## 5. The breakpoint registry and its lifecycle
 
-Each registry entry stores: `file_path`, recorded `line`, **anchor snippet**,
+Each registry entry stores: `file_path`, recorded `line`, anchor snippet,
 `enabled` flag, current `state`, and (when armed) the site's current serial
 plus the identity needed to toggle it on the wire.
 
-States and transitions:
+**Two states.**
 
-- **pending** — no toggleable site currently exists at the location (enclosing
-  command not yet evaluated, still running, or session lacks the evaluation).
-  Entries are created pending when `isabelle_set_breakpoint` cannot resolve a
-  site yet; the tool result says so explicitly.
 - **armed** — resolved to a live site; the site's `bool ref` mirrors the
   entry's `enabled` flag.
-- **lost** — reconciliation (below) found no matching site anymore. The entry
-  is kept (so the agent can inspect/delete it or the site may reappear), and
-  the loss is reported as a debug notice.
+- **pending** — no live site right now; the entry arms as soon as one
+  appears. The *reason* — the file has not been evaluated in this prover, the
+  enclosing command is still running, the code was edited away — is carried
+  as a short tag in listings and notices (§4.4), not as a state name: at the
+  moment reconciliation runs, "never evaluated here" and "edited away" are
+  indistinguishable, and the agent acts on the reason sentence anyway.
 
-**Reconciliation** runs after every evaluation round completes (and cheaply
-after each file-freshness resync): for every registry entry, re-resolve the
-site in the current snapshot —
+Entries are only ever created armed (§2.2). `pending` is entered when an
+armed entry's site disappears: the enclosing command was edited and
+recompiled (directly, or because anything upstream changed — execution
+objects are chained), the prover was relaunched, the session was switched,
+or `isabelle_cancel_evaluation` ran (its synthetic edit re-creates command
+ids and thus invalidates every serial **(probe)**).
 
-1. same position, same serial → nothing to do, no notice;
-2. matching site found (by anchor snippet, nearest to the recorded line —
-   this also survives edits that shifted line numbers), but the serial
-   changed → the enclosing command was recompiled and the old `bool ref` is
-   dead; re-enable the new site according to `enabled`, update recorded
-   line, and emit a notice, e.g.
-   `Breakpoint FILE:12 (before ‹fold upd args›) was invalidated by recompilation — re-armed.`
-   (plus `— moved to line 14` when the line changed);
-3. no matching site → state becomes `lost`, notice emitted with the nearest
-   available site as a suggestion;
-4. a `pending` entry whose site has now appeared → arm it, notice emitted.
+**The manual arming model.** The pending→armed transition happens **only
+through an explicit tool action**: `isabelle_set_breakpoint` for a new entry,
+`isabelle_enable_all_breakpoints` for existing ones. Nothing re-arms in the
+background — deliberately: automatic re-arming would race the very run it is
+re-arming for (the prover starts the next command the instant the compiling
+one finishes, while an arming round trip takes hundreds of milliseconds), it
+would make background runs' behaviour depend on who won, and it puts wire
+operations on paths that race the explicit tools. Under the manual model,
+arming happens between evaluation rounds, with no opponent; the agent's
+workflow is §2.2's three motions.
 
-Every state change is reported **exactly once**, as a debug notice.
+**Background bookkeeping** (all that remains of reconciliation): observe site
+death — on evaluation events, file resyncs, prover relaunch, and after
+cancellation — demote armed entries to pending, and emit one debugger notice
+per state change (§4.4's tags; a reason-tag change *within* pending also
+emits one, same once-only rule). The bookkeeping never toggles a site. Site
+resolution — by anchor snippet, nearest to the recorded line, updating the
+recorded line — runs at **arming time**, inside the explicit tools. Entries
+that resolve to the same site are merged into one (reported by a notice);
+an equal-distance tie in "nearest" resolves to the earlier line.
 
-## 6. Breakpoint hits and how the agent learns about them
+**Concurrency.** One registry lock serialises every read-check-mutate
+sequence (a deletion's match-disarm-remove, an enable's resolve-arm, the
+bookkeeping's demotions). All site toggles happen inside the explicit tools
+under that lock, which is what makes §1's projection invariant ("site state
+can be rebuilt from the registry at any time") actually hold.
+
+**The forgotten-re-enable fence.** The cost of the manual model is that a
+forgotten re-enable makes a run miss silently. Therefore `evaluate_to`, when
+enabled-but-unarmed entries exist in the target file, carries a warning line
+in its result:
+> {N} breakpoints in {file} are not armed (their code was recompiled) — this
+> run will not stop at them. Call isabelle_enable_all_breakpoints to arm
+> them.
+
+**Registry lifetime.** The registry is cleared when the MCP server process
+restarts (it lives in memory only). It is **retained** across a prover
+relaunch and across a session switch: entries become pending, and arm again
+on the next explicit enable, each transition reported by a debugger notice.
+
+## 6. Hits and how the agent learns about them
 
 ### 6.1 Hit = a completion signal of evaluation
 
 The typical situation: the agent called `isabelle_evaluate_to` and is waiting
-(or polling `isabelle_evaluation_status`). A stopped thread means the
-evaluation cannot progress past that command, so:
+(or polling `isabelle_evaluation_status`). A hit means the evaluation cannot
+progress past that command, so the wait loop gains a third exit condition
+besides "target processed" and timeout-with-progress: **a hit in the current
+evaluation's theory set**. Position→node resolution is a Scala-side
+responsibility (the worked precedent: `Document.Snapshot.current_command` /
+`PIDE/commands_at_lines`); a hit elsewhere becomes a debugger notice instead
+of ending the wait, and an unattributable hit fails open (ends the wait, as
+any exit does today).
 
-- The `evaluate_to` wait loop gains a third exit condition besides
-  "target processed" and timeout-with-progress: **a thread stopped in the
-  debugger**. The result then leads with a hit report:
+The result then leads with the hit report:
 
-  ```
-  Breakpoint hit: FILE line 12 (before ‹fold upd args›), thread Isabelle.worker-17.
-  Call stack:
-    0  my_function        FILE:12
-    1  outer_function     FILE:34
-    …
-  Locals of frame 0:
-    args = [t1, t2] : term list
-    …
-  Evaluation is paused, NOT finished. You can inspect with
-  isabelle_eval_at_breakpoint / isabelle_locals_at_breakpoint /
-  isabelle_step_at_breakpoint, or resume with isabelle_continue_breakpoint.
-  ```
+```
+Breakpoint hit: Foo.thy:14 before ‹fold upd args›, hit h1, thread Isabelle.worker-3.
+Call stack (innermost first; the number is the frame parameter):
+  frame 0  lookup          Foo.thy:14
+  frame 1  resolve         Foo.thy:52
+  frame 2  check_theory    Foo.thy:88
+Locals of frame 0:
+  key = "HOL.eq" : string
+  tab = {...} : term Symtab.table
+Evaluation is paused, NOT finished. Inspect with isabelle_eval_at_breakpoint /
+isabelle_locals_at_breakpoint / isabelle_step_at_breakpoint, or resume with
+isabelle_continue_breakpoint.
+```
 
-  The locals of frame 0 are included automatically (one implicit
-  `print_vals`), saving a round trip in the common case.
-- `isabelle_evaluation_status` reports the same "paused at breakpoint" section
-  whenever stopped threads exist, so polling never misreads a stop as a hang.
+- The report lists **all** live hits (further blocks as in §4.8) — parallel
+  evaluation makes several stopped threads a first-class case, not an edge.
+- Call-stack rows are labelled with the parameter name (`frame 0`, …), and
+  the header says so, so report and schema share the exact string.
+- The locals of frame 0 are fetched implicitly **for every hit in the
+  report**, concurrently (the rendezvous is per-thread, so the fetches run in
+  parallel and the time does not stack), all under one **10 s bound that
+  never aborts**: it is a convenience and must have no destructive
+  consequence. Inside each fetch the per-value 5 s bound of §4.10 applies, so
+  one pathological value costs one `<printing timed out>` line, not the
+  section. On a whole-fetch timeout the section reads `Locals of frame 0
+  could not be fetched in time — use isabelle_locals_at_breakpoint to fetch
+  them.`
+- The tail does not define terms; the instructions section (§4 preamble)
+  teaches the concepts.
+
+`isabelle_evaluation_status` reports a "paused at a breakpoint" section
+whenever hits are live (wording refined by the decoration probe), so polling
+never misreads a stop as a hang. **`isabelle_evaluate_to` is refused while
+any hit is live**: the frontier cannot advance, and `evaluate_to` still moves
+the caret. The refusal leads with the live hits and names the next actions:
+> Evaluation is paused at a breakpoint — hit h1 at Foo.thy:14 before ‹fold
+> upd args›. isabelle_evaluate_to cannot run while a hit is live. Inspect
+> with isabelle_debug_state, resume with isabelle_continue_breakpoint.
+
+This refusal **consumes** the queued notice of the hit it names (delivering
+the same hit twice in two formats would only confuse); the refusal lives in
+`evaluate_to` itself, so the query tools' auto-start path inherits it and the
+caret never moves during a hit. The seven query tools are served normally per their
+position-explicit guard — a line whose command finished before the hit
+answers normally; the stopped command itself answers `unfinished`; an
+unevaluated line is refused by the guard naming the evaluation target.
+**(probe:** whether the prover-side query forks are still scheduled with
+several workers parked at breakpoints; if they starve, the Scala side fails
+fast with an explicit sentence rather than hanging.**)**
 
 ### 6.2 Hits outside an evaluation wait
 
-A background re-evaluation (triggered by a file save) can also hit an enabled
-breakpoint while no `evaluate_to` is waiting. The stop is recorded in the
-Python-side state and surfaced: (a) as a debug notice on the next tool call of
-any kind (the existing per-call freshness hook is the natural place), and
-(b) in `isabelle_debug_state` / `isabelle_evaluation_status` at any time.
+A background re-evaluation (triggered by a file save) can hit an enabled
+breakpoint while nothing is waiting. The hit is recorded and surfaced: as a
+debugger notice on the next tool call of any kind, and in
+`isabelle_debug_state` / `isabelle_evaluation_status` at any time.
 
-### 6.3 Debug notices
+### 6.3 Debugger notices
 
-MCP has no server-initiated push channel into the agent's conversation, so all
-asynchronous events (reconciliation results, hits outside a wait, threads that
-resumed because a command was recompiled, …) are buffered as debug notices and
-**appended to the next tool result**, whatever the tool. Structured results
-carry them in a `notices` array; text results append a `Debug notices:`
-section. The buffer is cleared on delivery; each notice is delivered exactly
-once.
+MCP has no server-initiated push channel, so all asynchronous events
+(reconciliation results, hits outside a wait, stray halts, …) are buffered as
+debugger notices and appended to the next tool result, whatever the tool,
+under a `Debugger notices:` header. Delivery reuses the existing
+warning-injection middleware (`UnicodeWarningMiddleware`'s pattern: append as
+an extra text block after a successful call; keep the queue on error). The
+buffer is cleared on delivery; each notice is delivered exactly once. Notices
+use §4.4's reason tags verbatim.
 
 ### 6.4 Interaction with cancellation
 
-A thread stopped in the debugger loop is **uninterruptible**; the existing
-cancellation path cannot touch it. Therefore `isabelle_cancel_evaluation` is
-extended: if stopped threads exist, it first resumes them all (debugger
-`continue`), then proceeds with the normal cancellation. The result mentions
-that threads were resumed out of the debugger. Additionally, to keep a
-cancelled run from immediately re-stopping, the resume performed by *cancel*
-temporarily disables all armed sites for the duration of the cancellation and
-restores them afterwards (registry `enabled` flags are not changed).
+`isabelle_cancel_evaluation` runs the existing cancellation path
+**unchanged** — no resuming of stopped threads first, no temporary disabling
+of sites. (The 2026-08-11 draft's contrary design rested on the false premise
+that a stopped thread is uninterruptible; the review deleted it.) A thread
+leaves the hit table when it disappears from the prover's pushed debugger
+state; its hits are retired as "swept up by cancellation". After the cancel,
+reconciliation runs (§5). If a release-stopped-threads fallback is ever
+wanted, Isabelle's own mechanism is `Debugger.exit` (which frees every thread
+idle at a breakpoint), not per-thread resume.
 
-## 7. Wire protocol: LSP extension messages
+## 7. Wire protocol and prover-side machinery
 
-All messages follow the existing `PIDE/*` LSP-extension style of this
-project. Design constraint: the server side is a thin adapter over Isabelle's
-existing debugger API — it must not reimplement any debugger logic.
+All messages follow the existing `PIDE/*` LSP-extension style. The server
+side remains a thin adapter over Isabelle's existing debugger API
+(`session.debugger`) — no debugger logic is reimplemented. (The alternative —
+redefining the `Debugger.*` protocol commands in our prelude to carry richer
+stop messages — is recorded and rejected for v1: it would mean maintaining a
+copied debugger loop across Isabelle upgrades.)
 
-Client → server **requests**:
+### 7.1 Requests and notifications
+
+Client → server requests (timeouts are JSON numbers of seconds, chosen by the
+Python side, as in the query protocol):
 
 - `PIDE/debugger_breakpoints {uri, range?}` →
-  `{breakpoints: [{range, serial, state}]}` — every breakpoint site
-  (`ML_breakpoint` markup) in the given snapshot range. The server returns
-  only ranges and serials; anchor snippets are computed client-side from the
-  ranges and the file content.
+  `{breakpoints: [{range, serial, state}]}` — every breakable site
+  (`ML_breakpoint` markup) in the snapshot range. The server returns ranges
+  and serials; anchor snippets are computed client-side (§3.2, including the
+  one-symbol shift correction of §3.3).
 - `PIDE/debugger_toggle_breakpoint {uri, serial, state}` → `{ok}` or an error
-  (unknown serial / enclosing command not finished).
-- `PIDE/debugger_eval {thread, frame, expr}` → `{messages: [...]}` — sends the
-  debugger `eval` verb, then awaits the corresponding `debugger_output`
-  protocol messages for that thread (bounded by a timeout; partial output is
-  returned with a note). Same shape for `PIDE/debugger_print_vals
-  {thread, frame}`.
-- `PIDE/debugger_input {thread, verbs...}` → `{ok}` — raw resume verbs:
-  `continue`, `step`, `step_over`, `step_out`.
+  (unknown serial / enclosing command not finished). `state` is absolute; the
+  adapter reads the current state and toggles only on difference (§4.6).
+- `PIDE/debugger_eval {token, thread, frame, expr, timeout}` →
+  `{status, content}`; same shape without `expr` for
+  `PIDE/debugger_print_vals` — which is **realised through the eval verb**,
+  sending a call to the prelude's locals printer under `debug_eval` (§4.10),
+  never the stock `print_vals` verb. Statuses mirror the query protocol's
+  discipline (ok / timeout / resumed / crashed / …); the sentences live in
+  Python.
+- `PIDE/debugger_abort {token|thread}` — sets the abort flag (§7.3).
+- `PIDE/debugger_input {thread, verbs...}` → `{ok}` — resume/step verbs.
 
-Server → client **notifications**:
+Server → client notifications:
 
 - `PIDE/debugger_state {threads: [{thread, stack: [{position, function}]}]}` —
-  pushed on every `session.debugger_updates` event (thread stopped, resumed,
-  stack changed). An empty stack for a thread means it resumed. This is the
-  signal the evaluation wait loop listens for.
+  forwarded thread stacks. A thread's **absence** from the array means it
+  resumed (the Scala side removes the entry; an "empty stack" never appears).
 - `PIDE/debugger_output {thread, messages}` — spontaneous debugger output not
-  consumed by a pending eval request (e.g. errors), surfaced as debug notices.
+  consumed by a pending eval, surfaced as debugger notices.
 
-Implicit init: the Scala server calls `session.debugger.init(...)` (which
-emits the prover protocol command `Debugger.init`) before serving the first
-debugger request, and its session-ready hook re-issues it after a prover
-restart. `Debugger.exit` is sent on shutdown only.
+### 7.2 How the adapter consumes debugger messages
 
-Reserved for later (protocol names claimed now, not implemented in v1):
-`PIDE/debugger_break {state}` — the global "stop at the next site wherever
-execution currently is" switch, useful for diagnosing hangs.
+Two hard constraints from the distribution:
+
+- `Session` installs `Debugger.Handler` unconditionally, and a second
+  protocol handler claiming `debugger_state`/`debugger_output` throws at
+  init. **Our consumer therefore subscribes to `session.all_messages`**,
+  matching cheaply on the two markup kinds and ignoring everything else
+  (**probe**: cost under load).
+- `session.debugger_updates` is unusable as a signal: its event carries no
+  payload and is coalesced behind a 100 ms delay.
+
+**Completion signal.** The ML debugger loop emits **exactly one
+`debugger_state` per input**, always after that input's output (same thread,
+same channel, in order); the resume verbs emit the final one with an empty
+stack. So: clear output, send the verb, treat the next `debugger_state` for
+that thread as end-of-output; an empty-stack one means the thread is no
+longer stopped (answered as `resumed`, with whatever output was collected).
+A round trip with no output before its `debugger_state` is a successful empty
+result, not a timeout. Output is accumulated in our own consumer, gated on
+the pending entry — never read from `Debugger.State`'s per-thread buffer,
+where late output from an abandoned request would be indistinguishable.
+
+**Once-only discipline and the debt fence.** Requests live in a synchronized
+per-thread table; taking an entry out is the permission to answer it (the
+query protocol's invariant, reused verbatim; `Event_Timer` arms the Scala
+backstop the same way). If a backstop ever fires with the prover-side
+mechanism failed, the thread owes one `debugger_state`: a per-thread debt
+counter eats exactly that many completion signals, output for a thread with
+no pending entry is discarded, and new evaluations on an indebted thread are
+refused immediately with a sentence saying the previous evaluation has not
+returned and naming `isabelle_abort_eval_at_breakpoint` (no new status word —
+it is a sentence, not a token). The debt clears itself when the late
+`debugger_state` arrives. With the prover-side timeout this state should be
+nearly unreachable; it is the backstop's backstop.
+
+**Registration ordering.** The hit's own entry `debugger_state` must not be
+mistaken for a completion: the check-register-send step is ordered behind
+already-posted message callbacks (dispatcher-side execution; **probe** that
+the guard is load-bearing).
+
+The machinery is written alongside the query machinery, not merged into it
+(`Query_Handler` is a protocol handler keyed token→one reply; this consumer
+cannot be a protocol handler and is keyed thread→stream-until-sentinel).
+`query.scala` is not touched.
+
+### 7.3 The eval wrapper `Isabelle_MCP.debug_eval`
+
+We construct the ML text sent to `Debugger.eval`; the agent's expression is
+embedded in a call to a prelude function:
+
+```sml
+Isabelle_MCP.debug_eval (Time.fromSeconds 180) (fn () => ⟨expression⟩)
+```
+
+`debug_eval` does three things in one place:
+
+1. **Registers the running thread** in a prelude-side table keyed by the
+   debugger's own thread name — the same string the protocol messages carry —
+   and removes it on every exit path. This runs *before* the expression:
+   a runaway thread no longer reads its input queue, so anything sent later
+   would queue forever (hard ordering, not an optimisation). The abort flag
+   lives **inside this registration entry**: created with it, dead with it,
+   so a stale abort can never touch a later evaluation.
+2. **Enforces the deadline.** On expiry the expression ends with an ordinary
+   exception (the `Timeout.apply` pattern), which the debugger's error
+   wrapper catches and prints — the loop returns to waiting for input and
+   **the thread stays at the breakpoint**.
+3. **Watches the abort flag**, set by `PIDE/debugger_abort` via a prelude
+   protocol command, converted to an ordinary exception the same way — the
+   on-demand version of the deadline (§4.13).
+
+**How the containment actually works — binding requirements, not
+suggestions.** Both the deadline and the abort are physically delivered as
+**thread interrupts** (that is the only way to break into a running
+expression); what keeps them from killing the command is *classification
+inside the wrapper*, and stock `Timeout.apply` classifies only its own
+timer's interrupt — an abort interrupt passed through it would be re-raised
+as a genuine interrupt, escape the debugger's error wrapper (which re-raises
+interrupts), and kill the debugged command with the poisoned tail of point
+(2) below. Therefore:
+
+- Every interrupt leaving the expression must pass **one outermost
+  classifier** in `debug_eval`: deadline expired or abort flag set → an
+  ordinary exception; anything else → re-raised (a genuine cancellation must
+  still kill the command).
+- Deregistration is **mutually excluded** against the abort sender's
+  interrupt, and every exit path **drains pending interrupts under
+  `no_interrupts`** before returning — a late interrupt left undrained would
+  be delivered at the loop's next input wait, outside any wrapper, and kill
+  the command after a successful evaluation.
+
+The wrapper is also the home of the **locals printer** (§4.10): the same
+envelope, the expression being a call to the prelude function that prints a
+frame's variables with per-value 5 s bounds.
+
+One honest boundary: the envelope is assembled by embedding `expr` in ML
+text, so it is a convenience, not a security boundary — a token-unbalanced
+`expr` could in principle escape it. The client runs an ML token-balance
+check on `expr` (reusing the anchor-snippet tokenizer) before embedding.
+
+Two implementation requirements from the adversarial review:
+
+- The wrapper **sets the interrupt attributes explicitly**
+  (`Thread_Attributes.private_interrupts`), never inherits them: Poly/ML's
+  asynchronous interrupt really is delivered only once, nothing in the
+  debugger loop re-arms it, and a breakpoint taken in a deferred-interrupt
+  region would otherwise be uncuttable from the start. Setting the attribute
+  re-arms delivery.
+- If an interrupt is ever used as a fallback anyway, `Execution.discontinue`
+  must come first — without it the theory tail is permanently and silently
+  poisoned (the interrupted command's result is memoised as a non-retryable
+  failure; every later command fails reading it; none emits status markup;
+  only an edit at or before the command recovers it). The existing global
+  `Isabelle_MCP.cancel_execution` is safe precisely because it discontinues
+  first.
+
+**Timeout policy**: prover-side default 180 s, per-call `timeout` parameter
+on eval and locals (both genuinely prover-side — locals goes through the
+eval verb, §4.10); per-value print bound 5 s inside locals; Scala-side
+backstop 210 s; implicit frame-0 locals fetch 10 s (never aborts);
+step/continue wait bounds **30 s**, report and never abort.
+
+The prelude and the jar version-check each other (`mcp_prelude_version`);
+debugger additions to the prelude bump both sides together.
+
+### 7.4 Known limits
+
+Stated honestly in tool descriptions where they bite:
+
+- A **tight allocation-free loop** may offer no safe point; then neither the
+  deadline nor the abort flag can end it, and `isabelle_cancel_evaluation`
+  (global) is the only way out. **(probe:** the go/no-go experiment.**)**
+- A breakpoint taken on the **protocol thread** (e.g. inside a print
+  function) deadlocks the whole session — the thread that would read our
+  resume command is the stopped one. This is why the global "break at the
+  next site" switch stays out of v1 (§8) and why breakpoints are only ever
+  explicit sites.
+- Breakable sites crossed during an evaluation at a hit never fire (§4.9):
+  the break hook declines while the thread is debugging.
 
 ## 8. Out of scope for v1
 
-- Per-breakpoint enable/disable tools (the registry makes them trivial to add
-  later).
+- Per-breakpoint enable/disable tools (the registry makes them trivial later).
 - Global break — "stop at the next site wherever execution currently is"
-  (protocol slot reserved, §7).
+  (protocol name `PIDE/debugger_break` stays reserved; hard reason in §7.4).
 - Strict-SML evaluation mode and the explicit evaluation-context argument of
-  the prover's `eval` verb (defaults are used, §4.8).
-- Exception tracing (`ML_exception_debugger`) — an independent,
-  non-interactive feature.
+  the prover's `eval` verb.
+- Exception tracing (`ML_exception_debugger`) — independent, non-interactive.
+- Prelude takeover of the `Debugger.*` protocol commands (§7 preamble). (The
+  one admitted exception to "no debugger logic is reimplemented" is the
+  ~10-line locals printer of §4.10; it is bounded, and it exists because the
+  stock `print_vals` verb offers no timeout hook.)
+- Running the agent's expression in a forked task instead of on the stopped
+  thread (would keep the thread responsive forever, but diverges from the
+  stock debugger's semantics and thread-local state; recorded, not pursued).
+- A "detach the debugger" tool and a "delete all breakpoints" tool — both
+  reachable through existing tools; a tool slot is paid for on every request.
 
-## 9. Companion document
+## 9. Companion documents
 
-How this specification gets implemented — affected source files, the probe
-experiments that must validate the load-bearing assumptions first, and the
-staging of the work — is planned separately in
-[`DEBUGGER_IMPLEMENTATION_PLAN.md`](DEBUGGER_IMPLEMENTATION_PLAN.md).
+- [`DEBUGGER_IMPLEMENTATION_PLAN.md`](DEBUGGER_IMPLEMENTATION_PLAN.md) — how
+  this gets built: the probe experiments (integration tests, not
+  scaffolding), affected files, phases and gates.
+- [`DEBUGGER_REVIEW_AND_DECISIONS.md`](DEBUGGER_REVIEW_AND_DECISIONS.md) —
+  the historical record: the adversarial review of the 2026-08-11 draft, the
+  decisions taken in conversation, and the source-study findings this
+  revision rests on.

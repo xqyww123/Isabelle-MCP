@@ -1,165 +1,252 @@
 # ML Debugger Support — Implementation Plan
 
-Status: **draft, shelved as of 2026-08-11.** Companion to
-[`DEBUGGER_DESIGN.md`](DEBUGGER_DESIGN.md), which is the authoritative
-specification (tools, semantics, wire protocol, breakpoint lifecycle). This
-document only plans *how* to implement that specification: what to verify
-first, which files change, and in what order. Where this document and the
-specification disagree, the specification wins.
+Status: **active, rewritten 2026-08-13** alongside the specification. Companion
+to [`DEBUGGER_DESIGN.md`](DEBUGGER_DESIGN.md), which is authoritative for
+*what* is built; this document plans *how*: what to verify first, which files
+change, in what order. Where the two disagree, the specification wins.
+[`DEBUGGER_REVIEW_AND_DECISIONS.md`](DEBUGGER_REVIEW_AND_DECISIONS.md) is the
+historical record behind both.
 
-> Read [`DEBUGGER_REVIEW_AND_DECISIONS.md`](DEBUGGER_REVIEW_AND_DECISIONS.md)
-> before acting on this plan: it revises the Phase 0 probe list, and its review
-> concern (9) records a defect in Phase 1 below — the toggle is described as a
-> bare flip with the state argument dropped, which would make a second
-> `isabelle_enable_all_breakpoints` disable everything.
-
-Section references (§) are into `DEBUGGER_DESIGN.md` unless said otherwise.
+Standing constraints: never add `-c` to `isabelle build`; rebuilding our own
+jar is treated as costless; the Isabelle distribution is never modified; the
+prelude and the jar version-check each other, so prelude changes bump
+`mcp_prelude_version` and the Scala constant together; after editing `.ML`
+sources, restart the REPL/server rather than rebuilding heaps.
 
 ---
 
-## Phase 0 — Probe experiments
+## Phase Y — the YAML output change (precondition) — **done, commit c1feaa1**
 
-The specification is derived from source study of Isabelle2025-2 and of this
-repository. Project policy: Isabelle-MCP behavior must be measured, not
-inferred from source. Each load-bearing assumption below gets a probe before
-any implementation is built on it; every probe uses an observable side effect
-plus a positive control, and waits generously (≥60 s) before concluding a
-negative.
+Before any debugger code: the seven structured tools drop `output_schema` and
+return YAML text (spec §4 preamble; decisions §2.9). Own change, own commit —
+so the debugger tools are born into a settled output convention. `pyyaml`
+joins `pyproject.toml` and the conda recipe; serialisation lives in one helper
+in `utils/formatters.py`; `allow_unicode=True` is mandatory and pinned by a
+test (Unicode round-trip precedent exists in the integration suite).
 
-1. **Instrumentation reaches dynamically evaluated ML.** Launch with
-   `-o ML_debugger=true` (already possible today via the CLI `--` extra-args
-   escape hatch, no code change needed), evaluate a theory containing an
-   `ML ‹…›` block, and confirm `ML_breakpoint` markup is retrievable from the
-   snapshot on the Scala side. Positive control: markup of a kind we already
-   consume (e.g. decorations) is present for the same region.
-2. **A breakpoint actually stops a thread.** After `Debugger.init` and
-   enabling one site, run ML that crosses the site; confirm a
-   `debugger_state` protocol message with a non-empty stack arrives at the
-   Scala `Debugger.Handler` (observable via `session.debugger.status`).
-3. **What the rest of PIDE reports while a thread is stopped.** Record what
-   `PIDE/decoration` and `PIDE/theory_status` say for the affected region
-   during a stop — the "paused at breakpoint" wording of §6.1 and the wait
-   loop's exit condition depend on this.
-4. **Eval round-trip.** `eval` / `print_vals` output arrives as
-   `debugger_output` protocol messages keyed by the thread name, within a
-   bounded delay; measure a realistic timeout for the §7 rendezvous.
-5. **Cancellation interplay.** With a thread stopped, confirm the existing
-   cancellation path is indeed wedged, and that resuming all threads
-   un-wedges it (§6.4).
-6. **Recompilation invalidates serials.** Edit and re-evaluate the enclosing
-   ML block; confirm the site serials change and `Debugger.breakpoint` on the
-   stale serial fails the way §5(2) assumes.
+## Phase A — Scala requests, prelude wrapper, probes (former Phases 0 and 1, merged)
 
-Probes 1–2 gate the whole feature; 3–6 refine wording, timeouts, and the
-reconciliation logic. Probe results get recorded in this document (append a
-"Phase 0 results" section) before Phase 1 starts.
+There is no throw-away probe scaffolding. The real Scala requests are written
+first — they are thin adapters over `session.debugger` by design — and the
+probes drive them raw from Python as **integration tests**, the way
+`tests/integration/test_query_tools_e2e.py` drives
+`PIDE/find_theorems_at_position` directly with no MCP tool in between. The
+probes stay in the repository permanently: the assumptions they pin are
+exactly what an Isabelle upgrade would silently break. They live in
+`tests/integration/`, marked `integration`, deselected by default —
+made true by `addopts = -m "not integration"` in `pyproject.toml` (until
+2026-08-14 the claim was false: only CI's explicit flag deselected them, and
+a bare `pytest` on a machine with `isabelle` on PATH ran them, whose global
+state leaked into a unit test during Phase Y) — and skipped without
+`isabelle` on PATH. Running them is explicit: `pytest tests/integration
+-m integration`. To let the probes observe the server-pushed
+`PIDE/debugger_state` / `PIDE/debugger_output` notifications, **the two
+notification branches in `lsp_client.py` land in this phase** (they were
+Phase B work; the rest of Phase B stays put). Launching with debugging needs
+no new code: `isabelle-mcp -- -o ML_debugger=true` via the CLI extra-args
+escape hatch.
 
-Probe vehicle: probes 1–4 need ad-hoc access to the running session from the
-Scala side. Options: a temporary `PIDE/debugger_probe` request in the fork, or
-a scratch build of the component with extra logging. Decide when starting
-Phase 0; remove the scaffolding before release.
+Probe policy (project rule: measure, do not infer from source): every probe
+uses an observable side effect plus a positive control, and waits generously
+(≥60 s) before concluding a negative.
 
-## Phase 1 — Scala fork
+### Scala fork changes
 
-All changes under `src/isabelle_mcp/scala/Isabelle2025-2/` (package
-`isabelle.mcp`). Prover interaction goes exclusively through the existing
-`session.debugger` API (`isabelle.Debugger`, `src/Pure/Tools/debugger.scala`
-in the distribution) — per the §7 design constraint, no debugger logic is
-reimplemented.
+All under `src/isabelle_mcp/scala/Isabelle2025-2/` (package `isabelle.mcp`).
 
-- `src/lsp.scala` — extractor/emitter objects for the §7 messages, next to
-  the existing `PIDE/*` extensions (currently at `lsp.scala:670-745`).
-- `src/language_server.scala` —
-  - dispatch cases in `handle` for the four requests;
-  - `PIDE/debugger_breakpoints`: snapshot selection of `ML_breakpoint`
-    markup over the requested range — model the lookup on jEdit's
-    `JEdit_Rendering.breakpoint` (`src/Tools/jEdit/src/jedit_rendering.scala:208`
-    in the distribution), which also yields the enclosing `Command` needed
-    for toggling;
-  - `PIDE/debugger_toggle_breakpoint`: re-locate the command for the serial
-    in the snapshot, then `session.debugger.toggle_breakpoint(command, serial)`;
-  - `PIDE/debugger_eval` / `PIDE/debugger_print_vals`: send the verb via
-    `session.debugger.eval` / `.print_vals`, then await the matching
-    per-thread output entries (timeout from probe 4) — same rendezvous
-    pattern as the existing state-panel dance;
-  - `PIDE/debugger_input`: forward resume verbs;
-  - a consumer subscribed to `session.debugger_updates` forwarding thread
-    stacks as `PIDE/debugger_state` notifications, and unconsumed output as
-    `PIDE/debugger_output`;
-  - implicit `session.debugger.init(...)` before the first debugger action,
-    re-issued by the session-ready hook after a prover restart;
-    `Debugger.exit` on shutdown only (§7).
-- Jar rebuild: the usual manual release step —
-  `scripts/check_component.py` gate, recipe in
-  `docs/COMPONENT_INSTALL_PLAN.md`; CI check in
-  `.github/workflows/ci.yml`.
+- `src/lsp.scala` — extractor/emitter objects for the §7.1 messages, next to
+  the existing `PIDE/*` extensions. Timeouts as JSON numbers of seconds,
+  client-chosen, like `Query_Params`.
+- `src/debugger.scala` (new) — the request table and message consumer of spec
+  §7.2: `Synchronized` per-thread pending map (take-is-permission, verbatim
+  from `query.scala`'s invariant), per-thread debt counters, output
+  accumulation, `Event_Timer` backstop arm/cancel idiom. Written alongside
+  `query.scala`, not merged into it; `query.scala` is not touched.
+- `src/language_server.scala` — dispatch arms for the §7.1 requests; a
+  consumer on `session.all_messages` (NOT `session.debugger_updates` — no
+  payload, coalesced; and NOT a protocol handler — `Debugger.Handler` already
+  claims both function names and duplicate registration throws) matching
+  cheaply on `Markup.Debugger_State` / `Markup.Debugger_Output`; the
+  check-register-send step executed dispatcher-side so the hit's entry
+  `debugger_state` cannot be mistaken for a completion; implicit
+  `session.debugger.init` before the first debugger action, re-issued by the
+  session-ready hook; a functionless `Session.Protocol_Handler` registered
+  for its `exit` drain (answer orphans as crashed).
+- `src/vscode_rendering.scala` — a `breakpoint(range)` lookup mirroring
+  `jedit_rendering.scala`'s, yielding `(Command, serial)` for toggling.
+- `PIDE/debugger_breakpoints` returns the markup ranges and serials **as
+  found** — the one-symbol shift correction of spec §3.3 (anchor at the
+  range's end, line from the corrected position) is client-side, done by the
+  Python anchor computation of Phase C, per spec §3.2/§7.1.
+- `ML/mcp_prelude.ML` — `Isabelle_MCP.debug_eval` (spec §7.3): thread
+  registration table keyed by the debugger's thread-name string, explicit
+  `Thread_Attributes.private_interrupts`, **one outermost interrupt
+  classifier** (deadline or abort → ordinary exception; else re-raise),
+  deregistration mutually excluded with the abort sender, pending interrupts
+  drained under `no_interrupts` on every exit path, the abort flag living in
+  the registration entry; a protocol command for the abort flag; and the
+  **locals printer** (spec §4.10: `PolyML.DebuggerInterface` +
+  `printWithType` at `ML_print_depth`, per-value 5 s bounds,
+  `<printing timed out>` placeholders). Bump `mcp_prelude_version` and the
+  Scala constant together.
+- Jar rebuild: the usual release recipe (`isabelle scala_build` against a
+  scratch `USER_HOME`, copy back, `scripts/check_component.py` gate; never
+  `-f`, never `-c`).
 
-## Phase 2 — Python protocol layer
+### Probes
 
-`src/isabelle_mcp/lsp_client.py`:
+Gates — if 1, 2 or 3 fails, stop and revisit the specification:
 
-- The notification dispatch is a hardwired `if/elif` chain
-  (`_handle_notification`, `lsp_client.py:825`); unknown methods are silently
-  dropped. Add branches for `PIDE/debugger_state` and `PIDE/debugger_output`.
-- Request wrappers for the four §7 requests (the request/response path is
-  generic — correlation by id — so no dispatch change is needed there).
-- `isabelle_launch(debug=true)` plumbing: append `-o ML_debugger=true` to the
-  spawn argv (`start()`, `lsp_client.py:354-379`); record the flag on the
-  client so tools can fail fast when it is off (§2.1).
+1. **Sites are visible and where we think they are.** With `ML_debugger=true`,
+   evaluate an `ML ‹…›` block containing an indented statement, a column-1
+   statement, and top-level `val`/`fun` declarations. Assert: `ML_breakpoint`
+   markup is retrievable from the snapshot (positive control: decorations);
+   every range is a single symbol; the indented site's range covers the last
+   indentation space and the column-1 site's range covers the previous line's
+   newline (the one-symbol shift) — or, if both cover the statement's first
+   letter, the shift correction must be removed instead; top-level
+   declarations yield no sites.
+2. **A breakpoint stops a thread.** Enable one site, run code crossing it,
+   assert a `debugger_state` with a non-empty stack arrives through our
+   `all_messages` consumer.
+3. **Go/no-go for the timeout design.** At a real hit, evaluate an
+   **allocating** runaway under a 5 s `Timeout.apply` (e.g.
+   `let fun f xs = f (1 :: xs) in f [] end`). Assert the round trip ends with
+   a TIMEOUT error message and the thread is still parked (follow-up
+   `print_vals` answers). Repeat on the same thread (the asynch-once re-arm
+   via explicit attributes). If this fails, the eval/abort design of spec
+   §7.3-§7.4 must be reconsidered before Phase C.
+   The **allocation-free** worst case
+   (`let fun f (i:int) = f (i+1) in f 0 end`) is a separate refinement
+   measurement, not a gate: spec §7.4 already ships it as a stated known
+   limit, and this probe only fixes the limit's wording — or deletes it, if
+   the cut-off does land.
 
-## Phase 3 — Registry and tools
+Refinement probes (wording, bounds, reconciliation logic):
 
-- New `src/isabelle_mcp/debugger.py` — the breakpoint registry (§5): entry
-  store, `at_text`/first-site resolution (§3), anchor-snippet extraction from
-  file content, reconciliation with notices, the debug-notice buffer (§6.3),
-  and the stopped-thread state fed by `PIDE/debugger_state`.
-- `src/isabelle_mcp/server.py` — the ten tools of §4 with the exact schemas
-  of the specification; `debug` parameter on `isabelle_launch`; the fail-fast
-  guard.
-- `src/isabelle_mcp/models.py` — result models for
-  `isabelle_list_breakpoints` (§4.4) and `isabelle_debug_state` (§4.7),
-  including the `notices` field.
-- Output style split per §4: those two tools are structured; the other eight
-  are text results (`@mcp.tool(output_schema=None)` + formatter), matching
-  the repository's existing convention (structured for enumerable query
-  results, text for narrative reports). Formatters live with the existing
-  ones in `utils/formatters.py`.
+4. **One `debugger_state` per input, always last.** Drive `print_vals`, a
+   normal eval, a raising eval, then `continue`; assert exactly one state per
+   input, output-before-state, and thread absence after resume. A zero-output
+   eval (`eval "()"`) completes as an empty success, not a timeout.
+5. **Registration ordering.** A request issued immediately after the hit must
+   not complete instantly off the entry `debugger_state`. The negative arm
+   ("show the guard matters by removing it") is a **one-off design-time
+   experiment** with a variant jar, recorded in this file's results section,
+   not a permanent test — a checked-in test cannot run against an unguarded
+   jar under the `check_component.py` gate, and the race window is not
+   drivable from Python. The permanent residue is a Scala-side ordering
+   assertion.
+6. **Recompilation invalidates serials; explicit re-arming works.** Edit
+   before the enclosing block and re-evaluate: serials change, stale toggling
+   errors, entries are demoted with notices; then evaluate up to the definer,
+   `isabelle_enable_all_breakpoints`, evaluate onward — the caller hits
+   (§2.2 motion 3). Also confirm motion 2: an edit strictly after the definer
+   leaves the breakpoint armed and the re-run caller hits with no re-enable.
+7. **Cancellation's synthetic edit.** After `isabelle_cancel_evaluation`,
+   check whether all serials died (decides the reconcile-after-cancel
+   trigger of spec §5); assert threads left the hit table.
+8. **Query tools under parked workers.** With N threads stopped (N up to the
+   worker count), `isabelle_goal` / `isabelle_find_theorems` on processed
+   lines must answer promptly; if they starve, implement the fail-fast
+   sentence of spec §6.1 instead.
+9. **Stepping.** Step off the last statement of a block: the did-not-stop
+   outcome reports and retires the hit. Check whether the stepping flag leaks
+   onto a later unrelated task of the same worker (stray-halt anomaly path).
+10. **Status of a stopped command.** Record decorations /
+    `PIDE/theory_status` during a hit — fixes the "paused" wording in
+    `isabelle_evaluation_status`.
+11. **Abort flag.** An on-demand abort ends a slow (allocating) eval with an
+    error, thread still parked; refused with the no-evaluation error when
+    nothing is being evaluated; a stale abort never reaches the next
+    evaluation (flag lives in the registration entry).
+11bis. **Locals via the eval verb.** The prelude locals printer, called
+    through `debug_eval`, sees the halted stack from within an eval
+    (`PolyML.DebuggerInterface.debugState` on the stopped thread) and its
+    output matches stock `print_vals` byte-for-byte on the same frame; a
+    value with a deliberately slow printer yields `<printing timed out>`
+    while the rest print.
+12. **`all_messages` consumer cost** under a large evaluation.
+13. **Frame position resolution.** Which frames resolve to `file:line` on the
+    Scala side; how library-code frames look (fixes the placeholder wording).
+14. **Edits while a thread is parked.** A background file-save resync edits
+    the document during a hit: observe whether the stopped command's
+    execution is discarded and the parked thread disturbed. (Restores the
+    caret-move probe of the shelving record in its surviving form — no tool
+    moves the caret during a hit any more, but background resyncs still edit
+    the document.)
 
-## Phase 4 — Evaluation and cancellation integration
+## Phase B — Python protocol layer
+
+Files: `src/isabelle_mcp/lsp_client.py`, `server.py`, `models.py`,
+`tools/session.py`.
+
+- Request wrappers for the §7.1 requests in `lsp_client.py`
+  (request/response correlation is generic; the two notification branches
+  already landed in Phase A).
+- `debug` plumbing: `-o ML_debugger=true` in the spawn argv and the flag
+  recorded on the client (`lsp_client.py`); **the launch-identity error** of
+  spec §2.1 in `isabelle_launch` (`server.py` — reuse only when session name
+  matches AND debug matches; a differing debug value on the same session
+  errors both ways; `session_dirs` unchanged); `debug` in `SessionInfo`
+  (`models.py`, populated by `tools/session.py`).
+
+## Phase C — registry, tools, instructions
+
+- New `src/isabelle_mcp/debugger.py` — registry (two states, manual arming,
+  §5) with **one registry lock** across every read-check-mutate sequence,
+  anchor snippet computation (whole tokens, unique-in-line, from the
+  corrected position), `at_text` resolution with the resolves-differently
+  refusal, the demote-and-notify bookkeeping (no background toggles),
+  arming-time site resolution with same-site merging, hit table and `hit_id`
+  lifecycle (cleared on every prover teardown), the notice buffer, and the
+  refusal/report sentences (unit-tested verbatim, in the `query.py` style).
+- `src/isabelle_mcp/server.py` — the twelve tools of spec §4, all
+  `output_schema=None` with formatters in `utils/formatters.py`; notice
+  delivery through the existing middleware pattern.
+- `src/isabelle_mcp/instructions.py` — the debugger section teaching hit /
+  frame / breakable site, plus the run-twice consequence and the
+  discovery-first workflow (draft at implementation; user-visible text).
+
+## Phase D — evaluation and cancellation integration
 
 `src/isabelle_mcp/evaluation.py`:
 
-- Third exit condition in the `evaluate_to` wait loop: stopped threads
-  (fed from the `PIDE/debugger_state` handler), producing the §6.1 hit report
-  (including the automatic frame-0 locals, which is one
-  `PIDE/debugger_print_vals` round trip).
-- "Paused at breakpoint" section in `evaluation_status` (wording informed by
-  probe 3).
-- Reconciliation hook: run after every completed evaluation round, and
-  cheaply from the per-tool-call freshness path (§5, §6.2).
-- `cancel_evaluation` extension (§6.4): resume all stopped threads first —
-  with armed sites temporarily disabled and restored afterwards — then the
-  existing cancellation path.
+- Third exit condition in the `evaluate_to` wait loop: a hit **in the current
+  evaluation's theory set** (Scala-side position→node resolution); other hits
+  become notices; unattributable hits fail open. The result leads with the
+  hit report, including the implicit 10 s frame-0 locals fetch.
+- "Paused at a breakpoint" section in `evaluation_status` (wording from
+  probe 10).
+- `evaluate_to` refused while any hit is live (the refusal lives in
+  `evaluate_to` itself, so the query tools' auto-start inherits it), leading
+  with the live hits and consuming their queued notices; plus the
+  forgotten-re-enable warning line of spec §5 when enabled-but-unarmed
+  entries exist in the target file.
+- Demote-and-notify hooks: on evaluation events, on resync, after relaunch,
+  after cancellation (per probe 7). No background arming (spec §5).
+- Cancellation itself unchanged (spec §6.4); hits retired as swept-up, the
+  hit table cleared on every prover teardown path.
 
-## Phase 5 — Tests and documentation
+## Phase E — tests and documentation
 
-- Tests under `tests/`, following the existing pytest layout: unit tests for
-  registry resolution/reconciliation (pure Python, no prover), plus
-  integration tests behind the existing live-session test conventions for:
-  set → hit → locals → eval → continue; step modes; disable_all/enable_all;
-  recompilation re-arm; cancel-while-stopped.
-- `README.md` feature section; MCP server instructions (tool docstrings are
-  the primary agent-facing documentation — keep them aligned with §4
-  descriptions verbatim where possible); `CHANGELOG.md`.
+- Unit tests: registry resolution/reconciliation, anchor snippets, sentence
+  catalogue — pure Python, no prover.
+- Integration tests beyond the probes: set → hit → locals → eval → continue;
+  step modes; enable/disable-all idempotence; the three motions of §2.2
+  (incl. explicit re-arming after an upstream edit); cancel-while-stopped;
+  timeout and abort end-to-end; two hits at once.
+- `README.md`, MCP instructions, `CHANGELOG.md`, and the three design docs
+  (`SPECIFICATION.md`, `API_DESIGN.md`, `ARCHITECTURE.md`) updated for the
+  twelve tools and the changed launch.
 
 ## Ordering and gates
 
-Phases run in order; each phase is a working increment. Explicit gates:
+Phase Y, then A → E in order; each phase is a working increment. Explicit
+gates:
 
-- Phase 0 gates everything: if probe 1 or 2 fails, stop and revisit the
-  specification.
-- Phase 1 is complete only with a rebuilt jar passing
-  `scripts/check_component.py`.
-- Phases 2–4 land together behind the `debug=false` default: with debugging
-  off, every new code path is inert, so partial progress never destabilizes
-  the existing tools.
+- Phase A's probes 1–3 gate everything; failure means revisiting the
+  specification, and the thin Scala layer is the only sunk cost.
+- Phase A is complete only with a rebuilt jar passing
+  `scripts/check_component.py` and the probe tests green.
+- Phases B–D land behind the `debug=false` default: with debugging off, every
+  new code path is inert.

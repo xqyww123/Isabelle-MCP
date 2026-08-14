@@ -125,6 +125,11 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 asyncio_mode = "auto"
+# Integration tests (real prover, minutes) run only when asked for explicitly:
+#   pytest tests/integration -m integration
+# Without this, a machine with isabelle on PATH ran them inside a bare
+# `pytest`, and their global state leaked into unit tests (2026-08-14).
+addopts = "-m 'not integration'"
 markers = [
     "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
