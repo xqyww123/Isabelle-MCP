@@ -22,12 +22,14 @@ decisions, all folded (commits `14dc54c` and successors); **Phase A itself**
 the locals printer, the `lsp_client.py` notification branches, a rebuilt jar
 passing `check_component.py`, and the probes as integration tests
 (`tests/integration/test_debugger_probes.py`, 7 tests, all green in one run;
-unit suite 495 green). Probe results and the discoveries they forced are in
-"Phase A probe results (2026-08-14)" below — **read that section before
-Phase B/C: two design assumptions were refuted by measurement** (the
-`ML_write_global` correction, folded into spec §4.10; and whole-document
-sync killing every serial on any edit, which invalidates spec §2.2's
-motion 2 and awaits a design decision).
+unit suite 495 green) — commit `62008cf`. Probe results and the discoveries
+they forced are in "Phase A probe results (2026-08-14)" below.
+
+**Current position: the adversarial code review of `62008cf` is complete,
+every fix was itself adversarially verified, the user approved the whole
+repair round, and the NEXT ACTION is the "Phase A repair round" section
+below — start at its commit sequence.** The full review verdict is archived
+in [`DEBUGGER_REPAIR_REVIEW_VERDICT.md`](DEBUGGER_REPAIR_REVIEW_VERDICT.md).
 
 Concrete pointers a fresh context needs:
 
@@ -274,11 +276,28 @@ breakpoint serial dies, the fresh sites come back unarmed, and the re-run
 caller runs through the previously-armed site without stopping. Toggling the
 old serial errors (`unknown breakpoint serial`). Motion 1 on the edited file
 (evaluate to definer, arm the new serial, evaluate onward) is the working
-recovery and is verified. **Design decision needed before Phase C**: either
-the client learns to send range-based `didChange` (restoring PIDE edit
-granularity and motion 2), or spec §2.2/§5 are retaught around
-"any edit disarms the whole file". The registry's demote-and-notify model
-already fits the second reality (`code not found` on every old serial).
+recovery and is verified.
+
+**Resolution (decided 2026-08-14, user-approved): the client will send
+range-based `didChange`.** A three-arm follow-up experiment
+(`scratchpad ranged_sync_probe.py`, run against the real prover) settled it:
+with a RANGED edit of only the caller line, the definer's breakpoint serial
+survived and stayed armed, a 20 s upstream command did NOT re-run, and the
+still-armed breakpoint hit in **0.2 s** with no re-arming — motion 2 works
+exactly as §2.2 describes once the edit is ranged. The control arm (ranged
+edit strictly before the definer) re-ran the sleep and killed the serials —
+chained downstream execution, bounding the win as prefix-only, again as §2.2
+describes. So PIDE's own granularity was never the problem; the disk-edit
+sync path was. Implementation lands in Phase B: `sync_dirty_files` computes
+a minimal diff (old `doc.content` vs new disk text) and sends ranged
+`contentChanges` instead of the whole document; spec §2.2 stays as written.
+A source-and-archive verification pass also traced the whole pipeline
+(remove-all+insert-all → one `Malformed_Span` → `chop_common` matches
+nothing → empty reused prefix in `document.ML`'s `last_common`) and found
+the two documents that had wrongly asserted otherwise about this client
+(`docs/PIDE_MCP_COMPARISON.md` "neither re-runs a whole theory on every
+edit"; spec §2.2 motion 2 as previously measured) — both were source-derived
+projections never measured against this client's sync path.
 
 **Probe 7 — confirmed.** Cancellation sweeps the parked thread out of the
 hit table (`threads=[]`); the pre-cancel serial afterwards answers
@@ -323,6 +342,312 @@ prover and a probe can "pass" on a stale document (this produced a
 false-positive motion-2 result in the first draft); and the evaluation
 bookkeeping is module-global, so the fixture resets `ev.evaluation_state`
 per test.
+
+## Phase A repair round (2026-08-14, user-approved — THE NEXT ACTION)
+
+The adversarial code review of commit `62008cf` (22 findings, 15 surviving three
+refuters) plus three verification workflows produced this repair round. Every
+item below was itself adversarially verified (37 attack findings, 29 surviving
+two refuters, per-item judgment archived in full in
+[`DEBUGGER_REPAIR_REVIEW_VERDICT.md`](DEBUGGER_REPAIR_REVIEW_VERDICT.md) — read
+it for the reasoning behind any item; THIS section is the actionable contract).
+The user approved the whole round on 2026-08-14; implementation starts here.
+All source line references are as of `62008cf`.
+
+Standing constraints (unchanged): never run `isabelle build` in any form
+(binds every subagent); jar rebuilds via the release recipe only
+(`docs/COMPONENT_INSTALL_PLAN.md` §7: copy component to scratch, strip
+`no_build`, scratch `USER_HOME`, `isabelle scala_build`, copy jar back,
+`scripts/check_component.py` gate; a working scratch setup may exist at the
+session scratchpad's `jar-build/`); commit on `master`, never branch, never
+stash/clean; push only when asked, only `origin`; agent-facing sentences are
+drafted at implementation and shown to the user for approval before commit.
+
+### User decisions recorded this round (do not re-open)
+
+1. **Acknowledged toggle**: approved. Absolute-semantics prelude protocol
+   command through the existing query-reply machinery.
+2. **Abort**: outcome-based bounded retry, and after the verification team
+   killed the Scala-side state machine (wrong-target kill — see R2), the
+   retry loop lives in the PYTHON abort tool; Scala stays stateless.
+3. **Listing state truth**: the user chose real prover reads over a
+   registry-projection display — each listing resolves enabled-states from
+   the actual breakpoint refs (R5). The Python registry remains the
+   bookkeeping of record for REGISTERED breakpoints; a mismatch between
+   registry expectation and prover truth becomes a debugger notice.
+4. **`Isabelle_MCP_PolyML` global exposure**: accepted and documented in §7.4
+   (any user ML could re-derive it in five lines; hiding is cosmetic; the
+   probes rely on it).
+5. **Ranged `didChange`**: approved, and approved to land WITH this round as
+   its own commit (not deferred to Phase B). Spec §2.2 stays as written.
+6. Autonomy granted for the abort item's implementation once reworked; all
+   agent-facing copy still goes to the user verbatim before commit.
+
+### R1 — dispatcher-side backstop bookkeeping  [debugger.scala]
+
+Move the ENTIRE Event_Timer backstop callback body into
+`session.send_dispatcher { ... }`, so all four mutators of `pending`/`debt`
+(all_messages consumer, `start_eval`'s check-register-send, the backstop, and
+R8's `prover_exit`) are confined to the session dispatcher thread. Identity
+check: give `Pending` a fresh Scala-side serial (`Counter` — NOT the client
+token, which has no uniqueness guarantee); the timer closure captures the
+serial it armed for and, dispatcher-side, does look-up-COMPARE-remove:
+`pending.value.get(thread)` → if the serial matches, remove + respond TIMEOUT
++ increment debt; else do nothing (no take-then-re-insert). This closes all
+five confirmed races (stolen replies, stranded debt, busy-fence hole,
+wrong-request TIMEOUT, channel IO on the shared Timer thread — Event_Timer
+cancel returns false once fired, so a fired closure can run arbitrarily late).
+
+### R2 — abort: stateless Scala + Python retry loop
+
+Scala (`debugger.scala` `abort`, lands with R1's commit — two lines): the
+current handler consults only `pending` (:311-323) and wrongly answers
+`no_evaluation` for an indebted thread — precisely the runaway case abort
+exists for. New check: thread has neither pending entry nor debt →
+`no_evaluation`; else send `Isabelle_MCP.debug_abort` ONCE and reply
+`aborting` immediately. No timers, no waiters, no outcome classification in
+the reply (an aborted completion is wire-identical to a failed one; the
+eval's own LSP reply carries how it ended).
+
+Python (lands with the Phase C abort tool; wire is ready after R1): retry
+loop in the tool — send `PIDE/debugger_abort`; wait min(~2 s, the TARGETED
+eval's own outstanding reply); if that reply arrived, stop re-sending and
+report settled (this pins the abort to its target and structurally closes
+the wrong-target window: the tool never re-sends after the target settles,
+and the caller is blocked inside the tool so no eval#2 can start); in the
+debt case (eval already answered TIMEOUT by the backstop) keep re-sending
+until the abort reply flips to `no_evaluation` (debt cleared — safe, the
+busy fence refuses new evals while debt is owed); bound ~30 s total, then
+report honestly ("abort requested repeatedly; the evaluation has not
+ended" — never claim delivery; allocation-free-loop limit + global cancel
+named). The ML-side silent no-op for an unregistered thread is load-bearing
+staleness protection and stays. REJECTED alternatives (do not re-litigate):
+prover-side pre-abort table (stale-abort landmine, needs token threading);
+Scala-side retry state machine (re-sends across settlement boundaries kill
+the next evaluation — the ML table is keyed by thread name only); raw
+interrupt in the window (escapes error_wrapper, kills the command, poisons
+the theory tail).
+
+### R3 — self-compiling wrapper  [mcp_prelude.ML + debugger.scala]
+
+Composed eval text becomes constant-shape; the agent's expression travels as
+an ML string literal and is compiled INSIDE the protection:
+
+- Eval: `val _ = Isabelle_MCP.debug_eval_string (Time.fromSeconds N) "<literal>";`
+- Locals: `val _ = Isabelle_MCP.debug_eval (Time.fromSeconds N) (fn () => Isabelle_MCP.debug_locals F);`
+- Prelude addition (flags record verified to compile field-for-field on
+  2025-2):
+  ```sml
+  fun debug_eval_string timeout source =
+    debug_eval timeout (fn () =>
+      ML_Context.eval
+        {environment = ML_Env.Isabelle, redirect = false, verbose = true,
+         catch_all = false, debug = SOME false,
+         writeln = Debugger.writeln_message, warning = Debugger.warning_message}
+        Position.none
+        (ML_Lex.read "val it = (" @ ML_Lex.read_source (Input.string source) @
+         ML_Lex.read ");"));
+  ```
+- Literal encoder in Scala next to `print_vals_text`: `Symbol.encode` first,
+  then per UTF-8 byte: 32-126 except `"` and `\` verbatim, everything else
+  `\ddd` (exactly three decimal digits). Output is pure ASCII, so the later
+  `Symbol.encode` in the input call is a no-op.
+- DELETE the `strip_unit_echo`/`UNIT_ECHO` machinery entirely
+  (debugger.scala:63,73,140,269,298-302): the `val _` envelope emits no echo,
+  and a genuine `val it = (): unit` from the inner eval is legitimate output
+  the old filter would have eaten. The design's Python token-balance
+  pre-check is dropped (the literal closes the escape hole structurally; a
+  token-unbalanced expression can at worst smuggle declarations that run
+  INSIDE the protection and whose bindings die with the discarded context —
+  honest §4.9 note).
+- Two guards: a prelude comment stating that the envelope's silence rests on
+  `verbose = true` flushing one EMPTY writeln that only
+  `Debugger.writeln_message`'s `if msg = "" then ()` drops (probe pins it);
+  and the Python tool layer refuses empty/whitespace-only `expr` (empty now
+  compiles to valid `val it = ( );`).
+- Registration entry, classifier, drain discipline: UNCHANGED.
+- Residual window, stated in §7.3: before registration there remains the
+  input-queue round trip + a linear lexer scan of the composed text + the
+  frame-scope merge; an abort landing there is acknowledged and lost (the
+  Python retry re-covers it within one period); the window can no longer be
+  extended by expression content.
+
+### R4 — acknowledged toggle  [mcp_prelude.ML + debugger.scala + lsp.scala]
+
+Prelude protocol command via the existing `mcp_define` machinery, INLINE on
+the protocol thread (no fork):
+`Isabelle_MCP.toggle_breakpoint id node_name command_id serial state`.
+Absolute semantics (`b := Value.parse_bool state`; idempotent retry). Resolve
+via `mcp_resolve`; breakpoint via
+`ML_Env.get_breakpoint (Context.Proof (Toplevel.presentation_context st))
+(Value.parse_int serial)`; `NONE` → status `unknown_breakpoint` (the one new
+word); `SOME (b, _)` → read previous value, write, `mcp_finish id "ok" []`
+with the PREVIOUS value in the reply chunk (`query.scala` stays untouched —
+`Query.Result.text` delivers it). Other statuses: existing query vocabulary
+(`undefined`/`unfinished`/`interrupted`/`failed`/`crashed`; `cancelled` is
+unreachable inline — not advertised).
+
+Scala: `toggle_breakpoint` keeps `ensure_init` and the pre-checks, promoted
+to statuses `file_not_open` / `outdated` / `unknown_breakpoint` (dual meaning
+with the ML case — noted in §7.1); then the `query_at_position` pattern:
+token registered in **the existing `query_handler` instance** — expose it to
+`Debugger_Adapter` (a SECOND `Query_Handler` is impossible: duplicate handler
+class/function registration throws at init, protocol_handlers.scala:24-28) —
+Event_Timer at the client-chosen timeout answering `timeout`,
+`protocol_command_args` send. All `session.debugger.toggle_breakpoint` /
+`breakpoint_state` uses deleted; the `session.debugger.init`/`ready`
+lifecycle STAYS (it installs the break hook, debugger.ML:246-257).
+`lsp.scala`: `PIDE/debugger_toggle_breakpoint` gains `token` + `timeout`
+params; reply `{status, was?}`. Existing probe helpers/assertions
+(test_debugger_probes.py `_toggle`, `_enable_site_at`, :148-168, :185, :265)
+migrate IN THE SAME COMMIT.
+
+### R5 — prover-truth listing states  [mcp_prelude.ML + debugger.scala + lsp.scala]
+
+New prelude protocol command, same machinery, batch:
+`Isabelle_MCP.breakpoint_states id (node_name command_id serial)*` — for each
+triple `mcp_resolve` + `ML_Env.get_breakpoint` + read `! b`; one reply chunk
+encoding per-serial `true`/`false`/unresolvable(status-word). Folded INTO the
+listing: `PIDE/debugger_breakpoints` gains `token` + `timeout` (the async
+pattern requires them; today's synchronous reply would hang forever on a
+wedged prover), becomes async via the same shared `query_handler` +
+Event_Timer, and replies `{status, open, breakpoints:[{range, serial,
+state}]}` — top-level status ok/timeout/crashed, `state` ∈ true/false/
+unresolvable(word). Serials/ranges still AS FOUND (shift correction stays
+client-side). Registry discipline unchanged (armed recorded only on toggle
+`ok`; mismatch with prover truth → debugger notice).
+
+### R6 — refuse eval/print_vals on a not-stopped thread  [debugger.scala]
+
+Dispatcher-side, before registering: `threads.value` has no entry for the
+name → reply the NEW wire status `not_stopped` (do NOT reuse `resumed`,
+which means "input delivered, expression may have run" — sharing the word
+would lie about side effects). No registration, nothing sent. §7.4 gains the
+two honest races: the narrowing does not close the resume-between-check-and-
+dequeue window; and the benign inverse (an eval racing a brand-new hit whose
+state has not arrived is refused although stopped — impossible when the
+client acts on a received hit notification, since the state callback
+precedes the check on the same dispatcher).
+
+### R7 — bound the stock output buffer  [debugger.scala]
+
+`session.debugger.clear_output(thread)` at THREE points: after a completed
+round trip (handle_state answering a pending entry), when a thread leaves
+the map (resume), and IN THE DEBT-CLEARING BRANCH (:143-151 — the indebted
+thread is the abandoned runaway whose buffered output is most plausibly
+huge). Verified protocol-free and ordering-safe.
+
+### R8 — prover_exit via dispatcher  [debugger.scala]
+
+`Exit_Handler.exit` body becomes `session.send_dispatcher { prover_exit() }`
+(ghost-thread race: exit runs on the manager thread, session.scala:623-625,
+and can be overtaken by queued state callbacks). Verified: every teardown
+path still runs the posted closure (dispatcher drains its mailbox before the
+shutdown sentinel; `adapter.exit()` runs before `session.stop()`).
+
+### R9 — ranged didChange  [lsp_client.py; independent, parallel-safe]
+
+Direction: `sync_dirty_files` computes a line-level diff
+(`difflib.SequenceMatcher`) between `doc.content` (the sanitized old text —
+exactly what the server holds) and the new disk text, and sends ONE
+`didChange` carrying one ranged contentChange PER non-equal opcode, hunks in
+DESCENDING position order (the server applies changes sequentially, each
+against the already-edited model — verified vscode_resources.scala:186-200),
+one version bump, one `note_edit_sent`. Single-contiguous-range was REJECTED
+(two distant hunks — exactly what stat-backstop batching produces — would
+re-run everything between them). Hard requirements, all from the verdict:
+
+1. **UTF-16 columns**: LSP character offsets are UTF-16 code units and the
+   server does Java String arithmetic (line.scala:164-235); astral glyphs DO
+   reach doc.content through the unicode guard's warn-only paths. Build ONE
+   shared offset→(line, utf16-column) converter; every emitted position goes
+   through it; unit-test with an astral glyph before the edit point.
+   Implement and test the converter FIRST — every EOF/clamp case falls out
+   of it.
+2. **Silent-rejection recovery**: a rejected ranged didChange is dropped
+   server-side with only a window/logMessage (didChange has no reply) while
+   the client has already committed `doc.content` — permanent silent
+   divergence. KEEP the full-text didChange path as the recovery form, and
+   add a divergence hook in `_surface_server_message`: on a type=1 message
+   containing "Failed to apply document change" (stable text,
+   vscode_model.scala:172), drop `stat_sig` and force a full-text resync of
+   open documents (the force_interrupt self-healing pattern, :1225-1227).
+   This also covers partial application of a multi-hunk list.
+3. **Overlap clamp**: trim common prefix first, then common suffix over at
+   most min(len(old),len(new))−prefix chars ("aba"→"ababa" otherwise emits
+   start>stop, which the server rejects and the silent-drop swallows).
+4. **EOF anchoring**: newline is separator, not terminator (line.scala:99);
+   a hunk whose old side reaches EOF-without-trailing-newline anchors at
+   (last_kept_line, utf16-length) carrying/omitting the leading "\n".
+   Enumerate delete/replace-last-line, append-without-newline,
+   add/remove-trailing-newline in unit tests.
+5. **Wire-shape pin**: a malformed range object silently decodes as the
+   FULL-DOCUMENT form (lsp.scala:293-295) — one unit test asserts the exact
+   emitted JSON, plus a comment at the emission site.
+6. **Property test**: randomized old/new pairs, diff emitter vs a Python
+   reimplementation of `Line.Document.change` semantics.
+7. Settled (no further verification needed): CRLF safe end-to-end; the diff
+   base is `doc.content`; force_interrupt's synthetic-space healing now
+   emits a minimal hunk (strictly better); the `content != doc.content`
+   gate stays as the empty-diff guard.
+8. Integration: move the ranged-sync experiment (scratchpad
+   `ranged_sync_probe.py` — motion 2 restored 0.2 s, prefix reuse, upstream
+   edit still invalidates) into `tests/integration/` as permanent probes;
+   update `test_resync_detects_and_pushes_change` to assert the ranged
+   shape explicitly; add a two-distant-edits e2e case asserting both apply
+   and the middle commands did not re-run; `test_file_sync_e2e.py` stays
+   green.
+
+### R10 — docs and version (LAST, after wire shapes stop moving)
+
+- §7.1: implemented reply shapes — eval `{status, messages:[{kind,text}]}`;
+  listing `{status, open, breakpoints:[{range, serial, state}]}` (state
+  present per R5 — an earlier draft said the opposite; R5 wins); toggle
+  `{status, was?}` + token/timeout params on both; new words `not_stopped`,
+  `unknown_breakpoint` (with its dual meaning noted), `aborting`.
+- §4.13: rewritten to stateless-Scala + Python-retry abort; outcome
+  classification deleted from the reply vocabulary.
+- §7.3: residual-window sentence (R3). §4.9: smuggling note + wrapper-token
+  compile errors + empty-expr refusal. §4.10: strip clause removed. §7.4:
+  `Isabelle_MCP_PolyML` exposure note + R6's two races. §2.2: UNCHANGED.
+- `mcp_prelude_version` → `"4"` and `Language_Server.prelude_version`
+  together, ONCE, in the same commit as the round's LAST prelude change
+  (R3/R4/R5 all touch the prelude — sequence them contiguously), with the
+  jar rebuild and `check_component.py` gate in that commit.
+- Also fix `docs/PIDE_MCP_COMPARISON.md`'s false claim ("neither re-runs a
+  whole theory on every edit") — true again only after R9 lands.
+
+### R11 — probes
+
+The verdict's 20 live-breakpoint probes (envelope/echo 1-4 incl. the
+writeln-empty-drop guard, frame semantics 5-9 incl. the end-to-end unicode
+literal round trip, compile-phase containment 10-13, malformed input 14-15,
+acknowledged toggle 16-20), plus: abort on an indebted thread replies
+`aborting` (pins the R2 Scala fix); abort during the compile window succeeds
+via the Python retry within ~2 periods (Phase C timing); later-poll
+`no_evaluation` = settled; `not_stopped` refusal; `breakpoint_states` truth
+(armed → true; after a refused toggle on a running command → false);
+R9's test battery (see R9). Existing probes migrate with each wire change,
+never after.
+
+### Commit sequence
+
+1. R1 + R8 + R7 + R2's two-line Scala check fix — one commit (dispatcher
+   confinement is the foundation; everything else assumes it).
+2. R3 (touches `Pending` alongside R1's serial — adjacent avoids churn).
+3. R4, then R5 (R4 lands the query_handler exposure; R5 reuses it). Version
+   bump + jar rebuild with the last of R3/R4/R5. Probe migrations in the
+   same commits.
+4. R6 (needs R1's dispatcher-side threads read).
+5. R9 in parallel at any point (independent; converter + property tests
+   before the emitter, then the recovery hook, then e2e).
+6. R10 last. R2's Python loop ships with the Phase C abort tool.
+
+Definition of done for the round: all commits on `master`; jar gate green;
+FULL probe file green in one process run
+(`PATH=…/contrib/Isabelle2025-2/bin:$PATH pytest tests/integration/test_debugger_probes.py -m integration`);
+unit suite green (`python -m pytest tests/ -q`, 495+ tests); file-sync e2e
+green; agent-facing sentences approved by the user before their commit.
 
 ## Phase B — Python protocol layer
 
