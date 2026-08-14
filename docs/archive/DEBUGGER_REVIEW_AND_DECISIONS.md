@@ -665,6 +665,28 @@ conversation during that fold:
   cross-suite state leak this prevents was actually observed during Phase Y).
 - The step/continue wait bound is **30 s**.
 
+Late findings of the targeted third pass (folded 2026-08-14, after the
+above): the claim "`PolyML.DebuggerInterface` is reachable from the prelude"
+was **refuted** — the raw global namespace carries only a four-entry `PolyML`
+stub (`ML_Bootstrap.thy` shadows the original during Pure's bootstrap); the
+locals design survives via a one-time re-exposure compiled under theory
+`ML_Bootstrap`'s context, probed, with a stated fallback to the stock
+`print_vals` verb (no prover-side locals timeout) if the probe fails. Also
+folded: per-value bounds must be elapsed-checks against the one envelope,
+never nested `Timeout.apply` (a fired inner timer drains and swallows the
+outer interrupt); classifier ties break toward the ordinary exception,
+safely, because the scheduler retries cancelled groups every cycle (stated,
+load-bearing); the drain discipline re-raises drained interrupts that match
+neither deadline nor abort; deadlines are raw `Event_Timer`, unscaled; the
+implicit fetch's 10 s IS its prover-side deadline ("never destructive", not
+"never aborts"), it is registered and abortable, and collisions with it get
+their own refusal sentence; the eval's `val it = (): unit` echo is stripped
+before the output-identity claim holds; and the manual-arming attacker's
+nine findings (import-closure fence delivered also as a notice, zombie
+exclusion, stated blind spot, mid-run arming allowed-but-racy, enable_all
+file_path scope and armed-entry listing, ack-only arming, edit-superseded
+hit ending, transient registry/hit disagreement, enabled-flag readers).
+
 ### 2.14 Facts about breakable sites that change the design
 
 From a source study of `ml_compiler.ML` and the bundled Poly/ML, pending

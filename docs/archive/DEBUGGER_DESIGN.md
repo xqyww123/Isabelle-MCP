@@ -652,19 +652,46 @@ Print **all local variables** of a stack frame with their types and values
 `isabelle_eval_at_breakpoint`. *Text result*.
 
 **Mechanism** (differs from the stock `print_vals` verb, deliberately): the
-listing is produced by a small prelude function — `PolyML.DebuggerInterface`
-is reachable from the prelude, and `printWithType` at `ML_print_depth` gives
-output identical to stock `print_vals` — invoked **through the eval verb
-under `debug_eval`** (§7.3). This is a stated, ~10-line exception to "no
-debugger logic is reimplemented", and it is what makes the `timeout`
-parameter real: under the `print_vals` verb the printing runs in the debugger
-loop's own code, where nothing of ours can enforce anything.
+listing is produced by a small prelude function using
+`PolyML.DebuggerInterface` (`debugState` on the stopped thread — the live
+stack equals the loop-entry capture, since the eval is uninstrumented —
+`debugLocalNameSpace`, and `printWithType` at `ML_print_depth`), invoked
+**through the eval verb under `debug_eval`** (§7.3), emitting via
+`Debugger.writeln_message` so the output reaches the `debugger_output`
+channel. This is a stated exception to "no debugger logic is reimplemented",
+and it is what makes the `timeout` parameter real: under the `print_vals`
+verb the printing runs in the debugger loop's own code, where nothing of
+ours can enforce anything.
+
+**Reaching `PolyML.DebuggerInterface` needs one extra step (probe).** The
+raw global namespace every heap inherits carries only a four-entry `PolyML`
+stub — `ML_Bootstrap.thy` shadows the original during Pure's bootstrap. The
+full binding survives in exactly one place: theory `ML_Bootstrap`'s own
+Isabelle/ML environment (`structure PolyML = PolyML` in its first ML block,
+and `ML_write_global` is still true there). The prelude therefore, once at
+load time, compiles `structure Isabelle_MCP_PolyML = PolyML` under
+`Context.Theory (Thy_Info.get_theory "ML_Bootstrap")`, landing the binding
+back in the raw global namespace for the rest of the prelude. ~5 lines,
+version-coupled, and probed (including that the theory resolves at `--use`
+time in every launchable heap). **Fallback if the probe fails**: locals
+revert to the stock `print_vals` verb and the prover-side locals timeout is
+given up — the Scala backstop and the debt fence then govern, and §7.3's
+policy line changes accordingly.
+
+Output matches stock `print_vals` **after the adapter strips the eval's
+result echo** (`evaluate {verbose = true}` appends `val it = (): unit` after
+the listing; the stock verb emits only the chunks block).
 
 The cost of printing is real and unbounded by depth: Isabelle's installed
 printers for its core types build the **complete** pretty tree (full syntax
 elaboration of the value) and prune to `ML_print_depth` afterwards — depth
 bounds the output, not the computation. Hence, inside the listing, **each
-variable additionally gets its own 5 s bound**; a value that cannot be
+variable additionally gets its own 5 s bound — implemented as per-value
+elapsed/abort checks against the ONE envelope, never as nested
+`Timeout.apply`**: a nested inner timer that fires can drain the outer
+deadline's (or the abort's, or a genuine cancellation's) pending interrupt
+and swallow it, leaving the outer guard fictitious for the rest of the
+listing. A value that cannot be
 printed in time renders as `<printing timed out>` (no type — type layout can
 itself be slow) while the rest still print. The 5 s figure is internal
 policy, not a parameter.
@@ -764,8 +791,11 @@ A retired `hit_id` gets the standard retired-hit error.
 The abort flag's lifetime is bound to the per-evaluation registration entry
 (§7.3): it is created with `debug_eval`'s registration and dies with it, and
 setting it is mutually excluded against deregistration — so an abort racing a
-natural completion is either delivered to the still-live evaluation or
-refused with the error above, and can never leak into the next evaluation.
+natural completion is delivered to the still-live evaluation, or refused with
+the error above, or — the third outcome — accepted against an evaluation
+whose body has already produced its value, in which case it has no effect
+and the evaluation reports success. It can never leak into the next
+evaluation.
 
 Honest limits (stated in the description): the same safe-point caveat as the
 timeout — a tight allocation-free loop cannot be cut off; and since the
@@ -923,13 +953,19 @@ isabelle_continue_breakpoint.
   the header says so, so report and schema share the exact string.
 - The locals of frame 0 are fetched implicitly **for every hit in the
   report**, concurrently (the rendezvous is per-thread, so the fetches run in
-  parallel and the time does not stack), all under one **10 s bound that
-  never aborts**: it is a convenience and must have no destructive
-  consequence. Inside each fetch the per-value 5 s bound of §4.10 applies, so
-  one pathological value costs one `<printing timed out>` line, not the
-  section. On a whole-fetch timeout the section reads `Locals of frame 0
-  could not be fetched in time — use isabelle_locals_at_breakpoint to fetch
-  them.`
+  parallel and the time does not stack), all under one **10 s bound that is
+  never destructive**: the 10 s IS the fetch's prover-side `debug_eval`
+  deadline — at expiry the evaluation ends with an ordinary exception, the
+  thread stays at the breakpoint, only the listing is lost. The fetch **is
+  registered in the Python outstanding-request state and is abortable**; an
+  agent call colliding with it is refused with its own sentence ("an
+  implicit locals fetch is still running — retry in a few seconds or call
+  isabelle_abort_eval_at_breakpoint"), never with the previous-evaluation
+  sentence about an evaluation the agent never issued. Inside each fetch the
+  per-value 5 s bound of §4.10 applies, so one pathological value costs one
+  `<printing timed out>` line, not the section. On a whole-fetch timeout the
+  section reads `Locals of frame 0 could not be fetched in time — use
+  isabelle_locals_at_breakpoint to fetch them.`
 - The tail does not define terms; the instructions section (§4 preamble)
   teaches the concepts.
 
@@ -1114,12 +1150,27 @@ interrupts), and kill the debugged command with the poisoned tail of point
 - Every interrupt leaving the expression must pass **one outermost
   classifier** in `debug_eval`: deadline expired or abort flag set → an
   ordinary exception; anything else → re-raised (a genuine cancellation must
-  still kill the command).
+  still kill the command). **Ties break toward the ordinary exception**: a
+  genuine cancellation arriving while the deadline/abort predicate is true is
+  physically indistinguishable (all three senders deliver the same interrupt,
+  and pending interrupts coalesce) and gets swallowed — safely, because
+  cancelled Future groups are **retried by the scheduler every cycle**, so
+  the swallowed cancellation is re-delivered at the loop's next input wait
+  and the thread dies normally then. This rescue is load-bearing; do not
+  re-report the swallow as a cancellation-semantics bug.
 - Deregistration is **mutually excluded** against the abort sender's
   interrupt, and every exit path **drains pending interrupts under
   `no_interrupts`** before returning — a late interrupt left undrained would
   be delivered at the loop's next input wait, outside any wrapper, and kill
-  the command after a successful evaluation.
+  the command after a successful evaluation. **The classifier applies to the
+  drained result too**: drained interrupt with deadline/abort true → drop;
+  with neither → **re-raise** (stock `Timeout.apply`'s discipline — a
+  genuine cancellation arriving just after the body completes must not be
+  eaten into a success).
+- The deadline and the per-value bounds are **raw `Event_Timer`/elapsed-time
+  checks, unscaled** — `Timeout.apply`-based bounds would silently multiply
+  by `timeout_scale` and drift from the verbatim figures and the 210 s Scala
+  backstop.
 
 The wrapper is also the home of the **locals printer** (§4.10): the same
 envelope, the expression being a call to the prelude function that prints a
@@ -1149,7 +1200,8 @@ Two implementation requirements from the adversarial review:
 **Timeout policy**: prover-side default 180 s, per-call `timeout` parameter
 on eval and locals (both genuinely prover-side — locals goes through the
 eval verb, §4.10); per-value print bound 5 s inside locals; Scala-side
-backstop 210 s; implicit frame-0 locals fetch 10 s (never aborts);
+backstop 210 s; implicit frame-0 locals fetch 10 s (its own prover-side
+deadline, never destructive);
 step/continue wait bounds **30 s**, report and never abort.
 
 The prelude and the jar version-check each other (`mcp_prelude_version`);
@@ -1169,6 +1221,12 @@ Stated honestly in tool descriptions where they bite:
   explicit sites.
 - Breakable sites crossed during an evaluation at a hit never fire (§4.9):
   the break hook declines while the thread is debugging.
+- Every evaluation at a hit (including the locals printer) needs a generic
+  context on the stopped thread; a hit on a thread without one fails the
+  eval — same limit as the stock debugger.
+- The constructed eval text compiles under the frame's merged name space: a
+  local *structure* named `Isabelle_MCP` or `Time` in scope at the breakpoint
+  would shadow the envelope's names. Vanishingly rare; noted, not defended.
 
 ## 8. Out of scope for v1
 

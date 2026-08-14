@@ -18,10 +18,11 @@ sources, restart the REPL/server rather than rebuilding heaps.
 Done: Phase Y (commit `c1feaa1`); the specification rewrite plus two full
 adversarial review rounds and a targeted third pass on the post-review
 decisions, all folded (commits `14dc54c` and successors). The design is
-settled; **the next action is Phase A below.** One loose end may still
-arrive: a background reviewer attacking the `debug_eval` containment and the
-locals rerouting (spec §7.3/§4.10) may deliver late findings — fold any that
-survive scrutiny before or during Phase A.
+settled; **the next action is Phase A below.** All review rounds have
+reported and been folded; no reviewer is outstanding. The one design element
+still gated on measurement is the `PolyML` re-exposure for the locals
+printer (probe 11bis — its fallback is stated in spec §4.10 and must be
+decided before Phase C if the probe fails).
 
 Concrete pointers a fresh context needs:
 
@@ -112,11 +113,16 @@ All under `src/isabelle_mcp/scala/Isabelle2025-2/` (package `isabelle.mcp`).
   classifier** (deadline or abort → ordinary exception; else re-raise),
   deregistration mutually excluded with the abort sender, pending interrupts
   drained under `no_interrupts` on every exit path, the abort flag living in
-  the registration entry; a protocol command for the abort flag; and the
-  **locals printer** (spec §4.10: `PolyML.DebuggerInterface` +
-  `printWithType` at `ML_print_depth`, per-value 5 s bounds,
-  `<printing timed out>` placeholders). Bump `mcp_prelude_version` and the
-  Scala constant together.
+  the registration entry, deadline/per-value bounds as raw
+  `Event_Timer`/elapsed checks (never nested `Timeout.apply`, never scaled);
+  a protocol command for the abort flag; the **`PolyML` re-exposure** (spec
+  §4.10: compile `structure Isabelle_MCP_PolyML = PolyML` once under
+  `Context.Theory (Thy_Info.get_theory "ML_Bootstrap")` — the raw namespace
+  has only the four-entry stub); and the **locals printer** (`debugState` +
+  `debugLocalNameSpace` + `printWithType` at `ML_print_depth`, per-value
+  checks against the one envelope, `<printing timed out>` placeholders,
+  emitted via `Debugger.writeln_message`). Bump `mcp_prelude_version` and
+  the Scala constant together.
 - Jar rebuild: the usual release recipe (`isabelle scala_build` against a
   scratch `USER_HOME`, copy back, `scripts/check_component.py` gate; never
   `-f`, never `-c`).
@@ -187,12 +193,19 @@ Refinement probes (wording, bounds, bookkeeping logic):
     error, thread still parked; refused with the no-evaluation error when
     nothing is being evaluated; a stale abort never reaches the next
     evaluation (flag lives in the registration entry).
-11bis. **Locals via the eval verb.** The prelude locals printer, called
-    through `debug_eval`, sees the halted stack from within an eval
-    (`PolyML.DebuggerInterface.debugState` on the stopped thread) and its
-    output matches stock `print_vals` byte-for-byte on the same frame; a
-    value with a deliberately slow printer yields `<printing timed out>`
-    while the rest print.
+11bis. **Locals via the eval verb — gates the locals design.** First the
+    re-exposure: `Thy_Info.get_theory "ML_Bootstrap"` resolves at `--use`
+    time in every launchable heap and the compiled
+    `Isabelle_MCP_PolyML.DebuggerInterface` is the real one. Then: the
+    printer sees the halted stack from within an eval (live stack = the
+    loop-entry capture, same frame numbering), and its output matches stock
+    `print_vals` byte-for-byte on the same frame **after stripping the
+    `val it = (): unit` echo**; a value with a deliberately slow printer
+    yields `<printing timed out>` while the rest print, and the outer
+    deadline still fires during a slow value (the per-value check must not
+    mask it). **If the re-exposure probe fails, spec §4.10's fallback
+    applies** (stock `print_vals` verb, no prover-side locals timeout) —
+    decide before Phase C.
 12. **`all_messages` consumer cost** under a large evaluation.
 13. **Frame position resolution.** Which frames resolve to `file:line` on the
     Scala side; how library-code frames look (fixes the placeholder wording).
