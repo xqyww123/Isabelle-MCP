@@ -139,11 +139,14 @@ async def _wait_settled(client, tries=60):
 
 
 async def _breakpoints(client, path, timeout=30.0):
+    """Listing with prover-truth states: each call resolves the enabled-states
+    from the real breakpoint refs in one batched round trip."""
     reply = await client.request(
         "PIDE/debugger_breakpoints",
-        {"uri": "file://" + path},
-        timeout=timeout,
+        {"uri": "file://" + path, "token": "bps", "timeout": timeout},
+        timeout=timeout + 30.0,
     )
+    assert reply.get("status") == "ok", f"listing failed: {reply}"
     assert reply.get("open") is True, f"file not open in the prover: {reply}"
     return reply["breakpoints"]
 
@@ -466,6 +469,32 @@ async def test_r4_acknowledged_toggle(prover):
         timeout=30.0)
     assert await _wait_all_resumed(client), "the thread never resumed"
     assert await _wait_settled(client)
+
+
+# ── R5: listing states are prover truth ────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_r5_listing_states_are_prover_truth(prover):
+    client, path = prover
+    assert await _evaluate_through(client, path, DEFINER_END)
+
+    bps = await _breakpoints(client, path)
+    assert all(bp["state"] is False for bp in bps), bps
+    serial = next(bp["serial"] for bp in bps
+                  if _corrected(bp) == (VAL_XS - 1, 4))
+
+    # Arm through the acknowledged toggle; the next listing reads the real ref.
+    reply = await _toggle(client, path, serial, True)
+    assert reply == {"status": "ok", "was": False}, reply
+    states = {bp["serial"]: bp["state"] for bp in await _breakpoints(client, path)}
+    assert states[serial] is True, states
+    assert all(v is False for s, v in states.items() if s != serial), states
+
+    # Disarm; the listing follows.
+    reply = await _toggle(client, path, serial, False)
+    assert reply == {"status": "ok", "was": True}, reply
+    bps = await _breakpoints(client, path)
+    assert all(bp["state"] is False for bp in bps), bps
 
 
 # ── Probe 11bis: locals through the eval verb (gates the locals design) ────

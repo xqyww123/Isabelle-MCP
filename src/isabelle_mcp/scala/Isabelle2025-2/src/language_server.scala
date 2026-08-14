@@ -29,7 +29,7 @@ object Language_Server {
      a request that hangs with no correlatable trace.  Bump this whenever mcp_prelude.ML's
      protocol changes. */
 
-  val prelude_version = "3"
+  val prelude_version = "4"
 
   /* proof that the injected ML prelude is live
 
@@ -912,8 +912,8 @@ class Language_Server(
           case LSP.Find_Theorems_At_Position(id, params) => find_theorems_at_position(id, params)
           case LSP.Query_Cancel(token) => query_cancel(token)
           case LSP.Commands_At_Lines(id, file, lines) => commands_at_lines(id, file, lines)
-          case LSP.Debugger_Breakpoints(id, file, range) =>
-            debugger_adapter.breakpoints(id, file, range)
+          case LSP.Debugger_Breakpoints(id, file, range, token, timeout) =>
+            debugger_adapter.breakpoints(id, file, range, token, timeout)
           case LSP.Debugger_Toggle_Breakpoint(id, file, serial, state, token, timeout) =>
             debugger_adapter.toggle_breakpoint(id, file, serial, state, token, timeout)
           case LSP.Debugger_Eval(id, params) => debugger_adapter.eval(id, params)

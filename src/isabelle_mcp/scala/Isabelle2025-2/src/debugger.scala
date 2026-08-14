@@ -263,21 +263,68 @@ class Debugger_Adapter(server: Language_Server) {
   private def ensure_init(): Unit = session.debugger.init(adapter)
 
 
-  /* breakable sites and toggling.  Ranges and serials as found in the markup; the
-     one-symbol shift correction of design section 3.3 is client-side. */
+  /* Breakable sites with PROVER-TRUTH enabled-states (user decision): every listing
+     resolves the states from the actual breakpoint refs, in ONE batched round trip --
+     the write-only session.debugger mirror is not consulted.  Ranges and serials as
+     found in the markup; the one-symbol shift correction of design section 3.3 is
+     client-side.  Async like the toggle, so a wedged prover cannot block the main
+     loop: the client-chosen timeout answers {status: timeout} instead. */
 
-  def breakpoints(id: LSP.Id, file: JFile, range: Option[Line.Range]): Unit = {
+  def breakpoints(
+    id: LSP.Id,
+    file: JFile,
+    range: Option[Line.Range],
+    token: String,
+    timeout: Double
+  ): Unit = {
     ensure_init()
-    val result =
-      for (rendering <- server.resources.get_rendering(file)) yield {
+    def reply(status: String, open: Boolean, bps: List[(Line.Range, Long, JSON.T)]): Unit =
+      channel.write(LSP.Debugger_Breakpoints.reply(id, status, open, bps))
+
+    server.resources.get_rendering(file) match {
+      case None => reply(Query.OK, false, Nil)
+      case Some(rendering) =>
         val doc = rendering.model.content.doc
         val text_range =
           (for (r <- range; tr <- doc.text_range(r)) yield tr)
             .getOrElse(rendering.model.content.text_range)
-        for (Text.Info(info_range, (_, serial)) <- rendering.breakpoints(text_range))
-          yield (doc.range(info_range), serial, session.debugger.breakpoint_state(serial))
-      }
-    channel.write(LSP.Debugger_Breakpoints.reply(id, result))
+        val sites =
+          for (Text.Info(info_range, (command, serial)) <- rendering.breakpoints(text_range))
+            yield (doc.range(info_range), serial, command)
+        if (sites.isEmpty) reply(Query.OK, true, Nil)
+        else {
+          def respond(result: Query.Result): Unit =
+            if (result.status == Query.OK) {
+              val states =
+                (for {
+                  line <- split_lines(result.text)
+                  entry <-
+                    space_explode(' ', line) match {
+                      case List(Value.Long(serial), word) => Some(serial -> word)
+                      case _ => None
+                    }
+                } yield entry).toMap
+              reply(Query.OK, true,
+                sites.map({ case (r, serial, _) =>
+                  val word = states.getOrElse(serial, UNKNOWN_BREAKPOINT)
+                  val state: JSON.T = Value.Boolean.unapply(word).getOrElse(word)
+                  (r, serial, state)
+                }))
+            }
+            else reply(result.status, true, Nil)
+          val timer =
+            Event_Timer.request(Time.now() + Time.seconds(timeout)) {
+              for (respond_timeout <- server.query_handler.take(token))
+                respond_timeout(Query.Result(Query.TIMEOUT))
+            }
+          server.query_handler.register(token, result => { timer.cancel(); respond(result) })
+          session.protocol_command_args("Isabelle_MCP.breakpoint_states",
+            (token ::
+              sites.flatMap({ case (_, serial, command) =>
+                List(rendering.model.node_name.node, command.id.toString, serial.toString)
+              })).map(XML.string))
+        }
+    }
   }
 
   /* Acknowledged toggle (design section 7.1): the write happens prover-side, on the real

@@ -970,28 +970,34 @@ object LSP {
      shift correction of design section 3.3 is client-side. */
 
   object Debugger_Breakpoints {
-    def unapply(json: JSON.T): Option[(Id, JFile, Option[Line.Range])] =
+    def unapply(json: JSON.T): Option[(Id, JFile, Option[Line.Range], String, Double)] =
       json match {
         case RequestMessage(id, "PIDE/debugger_breakpoints", Some(params)) =>
           for {
             uri <- JSON.string(params, "uri") if Url.is_wellformed_file(uri)
-          } yield (id, Url.absolute_file(uri), JSON.value(params, "range", Range.unapply))
+            token <- JSON.string(params, "token")
+            timeout <- JSON.double(params, "timeout")
+          } yield
+            (id, Url.absolute_file(uri), JSON.value(params, "range", Range.unapply),
+              token, timeout)
         case _ => None
       }
 
-    def reply(id: Id, result: Option[List[(Line.Range, Long, Boolean)]]): JSON.T = {
-      val res =
-        result match {
-          case None => JSON.Object("open" -> false)
-          case Some(breakpoints) =>
-            JSON.Object(
-              "open" -> true,
-              "breakpoints" ->
-                breakpoints.map({ case (range, serial, state) =>
-                  JSON.Object("range" -> Range(range), "serial" -> serial, "state" -> state) }))
-        }
-      ResponseMessage(id, Some(res))
-    }
+    /* state is JSON true/false when the prover resolved the breakpoint ref, or the
+       word saying why it could not (undefined/unfinished/.../unknown_breakpoint) */
+    def reply(
+      id: Id,
+      status: String,
+      open: Boolean,
+      breakpoints: List[(Line.Range, Long, JSON.T)]
+    ): JSON.T =
+      ResponseMessage(id, Some(
+        JSON.Object(
+          "status" -> status,
+          "open" -> open,
+          "breakpoints" ->
+            breakpoints.map({ case (range, serial, state) =>
+              JSON.Object("range" -> Range(range), "serial" -> serial, "state" -> state) }))))
   }
 
   object Debugger_Toggle_Breakpoint {

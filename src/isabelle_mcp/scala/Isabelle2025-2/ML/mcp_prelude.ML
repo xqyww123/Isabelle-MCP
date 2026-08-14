@@ -14,7 +14,7 @@
     See docs/CANCELLATION.md for the full design and its validation.
 *)
 
-val mcp_prelude_version = "3";
+val mcp_prelude_version = "4";
 
 
 (* Global cancellation of all document execution, using only the PUBLIC Isabelle/ML API,
@@ -486,6 +486,37 @@ val _ =
                      mcp_finish id "ok" [] (XML.blob [Value.print_bool was]))
                   end))
       | _ => mcp_bad id ("failed", "Isabelle_MCP.toggle_breakpoint: bad arguments")));
+
+
+(* Prover-truth breakpoint states for a listing (design section 7.1, user decision):
+   Isabelle_MCP.breakpoint_states id (node_name command_id serial)* -- one batch, one
+   round trip per listing.  Each triple resolves independently; a triple that cannot
+   resolve carries its failure word (the toggle's vocabulary) instead of a state.  The
+   reply chunk is one line per triple, "<serial> <word>", in request order. *)
+
+val _ =
+  mcp_define "Isabelle_MCP.breakpoint_states"
+    (fn id => fn _ => fn args =>
+      (case args of
+        _ :: triple_args =>
+          let
+            val state = Document.state ();
+            fun group_triples (a :: b :: c :: rest) = (a, b, c) :: group_triples rest
+              | group_triples [] = []
+              | group_triples _ =
+                  raise Fail "Isabelle_MCP.breakpoint_states: ragged arguments";
+            fun one (node_name, command_id, serial) =
+              serial ^ " " ^
+              (case mcp_resolve state node_name (Document_ID.parse command_id) of
+                MCP_Bad (status, _) => status
+              | MCP_State (st, _) =>
+                  (case ML_Env.get_breakpoint
+                      (Context.Proof (Toplevel.presentation_context st))
+                      (Value.parse_int serial) of
+                    NONE => "unknown_breakpoint"
+                  | SOME (b, _) => Value.print_bool (! b)));
+          in mcp_finish id "ok" [] (XML.blob [cat_lines (map one (group_triples triple_args))]) end
+      | [] => mcp_bad id ("failed", "Isabelle_MCP.breakpoint_states: bad arguments")));
 
 
 (* At --use time there is no message channel yet, so nothing can go out over the protocol:
