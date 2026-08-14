@@ -497,6 +497,40 @@ async def test_r5_listing_states_are_prover_truth(prover):
     assert all(bp["state"] is False for bp in bps), bps
 
 
+# ── R6: eval/print_vals refused on a thread that is not stopped ────────────
+
+@pytest.mark.asyncio
+async def test_r6_eval_refused_on_not_stopped_thread(prover):
+    client, path = prover
+    assert await _evaluate_through(client, path, DEFINER_END)
+
+    # A name that never stopped: refused before anything is sent -- sending
+    # would create the thread's input queue and poison its next stop.
+    result = await _eval_at(client, "no-such-thread", "1 + 1", timeout_s=10)
+    assert result["status"] == "not_stopped", result
+
+    # A real thread after it resumed: same refusal, and the guarantee is the
+    # same -- the expression was never sent, so nothing ran.
+    await _enable_site_at(client, path, VAL_XS, 4)
+    await evaluate_to(client, path, -1)
+    thread = await _wait_for_hit(client)
+    await client.request(
+        "PIDE/debugger_input", {"thread": thread, "verbs": ["continue"]},
+        timeout=30.0)
+    assert await _wait_all_resumed(client)
+    result = await _eval_at(client, thread, "1 + 1", timeout_s=10)
+    assert result["status"] == "not_stopped", result
+    assert await _wait_settled(client)
+
+    # print_vals shares start_eval's fence.
+    reply = await client.request(
+        "PIDE/debugger_print_vals",
+        {"token": "pv-r6", "thread": thread, "frame": 0, "timeout": 10.0},
+        timeout=60.0,
+    )
+    assert reply["status"] == "not_stopped", reply
+
+
 # ── Probe 11bis: locals through the eval verb (gates the locals design) ────
 
 @pytest.mark.asyncio

@@ -57,6 +57,10 @@ object Debugger_Adapter {
   val TIMEOUT = "timeout"      // the Scala backstop fired (prover-side mechanism failed)
   val CRASHED = "crashed"      // prover exit drained the request
   val BUSY = "busy"            // the thread has an outstanding evaluation or owes a state
+  val NOT_STOPPED = "not_stopped"  // refused before sending: the thread is not stopped.
+                                   // NOT "resumed", which means "input delivered, the
+                                   // expression may have run" -- this one promises the
+                                   // expression was never sent at all
 
   /* abort reply statuses */
   val NO_EVALUATION = "no_evaluation"  // nothing outstanding and no debt: settled
@@ -391,6 +395,16 @@ class Debugger_Adapter(server: Language_Server) {
       val thread_name = params.thread
       if (debt.value.contains(thread_name) || pending.value.contains(thread_name)) {
         respond(BUSY, Nil)
+      }
+      else if (!threads.value.contains(thread_name)) {
+        // Not stopped: sending would create the thread's input queue and poison its next
+        // stop (Debugger.input queues for ANY name).  The check narrows the window, it
+        // does not close it -- a thread resuming between this check and the prover's
+        // dequeue still yields that scenario (design 7.4); the benign inverse (a fresh
+        // hit whose state has not arrived) cannot happen to a client that acts on a
+        // received hit notification, since the state callback precedes this check on
+        // the same dispatcher.
+        respond(NOT_STOPPED, Nil)
       }
       else {
         val serial = eval_counter()
