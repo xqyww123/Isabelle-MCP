@@ -707,17 +707,51 @@ class TestStatSigAndResync:
     async def test_resync_detects_and_pushes_change(self, tmp_path):
         client = _mock_process_client()
         f = tmp_path / "Foo.thy"
-        f.write_text("theory Foo begin end")
+        f.write_text("theory Foo\nimports Main\nbegin\nend\n")
         await client.open_document(str(f), wait_for_diagnostics=False)
         v1 = client.open_documents[str(f)].version
-        f.write_text("theory Foo begin (*v2*) end")
+        f.write_text("theory Foo\nimports Main\nbegin\n(*v2*)\nend\n")
         client.notify = AsyncMock()
         await client.resync_changed_open_documents()
         client.notify.assert_called_once()
         method, params = client.notify.call_args[0]
         assert method == "textDocument/didChange"
-        assert "v2" in params["contentChanges"][0]["text"]
+        # The RANGED shape, pinned exactly: one minimal hunk, not the whole
+        # document (a range-less didChange re-executes the entire file).
+        assert params["contentChanges"] == [{
+            "range": {"start": {"line": 3, "character": 0},
+                      "end": {"line": 3, "character": 0}},
+            "text": "(*v2*)\n",
+        }]
         assert client.open_documents[str(f)].version == v1 + 1
+        assert "(*v2*)" in client.open_documents[str(f)].content
+
+    @pytest.mark.asyncio
+    async def test_rejected_didchange_forces_full_text_recovery(self, tmp_path):
+        """The server drops a didChange it cannot apply, with only a type=1 log
+        message -- the client's model has already committed, so the divergence
+        is silent.  The hook must force the next sync to push FULL text (a
+        ranged diff against the server's unknown base would corrupt it)."""
+        client = _mock_process_client()
+        f = tmp_path / "Foo.thy"
+        f.write_text("theory Foo\nbegin\nend\n")
+        await client.open_document(str(f), wait_for_diagnostics=False)
+        doc = client.open_documents[str(f)]
+
+        client._surface_server_message(
+            {"type": 1, "message": "Failed to apply document change: Remove(...)"})
+        assert doc.needs_full_sync is True
+        assert doc.stat_sig is None
+
+        # Content on disk is UNCHANGED, yet the recovery must still push.
+        client.notify = AsyncMock()
+        await client.resync_changed_open_documents()
+        client.notify.assert_called_once()
+        method, params = client.notify.call_args[0]
+        assert method == "textDocument/didChange"
+        assert params["contentChanges"] == [{"text": "theory Foo\nbegin\nend\n"}]
+        assert doc.needs_full_sync is False
+        assert doc.stat_sig is not None
 
     @pytest.mark.asyncio
     async def test_resync_uses_inequality_not_greater(self, tmp_path):

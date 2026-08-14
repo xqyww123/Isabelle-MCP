@@ -531,6 +531,65 @@ async def test_r6_eval_refused_on_not_stopped_thread(prover):
     assert reply["status"] == "not_stopped", reply
 
 
+# ── R2: abort on an indebted thread ────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_r2_abort_on_indebted_thread_replies_aborting(prover):
+    client, path = prover
+    assert await _evaluate_through(client, path, DEFINER_END)
+    await _enable_site_at(client, path, VAL_XS, 4)
+    await evaluate_to(client, path, -1)
+    thread = await _wait_for_hit(client)
+
+    # Manufacture debt: the expression defers interrupt delivery around a 60s
+    # sleep, so the 3s prover-side deadline cannot cut it (measured: a bare
+    # self-recursive loop IS cut — function entry is a safe point — hence the
+    # explicit no_interrupts shield), the Scala backstop answers `timeout` at
+    # 3+30s, and the thread then OWES a debugger_state until the sleep ends.
+    result = await _eval_at(
+        client, thread,
+        "Thread_Attributes.with_attributes Thread_Attributes.no_interrupts "
+        "(fn _ => OS.Process.sleep (Time.fromSeconds 60))",
+        timeout_s=3, request_timeout=120.0)
+    assert result["status"] == "timeout", result
+
+    # The busy fence holds while the debt is owed...
+    follow = await _eval_at(client, thread, "1", timeout_s=5,
+                            request_timeout=60.0)
+    assert follow["status"] == "busy", follow
+
+    # ...and abort on the indebted thread is ACCEPTED: the abandoned runaway
+    # is exactly what abort exists for.  (Before the R2 fix this answered
+    # no_evaluation, because the check consulted only the pending table.)
+    reply = await client.request(
+        "PIDE/debugger_abort", {"thread": thread}, timeout=30.0)
+    assert reply == {"status": "aborting"}, reply
+
+    # The late completion arrives when the sleep ends, pays the debt, and the
+    # fence lifts — the settled thread answers evals again and abort now says
+    # no_evaluation, which is the Python retry loop's stop signal.
+    lifted = None
+    for _ in range(30):
+        r = await _eval_at(client, thread, "2 + 2", timeout_s=10,
+                           request_timeout=60.0)
+        if r["status"] == "ok":
+            lifted = r
+            break
+        assert r["status"] == "busy", r
+        await asyncio.sleep(5.0)
+    assert lifted is not None, "the debt never cleared"
+    assert any("val it = 4: int" in t for t in _texts(lifted)), _texts(lifted)
+    reply = await client.request(
+        "PIDE/debugger_abort", {"thread": thread}, timeout=30.0)
+    assert reply == {"status": "no_evaluation"}, reply
+
+    await client.request(
+        "PIDE/debugger_input", {"thread": thread, "verbs": ["continue"]},
+        timeout=30.0)
+    assert await _wait_all_resumed(client)
+    assert await _wait_settled(client)
+
+
 # ── Probe 11bis: locals through the eval verb (gates the locals design) ────
 
 @pytest.mark.asyncio
@@ -715,7 +774,7 @@ async def _continue_all(client):
 
 
 @pytest.mark.asyncio
-async def test_probe6_recompilation_invalidates_serials_and_rearming_works(prover):
+async def test_probe6_upstream_edit_invalidates_serials_and_rearming_works(prover):
     client, path = prover
 
     # Baseline: motion 1, and the caller's FIRST run hits.
@@ -726,16 +785,13 @@ async def test_probe6_recompilation_invalidates_serials_and_rearming_works(prove
     await _continue_all(client)
     assert await _wait_settled(client)
 
-    # ANY disk edit reaches the prover as a WHOLE-DOCUMENT didChange, and the
-    # Scala model turns range-less text into remove-all + insert-all
-    # (Text.Edit.replace is NOT a minimal diff) — so every command in the file
-    # is re-created: the definer recompiles, every serial dies, the fresh sites
-    # come back unarmed, and the re-run caller does NOT stop.  Measured
-    # 2026-08-14 (probe_result = 39 proved the new caller ran through the
-    # previously-armed site).  The design's motion 2 — an edit strictly after
-    # the definer leaves the breakpoint armed — does NOT survive
-    # whole-document sync; how to restore it (range didChange, or teach §2.2
-    # otherwise) is a design decision recorded in the plan's results.
+    # A disk edit AFTER the definer reaches the prover as a minimal RANGED
+    # didChange (since 2026-08-14; a range-less didChange was remove-all +
+    # insert-all server-side, re-created every command, and killed every
+    # serial on ANY edit).  The definer's serial therefore survives ARMED and
+    # the re-run caller hits with NO re-arm — the design's motion 2.  The
+    # timing probes (prefix reuse, multi-hunk sync) live in
+    # test_ranged_sync_probes.py.
     await _edit_on_disk(
         client, path,
         "ML \\<open>val probe_result = probe_target 4\\<close>",
@@ -743,20 +799,34 @@ async def test_probe6_recompilation_invalidates_serials_and_rearming_works(prove
     )
     await evaluate_to(client, path, -1)
     hit_after_edit = await client.wait_debugger_event(
-        lambda c: bool(c.debugger_threads), timeout=30.0)
-    print(f"\nPROBE 6 — armed breakpoint survives a caller edit: {hit_after_edit}")
-    if hit_after_edit:
-        await _continue_all(client)
+        lambda c: bool(c.debugger_threads), timeout=60.0)
+    assert hit_after_edit, (
+        "motion 2 regressed: the armed breakpoint did not survive a caller edit")
+    await _continue_all(client)
     assert await _wait_settled(client)
+    bps = await _breakpoints(client, path)
+    assert any(bp["serial"] == old_serial and bp["state"] is True for bp in bps), (
+        "the armed serial must survive a downstream edit, still armed")
 
+    # An edit strictly BEFORE the definer still invalidates it — chained
+    # execs; the ranged win is prefix-only.  The definer recompiles, fresh
+    # sites come back unarmed, the stale serial is refused, and the re-run
+    # caller does NOT stop.
+    await _edit_on_disk(
+        client, path,
+        'lemma probe_lemma: "(x::nat) + 0 = x"',
+        'lemma probe_lemma: "(x::nat) + 0 = x" (* touched *)',
+    )
+    await evaluate_to(client, path, -1)
+    assert await _wait_settled(client)
     bps = await _breakpoints(client, path)
     serials = [bp["serial"] for bp in bps]
-    print(f"PROBE 6 — sites after the edit: "
+    print(f"\nPROBE 6 — sites after the upstream edit: "
           f"{[(_corrected(b), b['serial'], b['state']) for b in bps]}; "
           f"old_serial={old_serial}")
     assert serials, "the re-evaluated file must have sites again"
     assert old_serial not in serials, (
-        "whole-document sync was expected to mint fresh serials")
+        "an upstream edit was expected to mint fresh serials")
     reply = await _toggle(client, path, old_serial, True)
     assert reply == {"status": "unknown_breakpoint"}, (
         f"toggling a stale serial must be refused: {reply}")

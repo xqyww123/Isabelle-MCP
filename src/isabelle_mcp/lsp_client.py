@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 from isabelle_mcp import query
+from isabelle_mcp.document_diff import ranged_content_changes
 from isabelle_mcp.models import RunningCommand
 from isabelle_mcp.query import QueryReply
 from isabelle_mcp.processing import (
@@ -188,6 +189,10 @@ class DocumentState:
     # Last on-disk signature we synced to the server. ``None`` forces a re-read on
     # the next stat backstop (used after force_interrupt mutates the model only).
     stat_sig: StatSig | None = None
+    # Set when the server may hold text that diverged from ``content`` (it rejected
+    # a didChange, which is a silent drop server-side): the next sync must push the
+    # FULL text, because a ranged diff against a wrong base corrupts the document.
+    needs_full_sync: bool = False
 
 
 @dataclass
@@ -855,6 +860,16 @@ class IsabelleLSPClient:
         mtype = params.get("type")
         if mtype == 1:
             logger.error("isabelle server: %s", text)
+            if "Failed to apply document change" in text:
+                # The server rejected a didChange and DROPPED it (no reply
+                # channel), while our model already committed the new text --
+                # silent divergence.  Heal like force_interrupt: drop the
+                # signatures so the next stat backstop re-syncs, and force the
+                # full-text form, since a ranged diff against the server's
+                # unknown base would corrupt the document further.
+                for doc in self.open_documents.values():
+                    doc.stat_sig = None
+                    doc.needs_full_sync = True
             if not self._handshake_done:
                 # A pre-handshake error (e.g. "Missing heap image ...") wedges
                 # the server before it ever answers `initialize` — fail the
@@ -1286,14 +1301,29 @@ class IsabelleLSPClient:
             if self.open_documents.get(path) is not doc:
                 # Closed (or replaced) while we were off-loop: don't didChange it.
                 continue
-            if content != doc.content:
+            if content != doc.content or doc.needs_full_sync:
+                # RANGED contentChanges preserve the server's evaluated prefix
+                # (a whole-document didChange is remove-all + insert-all server-
+                # side and re-executes the entire file).  The full-text form is
+                # kept as the recovery shape: after a server-side rejection the
+                # base text over there is unknown, so a diff would corrupt it.
+                changes = (
+                    None if doc.needs_full_sync
+                    else ranged_content_changes(doc.content, content)
+                )
+                if changes is None:
+                    changes = [{"text": content}]
                 doc.version += 1
                 doc.content = content
-                logger.info("Syncing dirty file: %s v%d", path, doc.version)
+                logger.info(
+                    "Syncing dirty file: %s v%d (%s)", path, doc.version,
+                    "full" if "range" not in changes[0] else f"{len(changes)} hunk(s)",
+                )
                 await self.notify("textDocument/didChange", {
                     "textDocument": {"uri": doc.uri, "version": doc.version},
-                    "contentChanges": [{"text": content}],
+                    "contentChanges": changes,
                 })
+                doc.needs_full_sync = False
                 note_edit_sent()
             doc.stat_sig = _stat_sig(path)
 
