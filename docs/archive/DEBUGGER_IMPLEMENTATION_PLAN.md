@@ -42,10 +42,51 @@ sync) — probe 6 was rewritten to the new reality in the same commit (a
 downstream edit now PRESERVES armed serials; only an upstream edit
 invalidates).  R11's probes landed incrementally with their items (R2's
 indebted-abort probe included).  Still open from the round: R2's Python
-retry loop ships with the Phase C abort tool.  **The NEXT ACTION is Phase
-B** (Python protocol layer, below).  The repair round's contract remains in
-the "Phase A repair round" section; the full review verdict is archived in
+retry loop ships with the Phase C abort tool.
+
+**A post-review fix round followed (2026-08-17, all committed).** A 17-agent
+two-turn adversarial review of the repair round produced four accepted
+findings (six raw survivors, two pairs being duplicate discoveries); a
+9-agent verification round then adjusted every fix before implementation.
+The commits, each gated (jar/check_component where Scala changed, full
+probe battery in one process run, unit suite):
+
+- `ee2ed65` — F3: the listing answers `outdated` on a snapshot with pending
+  edits (mirrors the toggle's pre-check; §7.1's status enumeration updated
+  with the honest scope: ok-with-empty still occurs for not-yet-compiled
+  commands and does not mean "no sites").
+- `7a6b0dd` — F4: `force_interrupt`'s synthetic-space position goes through
+  `document_diff.utf16_position` (the last raw position-emission site);
+  astral-first-line unit test.
+- `999a68a` — F1: the two-distant-edits probe now WITNESSES both hunks
+  (frame eval `n * 100 = 500`; `output_at_position` read-back of
+  `ranged_other = 8`; `ev._failed_count == 0`; whole-test caplog scan for
+  "Failed to apply document change" — the originally planned
+  `needs_full_sync` assertion was proven VACUOUS: the settle polling's own
+  resync heals the flag before it can be read).  F2: the R11 discriminating
+  leg via a sentinel-file-gated command (define; gate; call): while the gate
+  holds the command unfinished its site lists as `unfinished`, a toggle is
+  refused `unfinished`, and after the gate opens the ref reads False with
+  the control toggle answering ok/was:False.  On mechanism absence the
+  probe HARD-FAILS by user decision (a skip would silently retire the
+  contract check).  `_breakpoints` gained the bounded retry on `outdated`.
+
+Findings killed in that review (do not re-report): CR/`\r` divergence
+(excluded by text-mode `sanitize_read`); timer-callback channel IO on the
+Timer thread (real but contract-mandated pattern, copied from
+`query_at_position`); shared-Query_Handler token collision (contract-
+mandated, unreachable sequentially); one bad triple failing the whole
+`breakpoint_states` batch (own-code-only input, replied `failed`);
+timer-armed-before-register with non-positive timeout (client always sends
+positive); recovery-hook flag clobber by the in-flight sync (causally
+impossible on the single-threaded loop).
+
+**The NEXT ACTION is Phase B** (Python protocol layer, below).  The repair
+round's contract remains in the "Phase A repair round" section; the full
+review verdict of the FIRST review is archived in
 [`DEBUGGER_REPAIR_REVIEW_VERDICT.md`](DEBUGGER_REPAIR_REVIEW_VERDICT.md).
+Current gate numbers: unit suite 513 passing; integration battery 15
+passing (13 debugger probes + 2 ranged probes) plus test_file_sync_e2e.
 
 Concrete pointers a fresh context needs:
 
