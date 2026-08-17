@@ -529,8 +529,9 @@ listing: `PIDE/debugger_breakpoints` gains `token` + `timeout` (the async
 pattern requires them; today's synchronous reply would hang forever on a
 wedged prover), becomes async via the same shared `query_handler` +
 Event_Timer, and replies `{status, open, breakpoints:[{range, serial,
-state}]}` — top-level status ok/timeout/crashed, `state` ∈ true/false/
-unresolvable(word). Serials/ranges still AS FOUND (shift correction stays
+state}]}` — top-level status ok/timeout/crashed/outdated (outdated added in
+the post-review fix round, mirroring the toggle's pre-check), `state` ∈
+true/false/unresolvable(word). Serials/ranges still AS FOUND (shift correction stays
 client-side). Registry discipline unchanged (armed recorded only on toggle
 `ok`; mismatch with prover truth → debugger notice).
 

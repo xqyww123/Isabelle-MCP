@@ -288,45 +288,54 @@ class Debugger_Adapter(server: Language_Server) {
     server.resources.get_rendering(file) match {
       case None => reply(Query.OK, false, Nil)
       case Some(rendering) =>
-        val doc = rendering.model.content.doc
-        val text_range =
-          (for (r <- range; tr <- doc.text_range(r)) yield tr)
-            .getOrElse(rendering.model.content.text_range)
-        val sites =
-          for (Text.Info(info_range, (command, serial)) <- rendering.breakpoints(text_range))
-            yield (doc.range(info_range), serial, command)
-        if (sites.isEmpty) reply(Query.OK, true, Nil)
+        // Outdated snapshot: rendering.breakpoints would return Nil, which the reply
+        // below could not distinguish from a file with no breakable sites -- answer
+        // the same status word the toggle uses for the identical condition, so the
+        // client can retry once the pending edits are incorporated.  (An up-to-date
+        // snapshot whose commands are not yet ML-compiled still lists no sites; that
+        // ambiguity is inherent -- markup exists only after compilation.)
+        if (rendering.snapshot.is_outdated) reply(OUTDATED, true, Nil)
         else {
-          def respond(result: Query.Result): Unit =
-            if (result.status == Query.OK) {
-              val states =
-                (for {
-                  line <- split_lines(result.text)
-                  entry <-
-                    space_explode(' ', line) match {
-                      case List(Value.Long(serial), word) => Some(serial -> word)
-                      case _ => None
-                    }
-                } yield entry).toMap
-              reply(Query.OK, true,
-                sites.map({ case (r, serial, _) =>
-                  val word = states.getOrElse(serial, UNKNOWN_BREAKPOINT)
-                  val state: JSON.T = Value.Boolean.unapply(word).getOrElse(word)
-                  (r, serial, state)
-                }))
-            }
-            else reply(result.status, true, Nil)
-          val timer =
-            Event_Timer.request(Time.now() + Time.seconds(timeout)) {
-              for (respond_timeout <- server.query_handler.take(token))
-                respond_timeout(Query.Result(Query.TIMEOUT))
-            }
-          server.query_handler.register(token, result => { timer.cancel(); respond(result) })
-          session.protocol_command_args("Isabelle_MCP.breakpoint_states",
-            (token ::
-              sites.flatMap({ case (_, serial, command) =>
-                List(rendering.model.node_name.node, command.id.toString, serial.toString)
-              })).map(XML.string))
+          val doc = rendering.model.content.doc
+          val text_range =
+            (for (r <- range; tr <- doc.text_range(r)) yield tr)
+              .getOrElse(rendering.model.content.text_range)
+          val sites =
+            for (Text.Info(info_range, (command, serial)) <- rendering.breakpoints(text_range))
+              yield (doc.range(info_range), serial, command)
+          if (sites.isEmpty) reply(Query.OK, true, Nil)
+          else {
+            def respond(result: Query.Result): Unit =
+              if (result.status == Query.OK) {
+                val states =
+                  (for {
+                    line <- split_lines(result.text)
+                    entry <-
+                      space_explode(' ', line) match {
+                        case List(Value.Long(serial), word) => Some(serial -> word)
+                        case _ => None
+                      }
+                  } yield entry).toMap
+                reply(Query.OK, true,
+                  sites.map({ case (r, serial, _) =>
+                    val word = states.getOrElse(serial, UNKNOWN_BREAKPOINT)
+                    val state: JSON.T = Value.Boolean.unapply(word).getOrElse(word)
+                    (r, serial, state)
+                  }))
+              }
+              else reply(result.status, true, Nil)
+            val timer =
+              Event_Timer.request(Time.now() + Time.seconds(timeout)) {
+                for (respond_timeout <- server.query_handler.take(token))
+                  respond_timeout(Query.Result(Query.TIMEOUT))
+              }
+            server.query_handler.register(token, result => { timer.cancel(); respond(result) })
+            session.protocol_command_args("Isabelle_MCP.breakpoint_states",
+              (token ::
+                sites.flatMap({ case (_, serial, command) =>
+                  List(rendering.model.node_name.node, command.id.toString, serial.toString)
+                })).map(XML.string))
+          }
         }
     }
   }

@@ -1094,11 +1094,17 @@ Python side, as in the query protocol):
   `Isabelle_MCP.breakpoint_states`), so `state` is JSON `true`/`false`, or
   the word saying why that site's command could not be resolved (`undefined`
   / `unfinished` / `interrupted` / `failed` / `unknown_breakpoint`).
-  Top-level `status` is `ok`/`timeout`/`crashed` — the request is async like
-  the queries, so a wedged prover answers `timeout` instead of blocking the
-  main loop. The server returns ranges and serials as found; anchor snippets
-  are computed client-side (§3.2, including the one-symbol shift correction
-  of §3.3).
+  Top-level `status` is `ok`/`timeout`/`crashed`/`outdated` — the request is
+  async like the queries, so a wedged prover answers `timeout` instead of
+  blocking the main loop, and a snapshot with pending edits answers
+  `outdated` (the toggle's word for the identical condition; retry once the
+  edits are incorporated). `outdated` covers ONLY the pending-edit window: an
+  up-to-date snapshot whose commands have not yet been ML-compiled still
+  answers `ok` with no sites — breakpoint markup exists only after
+  compilation — so `ok` with an empty list does not by itself mean the file
+  has no breakable sites. The server returns ranges and serials as found;
+  anchor snippets are computed client-side (§3.2, including the one-symbol
+  shift correction of §3.3).
 - `PIDE/debugger_toggle_breakpoint {uri, serial, state, token, timeout}` →
   `{status, was?}` — the **acknowledged toggle**: the write happens
   prover-side on the real breakpoint ref (prelude command
