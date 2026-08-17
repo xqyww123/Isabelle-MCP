@@ -1,8 +1,9 @@
 """Debugger probes, against a REAL prover — the permanent form of Phase A's probes.
 
-These drive the raw ``PIDE/debugger_*`` requests with no MCP tool in between,
-the way test_query_tools_e2e.py drives ``PIDE/find_theorems_at_position``.  They
-pin the assumptions DEBUGGER_DESIGN.md builds on; an Isabelle upgrade that
+These drive the ``PIDE/debugger_*`` requests through the client's thin
+wrappers with no MCP tool in between, the way test_query_tools_e2e.py drives
+``PIDE/find_theorems_at_position``.  They pin the assumptions
+DEBUGGER_DESIGN.md builds on; an Isabelle upgrade that
 silently breaks one of them fails here first.  Numbering follows
 DEBUGGER_IMPLEMENTATION_PLAN.md's probe list; gates 1–3 gate the whole design.
 
@@ -148,11 +149,8 @@ async def _breakpoints(client, path, timeout=30.0):
     a bounded loop; every other non-ok status stays a hard failure."""
     reply: dict = {}
     for _ in range(30):
-        reply = await client.request(
-            "PIDE/debugger_breakpoints",
-            {"uri": "file://" + path, "token": "bps", "timeout": timeout},
-            timeout=timeout + 30.0,
-        )
+        reply = await client.debugger_breakpoints(
+            path, timeout=timeout, request_timeout=timeout + 30.0)
         if reply.get("status") != "outdated":
             break
         await asyncio.sleep(1.0)
@@ -171,12 +169,8 @@ def _corrected(bp):
 async def _toggle(client, path, serial, state, *, timeout=30.0):
     """Acknowledged toggle: absolute semantics, prover-truth write; the reply
     carries the previous value in `was` when status is ok."""
-    return await client.request(
-        "PIDE/debugger_toggle_breakpoint",
-        {"uri": "file://" + path, "serial": serial, "state": state,
-         "token": f"toggle-{serial}-{state}", "timeout": timeout},
-        timeout=timeout + 30.0,
-    )
+    return await client.debugger_toggle_breakpoint(
+        path, serial, state, timeout=timeout, request_timeout=timeout + 30.0)
 
 
 async def _enable_site_at(client, path, line_1indexed, character_0indexed):
@@ -211,15 +205,13 @@ async def _wait_all_resumed(client, timeout=60.0):
     )
 
 
-async def _eval_at(client, thread, expr, timeout_s=30.0, *, token="probe",
+async def _eval_at(client, thread, expr, timeout_s=30.0, *,
                    request_timeout=None):
     """The bare expression: the Scala side composes the wrapper text and carries
     the expression as one ML string literal (design section 4.9)."""
-    return await client.request(
-        "PIDE/debugger_eval",
-        {"token": token, "thread": thread, "frame": 0,
-         "expr": expr, "timeout": float(timeout_s)},
-        timeout=request_timeout or (timeout_s + 60.0),
+    return await client.debugger_eval(
+        thread, expr, timeout=float(timeout_s),
+        request_timeout=request_timeout or (timeout_s + 60.0),
     )
 
 
@@ -342,16 +334,14 @@ async def test_gate2_gate3_and_the_probes_at_a_live_hit(prover):
         assert any("val it = 4: int" in t for t in _texts(follow))
 
     # Probe 11: the abort flag.  Nothing evaluating -> refused.
-    reply = await client.request(
-        "PIDE/debugger_abort", {"thread": thread}, timeout=30.0)
+    reply = await client.debugger_abort(thread, request_timeout=30.0)
     assert reply == {"status": "no_evaluation"}, reply
 
     # A slow eval ends early on abort; the thread stays parked.
     eval_task = asyncio.create_task(
         _eval_at(client, thread, RUNAWAY, timeout_s=600, request_timeout=700.0))
     await asyncio.sleep(3.0)
-    reply = await client.request(
-        "PIDE/debugger_abort", {"thread": thread}, timeout=30.0)
+    reply = await client.debugger_abort(thread, request_timeout=30.0)
     assert reply == {"status": "aborting"}, reply
     result = await asyncio.wait_for(eval_task, timeout=60)
     assert result["status"] == "ok"
@@ -364,9 +354,7 @@ async def test_gate2_gate3_and_the_probes_at_a_live_hit(prover):
     assert any("val it = 6: int" in t for t in _texts(follow))
 
     # Resume; the theory runs to its end.
-    await client.request(
-        "PIDE/debugger_input", {"thread": thread, "verbs": ["continue"]},
-        timeout=30.0)
+    await client.debugger_input(thread, ["continue"], request_timeout=30.0)
     assert await _wait_all_resumed(client), "the thread never resumed"
     assert await _wait_settled(client)
 
@@ -435,9 +423,7 @@ async def test_r3_wrapper_envelope_and_containment(prover):
     assert follow["status"] == "ok", follow
     assert any("val it = 4: int" in t for t in _texts(follow)), _texts(follow)
 
-    await client.request(
-        "PIDE/debugger_input", {"thread": thread, "verbs": ["continue"]},
-        timeout=30.0)
+    await client.debugger_input(thread, ["continue"], request_timeout=30.0)
     assert await _wait_all_resumed(client), "the thread never resumed"
     assert await _wait_settled(client)
 
@@ -474,9 +460,7 @@ async def test_r4_acknowledged_toggle(prover):
     assert reply == {"status": "ok", "was": False}, reply
     await evaluate_to(client, path, -1)
     thread = await _wait_for_hit(client)
-    await client.request(
-        "PIDE/debugger_input", {"thread": thread, "verbs": ["continue"]},
-        timeout=30.0)
+    await client.debugger_input(thread, ["continue"], request_timeout=30.0)
     assert await _wait_all_resumed(client), "the thread never resumed"
     assert await _wait_settled(client)
 
@@ -549,11 +533,8 @@ async def test_r5_refused_toggle_on_running_command_lists_unfinished(gated_prove
     deadline = time.monotonic() + 45.0
     serial = None
     while time.monotonic() < deadline:
-        reply = await client.request(
-            "PIDE/debugger_breakpoints",
-            {"uri": "file://" + path, "token": "gated-bps", "timeout": 30.0},
-            timeout=60.0,
-        )
+        reply = await client.debugger_breakpoints(
+            path, timeout=30.0, request_timeout=60.0)
         if reply.get("status") == "ok" and reply.get("open") is True:
             match = [
                 bp for bp in reply["breakpoints"]
@@ -637,20 +618,15 @@ async def test_r6_eval_refused_on_not_stopped_thread(prover):
     await _enable_site_at(client, path, VAL_XS, 4)
     await evaluate_to(client, path, -1)
     thread = await _wait_for_hit(client)
-    await client.request(
-        "PIDE/debugger_input", {"thread": thread, "verbs": ["continue"]},
-        timeout=30.0)
+    await client.debugger_input(thread, ["continue"], request_timeout=30.0)
     assert await _wait_all_resumed(client)
     result = await _eval_at(client, thread, "1 + 1", timeout_s=10)
     assert result["status"] == "not_stopped", result
     assert await _wait_settled(client)
 
     # print_vals shares start_eval's fence.
-    reply = await client.request(
-        "PIDE/debugger_print_vals",
-        {"token": "pv-r6", "thread": thread, "frame": 0, "timeout": 10.0},
-        timeout=60.0,
-    )
+    reply = await client.debugger_print_vals(
+        thread, timeout=10.0, request_timeout=60.0)
     assert reply["status"] == "not_stopped", reply
 
 
@@ -684,8 +660,7 @@ async def test_r2_abort_on_indebted_thread_replies_aborting(prover):
     # ...and abort on the indebted thread is ACCEPTED: the abandoned runaway
     # is exactly what abort exists for.  (Before the R2 fix this answered
     # no_evaluation, because the check consulted only the pending table.)
-    reply = await client.request(
-        "PIDE/debugger_abort", {"thread": thread}, timeout=30.0)
+    reply = await client.debugger_abort(thread, request_timeout=30.0)
     assert reply == {"status": "aborting"}, reply
 
     # The late completion arrives when the sleep ends, pays the debt, and the
@@ -702,13 +677,10 @@ async def test_r2_abort_on_indebted_thread_replies_aborting(prover):
         await asyncio.sleep(5.0)
     assert lifted is not None, "the debt never cleared"
     assert any("val it = 4: int" in t for t in _texts(lifted)), _texts(lifted)
-    reply = await client.request(
-        "PIDE/debugger_abort", {"thread": thread}, timeout=30.0)
+    reply = await client.debugger_abort(thread, request_timeout=30.0)
     assert reply == {"status": "no_evaluation"}, reply
 
-    await client.request(
-        "PIDE/debugger_input", {"thread": thread, "verbs": ["continue"]},
-        timeout=30.0)
+    await client.debugger_input(thread, ["continue"], request_timeout=30.0)
     assert await _wait_all_resumed(client)
     assert await _wait_settled(client)
 
@@ -728,11 +700,8 @@ async def test_probe11bis_locals_through_the_eval_verb(prover):
     thread = await _wait_for_hit(client)
 
     # Ours: through the eval verb under debug_eval.
-    ours = await client.request(
-        "PIDE/debugger_print_vals",
-        {"token": "pv", "thread": thread, "frame": 0, "timeout": 60.0},
-        timeout=120.0,
-    )
+    ours = await client.debugger_print_vals(
+        thread, timeout=60.0, request_timeout=120.0)
     assert ours["status"] == "ok", ours
     our_texts = _texts(ours)
     assert not any(t == "val it = (): unit" for t in our_texts), (
@@ -744,11 +713,8 @@ async def test_probe11bis_locals_through_the_eval_verb(prover):
     # Stock print_vals on the same frame, byte for byte.
     outputs_before = len(client.debugger_output_history)
     states_before = len(client.debugger_state_history)
-    await client.request(
-        "PIDE/debugger_input",
-        {"thread": thread, "verbs": ["print_vals", "0", "false", ""]},
-        timeout=30.0,
-    )
+    await client.debugger_input(
+        thread, ["print_vals", "0", "false", ""], request_timeout=30.0)
     ok = await client.wait_debugger_event(
         lambda c: len(c.debugger_state_history) > states_before, timeout=90.0)
     assert ok, "the stock print_vals round trip never completed"
@@ -763,9 +729,7 @@ async def test_probe11bis_locals_through_the_eval_verb(prover):
         f"ours:  {our_texts!r}\nstock: {stock_texts!r}"
     )
 
-    await client.request(
-        "PIDE/debugger_input", {"thread": thread, "verbs": ["continue"]},
-        timeout=30.0)
+    await client.debugger_input(thread, ["continue"], request_timeout=30.0)
     assert await _wait_all_resumed(client)
     assert await _wait_settled(client)
 
@@ -782,11 +746,8 @@ async def test_probe11bis_per_value_bound_and_outer_deadline(prover):
         client.debugger_threads[thread])
 
     # The slow value placeholders out at 5s; the rest still print.
-    ours = await client.request(
-        "PIDE/debugger_print_vals",
-        {"token": "pv-slow", "thread": thread, "frame": 0, "timeout": 60.0},
-        timeout=150.0,
-    )
+    ours = await client.debugger_print_vals(
+        thread, timeout=60.0, request_timeout=150.0)
     assert ours["status"] == "ok", ours
     listing = "\n".join(_texts(ours))
     assert "val sluggish = <printing timed out>" in listing, (
@@ -795,20 +756,15 @@ async def test_probe11bis_per_value_bound_and_outer_deadline(prover):
 
     # The outer deadline still fires DURING a slow value (3s < the 5s per-value
     # bound): the whole listing ends as a TIMEOUT error, not a placeholder.
-    result = await client.request(
-        "PIDE/debugger_print_vals",
-        {"token": "pv-outer", "thread": thread, "frame": 0, "timeout": 3.0},
-        timeout=120.0,
-    )
+    result = await client.debugger_print_vals(
+        thread, timeout=3.0, request_timeout=120.0)
     assert result["status"] == "ok", result
     texts = _texts(result)
     assert any("Isabelle_MCP.debug_eval: TIMEOUT" in t for t in texts), (
         f"the outer deadline was masked by the per-value check: {texts}")
     assert thread in client.debugger_threads
 
-    await client.request(
-        "PIDE/debugger_input", {"thread": thread, "verbs": ["continue"]},
-        timeout=30.0)
+    await client.debugger_input(thread, ["continue"], request_timeout=30.0)
     assert await _wait_all_resumed(client)
 
 
@@ -824,9 +780,7 @@ async def test_probe9_stepping(prover):
 
     # A step from `val xs` stops again inside instrumented code.
     states_before = len(client.debugger_state_history)
-    await client.request(
-        "PIDE/debugger_input", {"thread": thread, "verbs": ["step"]},
-        timeout=30.0)
+    await client.debugger_input(thread, ["step"], request_timeout=30.0)
     ok = await client.wait_debugger_event(
         lambda c: len(c.debugger_state_history) > states_before
         and bool(c.debugger_threads.get(thread)),
@@ -842,9 +796,7 @@ async def test_probe9_stepping(prover):
         if not client.debugger_threads.get(thread):
             break
         states_before = len(client.debugger_state_history)
-        await client.request(
-            "PIDE/debugger_input", {"thread": thread, "verbs": ["step"]},
-            timeout=30.0)
+        await client.debugger_input(thread, ["step"], request_timeout=30.0)
         assert await client.wait_debugger_event(
             lambda c: len(c.debugger_state_history) > states_before,
             timeout=60.0,
@@ -864,9 +816,7 @@ async def test_probe9_stepping(prover):
           f"threads={ {t: [f.get('function') for f in s] for t, s in client.debugger_threads.items()} }")
     if stray:
         parked = next(iter(client.debugger_threads))
-        await client.request(
-            "PIDE/debugger_input", {"thread": parked, "verbs": ["continue"]},
-            timeout=30.0)
+        await client.debugger_input(parked, ["continue"], request_timeout=30.0)
         assert await _wait_all_resumed(client)
     assert await _wait_settled(client)
     assert not any(client.debugger_threads.values())
@@ -890,9 +840,7 @@ async def _edit_on_disk(client, path, old, new):
 
 async def _continue_all(client):
     for parked in [t for t, s in client.debugger_threads.items() if s]:
-        await client.request(
-            "PIDE/debugger_input", {"thread": parked, "verbs": ["continue"]},
-            timeout=30.0)
+        await client.debugger_input(parked, ["continue"], request_timeout=30.0)
     assert await _wait_all_resumed(client)
 
 
@@ -981,9 +929,7 @@ async def test_probe6_upstream_edit_invalidates_serials_and_rearming_works(prove
           f"threads={list(client.debugger_threads)}")
 
     if parked:
-        await client.request(
-            "PIDE/debugger_input", {"thread": thread, "verbs": ["continue"]},
-            timeout=30.0)
+        await client.debugger_input(thread, ["continue"], request_timeout=30.0)
         assert await _wait_all_resumed(client)
 
 

@@ -912,3 +912,96 @@ class TestEditStampWiring:
         self._reset_clock(monkeypatch)
         await client.open_document(str(f), wait_for_diagnostics=False)
         assert not self._clock_running()
+
+
+class TestDebuggerRequestWrappers:
+    """The section-7.1 wrappers pin the wire shape: method name, param keys,
+    fresh correlation tokens, and the crashed fallback on a non-dict reply."""
+
+    def _client(self):
+        client = IsabelleLSPClient()
+        client.request = AsyncMock(return_value={"status": "ok"})
+        return client
+
+    @pytest.mark.asyncio
+    async def test_breakpoints_wire_shape(self, tmp_path):
+        client = self._client()
+        f = tmp_path / "Foo.thy"
+        await client.debugger_breakpoints(str(f), timeout=12)
+        method, params = client.request.call_args.args[:2]
+        assert method == "PIDE/debugger_breakpoints"
+        assert params["uri"].startswith("file://")
+        assert params["uri"].endswith("/Foo.thy")
+        assert params["timeout"] == 12.0
+        assert isinstance(params["timeout"], float)
+        assert set(params) == {"uri", "token", "timeout"}
+        # Progress-monitored by default: no hard transport deadline.
+        assert client.request.call_args.kwargs == {"timeout": None}
+
+    @pytest.mark.asyncio
+    async def test_toggle_wire_shape(self, tmp_path):
+        client = self._client()
+        f = tmp_path / "Foo.thy"
+        await client.debugger_toggle_breakpoint(
+            str(f), 4711, True, timeout=9, request_timeout=60.0)
+        method, params = client.request.call_args.args[:2]
+        assert method == "PIDE/debugger_toggle_breakpoint"
+        assert params["serial"] == 4711
+        assert params["state"] is True
+        assert params["timeout"] == 9.0
+        assert set(params) == {"uri", "serial", "state", "token", "timeout"}
+        assert client.request.call_args.kwargs == {"timeout": 60.0}
+
+    @pytest.mark.asyncio
+    async def test_eval_wire_shape(self):
+        client = self._client()
+        await client.debugger_eval("worker-1", "n + 1", frame=2, timeout=5)
+        method, params = client.request.call_args.args[:2]
+        assert method == "PIDE/debugger_eval"
+        assert params["thread"] == "worker-1"
+        assert params["frame"] == 2
+        assert params["expr"] == "n + 1"
+        assert params["timeout"] == 5.0
+        assert set(params) == {"token", "thread", "frame", "expr", "timeout"}
+
+    @pytest.mark.asyncio
+    async def test_print_vals_wire_shape(self):
+        client = self._client()
+        await client.debugger_print_vals("worker-1", timeout=7)
+        method, params = client.request.call_args.args[:2]
+        assert method == "PIDE/debugger_print_vals"
+        assert params["frame"] == 0
+        # No expr on the wire: the server realises locals through the eval verb.
+        assert set(params) == {"token", "thread", "frame", "timeout"}
+
+    @pytest.mark.asyncio
+    async def test_abort_and_input_wire_shapes(self):
+        client = self._client()
+        await client.debugger_abort("worker-1")
+        method, params = client.request.call_args.args[:2]
+        assert (method, params) == ("PIDE/debugger_abort", {"thread": "worker-1"})
+
+        await client.debugger_input("worker-1", ["continue"])
+        method, params = client.request.call_args.args[:2]
+        assert method == "PIDE/debugger_input"
+        assert params == {"thread": "worker-1", "verbs": ["continue"]}
+
+    @pytest.mark.asyncio
+    async def test_tokens_are_fresh_and_shared_with_the_query_counter(self, tmp_path):
+        # The debugger requests live in the same Scala-side handler table as
+        # the position-explicit queries, so tokens must be unique ACROSS both.
+        client = self._client()
+        f = tmp_path / "Foo.thy"
+        await client.debugger_breakpoints(str(f))
+        t1 = client.request.call_args.args[1]["token"]
+        await client.debugger_eval("worker-1", "1")
+        t2 = client.request.call_args.args[1]["token"]
+        assert t1 != t2
+        assert client._query_seq == 2
+
+    @pytest.mark.asyncio
+    async def test_non_dict_reply_becomes_crashed(self):
+        client = IsabelleLSPClient()
+        client.request = AsyncMock(return_value=None)
+        reply = await client.debugger_eval("worker-1", "1")
+        assert reply == {"status": "crashed"}

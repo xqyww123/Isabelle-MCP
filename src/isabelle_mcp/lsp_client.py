@@ -1480,6 +1480,13 @@ class IsabelleLSPClient:
 
     # ── PIDE extension queries ──────────────────────────────────────────
 
+    def _next_query_token(self) -> str:
+        """Fresh correlation token, shared by the position-explicit queries and
+        the debugger requests (both live in the same Scala-side handler table,
+        so uniqueness must hold across them)."""
+        self._query_seq += 1
+        return str(self._query_seq)
+
     async def query_at_position(
         self,
         method: str,
@@ -1502,8 +1509,7 @@ class IsabelleLSPClient:
         if not doc:
             raise IsabelleToolError(f"Document not open: {file_path}")
 
-        self._query_seq += 1
-        token = str(self._query_seq)
+        token = self._next_query_token()
         params: dict[str, Any] = {
             "token": token,
             "textDocument": {"uri": doc.uri},
@@ -1547,6 +1553,97 @@ class IsabelleLSPClient:
             "PIDE/find_theorems_at_position", file_path, line, character,
             {"query": query_text, "limit": limit, "allow_dups": allow_dups},
         )
+
+    # ── ML debugger requests (docs/archive/DEBUGGER_DESIGN.md section 7.1) ──
+    #
+    # Thin wrappers: compose the wire params, correlate by a fresh query token,
+    # and return the reply dict as-is — status words become sentences in the
+    # tool layer, not here. The Scala side always answers (its backstop timer
+    # replies `timeout` itself), so the default wait is progress-monitored like
+    # the queries; ``request_timeout`` adds a hard transport deadline instead
+    # (the probes' failsafe against a wedged reply path).
+
+    async def _debugger_request(
+        self, method: str, params: dict[str, Any],
+        request_timeout: float | None,
+    ) -> JsonDict:
+        reply = await self.request(method, params, timeout=request_timeout)
+        return reply if isinstance(reply, dict) else {"status": query.CRASHED}
+
+    async def debugger_breakpoints(
+        self, file_path: str, *, timeout: float = 30.0,
+        request_timeout: float | None = None,
+    ) -> JsonDict:
+        """Every breakable site in the file, with prover-truth enabled-states.
+
+        ``outdated`` (pending edits not yet incorporated) is retryable; ``ok``
+        with an empty list does NOT mean "no sites" — breakpoint markup exists
+        only after ML compilation. (The wire's optional ``range`` filter is not
+        exposed: no consumer yet.)
+        """
+        return await self._debugger_request(
+            "PIDE/debugger_breakpoints",
+            {"uri": file_path_to_uri(file_path),
+             "token": self._next_query_token(), "timeout": float(timeout)},
+            request_timeout)
+
+    async def debugger_toggle_breakpoint(
+        self, file_path: str, serial: int, state: bool, *,
+        timeout: float = 30.0, request_timeout: float | None = None,
+    ) -> JsonDict:
+        """Acknowledged toggle on the real breakpoint ref; ``state`` is absolute
+        (retry is idempotent) and an ``ok`` reply carries ``was``, the previous
+        value — only an ``ok`` may record an arming client-side."""
+        return await self._debugger_request(
+            "PIDE/debugger_toggle_breakpoint",
+            {"uri": file_path_to_uri(file_path), "serial": serial,
+             "state": state, "token": self._next_query_token(),
+             "timeout": float(timeout)},
+            request_timeout)
+
+    async def debugger_eval(
+        self, thread: str, expr: str, *, frame: int = 0,
+        timeout: float = 30.0, request_timeout: float | None = None,
+    ) -> JsonDict:
+        """One ML expression in a stopped thread's frame; the Scala side embeds
+        ``expr`` as ONE ML string literal compiled inside the prelude wrapper's
+        protection, and ``timeout`` is the prover-side deadline."""
+        return await self._debugger_request(
+            "PIDE/debugger_eval",
+            {"token": self._next_query_token(), "thread": thread,
+             "frame": frame, "expr": expr, "timeout": float(timeout)},
+            request_timeout)
+
+    async def debugger_print_vals(
+        self, thread: str, *, frame: int = 0,
+        timeout: float = 30.0, request_timeout: float | None = None,
+    ) -> JsonDict:
+        """The frame's locals, realised through the eval verb server-side; the
+        reply shape is exactly ``debugger_eval``'s."""
+        return await self._debugger_request(
+            "PIDE/debugger_print_vals",
+            {"token": self._next_query_token(), "thread": thread,
+             "frame": frame, "timeout": float(timeout)},
+            request_timeout)
+
+    async def debugger_abort(
+        self, thread: str, *, request_timeout: float | None = None,
+    ) -> JsonDict:
+        """Set the abort flag for the thread's outstanding evaluation:
+        ``no_evaluation`` means the thread is settled (the retry loop's stop
+        signal), ``aborting`` means the flag command went out once."""
+        return await self._debugger_request(
+            "PIDE/debugger_abort", {"thread": thread}, request_timeout)
+
+    async def debugger_input(
+        self, thread: str, verbs: list[str], *,
+        request_timeout: float | None = None,
+    ) -> JsonDict:
+        """Raw debugger verbs (continue/step/...) to a stopped thread;
+        acknowledged with ``{ok: true}``, results arrive as notifications."""
+        return await self._debugger_request(
+            "PIDE/debugger_input", {"thread": thread, "verbs": verbs},
+            request_timeout)
 
     async def request_preview(
         self, file_path: str, column: int = 0,
