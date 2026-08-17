@@ -81,12 +81,38 @@ timer-armed-before-register with non-positive timeout (client always sends
 positive); recovery-hook flag clobber by the in-flight sync (causally
 impossible on the single-threaded loop).
 
-**The NEXT ACTION is Phase B** (Python protocol layer, below).  The repair
+**Phase B landed 2026-08-18** as two commits: `82eaff6` (the six client
+wrappers for the section-7.1 requests — wire params, tokens from the shared
+query counter, replies returned as-is, non-dict replies collapsed to
+`{status: crashed}`; both probe files migrated off raw `client.request` in
+the same commit) and `05e8937` (the `debug` launch parameter: `-o
+ML_debugger=true` in the spawn argv, the launch-identity error of spec §2.1
+in `isabelle_launch`, `debug` in `SessionInfo`; probe fixtures switched to
+`debug=True` so the battery exercises the plumbing; agent-facing wording
+user-approved 2026-08-18).  A 12-agent two-turn adversarial review
+(4 finder lenses, 2 default-refute skeptics per finding) confirmed ZERO
+findings.  The four killed (do not re-report): `extra_args` can still
+hand-write `-o ML_debugger=true` past the identity check (the contract keys
+on the launch parameter; `extra_args` is the documented unmodeled escape
+hatch); wrapper default timeout 30 s vs the design's 180 s (the 180 s lives
+in the Phase C tool schemas; §7.1 pins no wrapper default); the
+progress-monitored default wait vs long silent evals (unreachable — 30 s
+prover default answers well inside the 120 s stall window; pre-existing
+recorded wait policy); stale `debugger_threads`/histories surviving prover
+teardown (predates Phase B, no Phase B consumer; the design already
+mandates teardown clearing — a Phase C wiring duty, noted in Phase C
+below).
+
+**The NEXT ACTION is Phase C** (registry, tools, instructions, below).
+Reminder: Phase C's agent-facing sentences (tool descriptions, refusal and
+notice wording, the instructions section) must be shown to the user
+VERBATIM and approved before their commit.  The repair
 round's contract remains in the "Phase A repair round" section; the full
 review verdict of the FIRST review is archived in
 [`DEBUGGER_REPAIR_REVIEW_VERDICT.md`](DEBUGGER_REPAIR_REVIEW_VERDICT.md).
-Current gate numbers: unit suite 513 passing; integration battery 15
-passing (13 debugger probes + 2 ranged probes) plus test_file_sync_e2e.
+Current gate numbers: unit suite 525 passing; integration battery 25
+passing (tests/integration in one process run, incl. 13 debugger probes +
+2 ranged probes and the file-sync/query e2e tests).
 
 Concrete pointers a fresh context needs:
 
@@ -741,6 +767,17 @@ Files: `src/isabelle_mcp/lsp_client.py`, `server.py`, `models.py`,
   one losing move), the manual arming rule of spec §5, the single-expression
   rule, and the discovery-first workflow (draft at implementation;
   user-visible text).
+
+Two hand-off notes from the Phase B review (2026-08-18):
+
+- When a tool forwards §4.9's 180 s default (or any agent-chosen timeout
+  above the client's 120 s stall window) to `debugger_eval` /
+  `debugger_print_vals`, it MUST also pass `request_timeout` — the default
+  wait is progress-monitored and would flag a long silent eval as a stall.
+- When wiring the mandated hit-table clearing on every prover teardown path,
+  also clear `debugger_threads` / `debugger_state_history` /
+  `debugger_output_history` in `_clear_session_state` (they currently
+  survive teardown; harmless in Phase B, phantom stopped threads in C).
 
 ## Phase D — evaluation and cancellation integration
 
