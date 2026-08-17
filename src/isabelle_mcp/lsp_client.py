@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 from isabelle_mcp import query
-from isabelle_mcp.document_diff import ranged_content_changes
+from isabelle_mcp.document_diff import ranged_content_changes, utf16_position
 from isabelle_mcp.models import RunningCommand
 from isabelle_mcp.query import QueryReply
 from isabelle_mcp.processing import (
@@ -1224,14 +1224,16 @@ class IsabelleLSPClient:
             "uri": doc.uri, "line": 0, "character": 0, "focus": True,
         })
         first_line = doc.content.split("\n", 1)[0]
+        # LSP characters are UTF-16 code units; a raw len() counts code points
+        # and lands short of the line end when the first line carries astral
+        # glyphs, splitting model and server.  Same converter as the ranged
+        # diff emitter.
+        insert_at = utf16_position(doc.content, len(first_line))
         doc.version += 1
         await self.notify("textDocument/didChange", {
             "textDocument": {"uri": doc.uri, "version": doc.version},
             "contentChanges": [{
-                "range": {
-                    "start": {"line": 0, "character": len(first_line)},
-                    "end": {"line": 0, "character": len(first_line)},
-                },
+                "range": {"start": insert_at, "end": insert_at},
                 "text": " ",
             }],
         })
