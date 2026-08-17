@@ -106,7 +106,13 @@ below).
 **The NEXT ACTION is Phase C** (registry, tools, instructions, below).
 Reminder: Phase C's agent-facing sentences (tool descriptions, refusal and
 notice wording, the instructions section) must be shown to the user
-VERBATIM and approved before their commit.  The repair
+VERBATIM and approved before their commit.  Two decisions still open with
+the user as of 2026-08-18: (a) when to push the Phase B commits (push only
+on explicit order; the parent-repo gitlink bump follows the usual recipe),
+and (b) the approval rhythm for Phase C's wording — proposed: write code
+and sentences first, pin sentences verbatim in unit tests, then present ALL
+sentences in one batch for approval before committing the wording-bearing
+parts.  The repair
 round's contract remains in the "Phase A repair round" section; the full
 review verdict of the FIRST review is archived in
 [`DEBUGGER_REPAIR_REVIEW_VERDICT.md`](DEBUGGER_REPAIR_REVIEW_VERDICT.md).
