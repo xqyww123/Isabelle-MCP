@@ -13,6 +13,7 @@ policy as in test_debugger_probes: measure, positive controls, generous waits.
 
     PATH=contrib/Isabelle2025-2/bin:$PATH pytest tests/integration -m integration
 """
+import logging
 import os
 import shutil
 import time
@@ -22,12 +23,15 @@ import pytest
 from isabelle_mcp import evaluation as ev
 from isabelle_mcp.evaluation import evaluate_to
 from isabelle_mcp.lsp_client import IsabelleLSPClient
+from isabelle_mcp.utils import LSPCharacter, LSPLine, parse_command_output_html
 
 from .test_debugger_probes import (
     _breakpoints,
     _continue_all,
     _edit_on_disk,
     _enable_site_at,
+    _eval_at,
+    _texts,
     _wait_for_hit,
     _wait_settled,
 )
@@ -135,8 +139,12 @@ async def test_ranged_sync_prefix_reuse_and_upstream_invalidation(prover):
 
 
 @pytest.mark.asyncio
-async def test_two_distant_edits_arrive_as_one_multi_hunk_didchange(prover):
+async def test_two_distant_edits_arrive_as_one_multi_hunk_didchange(prover, caplog):
     client, path = prover
+    # A rejected didChange surfaces ONLY as a type=1 log message (the recovery
+    # hook then heals silently before settling, so no flag survives to assert
+    # on) -- the whole-test log scan at the bottom is the rejection witness.
+    caplog.set_level(logging.ERROR, logger="isabelle_mcp.lsp_client")
 
     await evaluate_to(client, path, -1)
     assert await _wait_settled(client, tries=90), "the theory never evaluated"
@@ -183,6 +191,12 @@ async def test_two_distant_edits_arrive_as_one_multi_hunk_didchange(prover):
     assert t_hit < PREFIX_SLEEP, (
         f"prefix reuse failed under a multi-hunk sync: hit after {t_hit:.1f}s"
     )
+    # Hunk 1's semantic witness, in prover truth: at the hit, the frame's n is
+    # the caller's NEW argument (5, not 4) — "hit arrived fast" alone shows
+    # only that the caller re-ran, not what text it ran.
+    result = await _eval_at(client, thread, "n * 100", timeout_s=30)
+    assert result["status"] == "ok", result
+    assert any("val it = 500: int" in t for t in _texts(result)), _texts(result)
     await _continue_all(client)
     assert await _wait_settled(client, tries=90)
     t_settled = time.monotonic() - t0
@@ -195,3 +209,31 @@ async def test_two_distant_edits_arrive_as_one_multi_hunk_didchange(prover):
     assert survivor is not None and survivor["state"] is True, (
         "the armed serial must survive two downstream hunks"
     )
+
+    # Hunk 2's semantic witness, in prover truth: the ranged_other command's
+    # rendered output shows the NEW value.  (Position-explicit request; no
+    # caret move, no evaluation start.)
+    read_back = await client.get_output_at_position(
+        path, LSPLine(17), LSPCharacter(4))
+    assert read_back is not None, "no command at the ranged_other line"
+    _source, _rng, content_html = read_back
+    messages = parse_command_output_html(content_html)
+    assert any("ranged_other = 8" in m["text"] for m in messages), messages
+
+    # The server's copy evaluates without a single failed command (a hunk
+    # misapplied into ML text would break compilation server-side).
+    assert ev._failed_count(client) == 0, "failed commands after the two-hunk sync"
+
+    # Client-model hygiene only (witnesses no server state): the model equals
+    # the on-disk text after the sync round trips.
+    with open(path) as f:
+        assert client.open_documents[path].content == f.read()
+
+    # The rejection witness: a didChange the server could not apply logs
+    # "Failed to apply document change" (type=1) and nothing else survives to
+    # settle time — the recovery hook heals the flag before we could read it.
+    rejections = [
+        r for r in caplog.records
+        if "Failed to apply document change" in r.getMessage()
+    ]
+    assert not rejections, rejections

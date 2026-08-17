@@ -18,6 +18,7 @@ is on PATH:
 import asyncio
 import os
 import shutil
+import time
 
 import pytest
 
@@ -140,12 +141,21 @@ async def _wait_settled(client, tries=60):
 
 async def _breakpoints(client, path, timeout=30.0):
     """Listing with prover-truth states: each call resolves the enabled-states
-    from the real breakpoint refs in one batched round trip."""
-    reply = await client.request(
-        "PIDE/debugger_breakpoints",
-        {"uri": "file://" + path, "token": "bps", "timeout": timeout},
-        timeout=timeout + 30.0,
-    )
+    from the real breakpoint refs in one batched round trip.
+
+    `outdated` (pending edits not yet incorporated) is the one status where
+    retrying is the uniquely correct response, so this helper absorbs it with
+    a bounded loop; every other non-ok status stays a hard failure."""
+    reply: dict = {}
+    for _ in range(30):
+        reply = await client.request(
+            "PIDE/debugger_breakpoints",
+            {"uri": "file://" + path, "token": "bps", "timeout": timeout},
+            timeout=timeout + 30.0,
+        )
+        if reply.get("status") != "outdated":
+            break
+        await asyncio.sleep(1.0)
     assert reply.get("status") == "ok", f"listing failed: {reply}"
     assert reply.get("open") is True, f"file not open in the prover: {reply}"
     return reply["breakpoints"]
@@ -469,6 +479,119 @@ async def test_r4_acknowledged_toggle(prover):
         timeout=30.0)
     assert await _wait_all_resumed(client), "the thread never resumed"
     assert await _wait_settled(client)
+
+
+# ── R5/R11: a refused toggle on a RUNNING command lists as unfinished ──────
+
+# One command holding all three pieces: the instrumented definition (whose
+# breakpoint markup is reported when its compile unit is COMPILED, before the
+# next unit runs), a gate polling for a sentinel file (holds the command
+# unfinished, no timing dependence), and the call.  The fixture interpolates
+# the sentinel path and opens the gate unconditionally at teardown.
+GATED_THEORY = r'''theory GatedProbe
+imports Main
+begin
+
+ML \<open>
+fun gated_target (n: int) =
+  let
+    val g = n + 1;
+  in g end;
+val _ =
+  let
+    fun wait 0 = ()
+      | wait k =
+          if OS.FileSys.access ("SENTINEL_PATH_PLACEHOLDER", []) then ()
+          else (OS.Process.sleep (Time.fromReal 0.25); wait (k - 1));
+  in wait 240 end;
+val gated_result = gated_target 3;
+\<close>
+
+end
+'''
+GATED_VAL_G = 8   # 1-indexed: `    val g = n + 1;` (site corrected to char 4)
+
+
+@pytest.fixture
+async def gated_prover(tmp_path):
+    ev.EVAL_POLL_INTERVAL = 4.0
+    sentinel = os.path.join(str(tmp_path), "gate-open")
+    path = os.path.join(str(tmp_path), "GatedProbe.thy")
+    with open(path, "w") as f:
+        f.write(GATED_THEORY.replace("SENTINEL_PATH_PLACEHOLDER", sentinel))
+    ev.evaluation_state = ev.EvaluationState()
+    client = IsabelleLSPClient(
+        logic="HOL",
+        project_root=str(tmp_path),
+        extra_args=["-o", "ML_debugger=true", "-o", "editor_tracing_messages=0"],
+    )
+    await client.start()
+    try:
+        yield client, path, sentinel
+    finally:
+        # Open the gate on EVERY path so a failed probe never wedges shutdown.
+        with open(sentinel, "w") as f:
+            f.write("open")
+        await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_r5_refused_toggle_on_running_command_lists_unfinished(gated_prover):
+    client, path, sentinel = gated_prover
+    await evaluate_to(client, path, -1)
+
+    # Poll the listing until the definition's site appears WITH state
+    # "unfinished".  Everything else is "not yet": the markup arrives
+    # asynchronously; a just-appeared site can transiently resolve
+    # "undefined" (assignment window); a listing during the pending-edit
+    # window answers top-level "outdated".  The gate holds the command
+    # unfinished, so poll-until-unfinished is monotone-safe.
+    deadline = time.monotonic() + 45.0
+    serial = None
+    while time.monotonic() < deadline:
+        reply = await client.request(
+            "PIDE/debugger_breakpoints",
+            {"uri": "file://" + path, "token": "gated-bps", "timeout": 30.0},
+            timeout=60.0,
+        )
+        if reply.get("status") == "ok" and reply.get("open") is True:
+            match = [
+                bp for bp in reply["breakpoints"]
+                if _corrected(bp) == (GATED_VAL_G - 1, 4)
+                and bp["state"] == "unfinished"
+            ]
+            if match:
+                serial = match[0]["serial"]
+                break
+        await asyncio.sleep(1.5)
+    assert serial is not None, (
+        "HARD FAIL by design, not an environment flake (the sentinel gate "
+        "removes all timing dependence): the gated command's site never "
+        "listed as 'unfinished' while the gate held the command running.  "
+        "The running-command listing semantics of DEBUGGER_DESIGN.md 7.1 and "
+        "R11's discriminating leg do not hold on this build — re-examine the "
+        "design; do not skip or retry this probe."
+    )
+
+    # The discriminating leg: the toggle on the running command is REFUSED
+    # with "unfinished" — and the listing keeps showing the real ref's state,
+    # not an echo of the attempted arming.
+    reply = await _toggle(client, path, serial, True)
+    assert reply == {"status": "unfinished"}, reply
+    bps = await _breakpoints(client, path)
+    entry = next(bp for bp in bps if bp["serial"] == serial)
+    assert entry["state"] == "unfinished", entry
+
+    # Open the gate; the command finishes; the real ref reads FALSE (the
+    # refused toggle wrote nothing), and the positive control now succeeds.
+    with open(sentinel, "w") as f:
+        f.write("open")
+    assert await _wait_settled(client, tries=60), "the gated command never finished"
+    bps = await _breakpoints(client, path)
+    entry = next(bp for bp in bps if _corrected(bp) == (GATED_VAL_G - 1, 4))
+    assert entry["state"] is False, entry
+    reply = await _toggle(client, path, entry["serial"], True)
+    assert reply == {"status": "ok", "was": False}, reply
 
 
 # ── R5: listing states are prover truth ────────────────────────────────────
