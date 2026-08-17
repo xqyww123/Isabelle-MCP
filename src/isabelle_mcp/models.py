@@ -269,6 +269,11 @@ class SessionInfo(BaseModel):
     version: str | None = Field(
         default=None, description="Isabelle server version reported at initialize (None if unknown)"
     )
+    debug: bool = Field(
+        default=False,
+        description="Whether the prover runs with ML debugger instrumentation "
+        "(launched with debug=true)",
+    )
 
 
 # Needed because models reference DiagnosticMessage via forward ref.

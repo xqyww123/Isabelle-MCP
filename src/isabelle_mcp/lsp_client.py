@@ -220,11 +220,17 @@ class IsabelleLSPClient:
         verbose: bool = False,
         extra_args: list[str] | None = None,
         project_root: str | None = None,
+        debug: bool = False,
     ):
         self.logic = logic
         self.session_dirs = session_dirs or []
         self.verbose = verbose
         self.extra_args = extra_args or []
+        # ML debugger instrumentation (design section 2.1): when set, start()
+        # spawns the server with `-o ML_debugger=true`, so newly compiled ML is
+        # breakable. Part of the launch identity — isabelle_launch refuses to
+        # reuse a running prover whose debug value differs.
+        self.debug = debug
         # Real paths of every source file precompiled into the running logic's
         # heap chain (filled by enumerate_heap_sources at launch). Such files
         # cannot be edited: PIDE ignores their changes and never reprocesses
@@ -375,6 +381,10 @@ class IsabelleLSPClient:
         # server), so gate it.
         if (isabelle_year() or 0) >= 2025:
             cmd += ["-o", "vscode_html_output=true"]
+        if self.debug:
+            # Not a build-identity option: it invalidates no heap, and only
+            # code compiled AFTER launch gets debug instrumentation.
+            cmd += ["-o", "ML_debugger=true"]
         for d in self.session_dirs:
             cmd.extend(["-d", d])
         if self.verbose:

@@ -78,7 +78,8 @@ async def prover(tmp_path):
     client = IsabelleLSPClient(
         logic="HOL",
         project_root=str(tmp_path),
-        extra_args=["-o", "ML_debugger=true", "-o", "editor_tracing_messages=0"],
+        debug=True,
+        extra_args=["-o", "editor_tracing_messages=0"],
     )
     await client.start()
     try:

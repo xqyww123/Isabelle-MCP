@@ -143,6 +143,7 @@ class MockLSPClient:
 
     def __init__(self):
         self.logic = "HOL"
+        self.debug = False
         self.initialized = True
         self.project_root = None
         # Present so launch/terminate/guard tests can simulate a (not-)running prover.

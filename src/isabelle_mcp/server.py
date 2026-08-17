@@ -279,14 +279,18 @@ def _startup_failure_error(
 @mcp.tool(output_schema=None)
 async def isabelle_launch(
     session: str = "Main", session_dirs: list[str] | None = None,
+    debug: bool = False,
 ) -> ToolResult:
     """Start (or restart) the Isabelle prover with the given session/logic.
 
     **Must be called before any evaluation or query tool** — the prover does not
     auto-start. Returns the running session name and server version.
 
-    Calling it again with the same session is a no-op; with a different session it
-    restarts the prover (any in-progress evaluation is discarded).
+    Calling it again with the same session and the same `debug` value is a
+    no-op; with a different session it restarts the prover (any in-progress
+    evaluation is discarded). Same session but a different `debug` value is an
+    error: call isabelle_terminate first, then launch with the wanted value —
+    a routine launch never silently kills a running debug session.
 
     No need to check whether the session is built — launch checks
     automatically: when its heap image (or any heap in its dependency chain)
@@ -310,6 +314,11 @@ async def isabelle_launch(
             Defaults to the server's working directory when that directory is itself
             a session root (contains ROOT/ROOTS), otherwise none. Built-in sessions
             (HOL, HOL-Analysis, …) need no session dirs.
+        debug: Launch with ML debugger instrumentation (`-o ML_debugger=true`):
+            newly compiled ML code gets breakable sites; code precompiled into
+            the heap is unaffected, and no heap is invalidated. Off by default
+            because instrumentation slows compiled ML. The value is part of the
+            launch identity (see above).
     """
     if _lsp_client is None:
         raise IsabelleToolError("LSP client not initialized")
@@ -317,7 +326,20 @@ async def isabelle_launch(
         if _lsp_client.process is not None:
             alive = _lsp_client.process.returncode is None
             if alive and _lsp_client.logic == session:
-                return _yaml_result(await session_info(_lsp_client))
+                if _lsp_client.debug == debug:
+                    return _yaml_result(await session_info(_lsp_client))
+                # The launch identity is (session, debug): same session but a
+                # differing debug value errors BOTH ways instead of restarting,
+                # so a routine launch can never silently kill a running debug
+                # session. (A different session name already implies a
+                # relaunch; debug simply applies to the new prover.)
+                raise IsabelleToolError(
+                    f"Session {session!r} is already running with "
+                    f"debug={str(_lsp_client.debug).lower()}, but "
+                    f"debug={str(debug).lower()} was requested. This launch "
+                    f"does not restart the prover: call isabelle_terminate "
+                    f"first, then isabelle_launch with the wanted debug value."
+                )
             # Switching sessions — or recovering from a crashed server (the
             # process object lingers with a returncode): tear down, start anew.
             await _lsp_client.shutdown()
@@ -326,6 +348,7 @@ async def isabelle_launch(
             session_dirs if session_dirs is not None else _default_session_dirs()
         )
         _lsp_client.logic = session
+        _lsp_client.debug = debug
         # Probe the build status and enumerate the heap's source files (for
         # precompiled-theory warnings) in parallel with the server start.
         enum_task = asyncio.create_task(_lsp_client.enumerate_heap_sources())

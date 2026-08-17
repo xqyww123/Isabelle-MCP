@@ -7,4 +7,5 @@ async def session_info(client: IsabelleLSPClient) -> SessionInfo:
     return SessionInfo(
         current_session=client.logic,
         version=version if version and version != "unknown" else None,
+        debug=client.debug,
     )

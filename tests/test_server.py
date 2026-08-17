@@ -208,6 +208,9 @@ def _launch_mock(*, running: bool, logic: str = "HOL"):
     if running:
         client.process.returncode = None  # the no-op path checks liveness
     client.logic = logic
+    # Explicit: the launch identity check compares this against the requested
+    # debug value; a MagicMock auto-attribute would never equal False.
+    client.debug = False
     client.extra_args = []
     client.isabelle_version = "Isabelle2024"
     client.start = AsyncMock()
@@ -288,6 +291,54 @@ class TestSessionManagement:
         client.start.assert_not_awaited()
         client.shutdown.assert_not_awaited()
         assert _yaml(result)["current_session"] == "HOL"
+
+    @pytest.mark.asyncio
+    async def test_launch_debug_mismatch_errors_both_ways(self):
+        # The launch identity is (session, debug): same session, differing
+        # debug value → error, no restart, in BOTH directions — a routine
+        # launch must never silently kill a running debug session.
+        import isabelle_mcp.server as server_mod
+        from isabelle_mcp.utils import IsabelleToolError
+
+        client = _launch_mock(running=True, logic="HOL")
+        with patch.object(server_mod, '_lsp_client', client):
+            with pytest.raises(IsabelleToolError, match="isabelle_terminate"):
+                await isabelle_launch("HOL", debug=True)
+        client.shutdown.assert_not_awaited()
+        client.start.assert_not_awaited()
+
+        client = _launch_mock(running=True, logic="HOL")
+        client.debug = True
+        with patch.object(server_mod, '_lsp_client', client):
+            with pytest.raises(IsabelleToolError, match="isabelle_terminate"):
+                await isabelle_launch("HOL", debug=False)
+        client.shutdown.assert_not_awaited()
+        client.start.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_launch_idempotent_same_session_same_debug(self):
+        import isabelle_mcp.server as server_mod
+
+        client = _launch_mock(running=True, logic="HOL")
+        client.debug = True
+        with patch.object(server_mod, '_lsp_client', client):
+            result = await isabelle_launch("HOL", debug=True)
+        client.start.assert_not_awaited()
+        assert _yaml(result)["debug"] is True
+
+    @pytest.mark.asyncio
+    async def test_launch_different_session_applies_debug(self):
+        # A different session name already implies a relaunch; debug simply
+        # applies to the new prover — no identity error.
+        import isabelle_mcp.server as server_mod
+
+        client = _launch_mock(running=True, logic="HOL")
+        with patch.object(server_mod, '_lsp_client', client):
+            result = await isabelle_launch("HOL-Analysis", debug=True)
+        client.shutdown.assert_awaited_once()
+        client.start.assert_awaited_once()
+        assert client.debug is True
+        assert _yaml(result)["debug"] is True
 
     @pytest.mark.asyncio
     async def test_launch_switches_session_restarts(self):

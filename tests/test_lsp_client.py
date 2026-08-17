@@ -96,6 +96,29 @@ class TestIsabelleLSPClient:
             assert "vscode_html_output=true" not in captured["cmd"]
 
     @pytest.mark.asyncio
+    async def test_start_debug_adds_ml_debugger_option(self):
+        # debug=True (design 2.1) spawns the server with -o ML_debugger=true;
+        # the default spawns without it. Capture the launch cmd by raising
+        # right after it is built.
+        import isabelle_mcp.lsp_client as lc
+        captured = {}
+
+        async def fake_exec(*cmd, **kw):
+            captured["cmd"] = cmd
+            raise RuntimeError("stop after cmd built")
+
+        with patch("asyncio.create_subprocess_exec", fake_exec), \
+                patch("isabelle_mcp.lsp_client.ensure_component"):
+            lc._isabelle_version_cache = ("Isabelle2025-2", 2025)
+            with pytest.raises(RuntimeError):
+                await IsabelleLSPClient(debug=True).start()
+            assert "ML_debugger=true" in captured["cmd"]
+
+            with pytest.raises(RuntimeError):
+                await IsabelleLSPClient().start()
+            assert "ML_debugger=true" not in captured["cmd"]
+
+    @pytest.mark.asyncio
     async def test_start_registers_the_component_before_spawning(self):
         # `isabelle mcp_server` only exists if our Scala component is registered, so the
         # registration must happen BEFORE the spawn — never leave a doomed process behind.
