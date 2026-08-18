@@ -103,20 +103,16 @@ teardown (predates Phase B, no Phase B consumer; the design already
 mandates teardown clearing — a Phase C wiring duty, noted in Phase C
 below).
 
-**The NEXT ACTION is Phase C** (registry, tools, instructions, below).
-Reminder: Phase C's agent-facing sentences (tool descriptions, refusal and
-notice wording, the instructions section) must be shown to the user
-VERBATIM and approved before their commit.  Two decisions still open with
-the user as of 2026-08-18: (a) when to push the Phase B commits (push only
-on explicit order; the parent-repo gitlink bump follows the usual recipe),
-and (b) the approval rhythm for Phase C's wording — proposed: write code
-and sentences first, pin sentences verbatim in unit tests, then present ALL
-sentences in one batch for approval before committing the wording-bearing
-parts.  The repair
+**Phase C landed 2026-08-18** — registry, tools, instructions (details in
+the Phase C section below, including the user decisions that overrode the
+specification during the wording review).  **The NEXT ACTION is Phase D**
+(evaluation and cancellation integration).  Still open with the user: when
+to push (push only on explicit order; the parent-repo gitlink bump follows
+the usual recipe).  The repair
 round's contract remains in the "Phase A repair round" section; the full
 review verdict of the FIRST review is archived in
 [`DEBUGGER_REPAIR_REVIEW_VERDICT.md`](DEBUGGER_REPAIR_REVIEW_VERDICT.md).
-Current gate numbers: unit suite 525 passing; integration battery 25
+Current gate numbers: unit suite 615 passing; integration battery 25
 passing (tests/integration in one process run, incl. 13 debugger probes +
 2 ranged probes and the file-sync/query e2e tests).
 
@@ -774,16 +770,68 @@ Files: `src/isabelle_mcp/lsp_client.py`, `server.py`, `models.py`,
   rule, and the discovery-first workflow (draft at implementation;
   user-visible text).
 
-Two hand-off notes from the Phase B review (2026-08-18):
+Both hand-off notes from the Phase B review are DONE: every debugger
+request passes `request_timeout` (= prover timeout + 60 s, so the
+progress-monitored wait can never flag a long silent eval as a stall), and
+`_clear_session_state` now clears `debugger_threads` / the two histories and
+calls `registry.on_prover_teardown()`.
 
-- When a tool forwards §4.9's 180 s default (or any agent-chosen timeout
-  above the client's 120 s stall window) to `debugger_eval` /
-  `debugger_print_vals`, it MUST also pass `request_timeout` — the default
-  wait is progress-monitored and would flag a long silent eval as a stall.
-- When wiring the mandated hit-table clearing on every prover teardown path,
-  also clear `debugger_threads` / `debugger_state_history` /
-  `debugger_output_history` in `_clear_session_state` (they currently
-  survive teardown; harmless in Phase B, phantom stopped threads in C).
+### Phase C as landed (2026-08-18)
+
+Implemented: `src/isabelle_mcp/debugger.py` (registry with one lock, anchor
+snippets, `at_text` resolution, demote-and-notify, hit table + `hit_id`
+lifecycle cleared on every prover teardown, notice buffer, the whole
+sentence catalogue); ELEVEN tools in `server.py` (all `output_schema=None`,
+text results); notice delivery + hit sync in `UnicodeWarningMiddleware`;
+`cartouche`/`indent_rows`/`format_call_stack` in `utils/formatters.py`;
+`BreakpointRef` input model in `models.py` (schema for
+`isabelle_del_breakpoints`' list argument; the specification's "models.py
+gains nothing" is about RESULT models — the twelve tools return text, and
+that holds); the "ML debugger" section in `instructions.py`.  R2's Python
+abort retry loop is implemented in `debugger.abort_eval_at_breakpoint`.
+Gates: unit suite 615, integration battery 25, both green.
+
+**User decisions during the wording review (2026-08-18) that OVERRIDE the
+specification — do not "restore" these from §4:**
+
+- `isabelle_abort_eval_at_breakpoint` is implemented but **not registered**
+  as an MCP tool: an agent's own eval call blocks, so the tool only serves
+  parallel tool-call clients; expose it when such a client exists.  The
+  three sentences that used to name it were rewritten accordingly.
+- §4.2's "the command is stopped at a breakpoint" refusal variant is
+  **deleted**: the client can only guess the cause (parallel workers make
+  the guess wrong), while the plain "still evaluating, retry" is never
+  misleading, and a parked run surfaces through the hit notices anyway.
+- §4.4's requirement that the tool description explain the reason tags is
+  **dropped**, and the tags themselves are short: `not evaluated yet`,
+  `still evaluating`, `code not found`, `state unknown, internal failure`
+  (the last one covers both a lost request and an unusable prover answer).
+  The listing output is self-explanatory.
+- The single-expression rule of §4.9 is **taught nowhere** (neither the tool
+  description nor the instructions): a bare declaration costs one compile
+  error, which is cheaper than a preventive sentence on every call.
+- Anchor snippets carry **at least three word tokens** (`ANCHOR_MIN_WORDS`;
+  symbols ride along uncounted), not merely the shortest line-unique run —
+  a bare `val` reads the same on every line of a `let` block.
+- A failed site listing tags the file's breakpoints `state unknown,
+  internal failure`; only a prover reply saying the file is not open tags
+  them `not evaluated yet` (`FileNotOpenInProver` distinguishes the two).
+- Demotion is worded `no longer works ({tag})`, never "demoted to pending";
+  `armed` / `set` / `no longer works` are the agent-facing state words.
+- Hit reports carry `hit_id` + thread name and NO source position: frame
+  positions resolve to `file:line` only when the prover's own frame
+  properties carry them.  §4.8's `Foo.thy:14 before ‹…›` headers and the
+  `(library code)` placeholder wait for Phase D's Scala-side position
+  resolution.
+
+Timing policy (user-approved 2026-08-18): listing/toggle 30 s prover-side;
+eval/locals 180 s by default (agent-chosen); `request_timeout` = prover
+timeout + 60 s on every request; step and continue wait 30 s; the abort
+loop re-sends every 2 s for at most 30 s.
+
+Known gap for Phase E: the `.ML` listing path has never been measured
+against a real prover (the specification marks it "(probe)"); its sentences
+are written but untested.
 
 ## Phase D — evaluation and cancellation integration
 
