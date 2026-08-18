@@ -15,6 +15,7 @@ from fastmcp.tools.tool import ToolResult
 from mcp.types import TextContent
 from pydantic import BaseModel
 
+from isabelle_mcp import debugger
 from isabelle_mcp.evaluation import (
     _evaluation_state_lock,
     cancel_evaluation,
@@ -28,7 +29,7 @@ from isabelle_mcp.evaluation import (
 from isabelle_mcp.file_watcher import FileWatcher
 from isabelle_mcp.instructions import get_instructions
 from isabelle_mcp.lsp_client import IsabelleLSPClient
-from isabelle_mcp.models import LinePosition
+from isabelle_mcp.models import BreakpointRef, LinePosition
 from isabelle_mcp.tools import (
     command_output,
     command_status,
@@ -110,14 +111,19 @@ _pending_footer: contextvars.ContextVar[str] = contextvars.ContextVar(
 
 
 class UnicodeWarningMiddleware(Middleware):
-    """Append queued unicode-conversion warnings and the evaluation footer to the
-    tool response.
+    """Append queued debugger notices, unicode-conversion warnings and the
+    evaluation footer to the tool response.
 
     The unicode guard (``unicode_guard.sanitize_read``) runs on the push paths
     and queues a warning per affected file; this middleware drains the queue
     after each successful tool call and appends the warning — with the
     instruction to emit Isabelle ASCII — as an extra text block. On a tool
-    error the queue is left intact for the next call.
+    error both queues are left intact for the next call.
+
+    Debugger notices (design section 6.3) ride the same mechanism and go
+    first: they are result-adjacent one-liners about asynchronous debugger
+    events, delivered exactly once, on the next tool call of any kind — so
+    the hit bookkeeping is synced here, not only in the debugger tools.
 
     The footer goes last, below the warning: it is a fixed-format line the agent
     learns to skim, and burying a rare, actionable warning underneath a constant
@@ -133,6 +139,14 @@ class UnicodeWarningMiddleware(Middleware):
         # content list — leave the queue for the next regular call.
         if not isinstance(result, ToolResult):
             return result
+        client = _lsp_client
+        if client is not None and client.process is not None and client.debug:
+            debugger.registry.sync_hits(client)
+        notices = debugger.registry.drain_notices()
+        if notices is not None:
+            result.content = [
+                *result.content, TextContent(type="text", text=notices),
+            ]
         warning = drain_warnings()
         if warning is not None:
             result.content = [
@@ -702,6 +716,227 @@ async def isabelle_command_status(positions: list[LinePosition]) -> ToolResult:
 async def isabelle_session_info() -> ToolResult:
     """Get information about current Isabelle session."""
     return _yaml_result(await session_info(await _ensure_lsp_started()))
+
+
+# ── ML debugger tools (docs/archive/DEBUGGER_DESIGN.md section 4) ─────
+#
+# All are text results; the sentences and the orchestration live in
+# debugger.py, the pure text assembly in utils/formatters.py. They require a
+# session launched with debug=true and fail fast otherwise. The abort tool
+# of section 4.13 is implemented (debugger.abort_eval_at_breakpoint) but NOT
+# registered — user decision 2026-08-18: an agent's own eval call blocks, so
+# the tool only serves parallel tool-call clients; expose it when one exists.
+
+
+def _text_result(text: str) -> ToolResult:
+    return ToolResult(content=[TextContent(type="text", text=text)])
+
+
+@mcp.tool(output_schema=None)
+async def isabelle_set_breakpoint(
+    file_path: str, line: int, at_text: str | None = None,
+) -> ToolResult:
+    """Register a breakpoint and enable its breakable site.
+
+    A breakable site exists only in ML code the prover has already compiled
+    with debugging on, at statement boundaries the compiler chooses — so
+    evaluate the file first, and use isabelle_list_breakable_sites to discover
+    where breakpoints can go.
+    After the breakpoint is set, it is hit the next time the armed code is
+    executed. If the target command has already been evaluated, insert a
+    space before it to force a re-evaluation so the command runs again and
+    hits the breakpoint.
+
+    Args:
+        file_path: Absolute path to the .thy or .ML file
+        line: Line number (1-indexed) of the breakable site
+        at_text: Optional text snippet on the line. The breakable site at or
+            nearest before its first occurrence is used (execution stops
+            before that code runs). Without at_text, the first site on the
+            line.
+    """
+    client = await _ensure_lsp_started()
+    return _text_result(
+        await debugger.set_breakpoint(client, file_path, line, at_text))
+
+
+@mcp.tool(output_schema=None)
+async def isabelle_del_breakpoints(
+    breakpoints: list[BreakpointRef],
+) -> ToolResult:
+    """Disable and remove breakpoints.
+
+    Args:
+        breakpoints: The breakpoints to delete, as printed by
+            isabelle_list_breakpoints.
+    """
+    client = await _ensure_lsp_started()
+    refs = [(b.file_path, b.line, b.at_text) for b in breakpoints]
+    return _text_result(await debugger.del_breakpoints(client, refs))
+
+
+@mcp.tool(output_schema=None)
+async def isabelle_list_breakpoints(file_path: str | None = None) -> ToolResult:
+    """List the registered breakpoints. (For where breakpoints CAN go, see
+    isabelle_list_breakable_sites.)
+
+    Args:
+        file_path: Absolute path; restricts the listing to one file. Omit for
+            the whole registry.
+    """
+    client = await _ensure_lsp_started()
+    return _text_result(debugger.list_breakpoints(client, file_path))
+
+
+@mcp.tool(output_schema=None)
+async def isabelle_list_breakable_sites(
+    file_path: str, start_line: int | None = None, end_line: int | None = None,
+) -> ToolResult:
+    """List the breakable sites — the places where a breakpoint can be set —
+    in a file's evaluated ML code.
+
+    Do not guess breakpoint positions from the source — lines you would
+    expect to be breakable often are not. Call this first, then set
+    breakpoints at the listed sites.
+
+    Args:
+        file_path: Absolute path to the .thy or .ML file
+        start_line: First line (1-indexed) of the range. Default: whole file.
+        end_line: Last line (1-indexed, inclusive). Default: whole file.
+    """
+    client = await _ensure_lsp_started()
+    return _text_result(await debugger.list_breakable_sites(
+        client, file_path, start_line, end_line))
+
+
+@mcp.tool(output_schema=None)
+async def isabelle_enable_all_breakpoints(
+    file_path: str | None = None,
+) -> ToolResult:
+    """Enable all no-longer-working breakpoints.
+
+    When the code of a breakpoint is recompiled, when the breakpoint is
+    disabled, or when the prover is relaunched, the breakpoint may not
+    work. This tool re-arms these no-longer-working breakpoints if their
+    code has been evaluated.
+
+    Args:
+        file_path: Restrict to breakpoints in this file. Omit for all
+            breakpoints.
+    """
+    client = await _ensure_lsp_started()
+    return _text_result(
+        await debugger.enable_all_breakpoints(client, file_path))
+
+
+@mcp.tool(output_schema=None)
+async def isabelle_disable_all_breakpoints(
+    file_path: str | None = None,
+) -> ToolResult:
+    """Disable all breakpoints, so an evaluation runs undisturbed.
+
+    The breakpoints stay set but not working; isabelle_enable_all_breakpoints
+    restores them.
+
+    Args:
+        file_path: Restrict to breakpoints in this file. Omit for all
+            breakpoints.
+    """
+    client = await _ensure_lsp_started()
+    return _text_result(
+        await debugger.disable_all_breakpoints(client, file_path))
+
+
+@mcp.tool(output_schema=None)
+async def isabelle_debug_state() -> ToolResult:
+    """Report all live hits — threads stopped in the debugger — with their
+    call stacks. Callable at any time.
+
+    A hit is one occasion of a thread halting; its hit_id is what the
+    breakpoint tools take (thread names are shown as information, never an
+    input). The frame numbers in the call stack are the frame parameter of
+    isabelle_eval_at_breakpoint / isabelle_locals_at_breakpoint.
+    """
+    client = await _ensure_lsp_started()
+    return _text_result(debugger.debug_state(client))
+
+
+@mcp.tool(output_schema=None)
+async def isabelle_eval_at_breakpoint(
+    expr: str, hit_id: str | None = None, frame: int = 0,
+    timeout: float = debugger.EVAL_DEFAULT_TIMEOUT,
+) -> ToolResult:
+    """Evaluate an Isabelle/ML expression in the context of a hit.
+
+    The expression can access the local variables in the context.
+    Antiquotations work. The evaluation is not affected by breakpoints
+    and never re-enters the debugger.
+
+    Args:
+        expr: Isabelle/ML expression to evaluate
+        hit_id: The hit to evaluate at (e.g. "h1", as shown by
+            isabelle_debug_state). May be omitted when exactly one hit is
+            live.
+        frame: Stack frame index from the call stack (0 = innermost).
+        timeout: Seconds before the evaluation is cut off.
+    """
+    client = await _ensure_lsp_started()
+    return _text_result(await debugger.eval_at_breakpoint(
+        client, expr, hit_id, frame, timeout))
+
+
+@mcp.tool(output_schema=None)
+async def isabelle_locals_at_breakpoint(
+    hit_id: str | None = None, frame: int = 0,
+    timeout: float = debugger.EVAL_DEFAULT_TIMEOUT,
+) -> ToolResult:
+    """Print all local variables in the context of a hit, with their types
+    and values — the cheap first look before isabelle_eval_at_breakpoint.
+
+    Args:
+        hit_id: The hit to inspect (e.g. "h1", as shown by
+            isabelle_debug_state). May be omitted when exactly one hit is
+            live.
+        frame: Stack frame index from the call stack (0 = innermost).
+        timeout: Seconds before the listing is cut off.
+    """
+    client = await _ensure_lsp_started()
+    return _text_result(await debugger.locals_at_breakpoint(
+        client, hit_id, frame, timeout))
+
+
+@mcp.tool(output_schema=None)
+async def isabelle_continue_breakpoint(hit_id: str | None = None) -> ToolResult:
+    """Resume execution from a hit.
+
+    Breakpoints stay armed — execution stops again at the next hit.
+
+    Args:
+        hit_id: Hit to resume. Omit to resume ALL live hits.
+    """
+    client = await _ensure_lsp_started()
+    return _text_result(await debugger.continue_breakpoint(client, hit_id))
+
+
+@mcp.tool(output_schema=None)
+async def isabelle_step_at_breakpoint(
+    mode: str, hit_id: str | None = None,
+) -> ToolResult:
+    """Single-step a hit's thread.
+
+    `step` runs to the next breakable site, entering calls; `step_over`
+    stays at the same or shallower stack depth; `step_out` runs until a
+    shallower depth. Stepping only stops in ML compiled with debugging on:
+    when execution leaves that region, stepping ends and the program simply
+    runs on — to completion, or to the next armed breakpoint.
+
+    Args:
+        mode: "step", "step_over" or "step_out".
+        hit_id: Hit to step. May be omitted when exactly one hit is live.
+    """
+    client = await _ensure_lsp_started()
+    return _text_result(
+        await debugger.step_at_breakpoint(client, mode, hit_id))
 
 
 def main() -> None:

@@ -613,3 +613,101 @@ class TestFooterScope:
         assert texts[0] == "the answer"
         assert texts[1].startswith("⚠️ NON-ASCII DETECTED")
         assert texts[2] == "Evaluating towards A.thy:20."
+
+
+class TestDebuggerToolPlumbing:
+    """The section-4 tools: registered on the server, text results,
+    notices delivered by the middleware. The tool BODIES are covered in
+    test_debugger.py; here only the server-side plumbing is pinned."""
+
+    # The abort tool of section 4.13 is implemented in debugger.py but NOT
+    # registered (user decision 2026-08-18) — eleven exposed tools.
+    DEBUGGER_TOOLS = [
+        "isabelle_set_breakpoint",
+        "isabelle_del_breakpoints",
+        "isabelle_list_breakpoints",
+        "isabelle_list_breakable_sites",
+        "isabelle_enable_all_breakpoints",
+        "isabelle_disable_all_breakpoints",
+        "isabelle_debug_state",
+        "isabelle_eval_at_breakpoint",
+        "isabelle_locals_at_breakpoint",
+        "isabelle_continue_breakpoint",
+        "isabelle_step_at_breakpoint",
+    ]
+
+    @pytest.mark.asyncio
+    async def test_all_twelve_are_registered_as_text_tools(self):
+        from isabelle_mcp.server import mcp
+
+        tools = {t.name: t for t in await mcp.list_tools()}
+        for name in self.DEBUGGER_TOOLS:
+            assert name in tools, f"{name} is not registered"
+            assert tools[name].output_schema is None, name
+        assert "isabelle_abort_eval_at_breakpoint" not in tools
+
+    @pytest.mark.asyncio
+    async def test_debug_state_fails_fast_without_debug(self, mock_lsp_client):
+        from isabelle_mcp import debugger
+        from isabelle_mcp.server import isabelle_debug_state
+        from isabelle_mcp.utils import IsabelleToolError
+
+        mock_lsp_client.debug = False
+        with _patch_ensure(mock_lsp_client):
+            with pytest.raises(IsabelleToolError) as exc:
+                await isabelle_debug_state()
+        assert str(exc.value) == debugger.DEBUG_OFF
+
+    @pytest.mark.asyncio
+    async def test_middleware_appends_notices_before_the_warning(self):
+        from fastmcp.tools.tool import ToolResult
+        from mcp.types import TextContent
+
+        from isabelle_mcp import debugger, unicode_guard
+        from isabelle_mcp.server import UnicodeWarningMiddleware, _pending_footer
+
+        unicode_guard.drain_warnings()          # start from a clean queue
+        debugger.registry.drain_notices()
+        debugger.registry.add_notice("breakpoint X no longer works (tag)")
+        unicode_guard.record_warning("/tmp/A.thy", "- /tmp/A.thy: converted")
+
+        async def call_next(_ctx):
+            return ToolResult(content=[TextContent(type="text", text="the answer")])
+
+        result = await UnicodeWarningMiddleware().on_call_tool(None, call_next)
+        _pending_footer.set("")
+        texts = [c.text for c in result.content]
+        assert texts[0] == "the answer"
+        assert texts[1] == (
+            "Debugger notices:\n- breakpoint X no longer works (tag)")
+        assert texts[2].startswith("⚠️ NON-ASCII DETECTED")
+        # Delivered exactly once: the queue is now empty.
+        assert debugger.registry.drain_notices() is None
+
+    @pytest.mark.asyncio
+    async def test_prover_teardown_clears_debugger_state(self):
+        """The Phase B review hand-off: _clear_session_state must clear the
+        thread map and histories AND run the registry teardown, so no
+        phantom stopped thread survives its prover."""
+        from isabelle_mcp import debugger
+        from isabelle_mcp.debugger import DebuggerRegistry
+        from isabelle_mcp.lsp_client import IsabelleLSPClient
+
+        old_registry = debugger.registry
+        debugger.registry = DebuggerRegistry()
+        try:
+            client = IsabelleLSPClient(logic="HOL")
+            client.debugger_threads = {"worker-1": [{"function": "f"}]}
+            client.debugger_state_history.append({"threads": []})
+            client.debugger_output_history.append({"messages": []})
+            debugger.registry.hits["h1"] = debugger.Hit(
+                hit_id="h1", thread="worker-1")
+            client._clear_session_state()
+            assert client.debugger_threads == {}
+            assert client.debugger_state_history == []
+            assert client.debugger_output_history == []
+            assert debugger.registry.hits == {}
+            assert debugger.registry.retired["h1"] == \
+                debugger.ENDED_TERMINATED
+        finally:
+            debugger.registry = old_registry

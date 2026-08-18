@@ -61,6 +61,33 @@ back as diagnostics, not a halt.
   whose glyphs all have ASCII forms is auto-rewritten on disk (re-read it
   before further edits); otherwise you get a warning to fix it yourself.
 
+## ML debugger
+
+Launch with `isabelle_launch(session, debug=true)` to use the breakpoint
+tools. Turning `debug` on or off needs `isabelle_terminate` first.
+
+- A **breakable site** is a place where execution can stop. The compiler
+  chooses these places, so call `isabelle_list_breakable_sites` rather than
+  guessing from the source.
+- A **breakpoint** is a site you armed with `isabelle_set_breakpoint`.
+  Breakpoints stop working when their code is recompiled or the prover is
+  relaunched; `isabelle_enable_all_breakpoints` re-arms them. Nothing
+  re-arms in the background.
+- A **hit** is one occasion of execution halting at a breakpoint, named
+  `h1`, `h2`, … Inspect it with `isabelle_debug_state`,
+  `isabelle_locals_at_breakpoint` and `isabelle_eval_at_breakpoint`; resume
+  with `isabelle_continue_breakpoint` or `isabelle_step_at_breakpoint`.
+  Resuming ends the hit — stopping again is a new hit with a new id. A
+  **frame** is one entry of a hit's call stack; frame 0 is where execution
+  stopped.
+
+The usual workflow: evaluate up to the end of the ML block that defines the
+code, or the `ML_file` command that loads it, then set the breakpoint and
+evaluate onward so the code runs and hits. If the code to hit has already been evaluated, insert a space
+before it and re-evaluate to run it again. After an edit at or before the
+defining block, its breakpoints stop working: evaluate up to that block
+again, call `isabelle_enable_all_breakpoints`, then evaluate onward.
+
 ## Working with the `isabelle` command line
 
 **Locate key directories.** `isabelle getenv NAME` prints `NAME=value` (several

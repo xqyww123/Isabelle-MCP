@@ -193,6 +193,22 @@ class LinePosition(BaseModel):
     line: int = Field(description="Line number (1-indexed)")
 
 
+class BreakpointRef(BaseModel):
+    """One breakpoint reference for isabelle_del_breakpoints, matched against
+    the registry (file, recorded line, anchor snippet) — an input model, not a
+    result (the debugger tools return text)."""
+
+    file_path: str = Field(description=(
+        "Path to the file, absolute or project-root-relative as listings "
+        "print it"))
+    line: int = Field(description=(
+        "Line number as shown by isabelle_list_breakpoints (1-indexed)"))
+    at_text: str | None = Field(default=None, description=(
+        "The text shown in ‹…› for that breakpoint by "
+        "isabelle_list_breakpoints. May be omitted when the line has only "
+        "one breakpoint."))
+
+
 class CommandStatusPosition(BaseModel):
     """One command covering a queried line, in a breakdown."""
 
