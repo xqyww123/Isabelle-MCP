@@ -638,6 +638,15 @@ class IsabelleLSPClient:
         self._first_diagnostic_event.clear()
         self._preview_waiters.clear()
         self._processing_trackers.clear()
+        # Debugger state must not survive its prover: thread names restart
+        # their counter with each prover process, so a stale map would show
+        # phantom stopped threads. The registry retires every hit ("the
+        # prover was terminated") and demotes armed entries to pending.
+        self.debugger_threads.clear()
+        self.debugger_state_history.clear()
+        self.debugger_output_history.clear()
+        from isabelle_mcp.debugger import registry
+        registry.on_prover_teardown()
 
         # Reset the module-global evaluation singleton so a later relaunch starts
         # clean — otherwise a terminate mid-evaluation leaves evaluation_state.active

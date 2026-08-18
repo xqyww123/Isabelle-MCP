@@ -327,6 +327,34 @@ def extract_symbol_at_position(file_path: str, line: MCPLine, column: MCPColumn)
         return ""
 
 
+# ── Debugger text assembly (pure; the sentences live in debugger.py) ──
+
+
+def cartouche(text: str) -> str:
+    """The ‹…› delimiter around copyable snippets. A delimiter, not
+    decoration: it marks exactly the text to pass back as ``at_text``
+    (snippets may contain commas), so nothing else may use these glyphs."""
+    return f"‹{text}›"
+
+
+def indent_rows(rows: list[str], indent: str = "    ") -> str:
+    return "\n".join(indent + r for r in rows)
+
+
+def format_call_stack(rows: list[tuple[str, str]]) -> str:
+    """Aligned ``frame N  function  position`` rows, innermost first; the
+    frame number is the tools' ``frame`` parameter. A frame without a
+    resolvable position gets no position column."""
+    if not rows:
+        return "  (empty stack)"
+    width = max(len(function) for function, _ in rows)
+    out = []
+    for i, (function, position) in enumerate(rows):
+        line = f"  frame {i}  {function.ljust(width)}"
+        out.append(f"{line}  {position}" if position else line.rstrip())
+    return "\n".join(out)
+
+
 _SEVERITY_MAP = {1: "error", 2: "warning", 3: "information", 4: "hint"}
 
 
