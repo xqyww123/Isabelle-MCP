@@ -33,7 +33,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from isabelle_mcp.lsp_client import IsabelleLSPClient
+from isabelle_mcp.lsp_client import IsabelleLSPClient, _stat_sig
 from isabelle_mcp.utils.core import IsabelleToolError, plural
 from isabelle_mcp.utils.formatters import (
     cartouche,
@@ -64,6 +64,8 @@ OUTDATED_RETRY_SLEEP = 0.5
 STEP_WAIT = 30.0              # bounded wait for a step to stop again
 CONTINUE_WAIT = 30.0          # bounded wait for a resumed thread to leave the map
 ABORT_TOTAL = 30.0            # section 4.13's overall retry bound
+IMPLICIT_LOCALS_TIMEOUT = 10.0  # section 6.1's implicit frame-0 locals bound
+CANCEL_SWEEP_WAIT = 5.0       # bounded wait for swept threads to leave the map
 ABORT_PERIOD = 2.0            # one retry period of the abort loop
 SITE_LISTING_CAP = 40         # section 4.5's truncation bound
 NEAREST_SITES_SHOWN = 8       # section 4.2 message 3: 4 each side
@@ -90,8 +92,8 @@ TAG_WIRE_FAILURE = "state unknown, internal failure"
 # {where} is file:line (project-root-relative). Templates are .format()-ed.
 
 DEBUG_OFF = (
-    "Debugging is not enabled in this session. Call isabelle_terminate, "
-    "then isabelle_launch with debug=true."
+    "Debugging is not enabled in this session. Call `isabelle_terminate`, "
+    "then `isabelle_launch` with debug=true."
 )
 
 # set_breakpoint refusals (section 4.2, messages 1-5)
@@ -119,11 +121,11 @@ NEAREST_SITES_LEAD_IN = "The nearest breakable sites in this file are:"
 NEAREST_SITES_TAIL = "Pass one of these as line + at_text."
 MORE_SITES_POINTER = (
     "({n} more breakable sites in this file — use "
-    "isabelle_list_breakable_sites to see them.)"
+    "`isabelle_list_breakable_sites` to see them.)"
 )
 MORE_SITES_POINTER_ONE = (
     "(1 more breakable site in this file — use "
-    "isabelle_list_breakable_sites to see it.)"
+    "`isabelle_list_breakable_sites` to see it.)"
 )
 NO_SITES_IN_FILE = (
     "This file has no breakable sites at all — it contains no ML code that "
@@ -173,7 +175,7 @@ FILE_NOT_OPEN_IN_PROVER_ML = (
 # indented line
 DELETED_COUNT = "deleted {count}"
 NO_MATCH_HEADER = (
-    "breakpoint not found — call isabelle_list_breakpoints to see the "
+    "breakpoint not found — call `isabelle_list_breakpoints` to see the "
     "current breakpoints:"
 )
 AMBIGUOUS_HEADER = (
@@ -205,28 +207,33 @@ STILL_PENDING = "Still pending: {counts}."
 DISABLED_RESULT = (
     "Switched off {armed} armed {breakpoints}; {pending} pending "
     "{entries} also marked disabled. Re-enable with "
-    "isabelle_enable_all_breakpoints."
+    "`isabelle_enable_all_breakpoints`."
 )
 
 # debug_state (section 4.8) and hit blocks
 NO_THREAD_STOPPED = "No thread is stopped."
 HITS_LIVE = "{n} {hits} live."
-HIT_HEADER = "Hit {hit_id}: thread {thread}."
+HIT_HEADER = "Hit id: {hit_id}\nthread {thread}"
 CALL_STACK_HEADER = (
-    "Call stack (innermost first; the number is the frame parameter):"
+    "Call stack (frame 0 is the innermost, top of the stack; outer frames "
+    "follow):"
 )
 
 # hit resolution errors
-UNKNOWN_HIT = "There is no hit {hit_id}. Call isabelle_debug_state for the live hits."
-RETIRED_HIT = (
-    "Hit {hit_id} has ended: {ending} Call isabelle_debug_state for the "
+UNKNOWN_HIT = (
+    "There is no hit id {hit_id}. Call `isabelle_debug_state` for the "
     "live hits."
 )
+RETIRED_HIT = (
+    "Hit id {hit_id} has ended: {ending} Call `isabelle_debug_state` for "
+    "the live hits."
+)
 SEVERAL_HITS = "Several hits are live; pass hit_id:"
+SEVERAL_HITS_ROW = "hit id {hit_id} — thread {thread}"
 NO_HIT_LIVE = "No thread is stopped at a breakpoint."
 
 # how a hit ended (the {ending} of RETIRED_HIT; each is a full clause)
-ENDED_CONTINUED = "it was resumed by isabelle_continue_breakpoint."
+ENDED_CONTINUED = "it was resumed by `isabelle_continue_breakpoint`."
 ENDED_STEP_LEFT = (
     "it stepped without stopping again — execution left the instrumented "
     "region."
@@ -243,7 +250,7 @@ EVAL_NO_OUTPUT = "The evaluation completed with no output."
 EVAL_BACKSTOP_TIMEOUT = (
     "The prover did not answer within {seconds}s. The evaluation may still "
     "be running, and this hit takes no new evaluations until it ends. "
-    "Retry later; isabelle_cancel_evaluation is the way out if it never "
+    "Retry later; `isabelle_cancel_evaluation` is the way out if it never "
     "ends."
 )
 EVAL_BUSY = (
@@ -252,26 +259,27 @@ EVAL_BUSY = (
 )
 EVAL_RESUMED = (
     "The thread resumed while the input was in flight; the expression may "
-    "or may not have run. The hit is over — call isabelle_debug_state."
+    "or may not have run. The hit is over — call `isabelle_debug_state`."
 )
 EVAL_NOT_STOPPED = (
-    "The thread of hit {hit_id} is not stopped any more — the expression "
-    "was never sent. Call isabelle_debug_state for the live hits."
+    "The thread of hit id {hit_id} is not stopped any more — the "
+    "expression was never sent. Call `isabelle_debug_state` for the live "
+    "hits."
 )
 EVAL_CRASHED = (
     "The prover could not answer this evaluation and could not say why."
 )
 
 # continue (section 4.11)
-RESUMED_ONE = "Resumed hit {hit_id} (thread {thread})."
+RESUMED_ONE = "Resumed hit id {hit_id} (thread {thread})."
 RESUMED_MANY_HEADER = "Resumed {n} hits:"
 NOT_RESUMED = (
-    "Hit {hit_id} did not resume within {seconds}s — the thread is still "
-    "stopped. Call isabelle_debug_state."
+    "Hit id {hit_id} did not resume within {seconds}s — the thread is "
+    "still stopped. Call `isabelle_debug_state`."
 )
 
 # step (section 4.12)
-STEP_STOPPED_AGAIN = "Hit {hit_id} stopped again."
+STEP_STOPPED_AGAIN = "Hit id {hit_id} stopped again."
 STEP_DID_NOT_STOP = (
     "The thread resumed and did not stop again within {seconds}s — "
     "execution left the instrumented region (stepping only stops in ML "
@@ -286,7 +294,7 @@ ABORT_OK = (
 ABORT_NOTHING = "No evaluation is running on this hit — there is nothing to abort."
 ABORT_UNCONFIRMED = (
     "The evaluation did not end within {seconds}s. Some ML code cannot be "
-    "interrupted at all; isabelle_cancel_evaluation is the way out."
+    "interrupted at all; `isabelle_cancel_evaluation` is the way out."
 )
 
 # debugger notices (section 6.3)
@@ -300,10 +308,78 @@ NOTICE_MERGED_DUPLICATE = (
     "duplicate breakpoint at {where} before {anchor} merged into one"
 )
 NOTICE_NEW_HIT = (
-    "thread {thread} stopped at a breakpoint — hit {hit_id}; inspect with "
-    "isabelle_debug_state"
+    "thread {thread} stopped at a breakpoint — hit id {hit_id}; inspect "
+    "with `isabelle_debug_state`"
 )
-NOTICE_HIT_ENDED = "hit {hit_id} ended: {ending}"
+NOTICE_HIT_ENDED = "hit id {hit_id} ended: {ending}"
+
+# evaluate_to hit report (section 6.1; Phase D sentence group 1)
+HIT_HEADLINE = "Breakpoint hit: {where} before {anchor}."
+HIT_HEADLINE_NO_ANCHOR = "Breakpoint hit: {where}."
+HIT_HEADLINE_NO_POSITION = "Breakpoint hit."
+LOCALS_HEADER = "Locals of frame 0:"
+HIT_REPORT_TAIL = (
+    "Evaluation is paused, NOT finished. Inspect with "
+    "`isabelle_eval_at_breakpoint` / `isabelle_locals_at_breakpoint` / "
+    "`isabelle_step_at_breakpoint`, or resume with "
+    "`isabelle_continue_breakpoint`."
+)
+LOCALS_FETCH_TIMEOUT = (
+    "Locals of frame 0 could not be fetched in time — use "
+    "`isabelle_locals_at_breakpoint` to fetch them."
+)
+
+# evaluate_to refusal while hits are live (section 6.1; group 3).
+# {at_breakpoints} is "a breakpoint" / "2 breakpoints"; {hits} enumerates
+# "hit id h1 at Foo.thy:14 before ‹fold upd args›" rows (anchor and
+# position degrade exactly as the headline does), joined by ", ".
+EVAL_TO_REFUSED = (
+    "Evaluation is paused at {at_breakpoints} — {hits}. "
+    "`isabelle_evaluate_to` cannot run while a hit is live. Inspect with "
+    "`isabelle_debug_state`, resume breakpoints with "
+    "`isabelle_continue_breakpoint`."
+)
+HIT_REF = "hit id {hit_id} at {where} before {anchor}"
+HIT_REF_NO_ANCHOR = "hit id {hit_id} at {where}"
+HIT_REF_NO_POSITION = "hit id {hit_id}"
+
+# implicit-fetch collision refusal (group 4)
+IMPLICIT_FETCH_RUNNING = (
+    "An implicit locals fetch is still running on this hit — retry in a "
+    "few seconds."
+)
+
+# the forgotten-re-enable fence (section 5; group 5)
+FENCE_WARNING = (
+    "{n} breakpoints in the files this run executes are not armed — the "
+    "run will not stop at them. Call `isabelle_enable_all_breakpoints` to "
+    "arm them."
+)
+FENCE_WARNING_ONE = (
+    "1 breakpoint in the files this run executes is not armed — the run "
+    "will not stop at it. Call `isabelle_enable_all_breakpoints` to arm "
+    "it."
+)
+
+# cancellation (section 6.4; groups 6-7)
+ENDED_CANCELLED = "it was swept up by `isabelle_cancel_evaluation`."
+HITS_SWEPT = "{n} hits were swept up; their threads are no longer stopped."
+HITS_SWEPT_ONE = "1 hit was swept up; its thread is no longer stopped."
+
+# evaluation_status paused section (group 8)
+PAUSED_LEAD_ONE = (
+    "Evaluation is paused at a breakpoint; it will not progress until the "
+    "hit is resumed with `isabelle_continue_breakpoint`."
+)
+PAUSED_LEAD_MANY = (
+    "Evaluation is paused at {n} breakpoints; it will not progress until "
+    "the hits are resumed with `isabelle_continue_breakpoint`."
+)
+PAUSED_TAIL = (
+    "Inspect with `isabelle_eval_at_breakpoint` / "
+    "`isabelle_locals_at_breakpoint`, or step with "
+    "`isabelle_step_at_breakpoint`."
+)
 
 
 # ── Anchor snippets (section 3.2) ──────────────────────────────────────
@@ -504,6 +580,10 @@ class Breakpoint:
     state: str = ARMED        # entries are only ever created armed
     reason: str | None = None  # section-4.4 tag while pending
     serial: int | None = None  # the live site's serial while armed
+    # Arming-time stat signature of a .ML file (None for .thy): the fence's
+    # "recorded position is no longer processed" test for blobs, which have
+    # no decoration tracker (section 5).
+    ml_sig: tuple[int, int, int, int] | None = None
 
 
 @dataclass
@@ -522,6 +602,10 @@ class Hit:
     # The outstanding eval/locals round trip, so a second request is
     # refused and the abort tool can wait on its target's own reply.
     eval_task: asyncio.Task[Any] | None = None
+    # Whether eval_task is the report's implicit locals fetch — a collision
+    # with it gets its own refusal, never the previous-evaluation sentence
+    # about an evaluation the agent never issued (section 6.1).
+    eval_implicit: bool = False
 
 
 class DebuggerRegistry:
@@ -538,6 +622,12 @@ class DebuggerRegistry:
         self.retired: dict[str, str] = {}   # hit_id -> how it ended
         self._hit_seq = 0
         self._notices: list[str] = []
+        # Dirty marks (Phase D bookkeeping): realpaths of files whose sites
+        # MAY have died — didChange sent, or a dependency blob's stat
+        # signature changed. Reconciliation pops the whole set synchronously
+        # and verifies by listing; a concurrent event during the listing
+        # round trip sets a fresh mark that survives to the next pass.
+        self._dirty: set[str] = set()
         # Index into client.debugger_state_history already folded into the
         # hit table; the history is replayed in order so a resume-and-restop
         # between two tool calls still yields retire + new hit.
@@ -547,6 +637,24 @@ class DebuggerRegistry:
 
     def add_notice(self, text: str) -> None:
         self._notices.append(text)
+
+    def consume_new_hit_notice(self, hit: Hit) -> None:
+        """Remove *hit*'s queued new-hit notice, if still buffered: a result
+        that leads with the hit must not deliver it twice in two formats
+        (section 6.1)."""
+        text = NOTICE_NEW_HIT.format(thread=hit.thread, hit_id=hit.hit_id)
+        if text in self._notices:
+            self._notices.remove(text)
+
+    def mark_dirty(self, file_path: str) -> None:
+        self._dirty.add(os.path.realpath(file_path))
+
+    def pop_dirty(self) -> set[str]:
+        """Take ALL dirty marks, atomically (synchronous — no await between
+        the read and the clear)."""
+        marks = self._dirty
+        self._dirty = set()
+        return marks
 
     def drain_notices(self) -> str | None:
         """The buffered notices as one block, clearing the buffer — each
@@ -623,8 +731,8 @@ class DebuggerRegistry:
             raise IsabelleToolError(NO_HIT_LIVE)
         if len(live) > 1:
             rows = indent_rows([
-                HIT_HEADER.format(hit_id=h.hit_id, thread=h.thread)
-                for h in live])
+                SEVERAL_HITS_ROW.format(hit_id=h.hit_id, thread=h.thread)
+                for h in live], indent="  ")
             raise IsabelleToolError(SEVERAL_HITS + "\n" + rows)
         return live[0]
 
@@ -661,6 +769,15 @@ class DebuggerRegistry:
         real = os.path.realpath(file_path)
         return [e for e in self.entries if e.file_path == real]
 
+    def demote_all_armed(self, client: IsabelleLSPClient, tag: str) -> None:
+        """Wire-free demotion of every armed entry — for events where site
+        death is CERTAIN (cancellation: the synthetic edit invalidates every
+        serial, and the listing answers `outdated` until a re-evaluation, so
+        verifying by listing would only burn the retry budget)."""
+        for entry in self.entries:
+            if entry.state == ARMED:
+                self.demote(client, entry, tag)
+
     # ── prover teardown (design: the hit table is cleared on EVERY
     #    prover teardown path; entries are retained and demoted) ──────
 
@@ -681,6 +798,9 @@ class DebuggerRegistry:
                     anchor=cartouche(entry.anchor),
                     tag=TAG_NOT_EVALUATED))
         self._consumed = 0
+        # Marks refer to the dead prover's serials; every entry is pending
+        # now, and reconciliation only demotes armed entries — drop them.
+        self._dirty.clear()
 
 
 registry = DebuggerRegistry()
@@ -875,6 +995,7 @@ async def _record_armed(
     keep.reason = None
     keep.line = site.line      # re-anchor: arming-time resolution updates
     keep.anchor = site.anchor  # the recorded line and snippet
+    keep.ml_sig = _stat_sig(file_path) if file_path.endswith(".ML") else None
     return keep
 
 
@@ -1157,6 +1278,8 @@ async def _arm_entry(
         entry.reason = None
         entry.line = site.line
         entry.anchor = site.anchor
+        entry.ml_sig = _stat_sig(entry.file_path) \
+            if entry.file_path.endswith(".ML") else None
         return registry.entry_row(client, entry)
     if status == "unfinished":
         registry.demote(client, entry, TAG_STILL_EVALUATING)
@@ -1269,7 +1392,16 @@ def debug_state(client: IsabelleLSPClient) -> str:
 
 def _check_eval_fence(hit: Hit) -> None:
     if hit.eval_task is not None and not hit.eval_task.done():
-        raise IsabelleToolError(EVAL_OUTSTANDING)
+        raise IsabelleToolError(
+            IMPLICIT_FETCH_RUNNING if hit.eval_implicit else EVAL_OUTSTANDING)
+
+
+def _eval_output_text(reply: dict[str, Any]) -> str:
+    texts = []
+    for m in reply.get("messages", []):
+        kind, text = m.get("kind", ""), m.get("text", "")
+        texts.append(text if kind in ("", "writeln") else f"[{kind}] {text}")
+    return "\n".join(texts)
 
 
 def _render_eval_reply(
@@ -1277,12 +1409,7 @@ def _render_eval_reply(
 ) -> str:
     status = reply.get("status")
     if status == "ok":
-        texts = []
-        for m in reply.get("messages", []):
-            kind, text = m.get("kind", ""), m.get("text", "")
-            texts.append(text if kind in ("", "writeln")
-                         else f"[{kind}] {text}")
-        return "\n".join(texts) if texts else EVAL_NO_OUTPUT
+        return _eval_output_text(reply) or EVAL_NO_OUTPUT
     if status == "timeout":
         raise IsabelleToolError(EVAL_BACKSTOP_TIMEOUT.format(
             seconds=int(timeout)))
@@ -1314,6 +1441,7 @@ async def eval_at_breakpoint(
         hit.thread, expr, frame=frame, timeout=timeout,
         request_timeout=timeout + REQUEST_MARGIN))
     hit.eval_task = task
+    hit.eval_implicit = False
     reply = await task
     registry.sync_hits(client)
     return _render_eval_reply(reply, hit.hit_id, timeout)
@@ -1333,6 +1461,7 @@ async def locals_at_breakpoint(
         hit.thread, frame=frame, timeout=timeout,
         request_timeout=timeout + REQUEST_MARGIN))
     hit.eval_task = task
+    hit.eval_implicit = False
     reply = await task
     registry.sync_hits(client)
     return _render_eval_reply(reply, hit.hit_id, timeout)
@@ -1433,6 +1562,352 @@ async def step_at_breakpoint(
         # map's evidence (the thread is not stopped).
         registry._retire(hit, ENDED_STEP_LEFT)
     return STEP_DID_NOT_STOP.format(seconds=int(STEP_WAIT))
+
+
+# ── Phase D: evaluation and cancellation integration ───────────────────
+#
+# The functions below are called from evaluation.py and the middleware
+# (late imports there — this module owns every agent-facing sentence).
+
+
+def _hit_frame0_position(hit: Hit) -> tuple[str, int] | None:
+    """realpath(frame-0 file) and its 1-indexed line, or None when frame 0
+    carries no resolvable position (D1 leaves such frames bare) or the path
+    is malformed (realpath raising ValueError fails open into "no
+    position", never into the teardown path)."""
+    frame0 = hit.stack[0] if hit.stack else {}
+    file, line = frame0.get("file"), frame0.get("line")
+    if not file or not isinstance(line, int):
+        return None
+    try:
+        return os.path.realpath(file), line
+    except ValueError:
+        return None
+
+
+def _hit_anchor(
+    client: IsabelleLSPClient, file_path: str, line: int,
+) -> str | None:
+    """The source of a hit report's `before ‹anchor›` phrase (approved +
+    verified): EXACTLY ONE armed entry at (realpath(frame-0 file), line)
+    whose recorded anchor still occurs on the current text of that line;
+    anything else omits the phrase. Never computed fresh — only the line is
+    known, not the site."""
+    matches = [
+        e for e in registry.entries
+        if e.state == ARMED and e.file_path == file_path
+        and e.line == line and e.anchor
+    ]
+    if len(matches) != 1:
+        return None
+    anchor = matches[0].anchor
+    lines = _file_lines(client, file_path)
+    text = lines[line - 1] if 0 < line <= len(lines) else ""
+    if not find_symbol_occurrences(text, anchor):
+        return None
+    return anchor
+
+
+def _hit_where(
+    client: IsabelleLSPClient, hit: Hit,
+) -> tuple[str, str | None] | None:
+    """(display position, anchor-or-None) of a hit, or None without one."""
+    pos = _hit_frame0_position(hit)
+    if pos is None:
+        return None
+    file_path, line = pos
+    where = f"{_display_path(client, file_path)}:{line}"
+    return where, _hit_anchor(client, file_path, line)
+
+
+def _hit_headline(client: IsabelleLSPClient, hit: Hit) -> str:
+    located = _hit_where(client, hit)
+    if located is None:
+        return HIT_HEADLINE_NO_POSITION
+    where, anchor = located
+    if anchor is None:
+        return HIT_HEADLINE_NO_ANCHOR.format(where=where)
+    return HIT_HEADLINE.format(where=where, anchor=cartouche(anchor))
+
+
+def _hit_ref(client: IsabelleLSPClient, hit: Hit) -> str:
+    located = _hit_where(client, hit)
+    if located is None:
+        return HIT_REF_NO_POSITION.format(hit_id=hit.hit_id)
+    where, anchor = located
+    if anchor is None:
+        return HIT_REF_NO_ANCHOR.format(hit_id=hit.hit_id, where=where)
+    return HIT_REF.format(hit_id=hit.hit_id, where=where,
+                          anchor=cartouche(anchor))
+
+
+def hits_live_refusal(client: IsabelleLSPClient) -> str | None:
+    """section 6.1's evaluate_to refusal while hits are live, or None. Runs
+    at evaluate_to's entry BEFORE the active-evaluation refusal (pinned
+    ordering: the other refusal tells the agent to cancel, which would
+    destroy the hits). Consumes the named hits' queued new-hit notices.
+    Synchronous."""
+    if not client.debug:
+        return None
+    registry.sync_hits(client)
+    hits = list(registry.hits.values())
+    if not hits:
+        return None
+    for hit in hits:
+        registry.consume_new_hit_notice(hit)
+    at_breakpoints = "a breakpoint" if len(hits) == 1 \
+        else f"{len(hits)} breakpoints"
+    return EVAL_TO_REFUSED.format(
+        at_breakpoints=at_breakpoints,
+        hits=", ".join(_hit_ref(client, h) for h in hits))
+
+
+async def _implicit_locals(client: IsabelleLSPClient, hit: Hit) -> str:
+    """One hit's implicit frame-0 locals section for the report, or "" to
+    omit it. The 10 s bound IS the prover-side debug_eval deadline — at
+    expiry the evaluation ends with an ordinary exception and only the
+    listing is lost (never destructive). Registered in hit.eval_task, so it
+    fences agent evals (with its own refusal) and the abort path can wait
+    on it. The per-value 5 s bound applies inside (mcp_prelude)."""
+    task = asyncio.create_task(client.debugger_print_vals(
+        hit.thread, frame=0, timeout=IMPLICIT_LOCALS_TIMEOUT,
+        request_timeout=IMPLICIT_LOCALS_TIMEOUT + REQUEST_MARGIN))
+    hit.eval_task = task
+    hit.eval_implicit = True
+    try:
+        reply = await task
+    except IsabelleToolError:
+        return ""
+    status = reply.get("status")
+    if status == "timeout":
+        return LOCALS_FETCH_TIMEOUT
+    if status != "ok":
+        # resumed / busy / crashed: nothing true to say in a locals
+        # section — those states surface through the hit bookkeeping.
+        return ""
+    body = _eval_output_text(reply)
+    if not body:
+        return ""
+    return LOCALS_HEADER + "\n" + indent_rows(body.split("\n"), indent="  ")
+
+
+async def hit_report(client: IsabelleLSPClient) -> str:
+    """section 6.1's hit report: ALL live hits, each with headline, hit
+    block and implicit frame-0 locals; the tail once. Render order (pinned):
+    final sync_hits, then every hit header — including the anchor
+    decisions — in ONE synchronous pass, THEN the concurrent locals fetches
+    (the registry lock is not held across them). Consumes the reported
+    hits' queued new-hit notices — the report already leads with them."""
+    registry.sync_hits(client)
+    hits = list(registry.hits.values())
+    heads = []
+    for hit in hits:
+        registry.consume_new_hit_notice(hit)
+        heads.append(_hit_headline(client, hit) + "\n" + _hit_block(hit))
+    locals_sections = await asyncio.gather(
+        *(_implicit_locals(client, h) for h in hits))
+    blocks = [
+        head + ("\n" + section if section else "")
+        for head, section in zip(heads, locals_sections)
+    ]
+    blocks.append(HIT_REPORT_TAIL)
+    return "\n\n".join(blocks)
+
+
+def paused_section(client: IsabelleLSPClient) -> str | None:
+    """The evaluation_status paused section (group 8): leads the result
+    whenever hits are live; None otherwise. Synchronous."""
+    if not client.debug:
+        return None
+    registry.sync_hits(client)
+    hits = list(registry.hits.values())
+    if not hits:
+        return None
+    lead = PAUSED_LEAD_ONE if len(hits) == 1 \
+        else PAUSED_LEAD_MANY.format(n=len(hits))
+    return "\n\n".join([lead, *(_hit_block(h) for h in hits), PAUSED_TAIL])
+
+
+def _transitive_importers(
+    marked_nodes: set[str], raw_theories: list[dict[str, Any]],
+) -> set[str]:
+    """realpaths of every theory that transitively imports one of the
+    marked files, per theory_status's header-import graph (theory names on
+    the edges, node_names on the nodes)."""
+    by_name: dict[str, str] = {}
+    imports: dict[str, list[str]] = {}
+    for t in raw_theories:
+        name = t.get("theory_name") or ""
+        node = t.get("node_name") or ""
+        if not name or not node:
+            continue
+        by_name[name] = os.path.realpath(node)
+        imports[name] = [
+            i.get("theory_name", "") for i in t.get("imports", [])]
+    tainted = {n for n, node in by_name.items() if node in marked_nodes}
+    changed = True
+    while changed:
+        changed = False
+        for name, imps in imports.items():
+            if name not in tainted and any(i in tainted for i in imps):
+                tainted.add(name)
+                changed = True
+    return {by_name[n] for n in tainted}
+
+
+async def reconcile_dirty(client: IsabelleLSPClient) -> None:
+    """Phase D2 reconciliation (the reviewed Scheme A): pop the dirty marks
+    synchronously, expand them (import propagation + the accepted .ML
+    over-approximation), then verify each affected armed entry against a
+    fresh listing — an entry stays armed iff its recorded serial is listed.
+    Only demotes; never toggles, never arms. Runs in the middleware after
+    sync_hits, before the notices are drained."""
+    marks = registry.pop_dirty()   # synchronous: before the first await
+    if not marks:
+        return
+    armed_files = {
+        e.file_path for e in registry.entries if e.state == ARMED}
+    if not armed_files:
+        return
+    targets = marks & armed_files
+    if any(m.endswith(".ML") for m in marks):
+        # A blob change kills serials in its loading theory and importers,
+        # but theory_status carries no blob↔loader edges: mark ALL
+        # armed-entry files (accepted over-approximation, user 2026-08-19).
+        targets = set(armed_files)
+    thy_marks = {m for m in marks if not m.endswith(".ML")}
+    if thy_marks and targets < armed_files:
+        # Theory-edit propagation: transitive importers of a marked theory
+        # lose serials too (execution chaining), and so can .ML blobs
+        # loaded downstream — the graph cannot express blobs, so all
+        # armed-entry .ML files ride along (same over-approximation).
+        targets |= {f for f in armed_files if f.endswith(".ML")}
+        try:
+            raw = await client.request_theory_status()
+        except IsabelleToolError:
+            # No graph to propagate over: over-approximate to every
+            # armed-entry file — the listing verification below is what
+            # protects against false demotion either way.
+            targets = set(armed_files)
+        else:
+            targets |= _transitive_importers(thy_marks, raw) & armed_files
+    for path in sorted(targets):
+        async with registry.lock:
+            entries = [
+                e for e in registry.entries
+                if e.file_path == path and e.state == ARMED]
+            if not entries:
+                continue
+            try:
+                sites, _lines = await fetch_sites(client, path)
+            except FileNotOpenInProver:
+                for entry in entries:
+                    registry.demote(client, entry, TAG_NOT_EVALUATED)
+                continue
+            except IsabelleToolError:
+                for entry in entries:
+                    registry.demote(client, entry, TAG_WIRE_FAILURE)
+                continue
+            listed = {site.serial for site in sites}
+            for entry in entries:
+                if entry.serial not in listed:
+                    registry.demote(client, entry, TAG_NOT_EVALUATED)
+
+
+def _position_reburied(client: IsabelleLSPClient, entry: Breakpoint) -> bool:
+    """Fence bullet 2: the armed entry's recorded position is no longer
+    processed — the site this very run is about to rebury. `.thy` asks the
+    decoration tracker; `.ML` compares the blob's stat signature against
+    the arming-time one. UNKNOWN and RUNNING do not count: the edit clock
+    is global, and a warning that fires on every healthy run stops being
+    read (section 5's rationale for excluding `code not found`)."""
+    from isabelle_mcp import processing
+    if entry.file_path.endswith(".ML"):
+        return entry.ml_sig is not None \
+            and _stat_sig(entry.file_path) != entry.ml_sig
+    state = _position_state(client, entry.file_path, entry.line)
+    return state in (processing.NOT_EVALUATED, processing.CANCELLED)
+
+
+async def forgotten_arming_fence(
+    client: IsabelleLSPClient, target_file: str,
+) -> str | None:
+    """section 5's forgotten-re-enable fence, computed at evaluate_to's
+    start: over the current evaluation's theory set, count enabled pending
+    entries except `code not found` (their arming attempt ran and failed)
+    plus enabled armed entries whose recorded position is no longer
+    processed. Emits the warning as the returned result line AND as a
+    debugger notice (the query tools' auto-start path discards a
+    promptly-completed view, the notice still delivers). None when quiet."""
+    if not client.debug:
+        return None
+    candidates = [
+        e for e in registry.entries if e.enabled and (
+            (e.state == PENDING and e.reason != TAG_CODE_NOT_FOUND)
+            or (e.state == ARMED and _position_reburied(client, e)))
+    ]
+    if not candidates:
+        return None
+    from isabelle_mcp.evaluation import (
+        _parse_theory_status,
+        evaluation_theory_set,
+    )
+    try:
+        raw = await client.request_theory_status()
+    except IsabelleToolError:
+        logger.warning("fence skipped: theory_status failed")
+        return None
+    theories = [_parse_theory_status(t) for t in raw]
+    theory_set = evaluation_theory_set(target_file, set(), theories)
+    n = sum(1 for e in candidates if e.file_path in theory_set)
+    if not n:
+        return None
+    line = FENCE_WARNING_ONE if n == 1 else FENCE_WARNING.format(n=n)
+    registry.add_notice(line)
+    return line
+
+
+def mark_hits_swept(client: IsabelleLSPClient) -> list[Hit]:
+    """Cancellation, before the interrupt: attribute the coming retirements
+    (section 6.4) so they happen silently — the attributed-ending
+    precedent; the ending clause survives only in the stale-id refusal.
+    Synchronous."""
+    if not client.debug:
+        return []
+    registry.sync_hits(client)
+    hits = list(registry.hits.values())
+    for hit in hits:
+        hit.pending_ending = ENDED_CANCELLED
+    return hits
+
+
+async def finish_cancel_sweep(
+    client: IsabelleLSPClient, marked: list[Hit],
+) -> str | None:
+    """Cancellation, after the interrupt: bounded wait for the swept
+    threads to leave the debugger map, then the certain-death demote-all
+    (wire-free — probe 7: the listing answers `outdated` until a
+    re-evaluation, so verifying by listing would only burn the retry
+    budget). Returns the swept-hits result line, or None when no hit was
+    actually swept (a still-stopped hit stays live; its attributed ending
+    stands for whenever the interrupt lands)."""
+    if not client.debug:
+        return None
+    # Demote FIRST (synchronously, before the wait): a cancel re-delivered
+    # on the wait below must not cost the demote-all its turn.
+    async with registry.lock:
+        registry.demote_all_armed(client, TAG_NOT_EVALUATED)
+    if marked:
+        await client.wait_debugger_event(
+            lambda c: all(
+                not c.debugger_threads.get(h.thread) for h in marked),
+            timeout=CANCEL_SWEEP_WAIT)
+    registry.sync_hits(client)
+    swept = [h for h in marked if h.hit_id in registry.retired]
+    if not swept:
+        return None
+    return HITS_SWEPT_ONE if len(swept) == 1 \
+        else HITS_SWEPT.format(n=len(swept))
 
 
 async def abort_eval_at_breakpoint(

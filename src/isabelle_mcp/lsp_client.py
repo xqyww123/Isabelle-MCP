@@ -1346,6 +1346,11 @@ class IsabelleLSPClient:
                 })
                 doc.needs_full_sync = False
                 note_edit_sent()
+                # Phase D bookkeeping: a didChange actually went out — the
+                # file's breakable-site serials may be dead. Lazy import:
+                # debugger.py imports this module at its top.
+                from isabelle_mcp.debugger import registry as _bp_registry
+                _bp_registry.mark_dirty(path)
             doc.stat_sig = _stat_sig(path)
 
     # ── Standard LSP queries ────────────────────────────────────────────

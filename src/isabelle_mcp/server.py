@@ -142,6 +142,12 @@ class UnicodeWarningMiddleware(Middleware):
         client = _lsp_client
         if client is not None and client.process is not None and client.debug:
             debugger.registry.sync_hits(client)
+            try:
+                await debugger.reconcile_dirty(client)
+            except Exception:
+                # Reconciliation must never fail a tool call that
+                # succeeded; unpopped work re-marks on the next event.
+                logger.exception("breakpoint reconciliation failed")
         notices = debugger.registry.drain_notices()
         if notices is not None:
             result.content = [
@@ -478,13 +484,16 @@ async def isabelle_evaluation_status() -> ToolResult:
     """
     client = await _ensure_lsp_started()
     view = await evaluation_status(client)
-    return ToolResult(content=[TextContent(
-        # No "call isabelle_evaluation_status" here: this IS that tool.
-        type="text",
-        text=format_evaluation_result(
-            view, client.project_root, call_to_action=False,
-        ),
-    )])
+    # No "call isabelle_evaluation_status" here: this IS that tool.
+    text = format_evaluation_result(
+        view, client.project_root, call_to_action=False,
+    )
+    # The paused-at-a-breakpoint section leads whenever hits are live
+    # (section 6.1): polling must never misread a stop as a hang.
+    paused = debugger.paused_section(client)
+    if paused is not None:
+        text = paused + "\n\n" + text
+    return ToolResult(content=[TextContent(type="text", text=text)])
 
 
 @mcp.tool(output_schema=None)
@@ -877,7 +886,8 @@ async def isabelle_eval_at_breakpoint(
         hit_id: The hit to evaluate at (e.g. "h1", as shown by
             isabelle_debug_state). May be omitted when exactly one hit is
             live.
-        frame: Stack frame index from the call stack (0 = innermost).
+        frame: Stack frame index from the call stack (frame 0 is the
+            innermost, top of the stack; outer frames follow).
         timeout: Seconds before the evaluation is cut off.
     """
     client = await _ensure_lsp_started()
@@ -897,7 +907,8 @@ async def isabelle_locals_at_breakpoint(
         hit_id: The hit to inspect (e.g. "h1", as shown by
             isabelle_debug_state). May be omitted when exactly one hit is
             live.
-        frame: Stack frame index from the call stack (0 = innermost).
+        frame: Stack frame index from the call stack (frame 0 is the
+            innermost, top of the stack; outer frames follow).
         timeout: Seconds before the listing is cut off.
     """
     client = await _ensure_lsp_started()

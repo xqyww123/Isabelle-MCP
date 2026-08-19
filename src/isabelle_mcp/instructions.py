@@ -78,8 +78,8 @@ tools. Turning `debug` on or off needs `isabelle_terminate` first.
   `isabelle_locals_at_breakpoint` and `isabelle_eval_at_breakpoint`; resume
   with `isabelle_continue_breakpoint` or `isabelle_step_at_breakpoint`.
   Resuming ends the hit — stopping again is a new hit with a new id. A
-  **frame** is one entry of a hit's call stack; frame 0 is where execution
-  stopped.
+  **frame** is one entry of a hit's call stack; frame 0 is the innermost,
+  top of the stack; outer frames follow.
 
 The usual workflow: evaluate up to the end of the ML block that defines the
 code, or the `ML_file` command that loads it, then set the breakpoint and

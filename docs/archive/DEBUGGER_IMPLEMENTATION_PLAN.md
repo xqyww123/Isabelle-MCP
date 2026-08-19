@@ -108,16 +108,16 @@ the Phase C section below, including the user decisions that overrode the
 specification during the wording review).  A two-workflow adversarial review
 on 2026-08-19 confirmed four defects; **the fix round of "Phase C review
 round (2026-08-19)" below landed the same day** (implementation notes at the
-end of that section).  **Phase D: D1 landed
-(commit `4863066`); the full design is finalized and user-approved
-(2026-08-19, see the Phase D section) — implementation awaits the user's
-explicit go-ahead.**  Still open
+end of that section).  **Phase D landed in full
+2026-08-19** — D1 (commit `4863066`), then D2 + D3 + the sentence retrofit
+on the user's go-ahead, exactly per the finalized Phase D section
+(implementation notes at its end).  Next: Phase E.  Still open
 with the user: when to push (push only on explicit order; the parent-repo
 gitlink bump follows the usual recipe).  The repair
 round's contract remains in the "Phase A repair round" section; the full
 review verdict of the FIRST review is archived in
 [`DEBUGGER_REPAIR_REVIEW_VERDICT.md`](DEBUGGER_REPAIR_REVIEW_VERDICT.md).
-Current gate numbers: unit suite 621 passing; integration battery 25
+Current gate numbers: unit suite 680 passing; integration battery 25
 passing (tests/integration in one process run, incl. 13 debugger probes +
 2 ranged probes and the file-sync/query e2e tests).
 
@@ -1230,6 +1230,42 @@ part of the sentences):
         Evaluation is paused at a breakpoint; it will not progress until the hit is resumed with `isabelle_continue_breakpoint`.
         Evaluation is paused at {N} breakpoints; it will not progress until the hits are resumed with `isabelle_continue_breakpoint`.
         Inspect with `isabelle_eval_at_breakpoint` / `isabelle_locals_at_breakpoint`, or step with `isabelle_step_at_breakpoint`.
+
+### Implementation notes (landed 2026-08-19)
+
+Micro-decisions taken while implementing, all below the design's waterline
+(none touches an approved sentence or a pinned mechanism):
+
+- The hit report consumes the reported hits' queued new-hit notices, the
+  refusal's §6.1 rationale extended verbatim ("delivering the same hit
+  twice in two formats would only confuse") — the report leads with those
+  same hits.
+- Implicit locals: a non-timeout failure (resumed/busy/crashed), and an ok
+  reply with empty output, omit the Locals section — only the timeout has
+  an approved replacement sentence, and nothing true was available to say.
+- Fence bullet 2 (`.thy`): only NOT_EVALUATED and CANCELLED count as "no
+  longer processed"; UNKNOWN (the global post-edit grace) and RUNNING do
+  not — a warning that fires on every healthy run stops being read. A
+  theory_status failure skips the fence for that run (logged).
+- The fence reuses the current evaluation's theory set (one concept, one
+  definition; auto-opened is empty at run start by construction).
+- Dirty-mark propagation runs at reconciliation time from one fresh
+  theory_status (marking stays synchronous — no wire call on any push
+  path); a theory_status failure there over-approximates to every
+  armed-entry file (the listing verification guards against false
+  demotion either way).
+- `on_prover_teardown` also clears the dirty set (all entries are pending
+  then; the marks refer to a dead prover's serials).
+- The cancel sweep waits a bounded `CANCEL_SWEEP_WAIT = 5 s` for the swept
+  threads to leave the map before counting the result line; a hit still
+  stopped after that stays live with its attributed ending standing. The
+  demote-all runs BEFORE that wait, so a re-delivered cancel cannot cost
+  it its turn.
+- `_HitWatch`: when the elsewhere-verdict's one re-fetch itself fails, the
+  stale verdict stands (the notice still delivers; degraded, not wrong).
+- The hit exit is checked before the frontier decision in the wait loop —
+  a parked fork keeps the prefix busy, and the frontier's plain
+  in_progress return would bury the hit in a notice.
 
 ### Review provenance and killed findings (do NOT re-report)
 

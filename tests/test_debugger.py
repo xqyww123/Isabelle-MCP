@@ -92,6 +92,7 @@ class FakeDebugClient:
         self.toggle_replies: list[dict] = [{"status": "ok", "was": False}]
         self.eval_replies: list[dict] = [{"status": "ok", "messages": []}]
         self.abort_replies: list[dict] = [{"status": "no_evaluation"}]
+        self.theory_replies: list[list[dict]] = [[]]
         self.calls: list[tuple] = []
         # Optional hook run when a continue/step verb is delivered.
         self.on_input = None
@@ -101,6 +102,11 @@ class FakeDebugClient:
 
     def _pop(self, replies: list[dict]) -> dict:
         return replies.pop(0) if len(replies) > 1 else replies[0]
+
+    async def request_theory_status(self):
+        self.calls.append(("theory_status",))
+        return self.theory_replies.pop(0) if len(self.theory_replies) > 1 \
+            else self.theory_replies[0]
 
     async def debugger_breakpoints(self, file_path, *, timeout, request_timeout):
         self.calls.append(("breakpoints", file_path, timeout, request_timeout))
@@ -173,7 +179,7 @@ class TestSentenceCatalogue:
     def test_debug_off(self):
         assert debugger.DEBUG_OFF == (
             "Debugging is not enabled in this session. Call "
-            "isabelle_terminate, then isabelle_launch with debug=true."
+            "`isabelle_terminate`, then `isabelle_launch` with debug=true."
         )
 
     def test_set_breakpoint_refusals(self):
@@ -223,12 +229,14 @@ class TestSentenceCatalogue:
         assert debugger.NO_THREAD_STOPPED == "No thread is stopped."
         assert debugger.NO_HIT_LIVE == "No thread is stopped at a breakpoint."
         assert debugger.RETIRED_HIT == (
-            "Hit {hit_id} has ended: {ending} Call isabelle_debug_state for "
-            "the live hits."
+            "Hit id {hit_id} has ended: {ending} Call "
+            "`isabelle_debug_state` for the live hits."
         )
         assert debugger.ENDED_TERMINATED == "the prover was terminated."
         assert debugger.ENDED_CONTINUED == \
-            "it was resumed by isabelle_continue_breakpoint."
+            "it was resumed by `isabelle_continue_breakpoint`."
+        assert debugger.ENDED_CANCELLED == \
+            "it was swept up by `isabelle_cancel_evaluation`."
 
     def test_eval_sentences(self):
         assert debugger.EMPTY_EXPR == (
@@ -253,7 +261,7 @@ class TestSentenceCatalogue:
         )
         assert debugger.ABORT_UNCONFIRMED == (
             "The evaluation did not end within {seconds}s. Some ML code "
-            "cannot be interrupted at all; isabelle_cancel_evaluation is "
+            "cannot be interrupted at all; `isabelle_cancel_evaluation` is "
             "the way out."
         )
 
@@ -397,8 +405,8 @@ class TestHitSync:
         notices = debugger.registry.drain_notices()
         assert notices == (
             "Debugger notices:\n"
-            "- thread worker-3 stopped at a breakpoint — hit h1; inspect "
-            "with isabelle_debug_state"
+            "- thread worker-3 stopped at a breakpoint — hit id h1; "
+            "inspect with `isabelle_debug_state`"
         )
         assert debugger.registry.drain_notices() is None  # delivered once
 
@@ -409,8 +417,8 @@ class TestHitSync:
         debugger.registry.sync_hits(client)
         assert debugger.registry.hits == {}
         assert debugger.registry.retired[hit.hit_id] == debugger.ENDED_RESUMED
-        assert "hit h1 ended: its thread resumed and is no longer stopped." \
-            in (debugger.registry.drain_notices() or "")
+        assert "hit id h1 ended: its thread resumed and is no longer " \
+            "stopped." in (debugger.registry.drain_notices() or "")
 
     def test_resume_and_restop_is_a_new_hit(self, client):
         _hit(client)
@@ -450,7 +458,7 @@ class TestHitSync:
         assert entry.state == PENDING and entry.serial is None
         assert entry.reason == debugger.TAG_NOT_EVALUATED
         notices = debugger.registry.drain_notices() or ""
-        assert "hit h1 ended: the prover was terminated." in notices
+        assert "hit id h1 ended: the prover was terminated." in notices
         assert "no longer works (not evaluated yet)" in notices
         assert debugger.registry._consumed == 0
 
@@ -460,8 +468,8 @@ class TestResolveHit:
         with pytest.raises(IsabelleToolError) as exc:
             debugger.registry.resolve_hit("h9")
         assert str(exc.value) == (
-            "There is no hit h9. Call isabelle_debug_state for the live "
-            "hits.")
+            "There is no hit id h9. Call `isabelle_debug_state` for the "
+            "live hits.")
 
     def test_retired_id_names_the_ending(self, client):
         hit = _hit(client)
@@ -470,8 +478,8 @@ class TestResolveHit:
         with pytest.raises(IsabelleToolError) as exc:
             debugger.registry.resolve_hit(hit.hit_id)
         assert str(exc.value) == (
-            "Hit h1 has ended: its thread resumed and is no longer stopped. "
-            "Call isabelle_debug_state for the live hits.")
+            "Hit id h1 has ended: its thread resumed and is no longer "
+            "stopped. Call `isabelle_debug_state` for the live hits.")
 
     def test_omitted_with_one_live(self, client):
         hit = _hit(client)
@@ -667,8 +675,8 @@ class TestDelBreakpoints:
         out = await debugger.del_breakpoints(client, [(THY, 99, None)])
         assert out == (
             f"deleted 0 breakpoints\n"
-            f"breakpoint not found — call isabelle_list_breakpoints to see "
-            f"the current breakpoints:\n"
+            f"breakpoint not found — call `isabelle_list_breakpoints` to "
+            f"see the current breakpoints:\n"
             f"  {THY}:99")
 
     @pytest.mark.asyncio
@@ -825,7 +833,7 @@ class TestEnableDisableAll:
         out = await debugger.disable_all_breakpoints(client, None)
         assert out == (
             "Switched off 1 armed breakpoint; 0 pending entries also marked "
-            "disabled. Re-enable with isabelle_enable_all_breakpoints.")
+            "disabled. Re-enable with `isabelle_enable_all_breakpoints`.")
         [entry] = debugger.registry.entries
         assert entry.state == ARMED and entry.enabled is False
         assert ("toggle", THY, 11, False) in client.calls
@@ -873,9 +881,10 @@ class TestDebugState:
         out = debugger.debug_state(client)
         assert out == (
             "1 hit is live.\n\n"
-            "Hit h1: thread worker-3.\n"
-            "Call stack (innermost first; the number is the frame "
-            "parameter):\n"
+            "Hit id: h1\n"
+            "thread worker-3\n"
+            "Call stack (frame 0 is the innermost, top of the stack; outer "
+            "frames follow):\n"
             "  frame 0  probe(1)xs-(1)"
         )
 
@@ -963,7 +972,7 @@ class TestContinueBreakpoint:
     async def test_resume_one(self, client):
         hit = _hit(client)
         out = await debugger.continue_breakpoint(client, hit.hit_id)
-        assert out == "Resumed hit h1 (thread worker-3)."
+        assert out == "Resumed hit id h1 (thread worker-3)."
         assert debugger.registry.hits == {}
         assert debugger.registry.retired["h1"] == debugger.ENDED_CONTINUED
 
@@ -992,7 +1001,7 @@ class TestStepAtBreakpoint:
             client.push_state({thread: new_stack})
         client.on_input = on_input
         out = await debugger.step_at_breakpoint(client, "step", hit.hit_id)
-        assert out.startswith("Hit h1 stopped again.")
+        assert out.startswith("Hit id h1 stopped again.")
         assert "probe(1)total-(1)" in out       # the post-step stack
         assert "probe(1)xs-(1)" not in out      # not the pre-step one
         assert list(debugger.registry.hits) == ["h1"]
@@ -1084,3 +1093,693 @@ class TestNotices:
         assert debugger.registry.drain_notices() == (
             "Debugger notices:\n- first thing\n- second thing")
         assert debugger.registry.drain_notices() is None
+
+
+# ── Phase D sentence groups, verbatim ──────────────────────────────────
+
+
+class TestPhaseDSentences:
+    def test_hit_report_sentences(self):
+        assert debugger.HIT_HEADLINE == \
+            "Breakpoint hit: {where} before {anchor}."
+        assert debugger.HIT_HEADLINE_NO_ANCHOR == "Breakpoint hit: {where}."
+        assert debugger.HIT_HEADLINE_NO_POSITION == "Breakpoint hit."
+        assert debugger.LOCALS_HEADER == "Locals of frame 0:"
+        assert debugger.HIT_REPORT_TAIL == (
+            "Evaluation is paused, NOT finished. Inspect with "
+            "`isabelle_eval_at_breakpoint` / `isabelle_locals_at_breakpoint`"
+            " / `isabelle_step_at_breakpoint`, or resume with "
+            "`isabelle_continue_breakpoint`."
+        )
+        assert debugger.LOCALS_FETCH_TIMEOUT == (
+            "Locals of frame 0 could not be fetched in time — use "
+            "`isabelle_locals_at_breakpoint` to fetch them."
+        )
+
+    def test_refusal_and_collision_sentences(self):
+        assert debugger.EVAL_TO_REFUSED == (
+            "Evaluation is paused at {at_breakpoints} — {hits}. "
+            "`isabelle_evaluate_to` cannot run while a hit is live. "
+            "Inspect with `isabelle_debug_state`, resume breakpoints with "
+            "`isabelle_continue_breakpoint`."
+        )
+        assert debugger.IMPLICIT_FETCH_RUNNING == (
+            "An implicit locals fetch is still running on this hit — "
+            "retry in a few seconds."
+        )
+
+    def test_fence_sentences(self):
+        assert debugger.FENCE_WARNING == (
+            "{n} breakpoints in the files this run executes are not armed "
+            "— the run will not stop at them. Call "
+            "`isabelle_enable_all_breakpoints` to arm them."
+        )
+        assert debugger.FENCE_WARNING_ONE == (
+            "1 breakpoint in the files this run executes is not armed — "
+            "the run will not stop at it. Call "
+            "`isabelle_enable_all_breakpoints` to arm it."
+        )
+
+    def test_cancellation_sentences(self):
+        assert debugger.HITS_SWEPT == (
+            "{n} hits were swept up; their threads are no longer stopped.")
+        assert debugger.HITS_SWEPT_ONE == (
+            "1 hit was swept up; its thread is no longer stopped.")
+
+    def test_paused_section_sentences(self):
+        assert debugger.PAUSED_LEAD_ONE == (
+            "Evaluation is paused at a breakpoint; it will not progress "
+            "until the hit is resumed with `isabelle_continue_breakpoint`."
+        )
+        assert debugger.PAUSED_LEAD_MANY == (
+            "Evaluation is paused at {n} breakpoints; it will not progress "
+            "until the hits are resumed with `isabelle_continue_breakpoint`."
+        )
+        assert debugger.PAUSED_TAIL == (
+            "Inspect with `isabelle_eval_at_breakpoint` / "
+            "`isabelle_locals_at_breakpoint`, or step with "
+            "`isabelle_step_at_breakpoint`."
+        )
+
+
+# ── Hit-report anchor sourcing (Phase D, verified scheme) ──────────────
+
+
+# A stack whose frame 0 resolves into the probe theory at the val xs line.
+LOCATED_STACK = [
+    {"function": "lookup", "file": THY, "line": VAL_XS, "pos": {}},
+    {"function": "resolve", "file": THY, "line": 5, "pos": {}},
+]
+
+
+def _armed_entry(line: int = VAL_XS, anchor: str = "val xs",
+                 path: str = THY, serial: int = 11) -> Breakpoint:
+    return Breakpoint(file_path=path, line=line, anchor=anchor,
+                      state=ARMED, serial=serial)
+
+
+class TestHitAnchorSourcing:
+    def test_exactly_one_matching_armed_entry_names_the_anchor(self, client):
+        debugger.registry.entries.append(_armed_entry())
+        assert debugger._hit_anchor(client, THY, VAL_XS) == "val xs"
+
+    def test_no_matching_entry_omits(self, client):
+        assert debugger._hit_anchor(client, THY, VAL_XS) is None
+
+    def test_two_matching_entries_omit(self, client):
+        debugger.registry.entries += [
+            _armed_entry(anchor="val xs", serial=11),
+            _armed_entry(anchor="map", serial=21),
+        ]
+        assert debugger._hit_anchor(client, THY, VAL_XS) is None
+
+    def test_pending_entry_is_not_a_source(self, client):
+        entry = _armed_entry()
+        entry.state = PENDING
+        entry.serial = None
+        debugger.registry.entries.append(entry)
+        assert debugger._hit_anchor(client, THY, VAL_XS) is None
+
+    def test_anchor_gone_from_the_line_omits(self, client):
+        debugger.registry.entries.append(
+            _armed_entry(anchor="vanished_text"))
+        assert debugger._hit_anchor(client, THY, VAL_XS) is None
+
+    def test_headline_degradation(self, client):
+        # No position at all.
+        hit = _hit(client)
+        assert debugger._hit_headline(client, hit) == "Breakpoint hit."
+        # Position but no anchor source.
+        hit.stack = LOCATED_STACK
+        assert debugger._hit_headline(client, hit) == \
+            f"Breakpoint hit: {THY}:{VAL_XS}."
+        # Position and exactly one matching armed entry.
+        debugger.registry.entries.append(_armed_entry())
+        assert debugger._hit_headline(client, hit) == \
+            f"Breakpoint hit: {THY}:{VAL_XS} before ‹val xs›."
+
+
+# ── evaluate_to refusal while hits are live (section 6.1) ──────────────
+
+
+class TestHitsLiveRefusal:
+    def test_no_hits_is_none(self, client):
+        assert debugger.hits_live_refusal(client) is None
+
+    def test_debug_off_is_none(self, client):
+        client.debug = False
+        assert debugger.hits_live_refusal(client) is None
+
+    def test_single_hit_sentence_verbatim(self, client):
+        client.project_root = "/fake"
+        client.push_state({"worker-3": [
+            {"function": "lookup", "file": THY, "line": VAL_XS, "pos": {}}]})
+        debugger.registry.sync_hits(client)
+        debugger.registry.entries.append(_armed_entry())
+        assert debugger.hits_live_refusal(client) == (
+            "Evaluation is paused at a breakpoint — hit id h1 at "
+            "DebugProbe.thy:7 before ‹val xs›. `isabelle_evaluate_to` "
+            "cannot run while a hit is live. Inspect with "
+            "`isabelle_debug_state`, resume breakpoints with "
+            "`isabelle_continue_breakpoint`."
+        )
+
+    def test_plural_lead_enumerates(self, client):
+        client.push_state({"worker-3": STACK, "worker-7": STACK})
+        debugger.registry.sync_hits(client)
+        msg = debugger.hits_live_refusal(client)
+        assert msg.startswith(
+            "Evaluation is paused at 2 breakpoints — hit id h1, hit id h2. ")
+
+    def test_consumes_the_named_hits_new_hit_notices(self, client):
+        _hit(client)
+        assert debugger.hits_live_refusal(client) is not None
+        assert debugger.registry.drain_notices() is None
+
+
+# ── The hit report (section 6.1) ───────────────────────────────────────
+
+
+def _run(coro):
+    return asyncio.get_event_loop_policy().new_event_loop().run_until_complete(coro)
+
+
+class TestHitReport:
+    @pytest.mark.asyncio
+    async def test_full_render(self, client):
+        client.push_state({"worker-3": LOCATED_STACK})
+        debugger.registry.sync_hits(client)
+        debugger.registry.entries.append(_armed_entry())
+        client.eval_replies = [{"status": "ok", "messages": [
+            {"kind": "writeln", "text": 'val xs = [2, 3, 4]: int list'}]}]
+        out = await debugger.hit_report(client)
+        assert out == (
+            f"Breakpoint hit: {THY}:{VAL_XS} before ‹val xs›.\n"
+            "Hit id: h1\n"
+            "thread worker-3\n"
+            "Call stack (frame 0 is the innermost, top of the stack; outer "
+            "frames follow):\n"
+            f"  frame 0  lookup   {THY}:{VAL_XS}\n"
+            f"  frame 1  resolve  {THY}:5\n"
+            "Locals of frame 0:\n"
+            "  val xs = [2, 3, 4]: int list\n\n"
+            "Evaluation is paused, NOT finished. Inspect with "
+            "`isabelle_eval_at_breakpoint` / `isabelle_locals_at_breakpoint`"
+            " / `isabelle_step_at_breakpoint`, or resume with "
+            "`isabelle_continue_breakpoint`."
+        )
+        # The implicit fetch went out with the 10 s never-destructive bound.
+        assert ("print_vals", "worker-3", 0, 10.0, 70.0) in client.calls
+
+    @pytest.mark.asyncio
+    async def test_whole_fetch_timeout_replaces_the_locals(self, client):
+        _hit(client)
+        client.eval_replies = [{"status": "timeout"}]
+        out = await debugger.hit_report(client)
+        assert debugger.LOCALS_FETCH_TIMEOUT in out
+        assert "Locals of frame 0:" not in out
+
+    @pytest.mark.asyncio
+    async def test_report_consumes_the_new_hit_notices(self, client):
+        _hit(client)
+        await debugger.hit_report(client)
+        assert debugger.registry.drain_notices() is None
+
+    @pytest.mark.asyncio
+    async def test_collision_with_implicit_fetch_has_its_own_refusal(
+            self, client):
+        hit = _hit(client)
+        hit.eval_task = asyncio.get_running_loop().create_future()
+        hit.eval_implicit = True
+        with pytest.raises(IsabelleToolError) as exc:
+            await debugger.eval_at_breakpoint(
+                client, "1 + 1", hit.hit_id, 0, 30.0)
+        assert str(exc.value) == debugger.IMPLICIT_FETCH_RUNNING
+        hit.eval_implicit = False
+        with pytest.raises(IsabelleToolError) as exc:
+            await debugger.eval_at_breakpoint(
+                client, "1 + 1", hit.hit_id, 0, 30.0)
+        assert str(exc.value) == debugger.EVAL_OUTSTANDING
+        hit.eval_task.cancel()
+
+
+# ── evaluation_status paused section (section 6.1) ─────────────────────
+
+
+class TestPausedSection:
+    def test_none_without_hits(self, client):
+        assert debugger.paused_section(client) is None
+
+    def test_single_hit(self, client):
+        _hit(client)
+        assert debugger.paused_section(client) == (
+            "Evaluation is paused at a breakpoint; it will not progress "
+            "until the hit is resumed with `isabelle_continue_breakpoint`."
+            "\n\n"
+            "Hit id: h1\n"
+            "thread worker-3\n"
+            "Call stack (frame 0 is the innermost, top of the stack; outer "
+            "frames follow):\n"
+            "  frame 0  probe(1)xs-(1)"
+            "\n\n"
+            "Inspect with `isabelle_eval_at_breakpoint` / "
+            "`isabelle_locals_at_breakpoint`, or step with "
+            "`isabelle_step_at_breakpoint`."
+        )
+
+    def test_two_hits_use_the_plural_lead(self, client):
+        client.push_state({"worker-3": STACK, "worker-7": STACK})
+        debugger.registry.sync_hits(client)
+        out = debugger.paused_section(client)
+        assert out.startswith("Evaluation is paused at 2 breakpoints; ")
+        assert out.count("Hit id:") == 2
+
+
+# ── D2: dirty marks and reconciliation (the reviewed Scheme A) ─────────
+
+
+def _theory(node: str, name: str, imports: list[str] = [],
+            external: bool = False) -> dict:
+    return {"node_name": node, "theory_name": name, "external": external,
+            "imports": [{"theory_name": i} for i in imports]}
+
+
+class TestReconcileDirty:
+    @pytest.mark.asyncio
+    async def test_no_marks_no_wire(self, client):
+        debugger.registry.entries.append(_armed_entry())
+        await debugger.reconcile_dirty(client)
+        assert client.calls == []
+
+    @pytest.mark.asyncio
+    async def test_no_armed_entries_no_wire(self, client):
+        debugger.registry.mark_dirty(THY)
+        await debugger.reconcile_dirty(client)
+        assert client.calls == []
+        # The mark was still consumed (pop happens before the check).
+        assert debugger.registry.pop_dirty() == set()
+
+    @pytest.mark.asyncio
+    async def test_dead_serial_demotes_as_not_evaluated(self, client):
+        entry = _armed_entry(serial=99)   # not in DEFAULT_SITES
+        debugger.registry.entries.append(entry)
+        debugger.registry.mark_dirty(THY)
+        await debugger.reconcile_dirty(client)
+        assert entry.state == PENDING
+        assert entry.reason == debugger.TAG_NOT_EVALUATED
+        assert "no longer works (not evaluated yet)" \
+            in (debugger.registry.drain_notices() or "")
+
+    @pytest.mark.asyncio
+    async def test_live_serial_stays_armed(self, client):
+        entry = _armed_entry(serial=11)   # listed in DEFAULT_SITES
+        debugger.registry.entries.append(entry)
+        debugger.registry.mark_dirty(THY)
+        await debugger.reconcile_dirty(client)
+        assert entry.state == ARMED and entry.serial == 11
+        assert debugger.registry.drain_notices() is None
+
+    @pytest.mark.asyncio
+    async def test_file_not_open_demotes_as_not_evaluated(self, client):
+        entry = _armed_entry(serial=11)
+        debugger.registry.entries.append(entry)
+        client.listing_replies = [_listing(open_=False)]
+        debugger.registry.mark_dirty(THY)
+        await debugger.reconcile_dirty(client)
+        assert entry.state == PENDING
+        assert entry.reason == debugger.TAG_NOT_EVALUATED
+
+    @pytest.mark.asyncio
+    async def test_listing_failure_demotes_as_wire_failure(self, client):
+        entry = _armed_entry(serial=11)
+        debugger.registry.entries.append(entry)
+        client.listing_replies = [_listing(status="error")]
+        debugger.registry.mark_dirty(THY)
+        await debugger.reconcile_dirty(client)
+        assert entry.state == PENDING
+        assert entry.reason == debugger.TAG_WIRE_FAILURE
+
+    @pytest.mark.asyncio
+    async def test_reconciliation_never_arms(self, client):
+        entry = Breakpoint(file_path=THY, line=VAL_XS, anchor="val xs",
+                           state=PENDING,
+                           reason=debugger.TAG_NOT_EVALUATED)
+        debugger.registry.entries.append(entry)
+        another = _armed_entry(serial=11)
+        debugger.registry.entries.append(another)
+        debugger.registry.mark_dirty(THY)
+        await debugger.reconcile_dirty(client)
+        assert entry.state == PENDING          # untouched
+        assert not any(c[0] == "toggle" for c in client.calls)
+
+    @pytest.mark.asyncio
+    async def test_marks_are_consumed_and_a_racing_mark_survives(
+            self, client):
+        entry = _armed_entry(serial=11)
+        debugger.registry.entries.append(entry)
+        debugger.registry.mark_dirty(THY)
+
+        real_breakpoints = client.debugger_breakpoints
+
+        async def racing_breakpoints(*a, **kw):
+            # An edit lands DURING the listing round trip: its fresh mark
+            # must survive this pass (consumed marks, never cleared).
+            debugger.registry.mark_dirty(THY)
+            return await real_breakpoints(*a, **kw)
+
+        client.debugger_breakpoints = racing_breakpoints
+        await debugger.reconcile_dirty(client)
+        assert debugger.registry.pop_dirty() == {THY}
+
+    @pytest.mark.asyncio
+    async def test_ml_mark_blasts_all_armed_files(self, client):
+        thy_entry = _armed_entry(serial=99)
+        ml_entry = _armed_entry(path=ML, serial=98)
+        debugger.registry.entries += [thy_entry, ml_entry]
+        client.open_documents[ML] = SimpleNamespace(content="fun f x = x")
+        debugger.registry.mark_dirty(ML)
+        await debugger.reconcile_dirty(client)
+        listed = [c[1] for c in client.calls if c[0] == "breakpoints"]
+        assert sorted(listed) == sorted([THY, ML])
+        assert thy_entry.state == PENDING and ml_entry.state == PENDING
+
+    @pytest.mark.asyncio
+    async def test_theory_mark_propagates_to_importers_and_ml(self, client):
+        upstream = "/fake/Base.thy"
+        importer_entry = _armed_entry(serial=99)          # in THY
+        ml_entry = _armed_entry(path=ML, serial=98)
+        unrelated = _armed_entry(path="/fake/Other.thy", serial=97)
+        debugger.registry.entries += [importer_entry, ml_entry, unrelated]
+        client.open_documents[ML] = SimpleNamespace(content="fun f x = x")
+        client.theory_replies = [[
+            _theory(upstream, "Base"),
+            _theory(THY, "DebugProbe", imports=["Base"]),
+            _theory("/fake/Other.thy", "Other"),
+        ]]
+        debugger.registry.mark_dirty(upstream)
+        await debugger.reconcile_dirty(client)
+        listed = {c[1] for c in client.calls if c[0] == "breakpoints"}
+        # THY imports Base (propagated); the .ML blob rides along; Other
+        # does not import Base and is left alone.
+        assert listed == {THY, ML}
+        assert unrelated.state == ARMED
+
+    @pytest.mark.asyncio
+    async def test_theory_status_failure_over_approximates(self, client):
+        entry = _armed_entry(serial=99)
+        unrelated = _armed_entry(path="/fake/Other.thy", serial=97)
+        debugger.registry.entries += [entry, unrelated]
+        client.open_documents["/fake/Other.thy"] = SimpleNamespace(
+            content="")
+
+        async def failing_theory_status():
+            raise IsabelleToolError("boom")
+
+        client.request_theory_status = failing_theory_status
+        debugger.registry.mark_dirty("/fake/Base.thy")
+        await debugger.reconcile_dirty(client)
+        listed = {c[1] for c in client.calls if c[0] == "breakpoints"}
+        assert listed == {THY, "/fake/Other.thy"}
+
+    def test_teardown_clears_the_marks(self, client):
+        debugger.registry.mark_dirty(THY)
+        debugger.registry.on_prover_teardown()
+        assert debugger.registry.pop_dirty() == set()
+
+
+# ── D2/D3: cancellation sweep (section 6.4) ────────────────────────────
+
+
+class TestCancellationSweep:
+    @pytest.mark.asyncio
+    async def test_sweep_is_silent_and_demotes_all(self, client):
+        hit = _hit(client)
+        entry = _armed_entry(serial=11)
+        debugger.registry.entries.append(entry)
+        debugger.registry.drain_notices()
+        marked = debugger.mark_hits_swept(client)
+        assert marked == [hit]
+        assert hit.pending_ending == debugger.ENDED_CANCELLED
+        client.push_state({})   # the interrupt freed the thread
+        line = await debugger.finish_cancel_sweep(client, marked)
+        assert line == "1 hit was swept up; its thread is no longer stopped."
+        assert debugger.registry.retired[hit.hit_id] == \
+            debugger.ENDED_CANCELLED
+        # Wire-free demote-all: no listing, no toggle — and the entry
+        # carries the self-resolving tag.
+        assert entry.state == PENDING
+        assert entry.reason == debugger.TAG_NOT_EVALUATED
+        assert not any(c[0] in ("breakpoints", "toggle")
+                       for c in client.calls)
+        notices = debugger.registry.drain_notices() or ""
+        # The retirement is silent (attributed ending); only the demotion
+        # notice appears.
+        assert "ended" not in notices
+        assert "no longer works (not evaluated yet)" in notices
+
+    @pytest.mark.asyncio
+    async def test_two_hits_pluralize(self, client):
+        client.push_state({"worker-3": STACK, "worker-7": STACK})
+        debugger.registry.sync_hits(client)
+        marked = debugger.mark_hits_swept(client)
+        client.push_state({})
+        line = await debugger.finish_cancel_sweep(client, marked)
+        assert line == \
+            "2 hits were swept up; their threads are no longer stopped."
+
+    @pytest.mark.asyncio
+    async def test_no_hits_no_line(self, client):
+        marked = debugger.mark_hits_swept(client)
+        assert marked == []
+        assert await debugger.finish_cancel_sweep(client, marked) is None
+
+    @pytest.mark.asyncio
+    async def test_stale_id_refusal_names_the_sweep(self, client):
+        hit = _hit(client)
+        marked = debugger.mark_hits_swept(client)
+        client.push_state({})
+        await debugger.finish_cancel_sweep(client, marked)
+        with pytest.raises(IsabelleToolError) as exc:
+            debugger.registry.resolve_hit(hit.hit_id)
+        assert str(exc.value) == (
+            "Hit id h1 has ended: it was swept up by "
+            "`isabelle_cancel_evaluation`. Call `isabelle_debug_state` for "
+            "the live hits.")
+
+
+# ── The forgotten-re-enable fence (section 5) ──────────────────────────
+
+
+class TestForgottenArmingFence:
+    def _theories(self):
+        return [[_theory(THY, "DebugProbe"),
+                 _theory(ML, "", external=True)]]
+
+    @pytest.mark.asyncio
+    async def test_enabled_pending_entry_warns_once_result_and_notice(
+            self, client):
+        debugger.registry.entries.append(Breakpoint(
+            file_path=THY, line=VAL_XS, anchor="val xs", state=PENDING,
+            reason=debugger.TAG_NOT_EVALUATED))
+        client.theory_replies = self._theories()
+        line = await debugger.forgotten_arming_fence(client, THY)
+        assert line == (
+            "1 breakpoint in the files this run executes is not armed — "
+            "the run will not stop at it. Call "
+            "`isabelle_enable_all_breakpoints` to arm it.")
+        assert line in (debugger.registry.drain_notices() or "")
+
+    @pytest.mark.asyncio
+    async def test_code_not_found_is_excluded(self, client):
+        debugger.registry.entries.append(Breakpoint(
+            file_path=THY, line=VAL_XS, anchor="val xs", state=PENDING,
+            reason=debugger.TAG_CODE_NOT_FOUND))
+        client.theory_replies = self._theories()
+        assert await debugger.forgotten_arming_fence(client, THY) is None
+        assert not any(c[0] == "theory_status" for c in client.calls)
+
+    @pytest.mark.asyncio
+    async def test_disabled_entries_stay_quiet(self, client):
+        debugger.registry.entries.append(Breakpoint(
+            file_path=THY, line=VAL_XS, anchor="val xs", state=PENDING,
+            reason=debugger.TAG_NOT_EVALUATED, enabled=False))
+        client.theory_replies = self._theories()
+        assert await debugger.forgotten_arming_fence(client, THY) is None
+
+    @pytest.mark.asyncio
+    async def test_entry_outside_the_theory_set_stays_quiet(self, client):
+        debugger.registry.entries.append(Breakpoint(
+            file_path="/fake/Elsewhere.thy", line=3, anchor="val x",
+            state=PENDING, reason=debugger.TAG_NOT_EVALUATED))
+        client.theory_replies = self._theories()
+        assert await debugger.forgotten_arming_fence(client, THY) is None
+
+    @pytest.mark.asyncio
+    async def test_armed_thy_entry_with_unprocessed_position_warns(
+            self, client):
+        debugger.registry.entries.append(_armed_entry(serial=11))
+        client.tracker = FakeTracker(state=processing.NOT_EVALUATED)
+        client.theory_replies = self._theories()
+        line = await debugger.forgotten_arming_fence(client, THY)
+        assert line is not None and line.startswith("1 breakpoint")
+
+    @pytest.mark.asyncio
+    async def test_armed_thy_entry_still_processed_stays_quiet(self, client):
+        debugger.registry.entries.append(_armed_entry(serial=11))
+        client.theory_replies = self._theories()   # tracker says PROCESSED
+        assert await debugger.forgotten_arming_fence(client, THY) is None
+
+    @pytest.mark.asyncio
+    async def test_armed_ml_entry_with_changed_sig_warns(
+            self, client, tmp_path):
+        blob = tmp_path / "tools.ML"
+        blob.write_text("fun f x = x\n")
+        entry = _armed_entry(path=str(blob), serial=11)
+        entry.ml_sig = (1, 2, 3, 4)    # arming-time signature, now stale
+        debugger.registry.entries.append(entry)
+        client.theory_replies = [[
+            _theory(THY, "DebugProbe"),
+            _theory(str(blob), "", external=True)]]
+        line = await debugger.forgotten_arming_fence(client, THY)
+        assert line is not None and line.startswith("1 breakpoint")
+
+    @pytest.mark.asyncio
+    async def test_two_entries_pluralize(self, client):
+        debugger.registry.entries += [
+            Breakpoint(file_path=THY, line=VAL_XS, anchor="val xs",
+                       state=PENDING, reason=debugger.TAG_NOT_EVALUATED),
+            Breakpoint(file_path=THY, line=VAL_SHIFT, anchor="val shift",
+                       state=PENDING, reason=debugger.TAG_STILL_EVALUATING),
+        ]
+        client.theory_replies = self._theories()
+        line = await debugger.forgotten_arming_fence(client, THY)
+        assert line == (
+            "2 breakpoints in the files this run executes are not armed — "
+            "the run will not stop at them. Call "
+            "`isabelle_enable_all_breakpoints` to arm them.")
+
+    @pytest.mark.asyncio
+    async def test_arming_records_the_ml_signature(self, client, tmp_path):
+        blob = tmp_path / "tools.ML"
+        blob.write_text("fun probe n = n\n")
+        path = str(blob)
+        client.open_documents[path] = SimpleNamespace(
+            content=blob.read_text())
+        client.listing_replies = [_listing(_bp(31, 1, 0))]
+        await debugger.set_breakpoint(client, path, 1, None)
+        [entry] = debugger.registry.entries
+        assert entry.ml_sig is not None
+        # A .thy arming records no signature.
+
+    @pytest.mark.asyncio
+    async def test_thy_arming_records_no_signature(self, client):
+        await debugger.set_breakpoint(client, THY, VAL_XS, None)
+        [entry] = debugger.registry.entries
+        assert entry.ml_sig is None
+
+
+# ── The current evaluation's theory set + the wait's third exit ────────
+# (evaluation.py units, tested here where the debugger fakes live)
+
+
+from isabelle_mcp.evaluation import (  # noqa: E402
+    _HitWatch,
+    _parse_theory_status,
+    evaluation_theory_set,
+)
+
+
+def _parsed(raw: list[dict]):
+    return [_parse_theory_status(t) for t in raw]
+
+
+class TestEvaluationTheorySet:
+    def test_target_alone(self):
+        assert evaluation_theory_set(THY, set(), []) == {THY}
+
+    def test_auto_opened_ride_along(self):
+        assert evaluation_theory_set(THY, {"/fake/Dep.thy"}, []) == \
+            {THY, "/fake/Dep.thy"}
+
+    def test_import_closure_node_names(self):
+        theories = _parsed([
+            _theory("/fake/Base.thy", "Base"),
+            _theory("/fake/Mid.thy", "Mid", imports=["Base"]),
+            _theory(THY, "DebugProbe", imports=["Mid"]),
+            _theory("/fake/Other.thy", "Other"),
+        ])
+        assert evaluation_theory_set(THY, set(), theories) == \
+            {THY, "/fake/Mid.thy", "/fake/Base.thy"}
+
+    def test_external_with_empty_theory_name_is_a_blob(self):
+        theories = _parsed([
+            _theory(THY, "DebugProbe"),
+            _theory(ML, "", external=True),           # ML_file blob: in
+            _theory("/fake/Loaded.thy", "Loaded", external=True),  # out
+        ])
+        assert evaluation_theory_set(THY, set(), theories) == {THY, ML}
+
+
+class TestHitWatchThirdExit:
+    def _watch(self, client):
+        state = SimpleNamespace(auto_opened_files=set())
+        return _HitWatch(client, THY, state)
+
+    @pytest.mark.asyncio
+    async def test_in_set_hit_ends_the_wait(self, client):
+        watch = self._watch(client)
+        client.push_state({"worker-3": LOCATED_STACK})
+        theories = _parsed([_theory(THY, "DebugProbe")])
+        assert await watch.hit_led_exit(theories) is True
+
+    @pytest.mark.asyncio
+    async def test_elsewhere_hit_keeps_waiting_and_the_notice_stands(
+            self, client):
+        watch = self._watch(client)
+        client.push_state({"worker-3": [
+            {"function": "f", "file": "/fake/Elsewhere.thy", "line": 3,
+             "pos": {}}]})
+        theories = _parsed([_theory(THY, "DebugProbe")])
+        assert await watch.hit_led_exit(theories) is False
+        # The verdict re-fetched theory_status once before finalizing.
+        assert ("theory_status",) in client.calls
+        assert "stopped at a breakpoint" \
+            in (debugger.registry.drain_notices() or "")
+        # Already classified: the next round neither re-fetches nor exits.
+        client.calls.clear()
+        assert await watch.hit_led_exit(theories) is False
+        assert ("theory_status",) not in client.calls
+
+    @pytest.mark.asyncio
+    async def test_refetch_can_flip_the_verdict(self, client):
+        watch = self._watch(client)
+        dep = "/fake/JustOpened.thy"
+        client.push_state({"worker-3": [
+            {"function": "f", "file": dep, "line": 3, "pos": {}}]})
+        # The iteration's snapshot does not know dep yet; the re-fetch does.
+        stale = _parsed([_theory(THY, "DebugProbe")])
+        client.theory_replies = [[
+            _theory(THY, "DebugProbe", imports=["JustOpened"]),
+            _theory(dep, "JustOpened"),
+        ]]
+        assert await watch.hit_led_exit(stale) is True
+
+    @pytest.mark.asyncio
+    async def test_unattributable_hit_fails_open(self, client):
+        watch = self._watch(client)
+        client.push_state({"worker-3": STACK})   # no file on frame 0
+        assert await watch.hit_led_exit([]) is True
+
+    @pytest.mark.asyncio
+    async def test_pre_existing_hits_are_not_reclassified(self, client):
+        _hit(client)                              # alive before the wait
+        watch = self._watch(client)
+        assert await watch.hit_led_exit([]) is False
+
+    @pytest.mark.asyncio
+    async def test_debug_off_never_exits(self, client):
+        client.debug = False
+        watch = self._watch(client)
+        client.debug = True
+        client.push_state({"worker-3": LOCATED_STACK})
+        assert await watch.hit_led_exit([]) is False

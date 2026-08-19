@@ -183,6 +183,32 @@ def _get_recursive_dependencies(
     return visited
 
 
+def evaluation_theory_set(
+    target: str, auto_opened: set[str], theories: list[TheoryStatus],
+) -> set[str]:
+    """The current evaluation's theory set (Phase D, approved 2026-08-19
+    after two adversarial verification rounds): the files a hit can belong
+    to for THIS run. The union of (a) the target, (b) the auto-opened
+    dependencies, (c) the import closure's node_names (deps absent from the
+    snapshot drop out — heap-precompiled code cannot hit), and (d) external
+    entries whose theory_name is EMPTY — exactly the ML_file-loaded blobs
+    ("all external" was refuted: the flag is never cleared, so it converges
+    on everything not currently open). All realpathed."""
+    out = {os.path.realpath(target)}
+    out |= set(auto_opened)   # already canonical (_canon at registration)
+    theory_map = {t.theory_name: t for t in theories}
+    target_name = _find_theory_name(target, theories)
+    if target_name is not None:
+        for dep in _get_recursive_dependencies(target_name, theories):
+            t = theory_map.get(dep)
+            if t is not None and t.node_name:
+                out.add(os.path.realpath(t.node_name))
+    for t in theories:
+        if t.external and not t.theory_name and t.node_name:
+            out.add(os.path.realpath(t.node_name))
+    return out
+
+
 def _dependency_done(t: TheoryStatus) -> bool:
     if t.canceled:
         return True
@@ -661,6 +687,69 @@ async def _finish_if_owner(
 # Wait loop
 # ---------------------------------------------------------------------------
 
+class _HitWatch:
+    """The evaluation wait's third exit condition (design section 6.1): a
+    new hit in the current evaluation's theory set ends the wait; a hit
+    elsewhere stays a debugger notice; an unattributable hit fails open
+    (ends the wait, as any exit does). The theory set is computed lazily —
+    only when a new hit must be classified — from the iteration's snapshot;
+    a would-be-"elsewhere" hit re-fetches theory_status once and recomputes
+    before the verdict is final (the auto-open awaits can leave the
+    iteration's snapshot seconds stale)."""
+
+    def __init__(
+        self, client: IsabelleLSPClient, target: str, state: EvaluationState,
+    ) -> None:
+        self._client = client
+        self._target = target
+        self._state = state
+        self._enabled = client.debug
+        if self._enabled:
+            from isabelle_mcp import debugger
+            self._registry = debugger.registry
+            self._registry.sync_hits(client)
+            # Hits alive before the wait were handled by their own paths
+            # (the entry refusal); only hits arriving DURING it are ours.
+            self._classified: set[str] = set(self._registry.hits)
+
+    async def hit_led_exit(self, theories: list[TheoryStatus]) -> bool:
+        if not self._enabled:
+            return False
+        client = self._client
+        self._registry.sync_hits(client)
+        theory_set: set[str] | None = None
+        for hit_id, hit in list(self._registry.hits.items()):
+            if hit_id in self._classified:
+                continue
+            frame0 = hit.stack[0] if hit.stack else {}
+            file = frame0.get("file")
+            if not file:
+                return True   # unattributable: fail open
+            try:
+                real = os.path.realpath(file)
+            except ValueError:
+                return True   # malformed path: fail open, never teardown
+            if theory_set is None:
+                theory_set = evaluation_theory_set(
+                    self._target, self._state.auto_opened_files, theories)
+            if real in theory_set:
+                return True
+            # Would-be "elsewhere": re-fetch once and recompute before the
+            # verdict is final.
+            try:
+                raw = await client.request_theory_status()
+            except IsabelleToolError:
+                pass   # keep the stale verdict; the notice still delivers
+            else:
+                theories = [_parse_theory_status(t) for t in raw]
+                theory_set = evaluation_theory_set(
+                    self._target, self._state.auto_opened_files, theories)
+                if real in theory_set:
+                    return True
+            self._classified.add(hit_id)   # elsewhere: the notice stands
+        return False
+
+
 async def _evaluation_wait_loop(
     client: IsabelleLSPClient,
     file_path: str,
@@ -672,6 +761,7 @@ async def _evaluation_wait_loop(
     deadline = time.monotonic() + timeout
     last_restat = time.monotonic()
     theories: list[TheoryStatus] = []
+    hit_watch = _HitWatch(client, file_path, state)
     while True:
         if evaluation.outcome or not state.active:
             # Someone else ended this run. Report the recorded reason rather than
@@ -689,6 +779,12 @@ async def _evaluation_wait_loop(
             # Push any edit that landed mid-evaluation; PIDE re-checks incrementally.
             await resync_changed_open_documents_locked(client)
         theories, running_commands = await _build_status_snapshot(client, state)
+        # The third exit condition, BEFORE the frontier decision: a parked
+        # fork keeps the prefix busy, and returning a plain in_progress
+        # there would bury the hit in a notice (section 6.1 wants the
+        # result to lead with the hit report).
+        if await hit_watch.hit_led_exit(theories):
+            return "hit", theories, client.get_all_running_commands()
         # Decide the instant the frontier reaches dest: prefix quiet → complete;
         # otherwise return in_progress NOW (no grace). Trailing forks are reported
         # (running/pending lines), not waited on — the caller polls to convergence.
@@ -722,7 +818,16 @@ async def evaluate_to(
     line: int,
     after_text: str | None = None,
 ) -> EvaluationView:
+    from isabelle_mcp import debugger
     async with _evaluation_state_lock:
+        # Pinned ordering (Phase D): the hits-live refusal runs BEFORE the
+        # active-evaluation refusal — the latter tells the agent to cancel,
+        # which would destroy the very hits it is being refused over. The
+        # refusal lives here, not in the tool wrapper, so the query tools'
+        # auto-start path inherits it and the caret never moves on a hit.
+        hits_refusal = debugger.hits_live_refusal(client)
+        if hits_refusal is not None:
+            raise IsabelleToolError(hits_refusal)
         if evaluation_state.active:
             raise IsabelleToolError(
                 "An evaluation is already in progress. "
@@ -747,6 +852,11 @@ async def evaluate_to(
         dest_line = LSPLine(caret_line).to_mcp()
         lsp_char = LSPCharacter(caret_char)
 
+        # The forgotten-re-enable fence (section 5), before the run
+        # starts: the warning describes what THIS run will miss. It also
+        # queues itself as a debugger notice.
+        fence_line = await debugger.forgotten_arming_fence(client, file_path)
+
         evaluation = evaluation_state.start(file_path, dest_line)
 
     try:
@@ -762,7 +872,7 @@ async def evaluate_to(
 
         # Own the state and carry no outcome stamp ⇒ still active: complete() and
         # cancel() are the only writers of the flag and both stamp.
-        if (heap_warning and status != "complete"
+        if (heap_warning and status not in ("complete", "hit")
                 and not evaluation.outcome and evaluation_state.owns(evaluation)):
             # The miss may be only the post-edit grace gate (a concurrent edit
             # re-armed it inside the short heap budget) — an unmodified precompiled
@@ -803,6 +913,15 @@ async def evaluate_to(
         # auto-opened after the canceller's own cleanup ran.
         await _finish_if_owner(client, evaluation, "cancelled")
         message = CANCELLED_MESSAGE
+    elif status == "hit":
+        # The hit-led exit (section 6.1) — a DISTINCT internal outcome,
+        # checked BEFORE the heap-abandonment branch (pinned ordering: that
+        # branch would abandon a run that is merely paused). The run stays
+        # active — evaluation is paused, not finished — and the
+        # agent-visible status stays the in_progress family (approved: the
+        # bare status word never reaches the output anyway).
+        message = await debugger.hit_report(client)
+        status = "in_progress"
     elif heap_warning and status != "complete":
         # The file differs from its precompiled copy, so PIDE will never
         # reprocess it — abandon the evaluation instead of leaving it pending.
@@ -831,6 +950,8 @@ async def evaluate_to(
             )
         if status == "complete":
             await _finish_if_owner(client, evaluation, "complete")
+    if fence_line:
+        message = message + "\n\n" + fence_line
     return EvaluationView(
         status=status,
         target_file=file_path,
@@ -975,6 +1096,10 @@ async def _dependency_freshness_wait(client: IsabelleLSPClient) -> float:
             # File_Watcher will didChange it internally; an edit like any other,
             # so start the decoration grace.
             note_edit_sent()
+            # Phase D bookkeeping: the blob's serials may be dead — mark it
+            # for the next reconciliation pass.
+            from isabelle_mcp import debugger
+            debugger.registry.mark_dirty(node)
             # sig = (ino, size, mtime_ns, ctime_ns); recent edit ⇒ within the debounce.
             if sig is not None and (now - sig[2] / 1e9) < delay:
                 need_wait = True
@@ -1014,6 +1139,11 @@ async def cancel_evaluation(
         # running, ``file_path`` may be the stale (now-closed) target; fall back
         # to whichever file still holds a running command so force_interrupt's
         # doc lookup resolves. (cancel_execution itself is global.)
+        from isabelle_mcp import debugger
+        # Attribute the coming retirements BEFORE the interrupt, so they
+        # happen silently (section 6.4: the ending clause survives only in
+        # the stale-id refusal).
+        swept_hits = debugger.mark_hits_swept(client)
         running = client.get_all_running_commands()
         fp = evaluation_state.file_path or (running[0].file_path if running else "")
         dest = int(evaluation_state.destination_line)
@@ -1026,10 +1156,15 @@ async def cancel_evaluation(
         finally:
             evaluation_state.cancel()
             await _cleanup_auto_opened(client, evaluation_state)
+        # The certain-death demote-all and the swept-hits result line.
+        swept_line = await debugger.finish_cancel_sweep(client, swept_hits)
+        message = CANCELLED_MESSAGE
+        if swept_line:
+            message += "\n" + swept_line
         return EvaluationView(
             status="cancelled",
             destination_line=dest,
-            message=CANCELLED_MESSAGE,
+            message=message,
         )
 
 
