@@ -585,6 +585,20 @@ class Breakpoint:
     # no decoration tracker (section 5).
     ml_sig: tuple[int, int, int, int] | None = None
 
+    def arm(self, site: Site) -> None:
+        """The armed-state transition, in ONE place (the counterpart of
+        registry.demote): re-anchoring — arming-time resolution updates the
+        recorded line and snippet — and the arming-time .ML stat signature
+        the fence's blob bullet reads. A new arming path cannot skip a
+        field."""
+        self.state = ARMED
+        self.serial = site.serial
+        self.reason = None
+        self.line = site.line
+        self.anchor = site.anchor
+        self.ml_sig = _stat_sig(self.file_path) \
+            if self.file_path.endswith(".ML") else None
+
 
 @dataclass
 class Hit:
@@ -655,6 +669,12 @@ class DebuggerRegistry:
         marks = self._dirty
         self._dirty = set()
         return marks
+
+    def remark_dirty(self, paths: set[str]) -> None:
+        """Put popped-but-unverified marks back (reconciliation's put-back
+        on an incomplete pass). A mark set concurrently since the pop is a
+        fresh member of the set; the union does not disturb it."""
+        self._dirty |= paths
 
     def drain_notices(self) -> str | None:
         """The buffered notices as one block, clearing the buffer — each
@@ -990,12 +1010,7 @@ async def _record_armed(
                           anchor=site.anchor)
         registry.entries.append(keep)
     keep.enabled = True
-    keep.state = ARMED
-    keep.serial = site.serial
-    keep.reason = None
-    keep.line = site.line      # re-anchor: arming-time resolution updates
-    keep.anchor = site.anchor  # the recorded line and snippet
-    keep.ml_sig = _stat_sig(file_path) if file_path.endswith(".ML") else None
+    keep.arm(site)
     return keep
 
 
@@ -1273,13 +1288,7 @@ async def _arm_entry(
         return None
     status = reply.get("status")
     if status == "ok":
-        entry.state = ARMED
-        entry.serial = site.serial
-        entry.reason = None
-        entry.line = site.line
-        entry.anchor = site.anchor
-        entry.ml_sig = _stat_sig(entry.file_path) \
-            if entry.file_path.endswith(".ML") else None
+        entry.arm(site)
         return registry.entry_row(client, entry)
     if status == "unfinished":
         registry.demote(client, entry, TAG_STILL_EVALUATING)
@@ -1769,49 +1778,67 @@ async def reconcile_dirty(client: IsabelleLSPClient) -> None:
         e.file_path for e in registry.entries if e.state == ARMED}
     if not armed_files:
         return
-    targets = marks & armed_files
-    if any(m.endswith(".ML") for m in marks):
-        # A blob change kills serials in its loading theory and importers,
-        # but theory_status carries no blob↔loader edges: mark ALL
-        # armed-entry files (accepted over-approximation, user 2026-08-19).
-        targets = set(armed_files)
-    thy_marks = {m for m in marks if not m.endswith(".ML")}
-    if thy_marks and targets < armed_files:
-        # Theory-edit propagation: transitive importers of a marked theory
-        # lose serials too (execution chaining), and so can .ML blobs
-        # loaded downstream — the graph cannot express blobs, so all
-        # armed-entry .ML files ride along (same over-approximation).
-        targets |= {f for f in armed_files if f.endswith(".ML")}
-        try:
-            raw = await client.request_theory_status()
-        except IsabelleToolError:
-            # No graph to propagate over: over-approximate to every
-            # armed-entry file — the listing verification below is what
-            # protects against false demotion either way.
+    # A popped mark may only vanish once its file is verified: an exit
+    # before that (a cancelled request mid-listing is the realistic one)
+    # puts everything not yet verified back, so the next pass retries it.
+    # Restoring is conservative and idempotent — a restored mark is merely
+    # re-expanded and re-verified (2026-08-19 review).
+    unverified = set(marks)
+    try:
+        targets = marks & armed_files
+        if any(m.endswith(".ML") for m in marks):
+            # A blob change kills serials in its loading theory and
+            # importers, but theory_status carries no blob↔loader edges:
+            # mark ALL armed-entry files (accepted over-approximation,
+            # user 2026-08-19).
             targets = set(armed_files)
-        else:
-            targets |= _transitive_importers(thy_marks, raw) & armed_files
-    for path in sorted(targets):
-        async with registry.lock:
-            entries = [
-                e for e in registry.entries
-                if e.file_path == path and e.state == ARMED]
-            if not entries:
-                continue
+        thy_marks = {m for m in marks if not m.endswith(".ML")}
+        if thy_marks and targets < armed_files:
+            # Theory-edit propagation: transitive importers of a marked
+            # theory lose serials too (execution chaining), and so can .ML
+            # blobs loaded downstream — the graph cannot express blobs, so
+            # all armed-entry .ML files ride along (same
+            # over-approximation).
+            targets |= {f for f in armed_files if f.endswith(".ML")}
             try:
-                sites, _lines = await fetch_sites(client, path)
-            except FileNotOpenInProver:
-                for entry in entries:
-                    registry.demote(client, entry, TAG_NOT_EVALUATED)
-                continue
+                raw = await client.request_theory_status()
             except IsabelleToolError:
+                # No graph to propagate over: over-approximate to every
+                # armed-entry file — the listing verification below is
+                # what protects against false demotion either way.
+                targets = set(armed_files)
+            else:
+                targets |= _transitive_importers(thy_marks, raw) \
+                    & armed_files
+        unverified |= targets
+        for path in sorted(targets):
+            async with registry.lock:
+                entries = [
+                    e for e in registry.entries
+                    if e.file_path == path and e.state == ARMED]
+                if not entries:
+                    unverified.discard(path)
+                    continue
+                try:
+                    sites, _lines = await fetch_sites(client, path)
+                except FileNotOpenInProver:
+                    for entry in entries:
+                        registry.demote(client, entry, TAG_NOT_EVALUATED)
+                    unverified.discard(path)
+                    continue
+                except IsabelleToolError:
+                    for entry in entries:
+                        registry.demote(client, entry, TAG_WIRE_FAILURE)
+                    unverified.discard(path)
+                    continue
+                listed = {site.serial for site in sites}
                 for entry in entries:
-                    registry.demote(client, entry, TAG_WIRE_FAILURE)
-                continue
-            listed = {site.serial for site in sites}
-            for entry in entries:
-                if entry.serial not in listed:
-                    registry.demote(client, entry, TAG_NOT_EVALUATED)
+                    if entry.serial not in listed:
+                        registry.demote(client, entry, TAG_NOT_EVALUATED)
+                unverified.discard(path)
+    except BaseException:
+        registry.remark_dirty(unverified)
+        raise
 
 
 def _position_reburied(client: IsabelleLSPClient, entry: Breakpoint) -> bool:

@@ -689,13 +689,20 @@ async def _finish_if_owner(
 
 class _HitWatch:
     """The evaluation wait's third exit condition (design section 6.1): a
-    new hit in the current evaluation's theory set ends the wait; a hit
+    hit in the current evaluation's theory set ends the wait; a hit
     elsewhere stays a debugger notice; an unattributable hit fails open
     (ends the wait, as any exit does). The theory set is computed lazily —
-    only when a new hit must be classified — from the iteration's snapshot;
+    only when a hit must be classified — from the iteration's snapshot;
     a would-be-"elsewhere" hit re-fetches theory_status once and recomputes
     before the verdict is final (the auto-open awaits can leave the
-    iteration's snapshot seconds stale)."""
+    iteration's snapshot seconds stale).
+
+    The classified set starts EMPTY: evaluate_to's entry refusal proved the
+    hit table empty, so every hit this loop ever sees is this run's to
+    classify by construction — including one that lands during the awaits
+    between the refusal and the loop (open_document, the fence's
+    theory_status round trip). Seeding from the live table here would
+    silently exempt exactly those hits (2026-08-19 review)."""
 
     def __init__(
         self, client: IsabelleLSPClient, target: str, state: EvaluationState,
@@ -707,10 +714,7 @@ class _HitWatch:
         if self._enabled:
             from isabelle_mcp import debugger
             self._registry = debugger.registry
-            self._registry.sync_hits(client)
-            # Hits alive before the wait were handled by their own paths
-            # (the entry refusal); only hits arriving DURING it are ours.
-            self._classified: set[str] = set(self._registry.hits)
+            self._classified: set[str] = set()
 
     async def hit_led_exit(self, theories: list[TheoryStatus]) -> bool:
         if not self._enabled:

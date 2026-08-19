@@ -146,7 +146,8 @@ class UnicodeWarningMiddleware(Middleware):
                 await debugger.reconcile_dirty(client)
             except Exception:
                 # Reconciliation must never fail a tool call that
-                # succeeded; unpopped work re-marks on the next event.
+                # succeeded. reconcile_dirty re-marks whatever it had not
+                # yet verified, so the next pass retries exactly that.
                 logger.exception("breakpoint reconciliation failed")
         notices = debugger.registry.drain_notices()
         if notices is not None:

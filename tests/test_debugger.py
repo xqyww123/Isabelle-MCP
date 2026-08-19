@@ -1501,6 +1501,38 @@ class TestReconcileDirty:
         listed = {c[1] for c in client.calls if c[0] == "breakpoints"}
         assert listed == {THY, "/fake/Other.thy"}
 
+    @pytest.mark.asyncio
+    async def test_cancelled_pass_restores_the_unverified_marks(
+            self, client):
+        entry = _armed_entry(serial=11)
+        debugger.registry.entries.append(entry)
+        debugger.registry.mark_dirty(THY)
+
+        async def cancelled_breakpoints(*a, **kw):
+            raise asyncio.CancelledError()
+
+        client.debugger_breakpoints = cancelled_breakpoints
+        with pytest.raises(asyncio.CancelledError):
+            await debugger.reconcile_dirty(client)
+        # The mark came back: the next pass retries the verification.
+        assert debugger.registry.pop_dirty() == {THY}
+        assert entry.state == ARMED   # nothing was guessed
+
+    @pytest.mark.asyncio
+    async def test_cancelled_expansion_restores_the_original_marks(
+            self, client):
+        debugger.registry.entries.append(_armed_entry(serial=11))
+        upstream = "/fake/Base.thy"
+
+        async def cancelled_theory_status():
+            raise asyncio.CancelledError()
+
+        client.request_theory_status = cancelled_theory_status
+        debugger.registry.mark_dirty(upstream)
+        with pytest.raises(asyncio.CancelledError):
+            await debugger.reconcile_dirty(client)
+        assert debugger.registry.pop_dirty() == {upstream}
+
     def test_teardown_clears_the_marks(self, client):
         debugger.registry.mark_dirty(THY)
         debugger.registry.on_prover_teardown()
@@ -1771,10 +1803,15 @@ class TestHitWatchThirdExit:
         assert await watch.hit_led_exit([]) is True
 
     @pytest.mark.asyncio
-    async def test_pre_existing_hits_are_not_reclassified(self, client):
-        _hit(client)                              # alive before the wait
+    async def test_a_hit_landing_before_the_first_iteration_is_classified(
+            self, client):
+        # The classified baseline is EMPTY: the entry refusal proved the
+        # table empty, so a hit arriving in the awaits between the refusal
+        # and the loop is still this run's to classify (here: no frame-0
+        # file → fail open).
+        _hit(client)
         watch = self._watch(client)
-        assert await watch.hit_led_exit([]) is False
+        assert await watch.hit_led_exit([]) is True
 
     @pytest.mark.asyncio
     async def test_debug_off_never_exits(self, client):

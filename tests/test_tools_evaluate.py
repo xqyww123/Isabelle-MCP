@@ -834,10 +834,15 @@ class TestDependencyEditStamp:
         await ev._dependency_freshness_wait(mock_lsp_client)  # baseline stat
         assert processing._grace_remaining() == 0.0           # no change yet
 
+        from isabelle_mcp import debugger
+        debugger.registry.pop_dirty()   # isolate from earlier tests
         dep.write_text("val x = 2; (* edited externally *)")
         wait = await ev._dependency_freshness_wait(mock_lsp_client)
         assert processing._grace_remaining() > 0.0            # clock bumped
         assert wait > 0.0                                     # debounce wait requested
+        # Phase D wiring: the changed blob is marked dirty for breakpoint
+        # reconciliation.
+        assert str(dep) in debugger.registry.pop_dirty()
 
 
 class TestEvaluationLifecycle:

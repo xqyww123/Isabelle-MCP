@@ -332,3 +332,34 @@ class TestUnicodeWarningMiddleware:
         result = await middleware.on_call_tool(MagicMock(), call_next)
         assert result is sentinel
         assert drain_warnings() is not None          # queue preserved
+
+    @pytest.mark.asyncio
+    async def test_reconciliation_runs_before_the_notice_drain(
+            self, monkeypatch):
+        """Phase D wiring: the middleware reconciles the dirty marks after
+        the tool body, and the demotion notice lands in THIS call's result
+        — not one call late."""
+        from fastmcp.tools.tool import ToolResult
+        from mcp.types import TextContent
+
+        from isabelle_mcp import debugger, server
+        from tests.test_debugger import THY, FakeDebugClient, _armed_entry
+
+        monkeypatch.setattr(
+            debugger, "registry", debugger.DebuggerRegistry())
+        client = FakeDebugClient()
+        client.process = object()   # "prover running" for the middleware
+        monkeypatch.setattr(server, "_lsp_client", client)
+        entry = _armed_entry(serial=99)   # not in the scripted listing
+        debugger.registry.entries.append(entry)
+        debugger.registry.mark_dirty(THY)
+
+        async def call_next(context):
+            return ToolResult(content=[TextContent(type="text", text="ok")])
+
+        result = await server.UnicodeWarningMiddleware().on_call_tool(
+            MagicMock(), call_next)
+        assert entry.state == "pending"
+        notices = [c.text for c in result.content
+                   if "Debugger notices:" in c.text]
+        assert notices and "no longer works (not evaluated yet)" in notices[0]

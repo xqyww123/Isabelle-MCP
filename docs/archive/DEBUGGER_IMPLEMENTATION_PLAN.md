@@ -117,7 +117,7 @@ gitlink bump follows the usual recipe).  The repair
 round's contract remains in the "Phase A repair round" section; the full
 review verdict of the FIRST review is archived in
 [`DEBUGGER_REPAIR_REVIEW_VERDICT.md`](DEBUGGER_REPAIR_REVIEW_VERDICT.md).
-Current gate numbers: unit suite 680 passing; integration battery 25
+Current gate numbers: unit suite 683 passing; integration battery 25
 passing (tests/integration in one process run, incl. 13 debugger probes +
 2 ranged probes and the file-sync/query e2e tests).
 
@@ -1266,6 +1266,39 @@ Micro-decisions taken while implementing, all below the design's waterline
 - The hit exit is checked before the frontier decision in the wait loop —
   a parked fork keeps the prefix busy, and the frontier's plain
   in_progress return would bury the hit in a notice.
+
+### Post-landing review round (2026-08-19, user-approved fixes)
+
+A 24-agent two-turn adversarial debate (4 lenses → crude dedupe → 2
+default-refute skeptics per finding; 16 raw → 10 debated → 6 upheld = 4
+distinct concerns, 4 killed) reviewed the landed commit. The user approved
+all four fixes:
+
+- **A. `_HitWatch` baseline** — the classified set now starts EMPTY: the
+  entry refusal proved the hit table empty, so every hit the wait loop
+  sees is this run's to classify by construction; seeding from the live
+  table at loop start silently exempted hits landing during the awaits
+  between the refusal and the loop (open_document's diagnostics wait is
+  the dominant window). Cost of the old shape: one degraded result and a
+  wasted poll interval, not a lost hit.
+- **B. Transactional dirty marks** — `reconcile_dirty` re-marks
+  (`remark_dirty`) everything not yet verified when the pass exits early
+  (the realistic trigger is a cancelled request mid-listing); a popped
+  mark can now only vanish once its file was actually verified.
+- **C. Wiring pins** — the three production `mark_dirty`/reconcile call
+  sites (didChange in `sync_dirty_files`, the dependency-stat path, the
+  middleware slot) were unpinned: a mutation deleting all three left the
+  whole suite green. Three cheap pins added in the existing harnesses;
+  each verified red with its wiring reverted.
+- **D. `Breakpoint.arm(site)`** — the six-field armed-state transition
+  (incl. the fence-critical `ml_sig`) was spelled out in two places; now
+  one method on the dataclass, the counterpart of `registry.demote`.
+
+Killed (do NOT re-report): the auto-start-path refusal-ordering claim
+(spec §6.1 prescribes the behaviour); an elegance variant of B refuted on
+misread evidence (OSError cannot escape — the wire wraps failures in
+IsabelleToolError); a `_transitive_importers`-should-use-TheoryStatus
+claim (false premise); render-order-unpinned (true, Phase E scope).
 
 ### Review provenance and killed findings (do NOT re-report)
 

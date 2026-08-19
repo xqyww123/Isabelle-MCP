@@ -748,6 +748,10 @@ class TestStatSigAndResync:
         }]
         assert client.open_documents[str(f)].version == v1 + 1
         assert "(*v2*)" in client.open_documents[str(f)].content
+        # Phase D wiring: the didChange that went out marked the file dirty
+        # for breakpoint reconciliation.
+        from isabelle_mcp import debugger
+        assert str(f) in debugger.registry.pop_dirty()
 
     @pytest.mark.asyncio
     async def test_rejected_didchange_forces_full_text_recovery(self, tmp_path):
@@ -801,9 +805,13 @@ class TestStatSigAndResync:
         await client.open_document(str(f), wait_for_diagnostics=False)
         os.utime(str(f), None)  # touch: new mtime, identical content
         client.notify = AsyncMock()
+        from isabelle_mcp import debugger
+        debugger.registry.pop_dirty()   # isolate from earlier tests
         await client.resync_changed_open_documents()
         client.notify.assert_not_called()
         assert client.open_documents[str(f)].stat_sig == _stat_sig(str(f))
+        # No didChange, no dirty mark: marked iff an edit actually went out.
+        assert str(f) not in debugger.registry.pop_dirty()
 
     @pytest.mark.asyncio
     async def test_resync_handles_deletion(self, tmp_path):
