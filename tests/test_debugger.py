@@ -129,6 +129,11 @@ class FakeDebugClient:
 
     async def debugger_input(self, thread, verbs, *, request_timeout):
         self.calls.append(("input", thread, verbs))
+        # Wire fidelity: on any resume verb the prover's debugger loop
+        # exits, emitting a full map WITHOUT the thread, before any
+        # re-stop state arrives.
+        self.push_state({t: s for t, s in self.debugger_threads.items()
+                         if t != thread})
         if self.on_input is not None:
             self.on_input(thread, verbs)
         return {"ok": True}
@@ -251,6 +256,16 @@ class TestSentenceCatalogue:
             "cannot be interrupted at all; isabelle_cancel_evaluation is "
             "the way out."
         )
+
+    def test_merge_notices(self):
+        assert debugger.NOTICE_MERGED == (
+            "breakpoint {where_a} before {anchor_a} resolves to the same "
+            "site as {where_b} before {anchor_b}; merged into one "
+            "breakpoint")
+        assert debugger.NOTICE_MERGED_DUPLICATE == (
+            "duplicate breakpoint at {where} before {anchor} merged into "
+            "one")
+        assert not hasattr(debugger, "NOTICE_STRAY_HALT")
 
     def test_step_did_not_stop(self):
         assert debugger.STEP_DID_NOT_STOP == (
@@ -578,6 +593,55 @@ class TestSetBreakpoint:
         assert len(debugger.registry.entries) == 1
 
     @pytest.mark.asyncio
+    async def test_field_identical_twins_merge_to_the_surviving_object(
+            self, client):
+        # F1: with value equality, list.remove would delete the twin the
+        # code means to KEEP and mutate a detached object instead.
+        for _ in range(2):
+            debugger.registry.entries.append(
+                Breakpoint(file_path=THY, line=VAL_XS, anchor="val xs = map",
+                           state=PENDING,
+                           reason=debugger.TAG_NOT_EVALUATED))
+        await debugger.set_breakpoint(client, THY, VAL_XS, None)
+        assert len(debugger.registry.entries) == 1
+        entry = debugger.registry.entries[0]
+        assert entry.state == ARMED
+        assert entry.serial == 11
+        assert (
+            "duplicate breakpoint at /fake/DebugProbe.thy:7 before "
+            "\u2039val xs = map\u203a merged into one"
+        ) in (debugger.registry.drain_notices() or "")
+        client.calls.clear()
+        await debugger.disable_all_breakpoints(client, None)
+        assert ("toggle", THY, 11, False) in client.calls
+
+    @pytest.mark.asyncio
+    async def test_recompiled_site_rebinds_the_entry_not_a_twin(self, client):
+        # F2: an ARMED entry whose serial died must be rebound, not
+        # twinned; its abandoned serial is switched off first.
+        await debugger.set_breakpoint(client, THY, VAL_XS, None)
+        assert debugger.registry.entries[0].serial == 11
+        client.listing_replies = [_listing(
+            _bp(21, VAL_XS, 4), _bp(22, VAL_SHIFT, 0), _bp(23, VAL_TOTAL, 4))]
+        await debugger.set_breakpoint(client, THY, VAL_XS, None)
+        assert len(debugger.registry.entries) == 1
+        entry = debugger.registry.entries[0]
+        assert entry.state == ARMED
+        assert entry.serial == 21
+        assert ("toggle", THY, 11, False) in client.calls
+
+    @pytest.mark.asyncio
+    async def test_empty_anchor_is_never_a_merge_key(self, client):
+        # F2: a site past the held content carries the degenerate empty
+        # anchor; an empty-anchored entry must not merge with it.
+        client.listing_replies = [_listing(_bp(31, 20, 0))]
+        debugger.registry.entries.append(
+            Breakpoint(file_path=THY, line=20, anchor="",
+                       state=PENDING, reason=debugger.TAG_NOT_EVALUATED))
+        await debugger.set_breakpoint(client, THY, 20, None)
+        assert len(debugger.registry.entries) == 2
+
+    @pytest.mark.asyncio
     async def test_other_sites_on_the_line_are_named(self, client):
         client.listing_replies = [_listing(
             _bp(21, VAL_XS, 4), _bp(22, VAL_XS, 13))]
@@ -776,8 +840,25 @@ class TestEnableDisableAll:
         ]
         await debugger.enable_all_breakpoints(client, None)
         assert len(debugger.registry.entries) == 1
-        assert "merged into one entry" in \
-            (debugger.registry.drain_notices() or "")
+        assert (
+            "breakpoint /fake/DebugProbe.thy:7 before \u2039val xs\u203a "
+            "resolves to the same site as /fake/DebugProbe.thy:7 before "
+            "\u2039val\u203a; merged into one breakpoint"
+        ) in (debugger.registry.drain_notices() or "")
+
+    @pytest.mark.asyncio
+    async def test_duplicate_position_merge_says_duplicate(self, client):
+        for _ in range(2):
+            debugger.registry.entries.append(
+                Breakpoint(file_path=THY, line=VAL_XS, anchor="val xs = map",
+                           state=PENDING,
+                           reason=debugger.TAG_NOT_EVALUATED))
+        await debugger.enable_all_breakpoints(client, None)
+        assert len(debugger.registry.entries) == 1
+        assert (
+            "duplicate breakpoint at /fake/DebugProbe.thy:7 before "
+            "\u2039val xs = map\u203a merged into one"
+        ) in (debugger.registry.drain_notices() or "")
 
 
 # ── debug_state, eval, locals (sections 4.8-4.10) ──────────────────────
@@ -877,20 +958,10 @@ class TestEvalAtBreakpoint:
 # ── continue / step / abort (sections 4.11-4.13) ───────────────────────
 
 
-def _resume_on_continue(client):
-    def on_input(thread, verbs):
-        if verbs == ["continue"]:
-            remaining = {t: s for t, s in client.debugger_threads.items()
-                         if t != thread}
-            client.push_state(remaining)
-    client.on_input = on_input
-
-
 class TestContinueBreakpoint:
     @pytest.mark.asyncio
     async def test_resume_one(self, client):
         hit = _hit(client)
-        _resume_on_continue(client)
         out = await debugger.continue_breakpoint(client, hit.hit_id)
         assert out == "Resumed hit h1 (thread worker-3)."
         assert debugger.registry.hits == {}
@@ -900,7 +971,6 @@ class TestContinueBreakpoint:
     async def test_omitted_resumes_all(self, client):
         client.push_state({"worker-3": STACK, "worker-7": STACK})
         debugger.registry.sync_hits(client)
-        _resume_on_continue(client)
         out = await debugger.continue_breakpoint(client, None)
         assert out.startswith("Resumed 2 hits:")
         assert debugger.registry.hits == {}
@@ -915,6 +985,7 @@ class TestStepAtBreakpoint:
     @pytest.mark.asyncio
     async def test_stopped_again_keeps_the_hit(self, client):
         hit = _hit(client)
+        debugger.registry.drain_notices()
         new_stack = [{"function": "probe(1)total-(1)", "pos": {}}]
 
         def on_input(thread, verbs):
@@ -922,18 +993,18 @@ class TestStepAtBreakpoint:
         client.on_input = on_input
         out = await debugger.step_at_breakpoint(client, "step", hit.hit_id)
         assert out.startswith("Hit h1 stopped again.")
-        assert "probe(1)total-(1)" in out
+        assert "probe(1)total-(1)" in out       # the post-step stack
+        assert "probe(1)xs-(1)" not in out      # not the pre-step one
         assert list(debugger.registry.hits) == ["h1"]
+        assert "h1" not in debugger.registry.retired
+        # The transient absence between the two states is the step itself:
+        # no hit-ended or new-hit notice may leak from it.
+        assert debugger.registry.drain_notices() is None
         assert ("input", "worker-3", ["step"]) in client.calls
 
     @pytest.mark.asyncio
     async def test_did_not_stop_retires_the_hit(self, client):
         hit = _hit(client)
-        _resume_on_continue(client)
-
-        def on_input(thread, verbs):
-            client.push_state({})
-        client.on_input = on_input
         out = await debugger.step_at_breakpoint(client, "step_out", hit.hit_id)
         assert out == debugger.STEP_DID_NOT_STOP.format(seconds=30)
         assert debugger.registry.retired["h1"] == debugger.ENDED_STEP_LEFT
@@ -943,6 +1014,17 @@ class TestStepAtBreakpoint:
         _hit(client)
         with pytest.raises(IsabelleToolError):
             await debugger.step_at_breakpoint(client, "leap", None)
+
+    @pytest.mark.asyncio
+    async def test_failed_verb_request_clears_the_stepping_flag(self, client):
+        hit = _hit(client)
+
+        async def boom(thread, verbs, *, request_timeout):
+            raise IsabelleToolError("wire died")
+        client.debugger_input = boom
+        with pytest.raises(IsabelleToolError):
+            await debugger.step_at_breakpoint(client, "step", hit.hit_id)
+        assert hit.stepping is False
 
 
 class TestAbortEval:

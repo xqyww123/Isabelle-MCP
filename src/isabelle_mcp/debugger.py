@@ -294,18 +294,16 @@ NOTICES_HEADER = "Debugger notices:"
 NOTICE_DEMOTED = "breakpoint {where} before {anchor} no longer works ({tag})"
 NOTICE_MERGED = (
     "breakpoint {where_a} before {anchor_a} resolves to the same site as "
-    "{where_b} before {anchor_b}; merged into one entry"
+    "{where_b} before {anchor_b}; merged into one breakpoint"
+)
+NOTICE_MERGED_DUPLICATE = (
+    "duplicate breakpoint at {where} before {anchor} merged into one"
 )
 NOTICE_NEW_HIT = (
     "thread {thread} stopped at a breakpoint — hit {hit_id}; inspect with "
     "isabelle_debug_state"
 )
 NOTICE_HIT_ENDED = "hit {hit_id} ended: {ending}"
-NOTICE_STRAY_HALT = (
-    "anomaly: thread {thread} stopped without any breakpoint being hit "
-    "(a stepping flag can linger after stepping off the end) — recorded as "
-    "hit {hit_id}; isabelle_continue_breakpoint clears it"
-)
 
 
 # ── Anchor snippets (section 3.2) ──────────────────────────────────────
@@ -490,9 +488,14 @@ def resolve_site(
 # ── The registry ───────────────────────────────────────────────────────
 
 
-@dataclass
+@dataclass(eq=False)
 class Breakpoint:
-    """One registry entry (section 5): the intent to stop at a location."""
+    """One registry entry (section 5): the intent to stop at a location.
+
+    eq=False is load-bearing: entries are removed from the registry list by
+    identity (_record_armed, del_breakpoints, _merge_same_site); with value
+    equality list.remove would delete a field-identical twin instead.
+    """
 
     file_path: str            # realpath
     line: int                 # recorded 1-indexed line, updated at arming
@@ -795,7 +798,7 @@ async def set_breakpoint(
         if status != "ok":
             raise IsabelleToolError(ARMING_FAILED.format(
                 where=where, status=status))
-        entry = _record_armed(client, file_path, site)
+        entry = await _record_armed(client, file_path, site)
         result = SET_OK.format(
             where=f"{_display_path(client, file_path)}:{entry.line}",
             anchor=cartouche(entry.anchor))
@@ -807,27 +810,61 @@ async def set_breakpoint(
         return result
 
 
-def _record_armed(
+def _add_merge_notice(
+    client: IsabelleLSPClient,
+    removed: Breakpoint, removed_at: tuple[int, str],
+    keep: Breakpoint, keep_at: tuple[int, str],
+) -> None:
+    """One notice per merge. The positions compared and printed are the
+    (line, anchor) pairs as RECORDED before any re-arming rewrote them —
+    after re-arming, entries on one site are field-identical, which would
+    make the different-position sentence self-referential."""
+    if removed.file_path == keep.file_path and removed_at == keep_at:
+        registry.add_notice(NOTICE_MERGED_DUPLICATE.format(
+            where=f"{_display_path(client, keep.file_path)}:{keep_at[0]}",
+            anchor=cartouche(keep_at[1])))
+    else:
+        registry.add_notice(NOTICE_MERGED.format(
+            where_a=f"{_display_path(client, removed.file_path)}:"
+                    f"{removed_at[0]}",
+            anchor_a=cartouche(removed_at[1]),
+            where_b=f"{_display_path(client, keep.file_path)}:{keep_at[0]}",
+            anchor_b=cartouche(keep_at[1])))
+
+
+async def _record_armed(
     client: IsabelleLSPClient, file_path: str, site: Site,
 ) -> Breakpoint:
     """Record an acknowledged arming: update the entry already on this site
-    (or merge duplicates into it), else create one. Caller holds the lock."""
+    (or merge duplicates into it), else create one. Caller holds the lock.
+
+    An entry matches by serial, or by identical recorded line and anchor
+    whatever its state (an armed entry whose serial died must not spawn a
+    twin). An empty anchor never matches: it is the degenerate snippet
+    minted when the line text cannot be read, not a key."""
     matching = [
         e for e in registry.entries
-        if e.file_path == file_path and (
+        if e.file_path == file_path and e.anchor and (
             e.serial == site.serial
-            or (e.state == PENDING and e.line == site.line
-                and e.anchor == site.anchor))
+            or (e.line == site.line and e.anchor == site.anchor))
     ]
     if matching:
         keep = matching[0]
+        for e in matching:
+            if e.serial is not None and e.serial != site.serial:
+                # The entry is being rebound away from a serial that may
+                # still be live: switch that site off, or it would stay
+                # enabled with no entry behind it.
+                try:
+                    await _toggle_site(client, e.file_path, e.serial, False)
+                except IsabelleToolError:
+                    logger.warning(
+                        "disarm of an abandoned site failed for %s",
+                        e.file_path)
         for extra in matching[1:]:
             registry.entries.remove(extra)
-            registry.add_notice(NOTICE_MERGED.format(
-                where_a=registry.where(client, extra),
-                anchor_a=cartouche(extra.anchor),
-                where_b=registry.where(client, keep),
-                anchor_b=cartouche(keep.anchor)))
+            _add_merge_notice(client, extra, (extra.line, extra.anchor),
+                              keep, (keep.line, keep.anchor))
     else:
         keep = Breakpoint(file_path=file_path, line=site.line,
                           anchor=site.anchor)
@@ -1027,6 +1064,7 @@ async def enable_all_breakpoints(
             return ENABLE_NONE_REGISTERED
         for entry in entries:
             entry.enabled = True
+        recorded = {e: (e.line, e.anchor) for e in entries}
         armed_rows: list[str] = []
         pending_counts: dict[str, int] = {}
         by_file: dict[str, list[Breakpoint]] = {}
@@ -1053,7 +1091,7 @@ async def enable_all_breakpoints(
                 row = await _arm_entry(client, entry, sites, pending_counts)
                 if row is not None:
                     armed_rows.append(row)
-        _merge_same_site(client, entries)
+        _merge_same_site(client, entries, recorded)
         out = []
         if armed_rows:
             out.append(ARMED_HEADER.format(n=len(armed_rows)))
@@ -1134,9 +1172,11 @@ async def _arm_entry(
 
 def _merge_same_site(
     client: IsabelleLSPClient, entries: list[Breakpoint],
+    recorded: dict[Breakpoint, tuple[int, str]],
 ) -> None:
     """Entries that resolved to the same site merge into one (section 5),
-    reported by a notice. Caller holds the lock."""
+    reported by a notice. ``recorded`` maps each entry to its (line,
+    anchor) before re-arming rewrote them. Caller holds the lock."""
     seen: dict[tuple[str, int], Breakpoint] = {}
     for entry in entries:
         if entry.state != ARMED or entry.serial is None:
@@ -1147,11 +1187,9 @@ def _merge_same_site(
             seen[key] = entry
         elif entry in registry.entries:
             registry.entries.remove(entry)
-            registry.add_notice(NOTICE_MERGED.format(
-                where_a=registry.where(client, entry),
-                anchor_a=cartouche(entry.anchor),
-                where_b=registry.where(client, keep),
-                anchor_b=cartouche(keep.anchor)))
+            _add_merge_notice(
+                client, entry, recorded.get(entry, (entry.line, entry.anchor)),
+                keep, recorded.get(keep, (keep.line, keep.anchor)))
 
 
 async def disable_all_breakpoints(
@@ -1270,8 +1308,8 @@ async def eval_at_breakpoint(
         raise IsabelleToolError(EMPTY_EXPR)
     hit = registry.resolve_hit(hit_id)
     _check_eval_fence(hit)
-    # create_task so a cancelled tool call leaves the round trip running
-    # and the abort tool can still wait on its reply.
+    # create_task publishes the round trip's handle for concurrent
+    # callers: _check_eval_fence and abort_eval_at_breakpoint wait on it.
     task = asyncio.create_task(client.debugger_eval(
         hit.thread, expr, frame=frame, timeout=timeout,
         request_timeout=timeout + REQUEST_MARGIN))
@@ -1359,8 +1397,12 @@ async def step_at_breakpoint(
     hit.stepping = True
     hit.pending_ending = None
     states_seen = len(client.debugger_state_history)
-    await client.debugger_input(
-        hit.thread, [verb], request_timeout=TOGGLE_TIMEOUT)
+    try:
+        await client.debugger_input(
+            hit.thread, [verb], request_timeout=TOGGLE_TIMEOUT)
+    except BaseException:
+        hit.stepping = False
+        raise
     deadline = time.monotonic() + STEP_WAIT
     while True:
         remaining = deadline - time.monotonic()
@@ -1375,8 +1417,12 @@ async def step_at_breakpoint(
         if client.debugger_threads.get(hit.thread):
             break  # stopped again — same hit, new position
     if client.debugger_threads.get(hit.thread):
-        hit.stepping = False
+        # Sync FIRST: the step's own transient thread-absent state is
+        # suppressed while stepping is still set, and the re-stop entry
+        # refreshes hit.stack. Clearing the flag before the sync would
+        # retire this hit and mint a new one for the same halt.
         registry.sync_hits(client)
+        hit.stepping = False
         return STEP_STOPPED_AGAIN.format(hit_id=hit.hit_id) + "\n" \
             + _hit_block(hit)
     hit.stepping = False
