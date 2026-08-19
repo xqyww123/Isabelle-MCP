@@ -134,21 +134,41 @@ class Debugger_Adapter(server: Language_Server) {
 
   /* forwarded thread stacks: the full current map after every update */
 
-  private def thread_json(name: String, stack: List[(Properties.T, String)]): JSON.T =
+  private def thread_json(
+    snapshot: Document.Snapshot,
+    name: String,
+    stack: List[(Properties.T, String)]
+  ): JSON.T =
     JSON.Object(
       "thread" -> name,
       "stack" ->
         stack.map({ case (props, function) =>
+          // ML frame positions carry only id/offset (command-relative, measured);
+          // resolve them against the snapshot, the same lookup the jEdit debugger
+          // uses for its stack hyperlinks.  Best-effort: an unresolvable frame
+          // keeps no file/line.  Line.Position is 0-based, Position.Line 1-based.
+          val resolved =
+            if (Position.File.unapply(props).isDefined) None
+            else
+              for {
+                id <- Position.Id.unapply(props)
+                node_pos <-
+                  snapshot.find_command_position(
+                    id, Position.Offset.unapply(props).getOrElse(0))
+              } yield node_pos
           JSON.Object("function" -> function) ++
-          JSON.optional("file" -> Position.File.unapply(props)) ++
-          JSON.optional("line" -> Position.Line.unapply(props)) ++
+          JSON.optional("file" ->
+            (Position.File.unapply(props) orElse resolved.map(_.name))) ++
+          JSON.optional("line" ->
+            (Position.Line.unapply(props) orElse resolved.map(_.pos.line + 1))) ++
           JSON.Object("pos" -> JSON.Object(props.map({ case (a, b) => a -> (b: JSON.T) }): _*))
         }))
 
   private def notify_state(): Unit = {
+    val snapshot = session.snapshot()
     val entries =
       for ((name, stack) <- threads.value.toList.sortBy(_._1))
-        yield thread_json(name, stack)
+        yield thread_json(snapshot, name, stack)
     channel.write(LSP.Debugger_State_Notification(entries))
   }
 

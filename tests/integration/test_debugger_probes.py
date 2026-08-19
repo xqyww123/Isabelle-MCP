@@ -289,6 +289,12 @@ async def test_gate2_gate3_and_the_probes_at_a_live_hit(prover):
     assert frame0.get("function"), f"frame 0 has no function name: {frame0}"
     print(f"\nPROBE 13 — frame positions at the hit: {stack}")
 
+    # Phase D1: the adapter resolves command-relative frame positions
+    # (id/offset only, per probe 13) to file:line via
+    # Document.Snapshot.find_command_position at forwarding time.
+    assert str(frame0.get("file", "")).endswith("DebugProbe.thy"), frame0
+    assert isinstance(frame0.get("line"), int) and frame0["line"] >= 1, frame0
+
     # Probe 8: query tools answer about processed lines while a thread is parked.
     state = await goal(client, path, MCPLine(LEMMA))
     assert state.subgoals == ["x + 0 = x"]
