@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- **ML breakpoint debugging.** `isabelle_launch(session, debug=true)` starts
+  the prover with Poly/ML debugger instrumentation (newly compiled ML gets
+  breakable sites; heap-precompiled code is unaffected and no heap is
+  invalidated), and eleven new tools drive it: `isabelle_set_breakpoint`,
+  `isabelle_del_breakpoints`, `isabelle_list_breakpoints`,
+  `isabelle_list_breakable_sites`, `isabelle_enable_all_breakpoints`,
+  `isabelle_disable_all_breakpoints`, `isabelle_debug_state`,
+  `isabelle_eval_at_breakpoint`, `isabelle_locals_at_breakpoint`,
+  `isabelle_continue_breakpoint`, `isabelle_step_at_breakpoint`.
+
+  Breakpoints are addressed by line plus an anchor snippet (no columns),
+  survive recompilation as registry entries that re-arm on explicit
+  `isabelle_enable_all_breakpoints` (nothing re-arms in the background), and
+  stop working when their code is recompiled, the prover is relaunched, or an
+  evaluation is cancelled — each demotion reported once as a *debugger
+  notice* appended to the next tool result. A thread stopping at a breakpoint
+  is a **hit** (`h1`, `h2`, …): `isabelle_evaluate_to` then returns early,
+  leading with a hit report (position, call stack, implicit frame-0 locals),
+  the evaluation stays paused until the hit is resumed, and
+  `isabelle_evaluation_status` leads with a paused section. A run that cannot
+  stop where the registry says it should warns up front
+  ("N breakpoints … are not armed"). `isabelle_cancel_evaluation` sweeps
+  stopped threads and says so. The launch identity is now the pair
+  (session, debug): changing `debug` needs `isabelle_terminate` first.
+
 - **The seven model-shaped tools now answer with YAML text instead of JSON
   structured output.** `isabelle_launch`, `isabelle_session_info`,
   `isabelle_hover`, `isabelle_definition`, `isabelle_local_occurrences`,

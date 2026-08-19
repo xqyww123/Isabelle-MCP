@@ -87,6 +87,21 @@ For Claude Desktop, register manually instead
 | `isabelle_command_status` | What state the command(s) covering each of several lines are in |
 | `isabelle_session_info` | Current session info |
 
+With `isabelle_launch(session, debug=true)` the **ML debugger** tools come alive
+(eleven more tools): set/delete/list breakpoints on compiled Isabelle/ML code
+(`isabelle_set_breakpoint`, `isabelle_del_breakpoints`,
+`isabelle_list_breakpoints`, `isabelle_list_breakable_sites`), arm and disarm
+them in bulk (`isabelle_enable_all_breakpoints`,
+`isabelle_disable_all_breakpoints`), and work with **hits** — threads stopped
+at a breakpoint: inspect (`isabelle_debug_state`), evaluate ML in a stack
+frame's scope (`isabelle_eval_at_breakpoint`), print a frame's locals
+(`isabelle_locals_at_breakpoint`), resume (`isabelle_continue_breakpoint`) and
+single-step (`isabelle_step_at_breakpoint`). A hit pauses the evaluation: the
+`isabelle_evaluate_to` result leads with a hit report (position, call stack,
+frame-0 locals), and asynchronous events arrive as one-line *debugger notices*
+on the next tool result. The full design lives in
+[`docs/archive/DEBUGGER_DESIGN.md`](docs/archive/DEBUGGER_DESIGN.md).
+
 All positions are **1-indexed**. File paths must be **absolute**.
 
 Every query tool names a file and a line, and the prover answers about the

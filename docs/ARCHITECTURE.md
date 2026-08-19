@@ -498,6 +498,40 @@ class DiagnosticCache:
 
 ---
 
+### 2.7 ML Debugger Subsystem
+
+Three layers, one per process boundary (authoritative design:
+[`docs/archive/DEBUGGER_DESIGN.md`](archive/DEBUGGER_DESIGN.md)):
+
+- **Prover (ML)**: Poly/ML debugger instrumentation (`-o ML_debugger=true`,
+  the `debug=true` launch parameter) plants *breakable sites* in newly
+  compiled ML. The injected prelude supplies `Isabelle_MCP.debug_eval` — the
+  protected envelope every debugger evaluation and locals listing runs in,
+  with a prover-side deadline, an abort flag, and a per-value print bound.
+- **Scala (`Debugger_Adapter` in the component jar)**: stateless forwarding
+  of Isabelle's `Debugger` state — the full stopped-thread map goes out as a
+  `PIDE/debugger_state` notification after every change, with command-relative
+  frame positions resolved to file:line against the document snapshot — plus
+  the six `PIDE/debugger_*` requests (§2.4 of API_DESIGN.md).
+- **Python (`debugger.py`)**: ALL policy. The **breakpoint registry** (an
+  entry = the intent to stop at a source location, surviving recompilation;
+  armed = has a live site, pending = has none, re-armed only by explicit
+  tool action — nothing re-arms in the background), the **hit table** (a hit
+  = one occasion of a thread halting, position-identified), the **debugger
+  notices** buffer (asynchronous events delivered on the next tool result via
+  the response middleware), and every agent-facing sentence, pinned verbatim
+  by unit tests.
+
+Integration points with the evaluation model (§3): a hit in the current
+evaluation's theory set is a third exit condition of `evaluate_to`'s wait
+loop (the result leads with the hit report and the run stays paused);
+`evaluate_to` is refused while any hit is live; a fence line warns when the
+run cannot stop where the registry says it should; `cancel_evaluation`
+sweeps stopped threads and demotes every armed entry (cancellation
+invalidates every site serial). Site death from edits is observed by
+dirty-marking synced files and verifying the marked files' serials against a
+fresh listing on the next tool call (the middleware), never by guessing.
+
 ## 3. Async Evaluation Model
 
 ### 3.1 Design

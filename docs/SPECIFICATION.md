@@ -108,9 +108,9 @@ def tool() -> LocalOccurrencesResult: ...
 
 ## 3. Feature Catalog
 
-The current server registers **11 MCP tools**: two prover-lifecycle tools
-(`isabelle_launch` / `isabelle_terminate`), three evaluation tools, and six
-query tools.
+The current server registers **24 MCP tools**: two prover-lifecycle tools
+(`isabelle_launch` / `isabelle_terminate`), three evaluation tools, eight
+query tools, and eleven ML-debugger tools (§3.4).
 
 ### 3.0 Evaluation Tools (3 tools)
 
@@ -190,6 +190,50 @@ called before any evaluation/query tool (the prover does not auto-start)
 **LSP Mapping**: In-memory client state ✅
 **Priority**: Low (Introspection)
 **Pattern**: New (info query)
+
+### 3.4 ML Debugger Tools (11 tools)
+
+Breakpoint debugging of Isabelle/ML code, available when the session is
+launched with `debug=true` (Poly/ML debugger instrumentation; see §4.3.1).
+The authoritative specification — the addressing model, the breakpoint
+registry lifecycle, hits and debugger notices, and every agent-facing
+sentence — is [`docs/archive/DEBUGGER_DESIGN.md`](archive/DEBUGGER_DESIGN.md);
+it is not duplicated here.
+
+#### `isabelle_set_breakpoint` / `isabelle_del_breakpoints`
+**Purpose**: Register a breakpoint at a *breakable site* (a stopping location
+the compiler inserted) and arm it / remove breakpoints
+**PIDE Mapping**: `PIDE/debugger_breakpoints` + `PIDE/debugger_toggle_breakpoint` ✅
+
+#### `isabelle_list_breakpoints` / `isabelle_list_breakable_sites`
+**Purpose**: The registry (where breakpoints ARE) / the sites (where they CAN go)
+
+#### `isabelle_enable_all_breakpoints` / `isabelle_disable_all_breakpoints`
+**Purpose**: Re-arm every no-longer-working breakpoint (THE re-arming action —
+nothing re-arms in the background) / switch everything off for an undisturbed run
+
+#### `isabelle_debug_state`
+**Purpose**: All live *hits* (threads stopped at a breakpoint, named `h1`, `h2`, …)
+with their call stacks
+
+#### `isabelle_eval_at_breakpoint` / `isabelle_locals_at_breakpoint`
+**Purpose**: Evaluate one ML expression in a stack frame's scope / print all
+locals of a frame
+**PIDE Mapping**: `PIDE/debugger_eval` + `PIDE/debugger_print_vals` ✅
+
+#### `isabelle_continue_breakpoint` / `isabelle_step_at_breakpoint`
+**Purpose**: Resume a hit (or all hits) / single-step (`step`, `step_over`,
+`step_out`)
+**PIDE Mapping**: `PIDE/debugger_input` ✅
+
+(A twelfth tool, `isabelle_abort_eval_at_breakpoint`, is implemented but
+deliberately not registered.)
+
+A hit inside the current evaluation ends `isabelle_evaluate_to`'s wait: the
+result leads with a hit report (position, call stack, frame-0 locals) and the
+evaluation stays paused until the hit is resumed. Asynchronous debugger
+events (breakpoints demoted by edits, hits outside a wait) are delivered as
+**debugger notices** appended to the next tool result, whatever the tool.
 
 ---
 
@@ -452,8 +496,11 @@ class CommandOutputResult(BaseModel):
 
 **Description**: Start (or restart) the Isabelle prover with the given
 session/logic. **Must be called before any evaluation or query tool** — the prover
-does not auto-start. Calling it with the same session is a no-op; a different session
-restarts the prover (any in-progress evaluation is discarded).
+does not auto-start. Calling it with the same session and the same `debug` value is
+a no-op; a different session restarts the prover (any in-progress evaluation is
+discarded). Same session but a different `debug` value is an error: call
+`isabelle_terminate` first — a routine launch never silently kills a running debug
+session (the launch identity is the pair (session, debug)).
 
 **Tool Annotations**:
 ```python
@@ -470,6 +517,12 @@ session_dirs: Annotated[Optional[list[str]], Field(
     description="Extra -d session search dirs for non-builtin sessions; "
                 "defaults to the server's working directory."
 )] = None
+debug: Annotated[bool, Field(
+    description="Launch with ML debugger instrumentation (-o ML_debugger=true): "
+                "newly compiled ML gets breakable sites; heap-precompiled code "
+                "is unaffected, no heap is invalidated. Off by default because "
+                "instrumentation slows compiled ML."
+)] = False
 ```
 
 **Output Model**: `SessionInfo` (below) — the running session name and server version.
@@ -677,7 +730,11 @@ the single source of truth; it is **not** reproduced here, to avoid drift.
 Its key points: positions are 1-indexed and file paths absolute; you edit `.thy`
 files on disk and the server syncs them to Isabelle automatically (§4.5);
 evaluation is asynchronous, so poll `isabelle_evaluation_status` and cancel a stuck
-run rather than waiting for `complete`; and errors do not halt checking.
+run rather than waiting for `complete`; and errors do not halt checking. Its
+ML-debugger section teaches the vocabulary (breakable site / breakpoint / hit /
+frame) and the taught workflow: evaluate the defining code, set breakpoints,
+re-evaluate so the code runs and hits; after an upstream edit, re-evaluate and
+`isabelle_enable_all_breakpoints`.
 
 ---
 
@@ -685,7 +742,7 @@ run rather than waiting for `complete`; and errors do not halt checking.
 
 ### 7.1 Functional Status
 
-1. Current server registers 13 MCP tools.
+1. Current server registers 24 MCP tools (13 base + 11 ML-debugger).
 2. Standard LSP features (hover, definition, local occurrences) are
    implemented and covered by tests.
 3. Every query tool is position-explicit: it names a file and a line, and the

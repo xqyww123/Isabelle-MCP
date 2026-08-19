@@ -108,10 +108,11 @@ the Phase C section below, including the user decisions that overrode the
 specification during the wording review).  A two-workflow adversarial review
 on 2026-08-19 confirmed four defects; **the fix round of "Phase C review
 round (2026-08-19)" below landed the same day** (implementation notes at the
-end of that section).  **Phase D landed in full
-2026-08-19** — D1 (commit `4863066`), then D2 + D3 + the sentence retrofit
-on the user's go-ahead, exactly per the finalized Phase D section
-(implementation notes at its end).  Next: Phase E.  Still open
+end of that section).  **Phases D and E landed in full
+2026-08-19** — D1 (commit `4863066`), D2 + D3 + the sentence retrofit
+(`64b52ee`), the post-landing review fixes (`4fb89be`), then Phase E's
+e2e tests and documentation (see both sections' notes). The debugger
+plan is complete.  Still open
 with the user: when to push (push only on explicit order; the parent-repo
 gitlink bump follows the usual recipe).  The repair
 round's contract remains in the "Phase A repair round" section; the full
@@ -1321,17 +1322,39 @@ claims refuted by the second: "leftover external hits are rare" (they are
 the steady state), "the iteration's snapshot is fresh enough" (the
 auto-open awaits open a multi-second window).
 
-## Phase E — tests and documentation
+## Phase E — tests and documentation (LANDED 2026-08-19)
 
-- Unit tests: registry resolution and demote-and-notify bookkeeping, anchor snippets, sentence
-  catalogue — pure Python, no prover.
-- Integration tests beyond the probes: set → hit → locals → eval → continue;
-  step modes; enable/disable-all idempotence; the three motions of §2.2
-  (incl. explicit re-arming after an upstream edit); cancel-while-stopped;
-  timeout and abort end-to-end; two hits at once.
-- `README.md`, MCP instructions, `CHANGELOG.md`, and the three design docs
-  (`SPECIFICATION.md`, `API_DESIGN.md`, `ARCHITECTURE.md`) updated for the
-  twelve tools and the changed launch.
+- Unit tests: registry resolution and demote-and-notify bookkeeping, anchor
+  snippets, sentence catalogue — landed across Phases C/D (683 as of the
+  review-fix round).
+- Integration tests beyond the probes — landed as
+  `tests/integration/test_debugger_e2e.py` (7 tests driving the TOOL BODIES
+  against a real prover, sentences asserted via the module constants):
+  set → hit report → locals → eval → continue; step modes;
+  enable/disable-all idempotence; motion 3 with the fence (the didChange
+  dirty mark, the middleware's reconciliation pass invoked directly, the
+  listing-verified demotion, re-arm, then the hit); cancel-while-stopped
+  (swept line, silent attributed retirement, demote-all);
+  backstop-timeout → busy fence → debt clearing → abort on a live runaway;
+  two simultaneous hits via `Future.fork` (several-hits refusal rows,
+  continue-all). Two empirical lessons recorded in the tests' docstrings:
+  the hit-led exit needs the CALLER's line as the destination (with a
+  farther destination PIDE can mark the destination line reached while the
+  parked command sits earlier in the prefix — the wait then ends "arrived,
+  not quiet" before the hit lands, and the hit correctly surfaces per §6.2
+  as notice + paused section); and the fence after an upstream edit fires
+  through bullet 1 via the D2 demotion, not bullet 2 (PIDE re-processes a
+  small edited block in the background within seconds).
+- Documentation — landed: `README.md` (debugger paragraph under Tools),
+  `CHANGELOG.md` (the ML-debugging entry), `SPECIFICATION.md` (§3.4 catalog,
+  the launch (session, debug) identity in §4.3.1, §6, §7 counts),
+  `API_DESIGN.md` (§2.4 wire table), `ARCHITECTURE.md` (§2.7 subsystem) —
+  each at pointer altitude, with `docs/archive/DEBUGGER_DESIGN.md` the
+  authoritative specification, not duplicated. The MCP instructions were
+  deliberately NOT extended: the user confirmed (2026-08-19) that the
+  pause-on-hit behaviour is taught in-band by the approved runtime
+  sentences (the report tail, the refusal, the paused section) and needs no
+  pre-teaching.
 
 ## Ordering and gates
 

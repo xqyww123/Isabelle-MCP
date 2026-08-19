@@ -48,9 +48,30 @@ ARCHITECTURE.md.
 
 | MCP Tool | Implementation | External Commands |
 |----------|----------------|-------------------|
-| `isabelle_launch` | Spawn the prover; set logic + `-d` session dirs | `isabelle mcp_server -l <session> -d <dirs…>` |
+| `isabelle_launch` | Spawn the prover; set logic + `-d` session dirs; `debug=true` adds `-o ML_debugger=true` | `isabelle mcp_server -l <session> -d <dirs…>` |
 | `isabelle_terminate` | LSP `shutdown`/`exit` + process teardown | - |
 | `isabelle_session_info` | Query LSP client state | - |
+
+### 2.4 PIDE Debugger Methods
+
+The eleven `isabelle_*_breakpoint*`/debugger tools sit on six requests and two
+notifications, all ours (Scala `Debugger_Adapter` over Isabelle's
+`Debugger` module). The wire contract — request/reply shapes, the eval
+wrapper `Isabelle_MCP.debug_eval`, timeout/abort semantics — is
+[`docs/archive/DEBUGGER_DESIGN.md`](archive/DEBUGGER_DESIGN.md) §7; the
+registry, hit table and every agent-facing sentence live Python-side in
+`src/isabelle_mcp/debugger.py`.
+
+| Wire | Kind | Carries |
+|------|------|---------|
+| `PIDE/debugger_breakpoints` | request | one file's breakable sites (serial, single-symbol range, enabled state) |
+| `PIDE/debugger_toggle_breakpoint` | request | absolute enable/disable of one site by serial |
+| `PIDE/debugger_eval` | request | one ML expression evaluated in a stopped thread's frame |
+| `PIDE/debugger_print_vals` | request | a frame's locals through the same eval verb |
+| `PIDE/debugger_abort` | request | abort flag for a thread's outstanding evaluation |
+| `PIDE/debugger_input` | request | raw debugger verbs (`continue`, `step`, …) |
+| `PIDE/debugger_state` | notification | full map of stopped threads with their stacks (frame positions resolved to file:line via the document snapshot) |
+| `PIDE/debugger_output` | notification | debugger-channel prover messages |
 
 ---
 
