@@ -105,10 +105,12 @@ below).
 
 **Phase C landed 2026-08-18** — registry, tools, instructions (details in
 the Phase C section below, including the user decisions that overrode the
-specification during the wording review).  **The NEXT ACTION is Phase D**
-(evaluation and cancellation integration).  Still open with the user: when
-to push (push only on explicit order; the parent-repo gitlink bump follows
-the usual recipe).  The repair
+specification during the wording review).  A two-workflow adversarial review
+on 2026-08-19 then confirmed four defects; **the NEXT ACTION is the fix
+round of "Phase C review round (2026-08-19)" below** (user-approved,
+validated fixes with exact anchors), and Phase D follows it.  Still open
+with the user: when to push (push only on explicit order; the parent-repo
+gitlink bump follows the usual recipe).  The repair
 round's contract remains in the "Phase A repair round" section; the full
 review verdict of the FIRST review is archived in
 [`DEBUGGER_REPAIR_REVIEW_VERDICT.md`](DEBUGGER_REPAIR_REVIEW_VERDICT.md).
@@ -833,6 +835,159 @@ Known gap for Phase E: the `.ML` listing path has never been measured
 against a real prover (the specification marks it "(probe)"); its sentences
 are written but untested.
 
+### Phase C review round (2026-08-19) — THE NEXT ACTION, user-approved
+
+Two adversarial-review workflows over the Phase C commits (`3b48367..HEAD`):
+16 agents (4 finder lenses, then 2 default-refute skeptics per finding) then
+12 agents (skeptics for the uncapped findings + 2 validators per proposed
+fix); 9 raw findings, 4 distinct defects survived.  The fixes below are the
+VALIDATED versions — each was attacked by two agents and hardened where they
+found a hole.  All line numbers are as of commit `3e35c0f`.
+
+**Sequencing:** F1 (identity equality) FIRST — F2's hardened form relies on
+it.  Then F2, F3, F4.  One commit for the four fixes plus their tests, one
+for the plan-doc update.  Gates: unit suite (from 615) and the FULL
+integration battery in one process run; the battery must be re-run because
+`step_at_breakpoint` changes.
+
+#### F1 — `Breakpoint` must compare by identity  [debugger.py:491]
+
+Defect (confirmed, HIGH): `Breakpoint` is a plain `@dataclass`, so it has
+value equality, and `list.remove(x)` deletes the FIRST equal element.  For
+two field-identical entries that is the entry the code intends to KEEP:
+`_record_armed` (:825) then mutates a detached object while the stale twin
+survives in the registry, so the prover site is ON with no armed entry
+behind it — `disable_all_breakpoints` skips it and sends no toggle, breaking
+the design's projection invariant.  Same pattern at `_merge_same_site`
+(:1149) and `del_breakpoints` (:892).
+
+Fix: `@dataclass(eq=False)` on `Breakpoint`, with a comment saying the three
+removal sites depend on identity semantics.  Validated by both agents as
+strictly better than deleting by an `is`-found index (one change fixes all
+three sites and turns `entry in registry.entries` at :1148 into the identity
+test it was always meant to be).  Verified: nothing in `src/` or `tests/`
+relies on value equality of `Breakpoint`; the class merely becomes hashable
+(unused).  `Hit` and `Site` keep value equality — they are never removed
+from a list by value.
+
+#### F2 — `_record_armed` mints undeletable duplicates  [debugger.py:815-830]
+
+Defect (confirmed, HIGH): the duplicate-detection predicate matches an
+existing entry only by equal serial, or by line+anchor when the entry is
+PENDING.  An ARMED entry whose serial died (normal after any re-execution of
+the enclosing command; nothing in Phase C demotes it — that is Phase D)
+matches neither, so a second entry with the identical file, line and anchor
+is appended.  `del_breakpoints` then refuses both as ambiguous, and its
+advice to pass `at_text` cannot disambiguate.  (Recovery exists —
+`enable_all_breakpoints` re-resolves and merges — but nothing tells the
+agent that.)
+
+Fix (HARDENED per both validators — the naive "drop the PENDING conjunct"
+form leaks a live site):
+
+1. Match on `e.file_path == file_path and e.anchor and (e.serial ==
+   site.serial or (e.line == site.line and e.anchor == site.anchor))` —
+   i.e. drop the `e.state == PENDING` conjunct AND require a non-empty
+   anchor, so the degenerate empty snippet (`anchor_snippet` returns `""`
+   when the client's line text is shorter than the site's offset, e.g. a
+   drifted `.ML` blob) can never act as a wildcard key.
+2. BEFORE rebinding or removing any matched entry, switch off every
+   abandoned LIVE site: for each matched `e` with `e.serial is not None and
+   e.serial != site.serial`, send `_toggle_site(client, e.file_path,
+   e.serial, False)` best-effort (suppress `IsabelleToolError`, log it).
+   Without this step the hardened predicate can swallow an entry whose old
+   serial is still live, leaving an enabled site with no entry — exactly the
+   invariant break F1 fixes elsewhere.
+3. Remove the extras by identity (free once F1 lands).
+
+Deliberately NOT fixed here (root cause is Phase D's demote-on-evaluation
+hooks, and heuristics would be worse than the disease): a duplicate can
+still be minted when the recorded LINE has drifted (an edit above the
+breakpoint) or when the ANCHOR text changed for the same statement.  Record
+this in the Phase D section as a task the demote hooks subsume.
+
+#### F3 — a successful step reports a dead hit id and a stale stack  [debugger.py:1377-1381]
+
+Defect (confirmed, HIGH): `hit.stepping = False` runs BEFORE
+`registry.sync_hits(client)`, so the step's own transient "thread absent"
+notification (Isabelle's debugger loop always emits one on the step verb) is
+replayed with the flag already cleared: `sync_hits` retires the hit with a
+false "hit ended" notice and the following re-stop notification mints a NEW
+hit.  The tool still returns `Hit h1 stopped again.` for the retired id and
+renders h1's PRE-step call stack.  Happens on EVERY successful step, in all
+three modes.
+
+Fix (per both validators — MOVE, do not delete): in the "stopped again"
+branch, call `registry.sync_hits(client)` FIRST (the transient absence is
+suppressed while `stepping` is still True, and the re-stop entry refreshes
+`hit.stack` and clears `stepping` itself), THEN set `hit.stepping = False`
+as a belt-and-braces clear, then render.  Deleting the assignment outright
+was rejected: if no state notification arrives within the wait, `stepping`
+would stay True forever and the hit could never be retired.
+
+Also in the same commit (both validators raised it independently):
+`hit.stepping = True` at :1359 is set before `await client.debugger_input`
+at :1361 with no protection — a raising verb request leaves the flag set
+forever.  Wrap so the flag is cleared on that failure path.
+
+The "did not stop" branch keeps its current order (clearing before the sync
+is intended there: the absence must retire the hit as `ENDED_STEP_LEFT`).
+
+#### F4 — wording and dead code
+
+- `NOTICE_MERGED` (:295) ends "merged into one **entry**"; `entry` is the
+  internal word the user removed everywhere else.  Change to "merged into
+  one **breakpoint**".
+- The same-position merge (which F2 makes the normal shape of a merge) reads
+  as a self-referential sentence.  Add a second constant, user-approved
+  VERBATIM 2026-08-19:
+  `duplicate breakpoint at {where} before {anchor} merged into one`
+  and use it when the two merged entries share file, line and anchor; the
+  existing sentence stays for the different-position case (design §5's
+  original motivation: two entries resolving to one site after an edit).
+- Delete `NOTICE_STRAY_HALT` (:304): no code path emits it, and the
+  measured stray halt is absorbed by the step tool's `stepping` flag.  (The
+  finding that it constitutes a lying notice was REFUTED; deleting the
+  unused constant is housekeeping, not a behaviour change.)
+- Fix the comment at :1273-1274 (`create_task so a cancelled tool call
+  leaves the round trip running`): awaiting a task propagates cancellation
+  into it, so that claim is false.  The real reason is that the handle is
+  published for a CONCURRENT caller — `_check_eval_fence` (:1232) and
+  `abort_eval_at_breakpoint` (:1402).  Comment only; the behaviour is
+  correct because the authoritative one-evaluation-per-thread fence is
+  prover-side (`scala/.../debugger.scala:405-406`).
+
+#### Tests to add or fix with the round
+
+- `tests/test_debugger.py`'s `FakeDebugClient` pushes only the re-stop state
+  on a step verb; that low fidelity is why F3 escaped.  It must push the
+  transient EMPTY state first, then the re-stop state, and the step test
+  must assert the hit id is UNCHANGED and the rendered stack is the NEW one.
+- F2: setting a breakpoint twice across a re-compilation (fresh serials)
+  leaves ONE entry; the abandoned live site is toggled off; an empty anchor
+  never matches.
+- F1: two field-identical entries merge to the one the tool then reports as
+  armed, and a following `disable_all_breakpoints` really sends the toggle.
+- F4: the two merge sentences pinned verbatim; `NOTICE_STRAY_HALT` gone.
+
+#### Findings killed in this round (do NOT re-report)
+
+- A non-ok toggle demotes an entry although the prover site is untouched
+  (serials are minted per compilation, so no live site is left behind).
+- The eval/locals round trip dies with a cancelled tool call (true, but the
+  authoritative busy fence is prover-side; the agent gets the accurate
+  `EVAL_BUSY` sentence — only the comment was wrong, see F4).
+- `NOTICE_STRAY_HALT` produces a lying notice (the stray halt is absorbed by
+  the stepping flag; only the dead constant is real).
+- Anchor prefix matching silently arms an unrelated site (not silent — the
+  resolved line and anchor are printed in the same result and in the
+  listing; the pick is decided by the approved nearest-recorded-line rule,
+  which behaves identically under exact matching).
+- `continue_breakpoint`'s level-triggered wait can burn the full 30 s when
+  the thread re-stops immediately (found twice, real, LATENCY ONLY — the
+  returned text is correct).  The user reviewed this on 2026-08-18 with the
+  evidence and decided to KEEP the current implementation; do not re-open.
+
 ## Phase D — evaluation and cancellation integration
 
 `src/isabelle_mcp/evaluation.py`:
@@ -852,6 +1007,12 @@ are written but untested.
   and as a debugger notice so the guard's auto-start path cannot drop it.
 - Demote-and-notify hooks: on evaluation events, on resync, after relaunch,
   after cancellation (per probe 7). No background arming (spec §5).
+  These hooks also subsume two duplicate-entry cases the 2026-08-19 fix
+  round deliberately left open (see F2 there): a `set_breakpoint` after a
+  re-compilation still mints a duplicate when the recorded LINE has drifted
+  (an edit above the breakpoint) or when the ANCHOR text of the same
+  statement changed — once an entry is demoted the moment its site dies,
+  both resolve through the normal pending path.
 - Cancellation itself unchanged (spec §6.4); hits retired as swept-up, the
   hit table cleared on every prover teardown path.
 
