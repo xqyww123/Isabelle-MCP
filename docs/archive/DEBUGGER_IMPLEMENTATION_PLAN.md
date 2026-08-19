@@ -108,7 +108,10 @@ the Phase C section below, including the user decisions that overrode the
 specification during the wording review).  A two-workflow adversarial review
 on 2026-08-19 confirmed four defects; **the fix round of "Phase C review
 round (2026-08-19)" below landed the same day** (implementation notes at the
-end of that section).  **The NEXT ACTION is Phase D.**  Still open
+end of that section).  **Phase D: D1 landed
+(commit `4863066`); the full design is finalized and user-approved
+(2026-08-19, see the Phase D section) — implementation awaits the user's
+explicit go-ahead.**  Still open
 with the user: when to push (push only on explicit order; the parent-repo
 gitlink bump follows the usual recipe).  The repair
 round's contract remains in the "Phase A repair round" section; the full
@@ -1015,31 +1018,239 @@ passing (615 + 6 new); integration battery 25 passing in one process run.
 
 ## Phase D — evaluation and cancellation integration
 
-`src/isabelle_mcp/evaluation.py`:
+**Design finalized and user-approved 2026-08-19** (every decision below was
+either taken verbatim from the specification or individually approved by the
+user; the two open spec gaps and the demote-observation mechanism were
+adversarially reviewed — provenance at the end of this section).
+**Implementation awaits the user's explicit go-ahead.**
 
-- Third exit condition in the `evaluate_to` wait loop: a hit **in the current
-  evaluation's theory set** (Scala-side position→node resolution); other hits
-  become notices; unattributable hits fail open. The result leads with the
-  hit report, including the implicit 10 s frame-0 locals fetch.
-- "Paused at a breakpoint" section in `evaluation_status` (wording from
-  probe 10).
-- `evaluate_to` refused while any hit is live (the refusal lives in
-  `evaluate_to` itself, so the query tools' auto-start inherits it), leading
-  with the live hits and consuming their queued notices; plus the
-  forgotten-re-enable fence of spec §5 — trigger computed over the target's
-  import closure (excluding `code not found` entries, including armed
-  entries at no-longer-processed positions), delivered both as a result line
-  and as a debugger notice so the guard's auto-start path cannot drop it.
-- Demote-and-notify hooks: on evaluation events, on resync, after relaunch,
-  after cancellation (per probe 7). No background arming (spec §5).
-  These hooks also subsume two duplicate-entry cases the 2026-08-19 fix
-  round deliberately left open (see F2 there): a `set_breakpoint` after a
-  re-compilation still mints a duplicate when the recorded LINE has drifted
-  (an edit above the breakpoint) or when the ANCHOR text of the same
-  statement changed — once an entry is demoted the moment its site dies,
-  both resolve through the normal pending path.
-- Cancellation itself unchanged (spec §6.4); hits retired as swept-up, the
-  hit table cleared on every prover teardown path.
+### D1 — frame position resolution (LANDED, commit `4863066`)
+
+`thread_json` in `debugger.scala` resolves command-relative frame positions
+(id/offset, probe 13) to file:line via
+`Document.Snapshot.find_command_position` at forwarding time; unresolvable
+frames keep no file/line. Jar rebuilt per COMPONENT_INSTALL_PLAN §7;
+probe 13 asserts frame 0 resolves to the probe theory. Gates: unit 621,
+battery 25.
+
+### D2 — the demote-and-notify bookkeeping (the reviewed "Scheme A", final)
+
+Spec §5 pins WHAT (observe site death → demote + one notice per state
+change; never toggle; never arm); the HOW below was designed here and
+reviewed by a 36-agent adversarial workflow (4 lenses → 2 default-refute
+skeptics per finding; 9 killed, 4 distinct defects folded in).
+
+**Event classification rule.** Events where site death is CERTAIN demote
+directly at the event, wire-free, exactly the `on_prover_teardown` shape:
+prover teardown (existing) and `isabelle_cancel_evaluation` (probe 7:
+the synthetic edit invalidates EVERY serial; the listing answers
+`outdated` until a re-evaluation, so reconciling by listing would burn the
+full 20-retry loop per file and then mistag). Tag: `not evaluated yet`.
+Events where death is UNCERTAIN (edits — probe 6: a downstream edit
+preserves serials) verify by listing before any demotion.
+
+**Dirty marks.** A registry-held set of realpaths. Marked by: every
+didChange actually sent for an open document (both resync paths); a `.ML`
+dependency blob whose stat signature changed (`_dependency_freshness_wait`
+already detects it). Propagation: marking F also marks every file that
+transitively imports F and holds armed entries (import graph from
+theory_status). The `.ML` blast radius (accepted over-approximation, user
+2026-08-19 "这点 dirty 是可以接受的"): a blob change marks ALL files
+holding armed entries; theory-edit propagation additionally marks all
+armed-entry `.ML` files (theory_status carries no blob↔loader edges — the
+graph cannot express them).
+
+**Consumed marks, never cleared afterwards.** Reconciliation POPS the dirty
+set synchronously (before its first await); a concurrent event during the
+listing round trip sets a fresh mark that survives to the next pass. This
+shape removes the mark-clearing race outright (no generation counters).
+
+**Reconciliation.** At the next tool call, in the middleware, after
+`sync_hits`, BEFORE notices are drained: for each popped file that holds
+armed entries, under the registry lock, `fetch_sites`; an armed entry stays
+armed iff its recorded serial appears in the listing. Demotion tags:
+serial absent from an ok listing → `not evaluated yet`; file not open →
+`not evaluated yet`; the listing request itself failed →
+`state unknown, internal failure`. `code not found` stays RESERVED for a
+failed arming attempt inside the explicit tools (this keeps the fence's
+exclusion of `code not found` sound). Reconciliation only demotes.
+
+### D3 — evaluation integration (spec §6 verbatim; gap-fills approved)
+
+**The current evaluation's theory set** (approved after two adversarial
+verification rounds): the union of (a) realpath(target file); (b)
+`auto_opened_files` (already realpathed); (c) realpath(node_name) of every
+theory in the target's import closure (`_find_theory_name` →
+`_get_recursive_dependencies` → `theory_map[dep].node_name`; deps absent
+from the snapshot drop out — heap-precompiled code cannot hit); (d)
+realpath(node_name) of every theory_status entry flagged `external` whose
+`theory_name` is EMPTY — exactly the `ML_file`-loaded blobs ("all external"
+was refuted: the external flag is never cleared, so it converges on
+"everything not currently open"). Computed LAZILY — only when a new hit
+must be classified — from the iteration's snapshot; when a new hit's
+frame-0 file is NOT in the set, re-fetch theory_status ONCE and recompute
+before finalizing "elsewhere" (closes the auto-open-await staleness
+window). Classification: frame-0 file absent → fail open (end the wait);
+realpath(frame-0 file) ∈ set → end the wait, lead with the hit report;
+else → buffered notice, keep waiting. Wrap the classification realpath —
+`ValueError` (embedded null byte) fails open, not into the
+`BaseException` teardown.
+
+**Two pinned orderings** (verifier-mandated): in `evaluate_to`'s entry,
+`sync_hits` + the §6.1 hits-live refusal run BEFORE the active-evaluation
+refusal (else the agent is told to cancel, which destroys the hits); the
+hit-led wait-loop exit is a DISTINCT internal loop outcome checked before
+the heap-abandonment branch (the agent-visible outcome stays the
+`in_progress` family — user-approved; the bare status word never reaches
+output).
+
+**Hit-report anchor sourcing** (approved + verified, amendment folded in):
+the `before ‹anchor›` phrase comes from the registry entry matching the
+stop position — EXACTLY ONE armed entry at (realpath(frame-0 file),
+frame-0 line), AND its recorded anchor text must occur on the current text
+of that line (`_file_lines`; the guard converts the stale-armed-entry
+wrong-anchor path into omission); zero or several matches, or the anchor
+absent from the line → omit the phrase. Never computed fresh (only the
+line is known, not the site). Render order: final `sync_hits`, then ALL
+hit headers (including anchor decisions) in ONE synchronous pass, THEN the
+concurrent implicit locals fetches; `registry.lock` is NOT held across the
+fetches. Accepted residue (documented, no cheap fix): an orphaned enabled
+site left by a logged best-effort disarm failure, on the same line as
+exactly one armed entry at a different statement, prints that entry's
+anchor.
+
+**Implicit frame-0 locals** (spec §6.1): fetched for every hit in the
+report, concurrently, one 10 s never-destructive bound (the prover-side
+`debug_eval` deadline); registered in `hit.eval_task` (abortable, fences
+agent evals); per-value 5 s bound inside.
+
+**Cancellation** (spec §6.4 + approvals): path unchanged. Live hits get
+`pending_ending` BEFORE the interrupt, so their retirement is SILENT (the
+attributed-ending precedent — `continue` emits no notice either); the
+ending clause survives only in the stale-id refusal. The cancel result
+gains one line when hits were swept (sentence below). Afterwards the
+certain-death demote-all of D2 runs.
+
+**`evaluation_status`**: the paused section (sentences below) leads the
+result whenever hits are live; the existing progress report follows.
+
+**Fence** (spec §5 verbatim): trigger over the target's import closure —
+enabled pending entries except `code not found`, plus armed entries whose
+recorded position is no longer processed (`.thy` via the decoration
+tracker; `.ML` via the blob's stat signature changed since arming — a new
+`Breakpoint` field records the arming-time signature). Emitted as a result
+line AND a debugger notice.
+
+### The approved sentence catalogue (verbatim; unify before commit)
+
+Global rules (user 2026-08-19): tool names in ALL runtime sentences carry
+backticks (retrofit the whole Phase C catalogue; verbatim test pins updated
+as a conscious edit); every concrete hit number is written `hit id {hit_id}`
+(retrofit table below); manual pluralization everywhere.
+
+New block shapes:
+
+- Hit block header (replaces `Hit {hit_id}: thread {thread}.` everywhere):
+  two lines `Hit id: {hit_id}` ␤ `thread {thread}`.
+- Stack header (replaces the Phase C line; instructions and the `frame`
+  parameter descriptions drop "innermost"/"where execution stopped" for the
+  same words): `Call stack (frame 0 is the innermost, top of the stack;
+  outer frames follow):`
+- Several-hits refusal rows: `  hit id {hit_id} — thread {thread}`
+  (header `Several hits are live; pass hit_id:` unchanged).
+
+Phase C retrofit table (hit id + backticks; meanings unchanged; each
+line below is one sentence, recorded verbatim — the backticks are part of
+the sentence):
+
+    There is no hit id {hit_id}. Call `isabelle_debug_state` for the live hits.
+    Hit id {hit_id} has ended: {ending} Call `isabelle_debug_state` for the live hits.
+    The thread of hit id {hit_id} is not stopped any more — the expression was never sent. Call `isabelle_debug_state` for the live hits.
+    Resumed hit id {hit_id} (thread {thread}).
+    Hit id {hit_id} did not resume within {seconds}s — the thread is still stopped. Call `isabelle_debug_state`.
+    Hit id {hit_id} stopped again.
+    thread {thread} stopped at a breakpoint — hit id {hit_id}; inspect with `isabelle_debug_state`
+    hit id {hit_id} ended: {ending}
+
+Backtick-only retrofits (DEBUG_OFF, ENDED_CONTINUED, the timeout
+sentences, …) follow the global rule mechanically; the full catalogue diff
+is shown to the user at gate time.
+
+Phase D sentences (all user-approved verbatim 2026-08-19; backticks are
+part of the sentences):
+
+1. `evaluate_to` hit report, per hit — headline (anchor omitted per the
+   sourcing rule drops the before-phrase; no position drops the location):
+
+        Breakpoint hit: {file}:{line} before ‹{anchor}›.
+        Breakpoint hit: {file}:{line}.
+        Breakpoint hit.
+
+   then the hit block (two-line header + stack), then `Locals of frame 0:`
+   + rows. Tail once, after all blocks:
+
+        Evaluation is paused, NOT finished. Inspect with `isabelle_eval_at_breakpoint` / `isabelle_locals_at_breakpoint` / `isabelle_step_at_breakpoint`, or resume with `isabelle_continue_breakpoint`.
+
+2. Whole-fetch timeout (replaces the Locals section):
+
+        Locals of frame 0 could not be fetched in time — use `isabelle_locals_at_breakpoint` to fetch them.
+
+3. `evaluate_to` refusal while hits are live (leads with the hits; consumes
+   their queued new-hit notices; anchor degradation as in 1; plural lead
+   enumerates: `Evaluation is paused at 2 breakpoints — hit id h1 at …,
+   hit id h2 at ….`):
+
+        Evaluation is paused at a breakpoint — hit id h1 at Foo.thy:14 before ‹fold upd args›. `isabelle_evaluate_to` cannot run while a hit is live. Inspect with `isabelle_debug_state`, resume breakpoints with `isabelle_continue_breakpoint`.
+
+4. Implicit-fetch collision refusal (the spec draft's abort-tool mention
+   dropped — that tool is not exposed):
+
+        An implicit locals fetch is still running on this hit — retry in a few seconds.
+
+5. Fence warning (result line AND notice; "the run" as subject in both
+   numbers):
+
+        {N} breakpoints in the files this run executes are not armed — the run will not stop at them. Call `isabelle_enable_all_breakpoints` to arm them.
+        1 breakpoint in the files this run executes is not armed — the run will not stop at it. Call `isabelle_enable_all_breakpoints` to arm it.
+
+6. Cancellation ending clause (stale-id refusal ONLY — no delayed notice,
+   the attributed-ending rule):
+
+        it was swept up by `isabelle_cancel_evaluation`.
+
+7. Cancel result line when hits were swept:
+
+        2 hits were swept up; their threads are no longer stopped.
+        1 hit was swept up; its thread is no longer stopped.
+
+8. `evaluation_status` paused section (leads the result; hit blocks as in
+   `isabelle_debug_state`; first line, then the blocks, then the closing
+   line):
+
+        Evaluation is paused at a breakpoint; it will not progress until the hit is resumed with `isabelle_continue_breakpoint`.
+        Evaluation is paused at {N} breakpoints; it will not progress until the hits are resumed with `isabelle_continue_breakpoint`.
+        Inspect with `isabelle_eval_at_breakpoint` / `isabelle_locals_at_breakpoint`, or step with `isabelle_step_at_breakpoint`.
+
+### Review provenance and killed findings (do NOT re-report)
+
+Scheme A workflow (36 agents): killed — lock convoy over all tools;
+theory_status-at-mark-time lock conflict; reconcile-after-call_next
+staleness; document-close as a missing event; ok-with-empty demotion
+wrongness (it is correct); fence-sees-pre-demotion-state ordering;
+stale-`code not found` fence suppression; dirty-set-as-shadow-state;
+no-correct-middleware-slot. Folded in — cancel direct demote (found by 3
+lenses); `.ML` blob edges missing (2 lenses; resolved by the accepted
+over-approximation, NOT by new wire edges); mark-clearing race (resolved
+by consumed marks, simpler than the proposed generation counter).
+Anchor verification (1 agent): CONFIRMED + the anchor-present-on-line
+guard + realpath + the synchronous-render ordering; the orphaned-site
+residue accepted. Theory-set verification (2 agents, adversarial second
+pass): "all external" refuted (never-cleared flag), empty-`theory_name`
+discriminator adopted; classification staleness re-fetch; the two pinned
+orderings; the realpath `ValueError` fail-open guard. First-verifier
+claims refuted by the second: "leftover external hits are rare" (they are
+the steady state), "the iteration's snapshot is fresh enough" (the
+auto-open awaits open a multi-second window).
 
 ## Phase E — tests and documentation
 
