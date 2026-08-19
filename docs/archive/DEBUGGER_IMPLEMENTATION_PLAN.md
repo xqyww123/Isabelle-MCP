@@ -106,15 +106,15 @@ below).
 **Phase C landed 2026-08-18** — registry, tools, instructions (details in
 the Phase C section below, including the user decisions that overrode the
 specification during the wording review).  A two-workflow adversarial review
-on 2026-08-19 then confirmed four defects; **the NEXT ACTION is the fix
-round of "Phase C review round (2026-08-19)" below** (user-approved,
-validated fixes with exact anchors), and Phase D follows it.  Still open
+on 2026-08-19 confirmed four defects; **the fix round of "Phase C review
+round (2026-08-19)" below landed the same day** (implementation notes at the
+end of that section).  **The NEXT ACTION is Phase D.**  Still open
 with the user: when to push (push only on explicit order; the parent-repo
 gitlink bump follows the usual recipe).  The repair
 round's contract remains in the "Phase A repair round" section; the full
 review verdict of the FIRST review is archived in
 [`DEBUGGER_REPAIR_REVIEW_VERDICT.md`](DEBUGGER_REPAIR_REVIEW_VERDICT.md).
-Current gate numbers: unit suite 615 passing; integration battery 25
+Current gate numbers: unit suite 621 passing; integration battery 25
 passing (tests/integration in one process run, incl. 13 debugger probes +
 2 ranged probes and the file-sync/query e2e tests).
 
@@ -987,6 +987,31 @@ is intended there: the absence must retire the hit as `ENDED_STEP_LEFT`).
   the thread re-stops immediately (found twice, real, LATENCY ONLY — the
   returned text is correct).  The user reviewed this on 2026-08-18 with the
   evidence and decided to KEEP the current implementation; do not re-open.
+
+#### As landed (2026-08-19)
+
+All four fixes applied as specified, with three implementation notes:
+
+- `_record_armed` became **async** (F2's disarm-before-rebind step sends
+  toggles); its one caller (`set_breakpoint`, under the registry lock)
+  awaits it.
+- The merge notice compares and prints the (line, anchor) pairs **as
+  recorded before re-arming rewrote them**: `_arm_entry` overwrites
+  `entry.line`/`entry.anchor` with the resolved site's values before
+  `_merge_same_site` runs, so a post-arming comparison would classify every
+  enable-all merge as a duplicate and made the different-position sentence
+  print itself twice (the self-referential form the user flagged).
+  `enable_all_breakpoints` snapshots the recorded pairs before its arming
+  loop and passes them to `_merge_same_site`; the shared
+  `_add_merge_notice` helper picks between the two approved sentences.
+  (F1's identity semantics is what lets entries key that snapshot dict.)
+- `FakeDebugClient.debugger_input` now emits the thread-absent full map
+  itself on every resume verb (the wire fact), which subsumed and deleted
+  the `_resume_on_continue` test helper.
+
+Each fix was verified to be pinned by its new test: reverting F1, F2 or F3
+in isolation makes the corresponding test fail.  Gates: unit suite 621
+passing (615 + 6 new); integration battery 25 passing in one process run.
 
 ## Phase D — evaluation and cancellation integration
 
