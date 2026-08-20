@@ -13,7 +13,7 @@
 ## 1. Overview
 
 This document provides API design and implementation guidance for Isabelle-MCP. The
-current server exposes 11 MCP tools.
+current server exposes 24 MCP tools.
 For high-level specifications, see SPECIFICATION.md. For architecture, see
 ARCHITECTURE.md.
 

@@ -801,22 +801,17 @@ class DebuggerRegistry:
     # ── prover teardown (design: the hit table is cleared on EVERY
     #    prover teardown path; entries are retained and demoted) ──────
 
-    def on_prover_teardown(self) -> None:
+    def on_prover_teardown(self, client: IsabelleLSPClient) -> None:
         for hit in list(self.hits.values()):
             self._retire(hit, ENDED_TERMINATED)
             self.add_notice(NOTICE_HIT_ENDED.format(
                 hit_id=hit.hit_id, ending=ENDED_TERMINATED))
+        # demote() is the ONLY writer of the pending transition (path
+        # display needs nothing the dying prover invalidates — only
+        # client.project_root and the filesystem).
         for entry in self.entries:
             if entry.state == ARMED:
-                # No client for path display here (the prover is going
-                # away); the raw stored path is the honest fallback.
-                entry.state = PENDING
-                entry.serial = None
-                entry.reason = TAG_NOT_EVALUATED
-                self.add_notice(NOTICE_DEMOTED.format(
-                    where=f"{entry.file_path}:{entry.line}",
-                    anchor=cartouche(entry.anchor),
-                    tag=TAG_NOT_EVALUATED))
+                self.demote(client, entry, TAG_NOT_EVALUATED)
         self._consumed = 0
         # Marks refer to the dead prover's serials; every entry is pending
         # now, and reconciliation only demotes armed entries — drop them.

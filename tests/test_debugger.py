@@ -447,10 +447,11 @@ class TestHitSync:
 
     def test_teardown_retires_hits_and_demotes_entries(self, client):
         hit = _hit(client)
+        client.project_root = "/fake"
         debugger.registry.entries.append(Breakpoint(
             file_path=THY, line=VAL_XS, anchor="val", state=ARMED, serial=11))
         debugger.registry.drain_notices()
-        debugger.registry.on_prover_teardown()
+        debugger.registry.on_prover_teardown(client)
         assert debugger.registry.hits == {}
         assert debugger.registry.retired[hit.hit_id] == \
             debugger.ENDED_TERMINATED
@@ -459,7 +460,10 @@ class TestHitSync:
         assert entry.reason == debugger.TAG_NOT_EVALUATED
         notices = debugger.registry.drain_notices() or ""
         assert "hit id h1 ended: the prover was terminated." in notices
-        assert "no longer works (not evaluated yet)" in notices
+        # The demotion goes through demote() — the notice renders the
+        # project-relative path like every other notice.
+        assert (f"breakpoint DebugProbe.thy:{VAL_XS} before ‹val› "
+                "no longer works (not evaluated yet)") in notices
         assert debugger.registry._consumed == 0
 
 
@@ -1535,7 +1539,7 @@ class TestReconcileDirty:
 
     def test_teardown_clears_the_marks(self, client):
         debugger.registry.mark_dirty(THY)
-        debugger.registry.on_prover_teardown()
+        debugger.registry.on_prover_teardown(client)
         assert debugger.registry.pop_dirty() == set()
 
 

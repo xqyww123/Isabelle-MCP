@@ -646,7 +646,7 @@ class IsabelleLSPClient:
         self.debugger_state_history.clear()
         self.debugger_output_history.clear()
         from isabelle_mcp.debugger import registry
-        registry.on_prover_teardown()
+        registry.on_prover_teardown(self)
 
         # Reset the module-global evaluation singleton so a later relaunch starts
         # clean — otherwise a terminate mid-evaluation leaves evaluation_state.active

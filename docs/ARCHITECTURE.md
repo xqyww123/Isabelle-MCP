@@ -4,9 +4,9 @@
 **Date:** 2026-06-04
 **Status:** Updated for async evaluation model + file-sync (FileWatcher) model
 
-> The server exposes 11 MCP tools: 2 session-lifecycle tools
-> (`isabelle_launch` / `isabelle_terminate`), 3 evaluation lifecycle tools, and
-> 6 query tools.  The previous blocking model (where every tool waited
+> The server exposes 24 MCP tools: 2 session-lifecycle tools
+> (`isabelle_launch` / `isabelle_terminate`), 3 evaluation lifecycle tools,
+> 8 query tools, and 11 ML-debugger tools (§2.7).  The previous blocking model (where every tool waited
 > for Isabelle to process the file) has been replaced by an explicit
 > evaluate-then-query workflow.
 
@@ -41,7 +41,7 @@ Isabelle-MCP is a Python-based MCP (Model Context Protocol) server that acts as 
 │  └────────────┬─────────────────────────────────────────┘   │
 │               │                                              │
 │  ┌────────────▼─────────────────────────────────────────┐   │
-│  │  MCP Tool Handlers (11 tools)                        │   │
+│  │  MCP Tool Handlers (24 tools)                        │   │
 │  │  Session lifecycle:                                  │   │
 │  │  - isabelle_launch                                   │   │
 │  │  - isabelle_terminate                                │   │
@@ -53,9 +53,12 @@ Isabelle-MCP is a Python-based MCP (Model Context Protocol) server that acts as 
 │  │  - isabelle_hover                                    │   │
 │  │  - isabelle_definition                               │   │
 │  │  - isabelle_local_occurrences                        │   │
-│  │  - isabelle_goal                                     │   │
+│  │  - isabelle_goal                                    │   │
+│  │  - isabelle_find_theorems                           │   │
 │  │  - isabelle_command_output                           │   │
+│  │  - isabelle_command_status                          │   │
 │  │  - isabelle_session_info                            │   │
+│  │  ML debugger (11 tools, §2.7)                        │   │
 │  └────────────┬─────────────────────────────────────────┘   │
 │               │                                              │
 │  ┌────────────▼─────────────────────────────────────────┐   │

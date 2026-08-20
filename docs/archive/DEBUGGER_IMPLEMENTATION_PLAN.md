@@ -1301,6 +1301,38 @@ misread evidence (OSError cannot escape — the wire wraps failures in
 IsabelleToolError); a `_transitive_importers`-should-use-TheoryStatus
 claim (false premise); render-order-unpinned (true, Phase E scope).
 
+### Second post-landing review round (2026-08-20, user-approved fixes)
+
+A second 24-agent two-turn adversarial debate reviewed the review-fix round
+and Phase E (commits `4fb89be` + `53933ce`), this time with a dedicated
+over-rigidity lens hunting constraint relaxations (the three user-rejected
+relaxations fenced off). Outcome: 2 upheld, 8 killed, and the relaxation
+lens produced ZERO proposals — every examined constraint's rationale
+outweighed its cost. The user approved both fixes:
+
+- **Doc tool counts aligned** — API_DESIGN §1 and ARCHITECTURE's header
+  note + component diagram said "11 MCP tools" (stale since before the
+  debugger: the base count was already 13; the diagram was missing
+  `isabelle_find_theorems` and `isabelle_command_status`); all now say 24
+  (2 lifecycle + 3 evaluation + 8 query + 11 ML-debugger), matching
+  SPECIFICATION. `docs/PIDE_MCP_COMPARISON.md` is another agent's
+  untracked file and was deliberately not touched.
+- **`on_prover_teardown` delegates to `demote()`** — it had open-coded the
+  pending transition behind a comment whose premise was false (path
+  display needs only client.project_root and the filesystem, nothing the
+  dying prover invalidates). `demote()` is now the only writer of the
+  pending transition, the counterpart of `Breakpoint.arm`; teardown
+  demotion notices gained the project-relative paths every other notice
+  uses (pinned by a new test assertion).
+
+Killed (do NOT re-report): pop-outside-registry-lock (trigger unreachable);
+two variants of "unverified.discard is repeated" (the proposed reshapes
+invert the transaction from fail-safe to fail-unsafe); the abort e2e 2 s
+race (misreads the mechanism — registration does not need the stopped
+thread to wake); ARCHITECTURE "stateless forwarding" wording (verified
+accurate); fork_prover fixture duplication; the wiring pins' pop-based
+isolation (cannot leak).
+
 ### Review provenance and killed findings (do NOT re-report)
 
 Scheme A workflow (36 agents): killed — lock convoy over all tools;
