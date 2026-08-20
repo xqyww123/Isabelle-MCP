@@ -72,8 +72,9 @@ requirements:
     # LSP server and registers a component into $ISABELLE_HOME_USER, so it is useless
     # without the distribution.  Bounded to the series its Scala component is built for.
     - isabelle >=2025.2,<2025.3
-    # The six pyproject dependencies.  Unlike isabelle-rpc's, every one of these has the
+    # The seven pyproject dependencies.  Unlike isabelle-rpc's, every one of these has the
     # SAME name on conda-forge as on PyPI -- checked, not assumed.
+    - anyio >=4.0.0
     - beautifulsoup4 >=4.12.0
     - fastmcp >=3.2,<4
     - mcp >=1.0.0

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 - **ML breakpoint debugging.** `isabelle_launch(session, debug=true)` starts
   the prover with Poly/ML debugger instrumentation (newly compiled ML gets
@@ -88,6 +88,17 @@
   non-ASCII warning, the evaluation footer — now lead with a blank line, so
   clients that join a result's text blocks without a separator still render
   them as their own paragraphs.
+
+- `anyio` is now a declared dependency. The code has always imported it
+  directly (evaluation shielding uses `anyio.move_on_after`), but it only
+  arrived transitively via `mcp`.
+
+## 0.3.1
+
+- The file watcher's inotify headroom check is now Linux-only. Off Linux the
+  probe read a /proc path that does not exist, concluded "exhausted", and
+  silently disabled event-driven file sync on every healthy macOS and Windows
+  machine.
 
 ## 0.3.0
 
