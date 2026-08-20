@@ -247,6 +247,7 @@ EVAL_OUTSTANDING = (
     "finish and retry."
 )
 EVAL_NO_OUTPUT = "The evaluation completed with no output."
+LOCALS_NONE = "Frame {frame} has no local variables to show."
 EVAL_BACKSTOP_TIMEOUT = (
     "The prover did not answer within {seconds}s. The evaluation may still "
     "be running, and this hit takes no new evaluations until it ends. "
@@ -1410,10 +1411,11 @@ def _eval_output_text(reply: dict[str, Any]) -> str:
 
 def _render_eval_reply(
     reply: dict[str, Any], hit_id: str, timeout: float,
+    empty: str = EVAL_NO_OUTPUT,
 ) -> str:
     status = reply.get("status")
     if status == "ok":
-        return _eval_output_text(reply) or EVAL_NO_OUTPUT
+        return _eval_output_text(reply) or empty
     if status == "timeout":
         raise IsabelleToolError(EVAL_BACKSTOP_TIMEOUT.format(
             seconds=int(timeout)))
@@ -1468,7 +1470,9 @@ async def locals_at_breakpoint(
     hit.eval_implicit = False
     reply = await task
     registry.sync_hits(client)
-    return _render_eval_reply(reply, hit.hit_id, timeout)
+    return _render_eval_reply(
+        reply, hit.hit_id, timeout,
+        empty=LOCALS_NONE.format(frame=frame))
 
 
 async def continue_breakpoint(

@@ -110,6 +110,15 @@ _pending_footer: contextvars.ContextVar[str] = contextvars.ContextVar(
 )
 
 
+def _append_block(result: ToolResult, text: str) -> None:
+    """Append one extra text block, led by a blank line: clients that join
+    a result's blocks without a separator (Claude Code does) still get a
+    paragraph break between the tool's own output and the extra block."""
+    result.content = [
+        *result.content, TextContent(type="text", text="\n\n" + text),
+    ]
+
+
 class UnicodeWarningMiddleware(Middleware):
     """Append queued debugger notices, unicode-conversion warnings and the
     evaluation footer to the tool response.
@@ -151,19 +160,13 @@ class UnicodeWarningMiddleware(Middleware):
                 logger.exception("breakpoint reconciliation failed")
         notices = debugger.registry.drain_notices()
         if notices is not None:
-            result.content = [
-                *result.content, TextContent(type="text", text=notices),
-            ]
+            _append_block(result, notices)
         warning = drain_warnings()
         if warning is not None:
-            result.content = [
-                *result.content, TextContent(type="text", text=warning),
-            ]
+            _append_block(result, warning)
         footer = _pending_footer.get()
         if footer:
-            result.content = [
-                *result.content, TextContent(type="text", text=footer),
-            ]
+            _append_block(result, footer)
         return result
 
 

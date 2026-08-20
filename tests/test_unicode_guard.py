@@ -283,6 +283,7 @@ class TestUnicodeWarningMiddleware:
         result = await middleware.on_call_tool(MagicMock(), call_next)
         assert len(result.content) == 2
         assert "NON-ASCII DETECTED" in result.content[1].text
+        assert result.content[1].text.startswith("\n\n")   # paragraph break
 
         # Queue drained: the next call is untouched.
         result2 = await middleware.on_call_tool(MagicMock(), call_next)

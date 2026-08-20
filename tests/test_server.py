@@ -492,8 +492,10 @@ class TestFooterPlumbing:
             return ToolResult(content=[TextContent(type="text", text="the answer")])
 
         result = await UnicodeWarningMiddleware().on_call_tool(None, call_next)
+        # The extra block leads with a blank line: clients that join blocks
+        # without a separator still render a paragraph break.
         assert [c.text for c in result.content] == [
-            "the answer", "Evaluating towards Foo.thy:20.",
+            "the answer", "\n\nEvaluating towards Foo.thy:20.",
         ]
 
     @pytest.mark.asyncio
@@ -611,8 +613,8 @@ class TestFooterScope:
         result = await UnicodeWarningMiddleware().on_call_tool(None, call_next)
         texts = [c.text for c in result.content]
         assert texts[0] == "the answer"
-        assert texts[1].startswith("⚠️ NON-ASCII DETECTED")
-        assert texts[2] == "Evaluating towards A.thy:20."
+        assert texts[1].startswith("\n\n⚠️ NON-ASCII DETECTED")
+        assert texts[2] == "\n\nEvaluating towards A.thy:20."
 
 
 class TestDebuggerToolPlumbing:
@@ -679,8 +681,8 @@ class TestDebuggerToolPlumbing:
         texts = [c.text for c in result.content]
         assert texts[0] == "the answer"
         assert texts[1] == (
-            "Debugger notices:\n- breakpoint X no longer works (tag)")
-        assert texts[2].startswith("⚠️ NON-ASCII DETECTED")
+            "\n\nDebugger notices:\n- breakpoint X no longer works (tag)")
+        assert texts[2].startswith("\n\n⚠️ NON-ASCII DETECTED")
         # Delivered exactly once: the queue is now empty.
         assert debugger.registry.drain_notices() is None
 

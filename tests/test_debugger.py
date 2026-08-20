@@ -249,6 +249,8 @@ class TestSentenceCatalogue:
         )
         assert debugger.EVAL_NO_OUTPUT == \
             "The evaluation completed with no output."
+        assert debugger.LOCALS_NONE == \
+            "Frame {frame} has no local variables to show."
 
     def test_abort_sentences(self):
         assert debugger.ABORT_OK == (
@@ -966,6 +968,15 @@ class TestEvalAtBreakpoint:
         out = await debugger.locals_at_breakpoint(client, hit.hit_id, 0, 60.0)
         assert out == "val n = 4: int"
         assert ("print_vals", "worker-3", 0, 60.0, 120.0) in client.calls
+
+    @pytest.mark.asyncio
+    async def test_empty_frame_gets_the_locals_sentence(self, client):
+        """An empty listing is answered by LOCALS_NONE with the queried
+        frame number — not by the eval tool's generic no-output sentence."""
+        hit = _hit(client)
+        client.eval_replies = [{"status": "ok", "messages": []}]
+        out = await debugger.locals_at_breakpoint(client, hit.hit_id, 1, 60.0)
+        assert out == "Frame 1 has no local variables to show."
 
 
 # ── continue / step / abort (sections 4.11-4.13) ───────────────────────

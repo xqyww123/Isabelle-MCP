@@ -104,6 +104,10 @@ async def test_full_workflow_set_hit_locals_eval_continue(dbg):
 
     out = await debugger.locals_at_breakpoint(client, None, 0, 60.0)
     assert "xs =" in out and "shift =" in out, out
+    # Frame 1 is the calling ML block: nothing is bound there at hit time,
+    # and the empty listing is answered by the dedicated sentence.
+    out = await debugger.locals_at_breakpoint(client, None, 1, 60.0)
+    assert out == debugger.LOCALS_NONE.format(frame=1), out
     out = await debugger.eval_at_breakpoint(
         client, "List.length xs", None, 0, 60.0)
     assert "val it = 3" in out, out
