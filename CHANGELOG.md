@@ -84,6 +84,11 @@
   recorded source hashes, so a skew between them would otherwise be a request
   that hangs with no trace.
 
+- The extra text blocks appended to a tool result — debugger notices, the
+  non-ASCII warning, the evaluation footer — now lead with a blank line, so
+  clients that join a result's text blocks without a separator still render
+  them as their own paragraphs.
+
 ## 0.3.0
 
 - **Isabelle-MCP no longer requires a patched Isabelle.** It ships its own Isabelle
