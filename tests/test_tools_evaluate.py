@@ -17,76 +17,7 @@ from isabelle_mcp.evaluation import _arrival_message
 from isabelle_mcp.models import EvaluationView, FileSnapshot, RunningCommand
 from isabelle_mcp.processing import ProcessingTracker, parse_decoration_ranges
 from isabelle_mcp.utils import IsabelleToolError, MCPLine
-
-
-class MockProcessingTracker:
-    """Configurable tracker stub exposing the decoration getters the snapshot reads."""
-
-    def __init__(self, *, all_processed=True, frontier=None, quiet=None,
-                 bad=None, overview_error=None, state=None,
-                 overview_warning=None, running=None, unprocessed=None):
-        self._all_processed = all_processed
-        self._frontier = all_processed if frontier is None else frontier
-        self._quiet = all_processed if quiet is None else quiet
-        self._state = state
-        self._bad = bad or []
-        self._oerr = overview_error or []
-        self._owarn = overview_warning or []
-        self._running = running or []
-        self._unproc = unprocessed or []
-
-    def range_processed(self, start_line, end_line):
-        return self._quiet
-
-    def line_reached(self, line):
-        return self._frontier
-
-    def line_running(self, line):
-        return False
-
-    def position_state(self, line):
-        """Mirror ProcessingTracker.position_state; *state* forces an answer."""
-        from isabelle_mcp import processing
-        if self._state is not None:
-            return self._state
-        if not self._frontier:
-            return processing.NOT_EVALUATED
-        if self.line_running(line):
-            return processing.RUNNING
-        return processing.PROCESSED
-
-    @property
-    def all_processed(self):
-        return self._all_processed
-
-
-    def get_running_ranges(self):
-        return list(self._running)
-
-    def get_running_ranges_with_onset(self):
-        return []
-
-    def get_unprocessed_ranges(self):
-        return list(self._unproc)
-
-    def get_bad_ranges(self):
-        return list(self._bad)
-
-    def get_overview_error_ranges(self):
-        return list(self._oerr)
-
-    def get_overview_warning_ranges(self):
-        return list(self._owarn)
-
-    async def wait_until_processed_bounded(
-        self, start_line, end_line, timeout=5.0, health_check=None, check_interval=5.0,
-    ):
-        return self._quiet
-
-    async def wait_until_line_reached_bounded(
-        self, line, timeout=5.0, health_check=None, check_interval=5.0,
-    ):
-        return self._frontier
+from tests.conftest import MockProcessingTracker
 
 
 @pytest.fixture(autouse=True)

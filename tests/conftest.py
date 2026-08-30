@@ -1,3 +1,5 @@
+import asyncio
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -58,31 +60,58 @@ def temp_theory_with_errors(tmp_path):
 
 
 class MockProcessingTracker:
-    """ProcessingTracker stub where everything is already processed.
+    """ProcessingTracker stub with an honest execution frontier.
 
-    *frontier* (line_reached) and *quiet* (range_processed) default to
-    *all_processed* but can be set independently to model "frontier reached the
-    target but a trailing fork in the prefix is still in flight".
+    The decoration ranges are the real tracker's vocabulary: 0-indexed
+    ``(start_line, start_char, end_line, end_char)`` tuples in ``unprocessed``
+    and ``running`` (plus the error/warning getters the snapshot reads).
+    ``line_reached`` / ``range_processed`` / ``line_running`` are derived from
+    them exactly as ProcessingTracker derives its own, so a test that moves
+    the frontier edits ``unprocessed`` (the lists are live — a concurrent task
+    can shrink them while an evaluation waits).
+
+    *all_processed=False* with no ranges means "nothing evaluated at all".
+    *frontier* / *quiet* force ``line_reached`` / ``range_processed`` outright
+    (for "frontier reached the target but a trailing fork in the prefix is
+    still in flight"); *state* forces ``position_state``.
     """
 
     def __init__(
         self, *, all_processed: bool = True,
         frontier: bool | None = None, quiet: bool | None = None,
         state: str | None = None,
+        bad=None, overview_error=None, overview_warning=None,
+        running=None, unprocessed=None,
     ):
         self._all_processed = all_processed
-        self._frontier = all_processed if frontier is None else frontier
-        self._quiet = all_processed if quiet is None else quiet
+        self._frontier = frontier
+        self._quiet = quiet
         self._state = state
+        self._bad = bad or []
+        self._oerr = overview_error or []
+        self._owarn = overview_warning or []
+        self.running = list(running or [])
+        self.unprocessed = list(unprocessed or [])
 
     def range_processed(self, start_line: LSPLine, end_line: LSPLine) -> bool:
-        return self._quiet
+        if self._quiet is not None:
+            return self._quiet
+        if not self._all_processed:
+            return False
+        return not any(
+            sl <= end_line and start_line <= el
+            for sl, _, el, _ in self.unprocessed + self.running
+        )
 
     def line_reached(self, line: int) -> bool:
-        return self._frontier
+        if self._frontier is not None:
+            return self._frontier
+        if not self._all_processed:
+            return False
+        return not any(sl <= line <= el for sl, _, el, _ in self.unprocessed)
 
     def line_running(self, line: int) -> bool:
-        return False
+        return any(sl <= line <= el for sl, _, el, _ in self.running)
 
     def position_state(self, line):
         """Mirror ProcessingTracker.position_state from this stub's frontier/running.
@@ -93,7 +122,7 @@ class MockProcessingTracker:
         from isabelle_mcp import processing
         if self._state is not None:
             return self._state
-        if not self._frontier:
+        if not self.line_reached(line):
             return processing.NOT_EVALUATED
         if self.line_running(line):
             return processing.RUNNING
@@ -101,37 +130,42 @@ class MockProcessingTracker:
 
     @property
     def all_processed(self) -> bool:
-        return self._all_processed
+        return self._all_processed and not self.unprocessed and not self.running
 
     def get_running_ranges(self) -> list[tuple[int, int, int, int]]:
-        return []
+        return list(self.running)
 
     def get_running_ranges_with_onset(self) -> list[tuple[int, int, int, int, float]]:
         return []
 
     def get_unprocessed_ranges(self) -> list[tuple[int, int, int, int]]:
-        return []
+        return list(self.unprocessed)
 
     def get_bad_ranges(self) -> list[tuple[int, int, int, int]]:
-        return []
+        return list(self._bad)
 
     def get_overview_error_ranges(self) -> list[tuple[int, int, int, int]]:
-        return []
+        return list(self._oerr)
 
     def get_overview_warning_ranges(self) -> list[tuple[int, int, int, int]]:
-        return []
+        return list(self._owarn)
 
+    # The wait stubs yield once and answer from the current ranges. Yielding
+    # exactly once closes the real race window (the loop re-reads state right
+    # after); a test about a race must install a wait that truly blocks.
     async def wait_until_processed_bounded(
         self, start_line: LSPLine, end_line: LSPLine,
         timeout: float = 5.0, health_check=None, check_interval: float = 5.0,
     ) -> bool:
-        return self._quiet
+        await asyncio.sleep(0)
+        return self.range_processed(start_line, end_line)
 
     async def wait_until_line_reached_bounded(
         self, line: LSPLine,
         timeout: float = 5.0, health_check=None, check_interval: float = 5.0,
     ) -> bool:
-        return self._frontier
+        await asyncio.sleep(0)
+        return self.line_reached(line)
 
 
 class MockLSPClient:
@@ -207,15 +241,24 @@ class MockLSPClient:
     ) -> None:
         pass
 
+    # The awaits an evaluation's wait loop actually hits yield the event loop
+    # once, so a concurrent task (another tool call, a frontier advance) gets
+    # to run. open_document / set_caret deliberately do not: evaluate_to awaits
+    # them inside its lock critical section, and yielding there would only
+    # manufacture lock contention.
     async def wait_for_processing(
         self, file_path: str, start_line: LSPLine, end_line: LSPLine | None = None,
     ) -> None:
-        pass
+        await asyncio.sleep(0)
 
     async def wait_for_processing_bounded(
         self, file_path: str, start_line: LSPLine, end_line: LSPLine, timeout: float,
     ) -> bool:
+        await asyncio.sleep(0)
         return True
+
+    async def resync_changed_open_documents(self) -> None:
+        await asyncio.sleep(0)
 
     async def force_interrupt(self) -> dict:
         return {"outcome": "nothing_running", "retired": [], "excluded": [],
@@ -241,6 +284,7 @@ class MockLSPClient:
         return list(self.loaders)
 
     async def request_theory_status(self) -> list[dict]:
+        await asyncio.sleep(0)
         theories = []
         for path in self.open_documents:
             name = Path(path).stem
@@ -353,6 +397,39 @@ def _reset_evaluation_state():
     evaluation_state.cancel()
     yield
     evaluation_state.cancel()
+
+
+# Modules that imported the lock by value (``from ... import _evaluation_state_lock``).
+_LOCK_HOLDERS = ("isabelle_mcp.evaluation", "isabelle_mcp.server")
+
+
+@pytest.fixture(autouse=True)
+def _fresh_evaluation_state_lock(monkeypatch):
+    """Give every test its own ``_evaluation_state_lock``.
+
+    An asyncio.Lock binds itself to the running event loop on its first
+    contended acquire, and pytest-asyncio runs each test on a new loop. Now
+    that the mocks yield, two tests can each contend for the module-level
+    lock, and the second one would die with "bound to a different event loop".
+    The lock is replaced in every module holding it by value; a holder that is
+    not listed in _LOCK_HOLDERS is reported rather than silently kept.
+    """
+    import importlib
+    old = importlib.import_module(_LOCK_HOLDERS[0])._evaluation_state_lock
+    new = asyncio.Lock()
+    for name in _LOCK_HOLDERS:
+        monkeypatch.setattr(importlib.import_module(name), "_evaluation_state_lock", new)
+    stale = [
+        f"{name}.{attr}"
+        for name, module in list(sys.modules.items())
+        if module is not None and name.startswith(("isabelle_mcp", "tests"))
+        for attr, value in vars(module).items()
+        if value is old
+    ]
+    assert not stale, (
+        f"{stale} still hold the old _evaluation_state_lock; "
+        "add the module to _LOCK_HOLDERS in tests/conftest.py"
+    )
 
 
 @pytest.fixture(autouse=True)

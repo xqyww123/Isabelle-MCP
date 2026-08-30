@@ -10,7 +10,7 @@ import pytest
 from isabelle_mcp.evaluation import evaluate_to, format_evaluation_result
 from isabelle_mcp.lsp_client import IsabelleLSPClient
 from isabelle_mcp.utils import IsabelleToolError
-from tests.test_tools_evaluate import MockProcessingTracker
+from tests.conftest import MockProcessingTracker
 
 LISTING = """\
 Session Pure/Pure
