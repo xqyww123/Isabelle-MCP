@@ -15,19 +15,6 @@ session's heap image); Isabelle can still load any other theory dynamically — 
 
 You should NEVER check whether the session is built — `isabelle_launch` checks automatically.
 
-**Precompiled theories cannot be edited.** The session you launch must NOT
-contain the theories you intend to work on. (`isabelle_evaluate_to` warns
-when its target file is precompiled into the running session — heed it.) In particular, do NOT launch a
-project's own session to edit that project — it typically precompiles exactly
-the target theories. Launch the project session's **base session** instead
-(the parent in its ROOT entry, `session NAME = BASE + …`): the imports come
-precompiled while the target theories stay editable.
-
-Choose the session closest to the work that does not swallow the target
-theories — e.g. "HOL-Analysis" for analysis — and ask the user if unsure.
-Omitting the session falls back to "Main", which precompiles very little, so
-substantial imports load slowly under it.
-
 When your call starts an evaluation, either by `isabelle_evaluate_to` or other query commands,
 the call may not wait for the evaluation to finish, but may return earlier with the current
 progress. You should keep polling `isabelle_evaluation_status` to watch it through:
@@ -45,78 +32,14 @@ error only when its fork joins).
 Watch for a stuck evaluation — a bad edit can make a command loop forever.
 A stuck command burns large amounts of CPU and can bog down the whole system, so
 cancel it promptly: cancel with `isabelle_cancel_evaluation`, fix the command,
-and evaluate again. Other tool calls wait while a cancellation is in progress.
-
-**Errors do not stop the checking.** Isabelle checks every command up to your
-target even when an earlier one fails, unless some command gets stuck. A failed
-command reports a diagnostic at its location. So `isabelle_evaluate_to` still
-reaches your target line when there are errors before it — you get those errors
-back as diagnostics, not a halt.
-
-## Conventions
-
-- Positions are **1-indexed**; file paths must be **absolute**.
-- Write **Isabelle ASCII notation** (`\\<alpha>`, `\\<Longrightarrow>`,
-  `x\\<^sub>1`) in `.thy`/`.ML` files, never Unicode glyphs (α, ⟹, x₁): a file
-  whose glyphs all have ASCII forms is auto-rewritten on disk (re-read it
-  before further edits); otherwise you get a warning to fix it yourself.
-
-## ML debugger
-
-Launch with `isabelle_launch(session, debug=true)` to use the breakpoint
-tools. Turning `debug` on or off needs `isabelle_terminate` first.
-
-- A **breakable site** is a place where execution can stop. The compiler
-  chooses these places, so call `isabelle_list_breakable_sites` rather than
-  guessing from the source.
-- A **breakpoint** is a site you armed with `isabelle_set_breakpoint`.
-  Breakpoints stop working when their code is recompiled or the prover is
-  relaunched; `isabelle_enable_all_breakpoints` re-arms them. Nothing
-  re-arms in the background.
-- A **hit** is one occasion of execution halting at a breakpoint, named
-  `h1`, `h2`, … Inspect it with `isabelle_debug_state`,
-  `isabelle_locals_at_breakpoint` and `isabelle_eval_at_breakpoint`; resume
-  with `isabelle_continue_breakpoint` or `isabelle_step_at_breakpoint`.
-  Resuming ends the hit — stopping again is a new hit with a new id. A
-  **frame** is one entry of a hit's call stack; frame 0 is the innermost,
-  top of the stack; outer frames follow.
-
-The usual workflow: evaluate up to the end of the ML block that defines the
-code, or the `ML_file` command that loads it, then set the breakpoint and
-evaluate onward so the code runs and hits. If the code to hit has already been evaluated, insert a space
-before it and re-evaluate to run it again. After an edit at or before the
-defining block, its breakpoints stop working: evaluate up to that block
-again, call `isabelle_enable_all_breakpoints`, then evaluate onward.
-
-## Working with the `isabelle` command line
-
-**Locate key directories.** `isabelle getenv NAME` prints `NAME=value` (several
-names allowed):
-- `ISABELLE_HOME` — the distribution (read-only install).
-- `ISABELLE_HOME_USER` — your per-user dir; all config below lives here.
-- `AFP` — the AFP `thys` dir (only if AFP is registered as a component).
-
-**Sessions & components.** A session is declared in a `ROOT` file
-(`session NAME = parent + theories …`); a `ROOTS` file lists subdirectories to
-recurse into. To make a session directory permanently discoverable (no `-d`
-needed), register it: `isabelle components -u /abs/dir` appends it to
-`$ISABELLE_HOME_USER/etc/components` (one path per line, `#` comments out;
-`-x DIR` removes, `isabelle components -l` lists). A registered directory
-contributes its `ROOT`/`ROOTS` and its own `etc/settings`.
-
-**Environment variables.** Isabelle does not reliably read environment variables
-from the calling shell. Set them persistently in
-`$ISABELLE_HOME_USER/etc/settings` (a bash-sourced file: `VAR=value` lines), or
-in a component's own `etc/settings`.
+and evaluate again.
 """
 
-# **Building.** `isabelle build -b SESSION` builds a session's heap image; `-d DIR`
-# adds a session directory, `-v` is verbose. For parallelism use `-o threads=N` —
-# it gives the prover N worker **threads inside** the session (0 = guess from
-# hardware), e.g. `isabelle build -o threads=8 -b HOL`. Avoid `-j N` (build N
-# separate **sessions** at once): it multiplies memory use and is rarely what you
-# want here. `-o NAME=VAL` overrides any system option (`isabelle options -l` to
-# list).
+# Claude Code truncates server instructions at 2048 characters. Everything that
+# a tool description carries (session choice, positions, ASCII notation, the
+# debugger vocabulary and workflow) lives in that tool's docstring in server.py;
+# the `isabelle` command-line guidance is the isabelle-command-line skill
+# shipped under skills/. tests/test_instructions.py pins the budget.
 
 
 def get_instructions() -> str:

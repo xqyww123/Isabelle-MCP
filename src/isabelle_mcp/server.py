@@ -364,7 +364,8 @@ async def isabelle_launch(
             session only provides precompiled theories; anything else still
             loads, just slowly. Precompiled theories cannot be edited, so the
             session must NOT contain the theories you will work on — for a
-            project, use its base session, not the project's own session.
+            project, use its base session (the parent in its ROOT entry,
+            `session NAME = BASE + …`), not the project's own session.
             The "Main" fallback precompiles very little. You need not check
             whether the session is built — launch checks automatically and
             errors with the exact build command if it is not.
@@ -494,6 +495,12 @@ async def isabelle_evaluate_to(
     Returns a per-file snapshot — errors / warnings / running command lines. The
     result may indicate evaluation is still in progress; if so, call
     ``evaluation_status`` to update the progress.
+
+    **Errors do not stop the checking.** Isabelle checks every command up to your
+    target even when an earlier one fails, unless some command gets stuck. A failed
+    command reports an error at its location. So `isabelle_evaluate_to` still
+    reaches your target line when there are errors before it — you get those errors
+    back, not a halt.
 
     Args:
         file_path: Absolute path to .thy file
@@ -794,6 +801,13 @@ async def isabelle_set_breakpoint(
     space before it to force a re-evaluation so the command runs again and
     hits the breakpoint.
 
+    The usual workflow: evaluate up to the end of the ML block that defines the
+    code, or the `ML_file` command that loads it, then set the breakpoint and
+    evaluate onward so the code runs and hits. If the code to hit has already been evaluated, insert a space
+    before it and re-evaluate to run it again. After an edit at or before the
+    defining block, its breakpoints stop working: evaluate up to that block
+    again, call `isabelle_enable_all_breakpoints`, then evaluate onward.
+
     Args:
         file_path: Absolute path to the .thy or .ML file
         line: Line number (1-indexed) of the breakable site
@@ -867,6 +881,10 @@ async def isabelle_enable_all_breakpoints(
     work. This tool re-arms these no-longer-working breakpoints if their
     code has been evaluated.
 
+    Breakpoints stop working when their code is recompiled or the prover is
+    relaunched; `isabelle_enable_all_breakpoints` re-arms them. Nothing
+    re-arms in the background.
+
     Args:
         file_path: Restrict to breakpoints in this file. Omit for all
             breakpoints.
@@ -903,6 +921,14 @@ async def isabelle_debug_state() -> ToolResult:
     breakpoint tools take (thread names are shown as information, never an
     input). The frame numbers in the call stack are the frame parameter of
     isabelle_eval_at_breakpoint / isabelle_locals_at_breakpoint.
+
+    A **hit** is one occasion of execution halting at a breakpoint, named
+    `h1`, `h2`, … Inspect it with `isabelle_debug_state`,
+    `isabelle_locals_at_breakpoint` and `isabelle_eval_at_breakpoint`; resume
+    with `isabelle_continue_breakpoint` or `isabelle_step_at_breakpoint`.
+    Resuming ends the hit — stopping again is a new hit with a new id. A
+    **frame** is one entry of a hit's call stack; frame 0 is the innermost,
+    top of the stack; outer frames follow.
     """
     client = await _ensure_lsp_started()
     return _text_result(debugger.debug_state(client))
