@@ -363,6 +363,123 @@ async def test_z17_edit_during_cancel(prover):
     assert _read(witness) == "ASC", _read(witness)
 
 
+# ── Z3: the interrupted command is in a dependency ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_z3_cancel_in_dependency_theory(prover):
+    """Z3: evaluating B (imports A) runs A's slow command; the cancel retires it
+    in A, B stays unevaluated (F7: the importer needs every command of A), and
+    a later evaluation of B completes with A's command re-run."""
+    client, root = prover
+    witness = os.path.join(root, "w3.txt")
+    a_path = os.path.join(root, "Z3A.thy")
+    b_path = os.path.join(root, "Z3B.thy")
+    with open(a_path, "w") as f:
+        f.write(_theory("Z3A", witness))
+    with open(b_path, "w") as f:
+        f.write('theory Z3B\nimports Z3A\nbegin\nlemma zb: "2 + 2 = (4::nat)" by simp\nend\n')
+
+    view = await evaluate_to(client, b_path, 5)
+    assert view.status == "in_progress"
+    deadline = time.monotonic() + 60
+    while _read(witness) != "A" and time.monotonic() < deadline:
+        await asyncio.sleep(1)
+    assert _read(witness) == "A"
+    await asyncio.sleep(2)   # the slow command is now running in A
+
+    view = await cancel_evaluation(client)
+    print(f"\nZ3 message:\n{view.message}")
+    assert view.message.split("\n")[0] == ev.CANCEL_MESSAGES[ev.CANCEL_OUTCOME_RETIRED]
+    assert "Z3A.thy:6 (ML)" in view.message, view.message
+    await asyncio.sleep(SLOW_SECONDS + 5)
+    assert _read(witness) == "A"                  # nothing re-ran while idle
+
+    view = await _run_to_completion(client, b_path, 5, timeout=180)
+    assert view.status == "complete", view
+    assert _read(witness) == "ASC", _read(witness)
+
+
+# ── Z5: the evaluation target whitelist and the redirect ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_z5_whitelist_and_redirect(prover):
+    """Z5: non-.thy targets are refused (and never become visible models); a
+    .ML target with a unique load command is redirected to that command, the
+    reply's first line says so, and the ML file's code really ran."""
+    from isabelle_mcp.utils import IsabelleToolError
+    client, root = prover
+    witness = os.path.join(root, "w5.txt")
+    w = witness.replace("\\", "\\\\")
+    ml_path = os.path.join(root, "Z5.ML")
+    thy_path = os.path.join(root, "Z5.thy")
+    with open(ml_path, "w") as f:
+        f.write(f'File.append (Path.explode "{w}") "M";\n')
+    with open(thy_path, "w") as f:
+        f.write('theory Z5\nimports Main\nbegin\nML_file "Z5.ML"\nlemma "True" by simp\nend\n')
+    for name in ("x.sml", "refs.bib", "y.ml"):
+        p = os.path.join(root, name)
+        with open(p, "w") as f:
+            f.write("(* nothing *)\n")
+        with pytest.raises(IsabelleToolError):
+            await evaluate_to(client, p, 1)
+        assert p not in client.open_documents
+
+    # the loading theory is not in the document model yet: no loader known,
+    # generic refusal (R-D3 (v) ②, zero loaders)
+    with pytest.raises(IsabelleToolError, match="cannot be an evaluation target"):
+        await evaluate_to(client, ml_path, 1)
+
+    # once the theory is open (evaluated), the redirect works
+    view = await _run_to_completion(client, thy_path, 3)
+    assert view.status == "complete"
+    view = await _run_to_completion(client, ml_path, 1)
+    print(f"\nZ5 message:\n{view.message}")
+    assert view.message.split("\n")[0] == (
+        f"Redirected: Z5.ML is a .ML file loaded by the ML_file command at Z5.thy:4; "
+        "evaluated through that command instead.")
+    assert view.status == "complete", view
+    assert _read(witness) == "M"
+    assert ml_path not in client.open_documents
+
+
+# ── Z12: retraction is a fixpoint (F15) ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_z12_retraction_is_a_fixpoint(prover):
+    """Z12(a): after the cancel, an edit pushed WITHOUT a caret move (a didChange
+    on an unrelated line) must not reschedule anything: the retired command
+    stays unevaluated and the witness does not grow. Z12(b), the positive
+    control: an evaluate_to (which moves the caret) does reschedule."""
+    client, root = prover
+    witness = os.path.join(root, "w12.txt")
+    path = os.path.join(root, "Z12.thy")
+    with open(path, "w") as f:
+        f.write(_theory("Z12", witness))
+    view = await evaluate_to(client, path, L_END)
+    assert view.status == "in_progress"
+    assert await _wait_state(client, path, L_SLOW, RUNNING) == RUNNING
+    view = await cancel_evaluation(client)
+    assert view.message.split("\n")[0] == ev.CANCEL_MESSAGES[ev.CANCEL_OUTCOME_RETIRED]
+    assert await _wait_state(client, path, L_SLOW, NOT_EVALUATED) == NOT_EVALUATED
+
+    # (a) an edit without a caret: change the lemma's name on the last line
+    text = _theory("Z12", witness).replace("lemma z_lemma:", "lemma z_lemma2:")
+    with open(path, "w") as f:
+        f.write(text)
+    await ev.sync_file_locked(client, path)
+    await asyncio.sleep(SLOW_SECONDS + 5)
+    assert _read(witness) == "A", _read(witness)
+    assert ev.position_state(client, path, MCPLine(L_SLOW)) == NOT_EVALUATED
+
+    # (b) the positive control: the caret moves, the prover schedules again
+    view = await _run_to_completion(client, path, L_END)
+    assert view.status == "complete", view
+    assert _read(witness) == "ASC", _read(witness)
+
+
 # ── Z14: probe cost with a large probe set ────────────────────────────────
 
 
