@@ -901,35 +901,11 @@ class TestEditStampWiring:
         f = tmp_path / "Foo.thy"
         f.write_text("theory Foo begin end")
         await client.open_document(str(f), wait_for_diagnostics=False)
-        client.request = AsyncMock()              # PIDE/cancel_execution
+        client.request = AsyncMock(               # PIDE/cancel_evaluation
+            return_value={"outcome": "nothing_running"})
         self._reset_clock(monkeypatch)
-        await client.force_interrupt(str(f))      # synthetic didChange
+        await client.force_interrupt()            # re-minted ids, emptied perspective
         assert self._clock_running()
-
-    @pytest.mark.asyncio
-    async def test_force_interrupt_position_is_utf16(self, tmp_path, monkeypatch):
-        """The synthetic space's didChange position must count UTF-16 code
-        units (an astral glyph counts 2), not Python code points -- the server
-        does Java String arithmetic, so a raw len() would land the space short
-        of the line end and split model from server."""
-        client = _mock_process_client()
-        f = tmp_path / "Foo.thy"
-        first_line = "theory Foo (*\U0001d569*)"      # astral glyph: len+1 in UTF-16
-        f.write_text(first_line + "\nbegin end")
-        await client.open_document(str(f), wait_for_diagnostics=False)
-        client.request = AsyncMock()              # PIDE/cancel_execution
-        client.notify = AsyncMock()
-        await client.force_interrupt(str(f))
-        did_change = [
-            c.args for c in client.notify.call_args_list
-            if c.args[0] == "textDocument/didChange"
-        ]
-        assert len(did_change) == 1
-        change = did_change[0][1]["contentChanges"][0]
-        expected = len(first_line) + 1            # one astral glyph -> +1 unit
-        assert change["range"]["start"] == {"line": 0, "character": expected}
-        assert change["range"]["end"] == {"line": 0, "character": expected}
-        assert change["text"] == " "
 
     @pytest.mark.asyncio
     async def test_reopen_already_open_does_not_bump(self, tmp_path, monkeypatch):

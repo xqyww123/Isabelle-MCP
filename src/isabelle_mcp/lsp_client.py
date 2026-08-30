@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 from isabelle_mcp import query
-from isabelle_mcp.document_diff import ranged_content_changes, utf16_position
+from isabelle_mcp.document_diff import ranged_content_changes
 from isabelle_mcp.models import RunningCommand
 from isabelle_mcp.query import QueryReply
 from isabelle_mcp.processing import (
@@ -26,6 +26,7 @@ from isabelle_mcp.processing import (
 from isabelle_mcp.unicode_guard import record_warning, sanitize_read
 from isabelle_mcp.component import ensure_component
 from isabelle_mcp.utils import (
+    IsabelleCatastrophe,
     IsabelleToolError,
     LSPCharacter,
     LSPLine,
@@ -96,6 +97,25 @@ def _canon(file_path: str) -> str:
 
 
 StatSig = tuple[int, int, int, int]
+
+
+# Backstop for PIDE/cancel_evaluation's REPLY: the server's own budget is 120 s
+# from the moment its worker thread starts; the 15 s on top cover queueing in the
+# server's dispatch loop. Hitting it is the catastrophe (the prover is torn
+# down), so it is not an envelope the server must meet but an independent gate.
+# The send is bounded separately by SEND_TIMEOUT, so one force_interrupt takes at
+# most 135 + 30 s; the lock in evaluation.cancel_evaluation is held for that plus
+# the bounded wrap-up (teardown bounds, per-file close budget, the debugger sweep).
+CANCEL_REQUEST_TIMEOUT: float = 135.0
+
+# Bound on one wire write (taking the write lock included): a server that does not
+# drain its stdin is not coming back, and cancel_evaluation holds the evaluation
+# lock across every send, so no send may hang.
+SEND_TIMEOUT: float = 30.0
+
+# Bound on the bookkeeping steps of a teardown (reader-task cancellation, the
+# process wait after a kill).
+TEARDOWN_STEP_TIMEOUT: float = 5.0
 
 
 def _stat_sig(file_path: str) -> StatSig | None:
@@ -187,7 +207,7 @@ class DocumentState:
     content: str
     language_id: str = "isabelle"
     # Last on-disk signature we synced to the server. ``None`` forces a re-read on
-    # the next stat backstop (used after force_interrupt mutates the model only).
+    # the next stat backstop.
     stat_sig: StatSig | None = None
     # Set when the server may hold text that diverged from ``content`` (it rejected
     # a didChange, which is a silent drop server-side): the next sync must push the
@@ -375,7 +395,7 @@ class IsabelleLSPClient:
         # by default emits plain text + decorations — but that path is broken upstream
         # (`decorations.map(_.json)` eta-expands `Decoration.json(file)` into a lambda →
         # "Bad JSON value"). No tool consumes those panels any more, but the server still
-        # RUNS Dynamic_Output and pushes on every caret move (force_interrupt makes one),
+        # RUNS Dynamic_Output and pushes on every caret move (evaluate_to makes one),
         # so leaving the broken branch enabled would put errors on the wire for output
         # nobody reads. The option does not exist pre-2025 (passing it aborts the
         # server), so gate it.
@@ -592,7 +612,7 @@ class IsabelleLSPClient:
     async def reap(self) -> None:
         """Reap a killed/dead server: cancel the reader tasks, collect the
         process, clear per-session state. Counterpart of kill()."""
-        await self._cancel_background_tasks()
+        await self._cancel_background_tasks_bounded()
         if self.process is not None:
             with contextlib.suppress(Exception):
                 # Killed via the process group, so the pipes are closed and
@@ -616,17 +636,49 @@ class IsabelleLSPClient:
             except (asyncio.TimeoutError, IsabelleToolError):
                 pass
             with contextlib.suppress(IsabelleToolError):
-                await self.notify("exit", {})
-            await self._cancel_background_tasks()
+                await self.notify("exit", {})   # bounded by _send
+            await self._cancel_background_tasks_bounded()
             try:
                 await asyncio.wait_for(self.process.wait(), timeout=5.0)
             except asyncio.TimeoutError:
                 # Group kill: killing just the bash wrapper would leave the
                 # java child holding the pipes and this wait would never end.
                 _kill_process_tree(self.process)
-                await self.process.wait()
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(
+                        self.process.wait(), timeout=TEARDOWN_STEP_TIMEOUT)
 
         self._clear_session_state()
+
+    async def teardown(
+        self, reason: str = "The Isabelle session was terminated.",
+    ) -> None:
+        """Tear the prover down without taking any lock. isabelle_terminate, a
+        relaunch, server shutdown and the catastrophe handler all share this so
+        they cannot drift, and its guarantees are layered so a failure inside it cannot
+        undo them: every in-flight waiter is failed with *reason* first (no
+        request may outlive its prover); whatever shutdown() does, the process
+        is killed and forgotten; the remaining bookkeeping is best-effort and
+        only logged -- the next launch clears session state again anyway.
+        Every await inside is bounded (shutdown's segments)."""
+        self._fail_pending_waiters(IsabelleToolError(reason))
+        try:
+            await self.shutdown()
+        except Exception:
+            logger.error("teardown: shutdown raised; killing the process regardless",
+                         exc_info=True)
+        finally:
+            self.kill()                    # no-op once the process is gone
+            self.process = None
+            try:
+                self._clear_session_state()   # idempotent; shutdown() ran it on success
+            except Exception:
+                logger.error("teardown: clearing session state failed", exc_info=True)
+            try:
+                if self.file_watcher is not None:
+                    self.file_watcher.clear_watches()
+            except Exception:
+                logger.error("teardown: clearing file watches failed", exc_info=True)
 
     def _clear_session_state(self) -> None:
         self._handshake_done = False
@@ -698,15 +750,26 @@ class IsabelleLSPClient:
     async def _send(self, message: JsonDict) -> None:
         if not self.process or not self.process.stdin:
             raise IsabelleToolError("LSP process not running")
+        stdin = self.process.stdin
         _wire_dump("out", message)
         content = json.dumps(message).encode('utf-8')
         header = f"Content-Length: {len(content)}\r\n\r\n".encode('ascii')
-        async with self._write_lock:
-            try:
-                self.process.stdin.write(header + content)
-                await self.process.stdin.drain()
-            except (BrokenPipeError, ConnectionError, OSError) as exc:
-                raise IsabelleToolError("Failed to write to LSP process") from exc
+
+        async def write() -> None:
+            async with self._write_lock:
+                try:
+                    stdin.write(header + content)
+                    await stdin.drain()
+                except (BrokenPipeError, ConnectionError, OSError) as exc:
+                    raise IsabelleToolError("Failed to write to LSP process") from exc
+
+        # Bounded: notify() and close_document come straight here, and
+        # cancel_evaluation holds the evaluation lock across every send.
+        try:
+            await asyncio.wait_for(write(), timeout=SEND_TIMEOUT)
+        except asyncio.TimeoutError as exc:
+            raise IsabelleToolError(
+                f"LSP write did not complete within {SEND_TIMEOUT:g}s") from exc
 
     # ── Background readers ──────────────────────────────────────────────
 
@@ -793,6 +856,17 @@ class IsabelleLSPClient:
             raise
         except Exception:
             logger.debug("stderr drain stopped", exc_info=True)
+
+    async def _cancel_background_tasks_bounded(self) -> None:
+        """_cancel_background_tasks with a bound: a teardown must not hang on a
+        reader that ignores its cancellation."""
+        try:
+            await asyncio.wait_for(
+                self._cancel_background_tasks(), timeout=TEARDOWN_STEP_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning("reader tasks did not stop within %ss", TEARDOWN_STEP_TIMEOUT)
+            self.reader_task = None
+            self.stderr_task = None
 
     async def _cancel_background_tasks(self) -> None:
         tasks = [
@@ -882,8 +956,8 @@ class IsabelleLSPClient:
             if "Failed to apply document change" in text:
                 # The server rejected a didChange and DROPPED it (no reply
                 # channel), while our model already committed the new text --
-                # silent divergence.  Heal like force_interrupt: drop the
-                # signatures so the next stat backstop re-syncs, and force the
+                # silent divergence.  Drop the signatures so the next stat
+                # backstop re-syncs, and force the
                 # full-text form, since a ranged diff against the server's
                 # unknown base would corrupt the document further.
                 for doc in self.open_documents.values():
@@ -1187,10 +1261,6 @@ class IsabelleLSPClient:
         result = await self.request("PIDE/theory_status", {})
         return result.get("theories", []) if isinstance(result, dict) else []
 
-    async def cancel_execution(self) -> None:
-        """Send PIDE/cancel_execution to atomically stop all processing."""
-        await self.request("PIDE/cancel_execution", {})
-
     def get_all_running_commands(self) -> list[RunningCommand]:
         """Collect running commands from all tracked files with elapsed time and text."""
         now = time.monotonic()
@@ -1223,45 +1293,48 @@ class IsabelleLSPClient:
                 ))
         return result
 
-    async def force_interrupt(self, file_path: str) -> None:
-        """Cancel all processing via PIDE/cancel_execution and restrict perspective.
+    async def request_loaders(self, file_path: str) -> list[dict[str, Any]]:
+        """The load commands (ML_file and kin) that load *file_path*, each with
+        ``file``, ``theory``, ``command``, ``state`` (unevaluated | running |
+        evaluated) and, when the loading theory is open, ``line``. Empty
+        until the loading theory is in the document model."""
+        result = await self.request(
+            "PIDE/loaders", {"uri": file_path_to_uri(file_path)}, timeout=10.0)
+        loaders = result.get("loaders") if isinstance(result, dict) else None
+        return [x for x in loaders if isinstance(x, dict)] if loaders else []
 
-        Uses a three-step approach (verified 2026-05-27):
-        1. PIDE/cancel_execution — global stop + interrupt all running threads
-        2. Caret to line 0 — restrict perspective
-        3. Single edit — trigger Document.update with restricted perspective
+    async def force_interrupt(self) -> dict[str, Any]:
+        """One PIDE/cancel_evaluation request; returns its reply payload.
 
-        The trailing space on line 0 is self-healing: we drop ``stat_sig`` so the
-        next tool-call stat backstop (resync_changed_open_documents) re-reads from
-        disk, sees the content mismatch, and didChanges back to the real file.
+        The server does the whole cancellation itself -- stanch the prover,
+        retract every perspective, retire each interrupted command with a
+        zero-length edit until none is left -- within its own 120 s budget, and
+        answers once with one of two success outcomes: retired, nothing_running
+        (see ``evaluation.CANCEL_OUTCOME_*``).  Nothing here touches the
+        document model: the text on the prover is byte-identical afterwards.
+        Everything else -- the server's aborted outcome, a timeout, a transport
+        failure, a reply outside the contract -- is the catastrophe: it raises
+        IsabelleCatastrophe, and the tool boundary terminates the session.
         """
-        doc = self.open_documents.get(_canon(file_path))
-        if doc is None:
-            return
-        await self.cancel_execution()
-        await self.notify("PIDE/caret_update", {
-            "uri": doc.uri, "line": 0, "character": 0, "focus": True,
-        })
-        first_line = doc.content.split("\n", 1)[0]
-        # LSP characters are UTF-16 code units; a raw len() counts code points
-        # and lands short of the line end when the first line carries astral
-        # glyphs, splitting model and server.  Same converter as the ranged
-        # diff emitter.
-        insert_at = utf16_position(doc.content, len(first_line))
-        doc.version += 1
-        await self.notify("textDocument/didChange", {
-            "textDocument": {"uri": doc.uri, "version": doc.version},
-            "contentChanges": [{
-                "range": {"start": insert_at, "end": insert_at},
-                "text": " ",
-            }],
-        })
-        parts = doc.content.split("\n", 1)
-        doc.content = parts[0] + " " + ("\n" + parts[1] if len(parts) > 1 else "")
-        # The model now diverges from disk (synthetic space, never written out).
-        # Drop the signature so the next stat backstop re-reads disk and heals it.
-        doc.stat_sig = None
+        try:
+            result = await self.request(
+                "PIDE/cancel_evaluation", {}, timeout=CANCEL_REQUEST_TIMEOUT)
+        except IsabelleToolError as exc:
+            raise IsabelleCatastrophe(f"cancel request failed: {exc}") from exc
+        # Retirement re-mints command ids and retraction empties the
+        # perspective: both change what the decorations describe.
         note_edit_sent()
+        # The payload contract is enforced here, the only place the value comes
+        # from outside the process.
+        if not isinstance(result, dict) or result.get("outcome") not in (
+                "retired", "nothing_running"):
+            reason = (
+                result.get("reason", "no reason given")
+                if isinstance(result, dict) and result.get("outcome") == "aborted"
+                else f"unexpected reply {result!r}"
+            )
+            raise IsabelleCatastrophe(f"cancellation aborted: {reason}")
+        return result
 
     def file_all_processed(self, file_path: str) -> bool:
         """True if the entire file has been processed (no unprocessed/running)."""

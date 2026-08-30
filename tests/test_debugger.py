@@ -186,7 +186,7 @@ class TestSentenceCatalogue:
         assert debugger.NO_SITE_NOT_EVALUATED == (
             "There is no breakable site at {where} — that line has not been "
             "evaluated yet. Breakpoints can only be set on code the prover "
-            "has already compiled, so evaluate the file first."
+            "has already compiled, so evaluate to that line first."
         )
         assert debugger.NO_SITE_NOT_EVALUATED_ML == (
             "There is no breakable site at {where} — that line has not been "
@@ -1568,7 +1568,9 @@ class TestCancellationSweep:
         assert marked == [hit]
         assert hit.pending_ending == debugger.ENDED_CANCELLED
         client.push_state({})   # the interrupt freed the thread
-        line = await debugger.finish_cancel_sweep(client, marked)
+        line = await debugger.finish_cancel_sweep(client, marked, {
+            "outcome": "retired",
+            "unloaded_from": [{"file": THY, "line": 1, "loads": []}]})
         assert line == "1 hit was swept up; its thread is no longer stopped."
         assert debugger.registry.retired[hit.hit_id] == \
             debugger.ENDED_CANCELLED
@@ -1590,22 +1592,36 @@ class TestCancellationSweep:
         debugger.registry.sync_hits(client)
         marked = debugger.mark_hits_swept(client)
         client.push_state({})
-        line = await debugger.finish_cancel_sweep(client, marked)
+        line = await debugger.finish_cancel_sweep(
+            client, marked, {"outcome": "retired", "unloaded_from": []})
         assert line == \
             "2 hits were swept up; their threads are no longer stopped."
+
+    @pytest.mark.asyncio
+    async def test_nothing_running_rolls_the_attribution_back(self, client):
+        hit = _hit(client)
+        marked = debugger.mark_hits_swept(client)
+        assert hit.pending_ending == debugger.ENDED_CANCELLED
+        line = await debugger.finish_cancel_sweep(
+            client, marked, {"outcome": "nothing_running"})
+        assert line is None
+        assert hit.pending_ending is None          # nothing was interrupted
+        assert hit.hit_id in debugger.registry.hits   # still live, not swept
 
     @pytest.mark.asyncio
     async def test_no_hits_no_line(self, client):
         marked = debugger.mark_hits_swept(client)
         assert marked == []
-        assert await debugger.finish_cancel_sweep(client, marked) is None
+        assert await debugger.finish_cancel_sweep(
+            client, marked, {"outcome": "retired", "unloaded_from": []}) is None
 
     @pytest.mark.asyncio
     async def test_stale_id_refusal_names_the_sweep(self, client):
         hit = _hit(client)
         marked = debugger.mark_hits_swept(client)
         client.push_state({})
-        await debugger.finish_cancel_sweep(client, marked)
+        await debugger.finish_cancel_sweep(
+            client, marked, {"outcome": "retired", "unloaded_from": []})
         with pytest.raises(IsabelleToolError) as exc:
             debugger.registry.resolve_hit(hit.hit_id)
         assert str(exc.value) == (

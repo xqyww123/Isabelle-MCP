@@ -6,7 +6,8 @@ evaluation; query tools call :func:`check_evaluation_guard` to ensure
 the target region has been processed.
 
 v0.3.0 leverages PIDE/theory_status for dependency-aware completion and
-PIDE/cancel_execution for global cancellation.
+PIDE/cancel_evaluation for cancellation (stanch, retire, retract -- see
+ISABELLE_MCP_CANCELLATION_REDESIGN_PLAN.md section 3).
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
-from isabelle_mcp.lsp_client import IsabelleLSPClient, _canon, _stat_sig, _stat_sigs
+from isabelle_mcp.lsp_client import IsabelleLSPClient, _canon, _stat_sigs
 from isabelle_mcp.models import (
     EvaluationView,
     FileSnapshot,
@@ -37,6 +38,7 @@ from isabelle_mcp.processing import (
     note_edit_sent,
 )
 from isabelle_mcp.utils import (
+    IsabelleCatastrophe,
     IsabelleToolError,
     LSPCharacter,
     LSPLine,
@@ -67,9 +69,68 @@ _LONG_EVAL_RESTAT_INTERVAL: float = 3.0
 _CLOSE_TIMEOUT: float = 5.0
 
 # One sentence for every way a run is stopped by someone else — the agent's own
-# cancel and a session teardown alike. Shared so evaluate_to and
-# cancel_evaluation cannot drift apart.
+# cancel and a session teardown alike — as seen from the evaluate_to side.
 CANCELLED_MESSAGE = "Evaluation cancelled."
+
+# Approved (R-D4 ②): an evaluation still in flight when the prover is gone --
+# torn down by isabelle_terminate, by a relaunch, or by the catastrophe
+# handler.  ``client.process is None`` is the only marker.
+SESSION_GONE_MESSAGE = (
+    "Evaluation stopped: the Isabelle session is no longer running. "
+    "Call isabelle_launch to start a new one."
+)
+
+# The three outcomes of PIDE/cancel_evaluation, keyed by the server's ``outcome``
+# field (ISABELLE_MCP_CANCELLATION_REDESIGN_PLAN.md section 3.1.4).  The server
+# stanches the prover, retracts every perspective and retires the interrupted
+# commands until none is left. The server's third outcome, ``aborted``, never
+# reaches this module: force_interrupt turns it into IsabelleCatastrophe.
+CANCEL_OUTCOME_RETIRED = "retired"
+CANCEL_OUTCOME_NOTHING_RUNNING = "nothing_running"
+
+# The whole cancel request -- the LSP request (135 s: the server's 120 s budget
+# plus dispatch queueing) and the wrap-up -- runs under ONE deadline; expiry is
+# the catastrophe. This is the bound on how long the evaluation-state lock is
+# held by a cancellation (R5); the teardown that follows a catastrophe runs
+# outside it and is bounded by its own segments.
+CANCEL_TOTAL_BUDGET: float = 150.0
+
+# Approved copy (R-D4): the two success sentences.
+CANCEL_MESSAGES = {
+    CANCEL_OUTCOME_RETIRED:
+        "Evaluation cancelled. The interrupted commands are back to unevaluated.",
+    CANCEL_OUTCOME_NOTHING_RUNNING:
+        "Evaluation cancelled. Nothing was running.",
+}
+# The lines after the main sentence (R-D4 ⑤). Every command entry is rendered
+# the same way by _cancel_item: "file:line (keyword)". Commands the server
+# excluded (gone / reassigned) are not rendered: they are back to unevaluated
+# all the same, just not by this request.
+CANCEL_RESET_LINE = "Reset to unevaluated: {items}."
+CANCEL_WAIVED_LINE = "Also reset by the same re-parse: the commands following {items}."
+
+# The evaluation target whitelist (R-D3 (v)): only a .thy file can be evaluated.
+# A .ML/.sml file is compiled by the load command (ML_file and kin) that loads
+# it; with exactly one such command known, isabelle_evaluate_to is redirected to
+# it and says so in its first line.  Wording approved verbatim; {kind} is the
+# actual suffix and {keyword} the load command's actual keyword.
+LOAD_TARGET_SUFFIXES = (".ML", ".sml")
+LOAD_TARGET_POINTER = (
+    "{file} is a {kind} file, which cannot be an evaluation target. "
+    "Evaluate to {loader} (the {keyword} command that loads this file) instead."
+)
+LOAD_TARGET_POINTER_MANY = (
+    "{file} is a {kind} file, which cannot be an evaluation target. "
+    "Evaluate to {loaders} (the {keyword} commands that load this file) instead."
+)
+LOAD_TARGET_GENERIC = "{file} is a {kind} file, which cannot be an evaluation target."
+NON_THEORY_TARGET = (
+    "{file} is not a theory (.thy) file and cannot be an evaluation target."
+)
+REDIRECTED_LINE = (
+    "Redirected: {file} is a {kind} file loaded by the {loader_command} command "
+    "at {loader}; evaluated through that command instead."
+)
 
 # Position state judged with the document itself missing — the one answer the
 # decoration cache cannot give, so it lives here rather than in `processing`.
@@ -403,11 +464,14 @@ def last_evaluation_was_cancelled() -> bool:
     """
     current = evaluation_state.current
     return current is not None and current.outcome == "cancelled"
-# Serializes the short evaluation-state transitions (evaluate_to start /
-# cancel / guard) and the document content/version mutations and caret-target
-# resolution that must stay atomic with them. Held only for those transitions —
-# NOT for the whole evaluation. The event-driven file-sync push and the tool-call
-# stat backstop also take it so a concurrent sync cannot interleave with a start/stop.
+# Serializes the short evaluation-state transitions (evaluate_to start / guard)
+# and the document content/version mutations and caret-target resolution that
+# must stay atomic with them — NOT the whole evaluation. The event-driven
+# file-sync push and the tool-call stat backstop also take it so a concurrent
+# sync cannot interleave with a start/stop. The one long holder is
+# cancel_evaluation (R-D8): it keeps the lock for the whole cancel request, so
+# every other tool call — evaluation_status and terminate included — queues
+# behind a cancellation; every await under the lock there has an explicit bound.
 _evaluation_state_lock = asyncio.Lock()
 
 # Sentinel for "dependency never stat'd before" (its recorded value may be None).
@@ -816,6 +880,63 @@ async def _evaluation_wait_loop(
 # Public API
 # ---------------------------------------------------------------------------
 
+def render_loader(loader: dict, root: str | None) -> str:
+    where = relativize(loader.get("file", ""), root)
+    line = loader.get("line")
+    return f"{where}:{line}" if line is not None else where
+
+
+def render_loaders(loaders: list[dict], root: str | None) -> str:
+    """``A`` / ``A or B`` / ``A, B or C`` — the approved pointer shape."""
+    names = [render_loader(x, root) for x in loaders]
+    if len(names) == 1:
+        return names[0]
+    return ", ".join(names[:-1]) + " or " + names[-1]
+
+
+def _load_target_refusal(
+    rel: str, kind: str, loaders: list[dict], root: str | None,
+) -> str:
+    """The R-D3 (iv) refusal for a .ML/.sml target: pointer, pointer with several
+    loaders, or the generic sentence when no loader is known."""
+    if not loaders or (len(loaders) == 1 and loaders[0].get("line") is None):
+        # zero loaders, or one whose theory is not in the document model yet
+        return LOAD_TARGET_GENERIC.format(file=rel, kind=kind)
+    keywords = sorted({x.get("command") or "ML_file" for x in loaders})
+    keyword = " or ".join(keywords)
+    if len(loaders) == 1:
+        return LOAD_TARGET_POINTER.format(
+            file=rel, kind=kind, keyword=keyword,
+            loader=render_loader(loaders[0], root))
+    return LOAD_TARGET_POINTER_MANY.format(
+        file=rel, kind=kind, keyword=keyword, loaders=render_loaders(loaders, root))
+
+
+async def evaluation_target(
+    client: IsabelleLSPClient, file_path: str, *, redirect: bool,
+) -> dict | None:
+    """Apply the evaluation target whitelist (R-D3 (v)).
+
+    A .thy file passes: returns None. A .ML/.sml file with exactly one known
+    load command that has a line is returned as that loader when *redirect* is
+    allowed (evaluate_to evaluates to the loader instead); otherwise it is
+    refused with the pointer/generic sentence. Any other suffix is refused.
+    Raises IsabelleToolError for every refusal. The loader round trip happens on
+    the non-.thy path only.
+    """
+    if file_path.endswith(".thy"):
+        return None
+    rel = relativize(file_path, client.project_root)
+    kind = next((k for k in LOAD_TARGET_SUFFIXES if file_path.endswith(k)), None)
+    if kind is None:
+        raise IsabelleToolError(NON_THEORY_TARGET.format(file=rel))
+    loaders = await client.request_loaders(file_path)
+    if redirect and len(loaders) == 1 and loaders[0].get("line") is not None:
+        return loaders[0]
+    raise IsabelleToolError(
+        _load_target_refusal(rel, kind, loaders, client.project_root))
+
+
 async def evaluate_to(
     client: IsabelleLSPClient,
     file_path: str,
@@ -823,6 +944,20 @@ async def evaluate_to(
     after_text: str | None = None,
 ) -> EvaluationView:
     from isabelle_mcp import debugger
+    redirected_line: str | None = None
+    loader = await evaluation_target(client, file_path, redirect=True)
+    if loader is not None:
+        # R-D3 (v) ②: evaluate to the load command instead; the caller's line
+        # and after_text are dropped, the load command's own keyword pins the
+        # target on that command.
+        kind = next(k for k in LOAD_TARGET_SUFFIXES if file_path.endswith(k))
+        redirected_line = REDIRECTED_LINE.format(
+            file=relativize(file_path, client.project_root), kind=kind,
+            loader_command=loader.get("command") or "ML_file",
+            loader=render_loader(loader, client.project_root))
+        file_path = os.path.realpath(loader["file"])
+        line = int(loader["line"])
+        after_text = loader.get("command")
     async with _evaluation_state_lock:
         # Pinned ordering (Phase D): the hits-live refusal runs BEFORE the
         # active-evaluation refusal — the latter tells the agent to cancel,
@@ -863,12 +998,24 @@ async def evaluate_to(
 
         evaluation = evaluation_state.start(file_path, dest_line)
 
-    try:
+        # Sent under the lock, as its last act: cancel_evaluation writes
+        # PIDE/cancel_evaluation only after taking THIS lock, so the caret
+        # notification is on the wire ahead of any cancel request by
+        # construction -- not by there happening to be no checkpoint between
+        # the release and the write. Bounded by SEND_TIMEOUT.
         # No freshness invalidation here: every edit-send path calls
         # note_edit_sent (didOpen/didChange/dep change), and a caret-only move
         # cannot make stale decorations claim "processed" for work that isn't
         # (see note_edit_sent's docstring).
-        await client.set_caret(file_path, dest_line.to_lsp(), lsp_char)
+        try:
+            await client.set_caret(file_path, dest_line.to_lsp(), lsp_char)
+        except BaseException:
+            # start() already flipped ``active``; the anti-wedge invariant needs
+            # it cleared on every failure path, as the handler below does.
+            await _finish_if_owner(client, evaluation, "cancelled")
+            raise
+
+    try:
         status, theories, running_commands = await _evaluation_wait_loop(
             client, file_path, dest_line, evaluation_state, evaluation,
             HEAP_POLL_INTERVAL if heap_warning else EVAL_POLL_INTERVAL,
@@ -910,7 +1057,15 @@ async def evaluate_to(
     # Build the snapshot BEFORE cleanup closes the auto-opened deps (which would
     # drop their decoration trackers).
     files = _snapshot_files(client, file_path, theories, auto_opened, dest_line)
-    if evaluation.outcome == "cancelled":
+    if client.process is None:
+        # The prover is gone from under this run: torn down by isabelle_terminate,
+        # a relaunch, or the catastrophe handler. That fact, not
+        # the recorded outcome, is what the agent needs; checked before the hit
+        # and heap branches, which would report on a prover that no longer exists.
+        await _finish_if_owner(client, evaluation, "cancelled")
+        status = "cancelled"
+        message = SESSION_GONE_MESSAGE
+    elif evaluation.outcome == "cancelled":
         # Stopped by isabelle_cancel_evaluation or by a session teardown. Say only
         # that; naming any other cause (a heap divergence, a timeout) would
         # fabricate one. The cleanup repeats because a dependency may have been
@@ -956,6 +1111,8 @@ async def evaluate_to(
             await _finish_if_owner(client, evaluation, "complete")
     if fence_line:
         message = message + "\n\n" + fence_line
+    if redirected_line:
+        message = redirected_line + "\n" + message
     return EvaluationView(
         status=status,
         target_file=file_path,
@@ -1135,41 +1292,93 @@ async def resync_and_check_freshness(client: IsabelleLSPClient) -> None:
 async def cancel_evaluation(
     client: IsabelleLSPClient,
 ) -> EvaluationView:
+    """One PIDE/cancel_evaluation request, under the evaluation-state lock for
+    its whole duration (R-D8), and the agent-facing view of its outcome.
+
+    Two outcomes come back: retired, nothing_running. Everything else -- the
+    server's aborted outcome, a transport failure, the total budget running
+    out, anything throwing in the wrap-up -- is the catastrophe: it leaves here
+    as IsabelleCatastrophe and the tool boundary terminates the session (plan
+    section 3.1.5). A genuine cancellation of the tool call (CancelledError)
+    passes through untouched: state reset, attribution withdrawn, no teardown.
+    """
     async with _evaluation_state_lock:
         if _no_pending_work(client):
             return _no_evaluation_view()
 
-        # When the active evaluation already completed but a fork is still
-        # running, ``file_path`` may be the stale (now-closed) target; fall back
-        # to whichever file still holds a running command so force_interrupt's
-        # doc lookup resolves. (cancel_execution itself is global.)
         from isabelle_mcp import debugger
-        # Attribute the coming retirements BEFORE the interrupt, so they
-        # happen silently (section 6.4: the ending clause survives only in
-        # the stale-id refusal).
-        swept_hits = debugger.mark_hits_swept(client)
-        running = client.get_all_running_commands()
-        fp = evaluation_state.file_path or (running[0].file_path if running else "")
         dest = int(evaluation_state.destination_line)
-        # Guard force_interrupt: a re-delivered cancel on any of its awaits (the cancel
-        # request + 2 notifies) must still reset state, else active stays True and wedges
-        # every later evaluate_to. cancel() is synchronous; _cleanup_auto_opened is
-        # self-shielding so its closes complete despite the cancel.
+        # Attribute the coming retirements BEFORE the interrupt, so they
+        # happen silently (section 6.4). finish_cancel_sweep rolls the
+        # attribution back when nothing was running; every other exit
+        # withdraws it below.
+        swept_hits = debugger.mark_hits_swept(client)
+        message = ""
+        # move_on_after, not fail_after: a deadline that passes inside a shielded
+        # segment (a close below) with no unshielded checkpoint after it raises
+        # nothing, so the scope's cancel_called flag is the one reliable witness.
+        # Inside the scope, expiry looks like a cancellation (CancelledError at
+        # the current await, finally blocks run, shielded awaits complete).
         try:
-            await client.force_interrupt(fp)
-        finally:
-            evaluation_state.cancel()
-            await _cleanup_auto_opened(client, evaluation_state)
-        # The certain-death demote-all and the swept-hits result line.
-        swept_line = await debugger.finish_cancel_sweep(client, swept_hits)
-        message = CANCELLED_MESSAGE
-        if swept_line:
-            message += "\n" + swept_line
+            with anyio.move_on_after(CANCEL_TOTAL_BUDGET) as budget:
+                try:
+                    payload = await client.force_interrupt()
+                finally:
+                    # The state reset is UNCONDITIONAL (the anti-wedge
+                    # invariant): a failed or cancelled request must still
+                    # leave ``active`` False, else every later evaluate_to is
+                    # refused. The auto-opened documents are closed on every
+                    # exit but a spent budget (self-shielding, 5 s per file):
+                    # the prover lives on after a cancelled tool call.
+                    evaluation_state.cancel()
+                    if not budget.cancel_called:
+                        await _cleanup_auto_opened(client, evaluation_state)
+                swept_line = await debugger.finish_cancel_sweep(
+                    client, swept_hits, payload)
+                message = render_cancel_outcome(payload, client.project_root)
+                if swept_line:
+                    message += "\n" + swept_line
+            if budget.cancel_called:
+                raise IsabelleCatastrophe(
+                    f"cancellation exceeded its {CANCEL_TOTAL_BUDGET:g}s budget")
+        except BaseException as exc:
+            # a request that produced no success outcome: the attribution must
+            # not stand (the teardown, if one follows, retires the hits itself)
+            debugger.withdraw_sweep_attribution(swept_hits)
+            if isinstance(exc, (IsabelleCatastrophe, asyncio.CancelledError)):
+                raise
+            raise IsabelleCatastrophe(f"cancellation failed: {exc!r}") from exc
         return EvaluationView(
             status="cancelled",
             destination_line=dest,
             message=message,
         )
+
+
+def _cancel_item(entry: dict, root: str | None) -> str:
+    where = relativize(entry.get("file", ""), root)
+    line = entry.get("line")
+    name = entry.get("command") or ""
+    loc = f"{where}:{line}" if line is not None else where
+    return f"{loc} ({name})" if name else loc
+
+
+def render_cancel_outcome(payload: dict, root: str | None) -> str:
+    """The agent-facing text for one successful PIDE/cancel_evaluation reply
+    (force_interrupt admits no other)."""
+    lines = [CANCEL_MESSAGES[payload["outcome"]]]
+    retired = payload.get("retired") or []
+    if retired:
+        lines.append(CANCEL_RESET_LINE.format(
+            items=", ".join(_cancel_item(r, root) for r in retired)))
+    excluded = payload.get("excluded") or []
+    if excluded:
+        logger.info("cancel_evaluation: not retired by this request: %s", excluded)
+    waived = payload.get("waived") or []
+    if waived:
+        lines.append(CANCEL_WAIVED_LINE.format(
+            items=", ".join(_cancel_item(w, root) for w in waived)))
+    return "\n".join(lines)
 
 
 def position_state(
@@ -1341,6 +1550,7 @@ async def check_evaluation_guard(
         renders it (``format_evaluation_result``) and raises it.
     Raises :class:`IsabelleToolError` when the position cannot be served.
     """
+    await evaluation_target(client, file_path, redirect=False)
     state = await _settled_position_state(client, file_path, line)
 
     if state == PROCESSED:

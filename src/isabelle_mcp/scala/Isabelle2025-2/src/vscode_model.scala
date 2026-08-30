@@ -53,8 +53,12 @@ object VSCode_Model {
     node_name: Document.Node.Name
   ): VSCode_Model = {
     val content = Content(node_name, Line.Document.empty)
-    val is_theory = File_Format.registry.is_theory(node_name)
-    VSCode_Model(session, editor, content, node_required = is_theory)
+    // R-D11: never required.  Upstream derives this from File_Format.registry.is_theory,
+    // which suffix-matches the THEORY NAME against registered file formats -- meant for
+    // .bib/ROOTS nodes, but it also marks a theory called bib.thy, and "required" spreads
+    // through make_required to every import, defeating retraction.  This server only opens
+    // .thy files; file-format nodes appear as external models only.
+    VSCode_Model(session, editor, content, node_required = false)
   }
 }
 
@@ -101,12 +105,27 @@ sealed case class VSCode_Model(
   def node_perspective(
     doc_blobs: Document.Blobs,
     caret: Option[Line.Position]
+  ): (Boolean, Document.Node.Perspective_Text.T) =
+    if (is_theory) {
+      node_perspective(session.resources.snapshot(model), doc_blobs, caret,
+        editor.node_overlays(node_name), node_required || editor.document_node_required(node_name))
+    }
+    else (false, Document.Node.Perspective_Text.empty)
+
+  /* The same computation from ingredients the caller already holds.  The overload above
+     takes the document state through a session round trip (resources.snapshot) and the
+     overlay table through the resources monitor; the cancel request holds that monitor
+     while it recomputes every model, and a round trip under the monitor pins the whole
+     server (plan section 3.1.0), so it hands the snapshot and the overlay table in. */
+
+  def node_perspective(
+    snapshot: Document.Snapshot,
+    doc_blobs: Document.Blobs,
+    caret: Option[Line.Position],
+    overlays: Document.Node.Overlays,
+    required: Boolean
   ): (Boolean, Document.Node.Perspective_Text.T) = {
     if (is_theory) {
-      val snapshot = session.resources.snapshot(model)
-
-      val required = node_required || editor.document_node_required(node_name)
-
       val caret_perspective = session.resources.options.int("vscode_caret_perspective") max 0
       val caret_range =
         if (caret_perspective != 0) {
@@ -130,8 +149,6 @@ sealed case class VSCode_Model(
             case Some(range) => Text.Perspective(List(range))
             case None => Text.Perspective.empty
           }
-
-      val overlays = editor.node_overlays(node_name)
 
       (snapshot.node.load_commands_changed(doc_blobs),
         Document.Node.Perspective(required, text_perspective, overlays))

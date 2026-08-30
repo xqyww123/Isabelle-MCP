@@ -11,54 +11,137 @@
     outright rather than degrading.  Language_Server guards the file's existence and
     surfaces the compiler output; keep this file small and dependency-free.
 
-    See docs/CANCELLATION.md for the full design and its validation.
+    See ISABELLE_MCP_CANCELLATION_REDESIGN_PLAN.md (and docs/CANCELLATION.md, which it
+    supersedes for the cancel design) for the design and its validation.
 *)
 
-val mcp_prelude_version = "4";
+val mcp_prelude_version = "6";
 
 
-(* Global cancellation of all document execution, using only the PUBLIC Isabelle/ML API,
+(* Cancellation of document execution, using only the PUBLIC (unpatched) Isabelle/ML API,
    so that Isabelle-MCP needs no patched Isabelle distribution.
 
-     * Execution.discontinue () clears the current execution id.  Command.exec registers an
-       exec via "Execution.running execution_id exec_id groups", which fails once the ids no
-       longer match -- so any exec that has not started yet never starts.  This is the barrier,
-       and it runs FIRST, before anything that could raise.
+     Isabelle_MCP.cancel_evaluation serial cancel_ids probe_ids
 
-     * Execution.cancel exec_id cancels every Future group registered for that exec.
-       Execution.fork prepends the subgroup of each forked proof to that list, and Task_Queue
-       registers every task under all of its ancestor groups, so cancelling reaches the running
-       threads of forked proofs too.
+   This is the "stanch + probe" half of a cancel request (ISABELLE_MCP_CANCELLATION_REDESIGN_
+   PLAN.md section 3.1.1); the Scala side then retracts every perspective and retires each
+   exec reported alive with a zero-length edit, until none is left.  Three steps, and the
+   order is load-bearing:
 
-   The exec ids are supplied by the Scala side from Document.State.execs, which spans all
-   nodes.  An id ML does not know is a silent no-op: Execution.cancel -> peek -> exec_groups
-   returns [] for an unknown id. *)
+     1. Execution.discontinue () clears the current execution id.  Command.exec registers an
+        exec via "Execution.running execution_id exec_id groups", which fails once the ids no
+        longer match -- so any exec that has not started yet never starts.  This cannot fail
+        and runs FIRST, before anything that could raise.
+
+     2. Probe which of probe_ids (the eval execs Scala knows on its stable version) still
+        have live tasks.  Execution.snapshot answers for a whole id list with ONE flat task
+        list, so a single call only says "some of these are alive"; the per-id answer comes
+        from binary narrowing: a non-empty list is split in half and only non-empty halves
+        are recursed into.  Attribution is by ancestry -- Task_Queue registers a task under
+        every ancestor group -- so "snapshot [id]" also sees tasks forked inside the command
+        body under fresh subgroups.  After discontinue the live set only shrinks, so samples
+        taken at different moments stay consistent.  No cap on the number of calls: the
+        protocol loop runs this inline and uninterruptibly, and the only bound is the Scala
+        side's request budget, after which it terminates the prover.
+
+     3. Execution.cancel on every id in cancel_ids (every exec Scala knows, no version
+        needed).  It cancels the Future groups registered for the exec and, through the
+        ancestor registration, the running threads of forked proofs too.  An id ML does not
+        know is a silent no-op: Execution.cancel -> peek -> exec_groups returns [].
+
+   Probe BEFORE cancel: a cancelled task leaves its group before a later snapshot could see
+   it, and an interrupted command nobody reports is exactly the corpse the design forbids.
+
+   The reply is ONE protocol message (function isabelle_mcp_cancel_report) with the serial,
+   the number of probe calls, and -- if any step after the serial was stripped failed -- an
+   "error" property; its single body chunk lists the live ids.  It goes out after every
+   step, so a failure anywhere is visible in it (the Scala side treats "error" as fatal),
+   and only then is the failure re-raised on the protocol thread.  On failure the whole
+   probe set is reported alive: an exec nobody could examine must be retired, not forgotten.
+   Only the serial is parsed outside the protected region -- a request without one cannot
+   be answered at all, does nothing, and is left to the Scala side's budget.  The body chunk is always
+   present, possibly empty: the Scala parser reads exactly one. *)
+
+fun mcp_probe_alive ids =
+  let
+    val calls = Unsynchronized.ref 0;
+    fun alive ids = (calls := ! calls + 1; not (null (Execution.snapshot ids)));
+    fun narrow [] acc = acc
+      | narrow [id] acc = if alive [id] then id :: acc else acc
+      | narrow ids acc =
+          if alive ids then
+            let val (l, r) = chop (length ids div 2) ids
+            in narrow l (narrow r acc) end
+          else acc;
+  in (narrow ids [], ! calls) end;
 
 val _ =
-  Protocol_Command.define "Isabelle_MCP.cancel_execution"
+  Protocol_Command.define "Isabelle_MCP.cancel_evaluation"
     (fn args =>
-      let
-        (* barrier first: this cannot fail, and it alone stops everything not yet started *)
-        val _ = Execution.discontinue ();
-        val exec_ids = maps (map Document_ID.parse o space_explode ",") args;
-        val _ = List.app Execution.cancel exec_ids;
-      in
-        Output.system_message
-          ("Isabelle_MCP.cancel_execution: discontinued, cancelled " ^
-            string_of_int (length exec_ids) ^ " execs")
-      end);
+      (case args of
+        [] => ()
+      | serial :: rest =>
+            let
+              val result =
+                Exn.capture (fn () =>
+                  let
+                    val _ = Execution.discontinue ();
+                    val (cancel_ids, probe_ids) =
+                      (case rest of
+                        [cancel_arg, probe_arg] =>
+                          (map Document_ID.parse (space_explode "," cancel_arg),
+                            map Document_ID.parse (space_explode "," probe_arg))
+                      | _ => raise Fail "Isabelle_MCP.cancel_evaluation: bad arguments");
+                    val (alive, calls) =
+                      (case Exn.capture mcp_probe_alive probe_ids of
+                        Exn.Res res => res
+                      | Exn.Exn exn =>
+                          raise Fail ("probe failed: " ^ Runtime.exn_message exn));
+                    val _ =
+                      (case Exn.capture (List.app Execution.cancel) cancel_ids of
+                        Exn.Res () => ()
+                      | Exn.Exn exn =>
+                          raise Fail ("cancel failed: " ^ Runtime.exn_message exn));
+                  in (alive, calls) end) ();
+              val (alive, calls, error) =
+                (case result of
+                  Exn.Res (alive, calls) => (alive, calls, [])
+                | Exn.Exn exn =>
+                    (* the probe set is whatever the raw argument holds, parsed leniently:
+                       nothing here may raise before the report is out *)
+                    let
+                      val probe_ids =
+                        (case rest of
+                          [_, probe_arg] =>
+                            map_filter (try Document_ID.parse) (space_explode "," probe_arg)
+                        | _ => []);
+                    in (probe_ids, 0, [("error", Runtime.exn_message exn)]) end);
+              val _ =
+                Output.protocol_message
+                  ([("function", "isabelle_mcp_cancel_report"), ("serial", serial),
+                    ("calls", Value.print_int calls)] @ error)
+                  [[XML.Text (space_implode "," (map Document_ID.print alive))]];
+            in Exn.release result; () end));
 
 
-(* Startup probe.  A protocol command that ML does not know is NOT fatal -- the loop turns it
-   into a system message and carries on -- so a missing prelude would otherwise degrade
-   silently, reporting successful cancellations that never happened.  Language_Server issues
-   this ping after startup and refuses to serve if no pong comes back. *)
+(* Startup probe, and the ordering probe of a cancel request.  A protocol command that ML
+   does not know is NOT fatal -- the loop turns it into a system message and carries on --
+   so a missing prelude would otherwise degrade silently, reporting successful cancellations
+   that never happened.  Language_Server issues this ping after startup and refuses to serve
+   if no pong comes back.  A cancel request sends a second ping, with its serial, right
+   after the cancel command: every channel between the two sides is FIFO, so a pong that
+   arrives before the cancel report proves the report lost.  The serial goes in the
+   PROPERTIES, after "function" (the dispatcher reads the first property only); the body
+   stays the bare version string the startup handshake compares. *)
 
 val _ =
   Protocol_Command.define "Isabelle_MCP.ping"
-    (fn _ =>
-      Output.protocol_message
-        [("function", "isabelle_mcp_pong")] [[XML.Text mcp_prelude_version]]);
+    (fn args =>
+      let val serial = (case args of s :: _ => s | [] => "") in
+        Output.protocol_message
+          [("function", "isabelle_mcp_pong"), ("serial", serial)]
+          [[XML.Text mcp_prelude_version]]
+      end);
 
 (* Position-explicit queries: the proof state and find_theorems at one command, read straight
    out of the document state -- no caret move, no overlay, no document update at all.

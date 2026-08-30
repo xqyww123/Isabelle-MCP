@@ -672,9 +672,23 @@ object LSP {
       ResponseMessage(id, Some(JSON.Object("theories" -> theories)))
   }
 
-  object Cancel_Execution extends Request0("PIDE/cancel_execution") {
-    def reply(id: Id): JSON.T =
-      ResponseMessage(id, Some(JSON.Object("cancelled" -> true)))
+  /* one request, one reply, eight outcomes; the payload is documented at
+     Language_Server.cancel_evaluation */
+  object Cancel_Evaluation extends Request0("PIDE/cancel_evaluation") {
+    def reply(id: Id, result: JSON.T): JSON.T = ResponseMessage(id, Some(result))
+  }
+
+  /* the load commands (ML_file and kin) that load a file, with their evaluation state */
+  object Loaders {
+    def unapply(json: JSON.T): Option[(Id, JFile)] =
+      json match {
+        case RequestMessage(id, "PIDE/loaders", Some(params)) =>
+          for (uri <- JSON.string(params, "uri") if Url.is_wellformed_file(uri))
+            yield (id, Url.absolute_file(uri))
+        case _ => None
+      }
+    def reply(id: Id, loaders: List[JSON.T]): JSON.T =
+      ResponseMessage(id, Some(JSON.Object("loaders" -> loaders)))
   }
 
   object Command_At_Position extends RequestTextDocumentPosition("PIDE/command_at_position") {

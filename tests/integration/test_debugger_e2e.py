@@ -208,8 +208,12 @@ async def test_motion3_fence_then_rearm_after_upstream_edit(dbg):
 
 @pytest.mark.asyncio
 async def test_cancel_while_stopped_sweeps_and_demotes(dbg):
-    """§6.4: cancellation with a live hit — the swept line in the result,
-    the silent attributed retirement, the wire-free demote-all."""
+    """§6.4 + cancellation redesign §3.4: cancellation with a live hit — the
+    retired outcome with the swept line, the silent attributed retirement, and
+    the TARGETED demotion (R11): only sites from the first retired command of a
+    file onward are unloaded. The parked thread sits in the caller, which is
+    retired; the breakpoint's site is in the definer, evaluated earlier and
+    untouched (F2), so it stays armed."""
     client, path = dbg
     assert await _evaluate_through(client, path, DEFINER_END)
     await debugger.set_breakpoint(client, path, VAL_TOTAL, None)
@@ -218,18 +222,25 @@ async def test_cancel_while_stopped_sweeps_and_demotes(dbg):
 
     view = await cancel_evaluation(client)
     assert view.status == "cancelled"
-    assert view.message == (
-        ev.CANCELLED_MESSAGE + "\n" + debugger.HITS_SWEPT_ONE), view.message
+    # main sentence (the parked thread's command is retired), then the sweep line
+    lines = view.message.split("\n")
+    assert lines[0] == ev.CANCEL_MESSAGES[ev.CANCEL_OUTCOME_RETIRED], view.message
+    assert lines[-1] == debugger.HITS_SWEPT_ONE, view.message
 
     with pytest.raises(IsabelleToolError) as exc:
         debugger.registry.resolve_hit("h1")
     assert debugger.ENDED_CANCELLED in str(exc.value)
 
     listing = debugger.list_breakpoints(client, None)
-    assert "pending (not evaluated yet)" in listing, listing
+    assert "armed" in listing and "pending" not in listing, listing
     notices = debugger.registry.drain_notices() or ""
-    assert "no longer works (not evaluated yet)" in notices, notices
     assert "ended" not in notices   # the retirement was silent (attributed)
+
+    # the site is genuinely alive: the next evaluation through the caller hits it
+    view = await _hit_led_evaluate(client, path, CALLER)
+    assert "DebugProbe.thy:13" in view.message, view.message
+    await debugger.continue_breakpoint(client, None)
+    assert await _wait_settled(client)
 
 
 @pytest.mark.asyncio

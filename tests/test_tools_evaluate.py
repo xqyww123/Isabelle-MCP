@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -333,20 +334,22 @@ class TestLingeringFork:
         await evaluate_to(mock_lsp_client, temp_theory_file, 5)
         assert not evaluation_state.active
 
-        interrupted: list[str] = []
+        interrupted: list[bool] = []
         monkeypatch.setattr(
             mock_lsp_client, "get_all_running_commands",
             lambda: [_fork(temp_theory_file)],
         )
 
-        async def _spy(fp):
-            interrupted.append(fp)
+        async def _spy():
+            interrupted.append(True)
+            return {"outcome": "retired", "retired": [], "excluded": [],
+                    "waived": [], "unloaded_from": []}
 
         monkeypatch.setattr(mock_lsp_client, "force_interrupt", _spy)
 
         result = await cancel_evaluation(mock_lsp_client)
         assert result.status == "cancelled"
-        assert interrupted == [temp_theory_file]    # the fork was actually interrupted
+        assert interrupted == [True]    # the request went to the server
 
     @pytest.mark.asyncio
     async def test_idle_reports_no_evaluation(self, mock_lsp_client):
@@ -754,7 +757,7 @@ class TestCancelSafety:
         evaluation_state.start(temp_theory_file, MCPLine(5))  # active=True, in progress
         evaluation_state.auto_opened_files.add("/tmp/Dep_cancel_eval.thy")
 
-        async def boom(fp):
+        async def boom():
             raise asyncio.CancelledError()
 
         monkeypatch.setattr(mock_lsp_client, "force_interrupt", boom)
@@ -1364,3 +1367,221 @@ class TestEvaluationFooter:
         await ev.evaluation_footer(client)
         assert "/tmp/Broken_footer.thy" not in client.open_documents
         assert evaluation_state.auto_opened_files == set()
+
+
+class TestForceInterruptContract:
+    """force_interrupt admits only the two success outcomes; everything else
+    is the catastrophe."""
+
+    def _client(self, monkeypatch, reply):
+        from unittest.mock import AsyncMock
+        from isabelle_mcp.lsp_client import IsabelleLSPClient
+        client = IsabelleLSPClient.__new__(IsabelleLSPClient)
+        client.request = AsyncMock(**reply)
+        monkeypatch.setattr("isabelle_mcp.lsp_client.note_edit_sent", lambda: None)
+        return client
+
+    @pytest.mark.asyncio
+    async def test_unknown_outcome_is_a_catastrophe(self, monkeypatch):
+        from isabelle_mcp.utils import IsabelleCatastrophe
+        client = self._client(monkeypatch, {"return_value": {"outcome": "degraded"}})
+        with pytest.raises(IsabelleCatastrophe, match="degraded"):
+            await client.force_interrupt()
+
+    @pytest.mark.asyncio
+    async def test_aborted_reply_is_a_catastrophe(self, monkeypatch):
+        from isabelle_mcp.utils import IsabelleCatastrophe
+        client = self._client(monkeypatch, {
+            "return_value": {"outcome": "aborted", "reason": "budget exhausted"}})
+        with pytest.raises(IsabelleCatastrophe, match="budget exhausted"):
+            await client.force_interrupt()
+
+    @pytest.mark.asyncio
+    async def test_transport_failure_is_a_catastrophe(self, monkeypatch):
+        from isabelle_mcp.utils import IsabelleCatastrophe
+        client = self._client(monkeypatch, {
+            "side_effect": IsabelleToolError("LSP request timed out")})
+        with pytest.raises(IsabelleCatastrophe, match="timed out"):
+            await client.force_interrupt()
+
+
+class TestCancelCatastrophe:
+    """Every non-success exit of cancel_evaluation leaves as IsabelleCatastrophe
+    (the tool boundary tears the prover down), with the state reset; a genuine
+    cancellation of the tool call passes through untouched."""
+
+    @pytest.mark.asyncio
+    async def test_catastrophe_propagates_with_state_reset(
+        self, temp_theory_file, mock_lsp_client, monkeypatch,
+    ):
+        from isabelle_mcp.utils import IsabelleCatastrophe
+        evaluation_state.start(temp_theory_file, MCPLine(5))
+
+        async def _aborted():
+            raise IsabelleCatastrophe("cancellation aborted: budget exhausted")
+
+        monkeypatch.setattr(mock_lsp_client, "force_interrupt", _aborted)
+        with pytest.raises(IsabelleCatastrophe, match="budget exhausted"):
+            await cancel_evaluation(mock_lsp_client)
+        assert not evaluation_state.active
+        assert mock_lsp_client.process is not None   # the boundary tears down, not here
+
+    @pytest.mark.asyncio
+    async def test_total_budget_is_a_catastrophe(
+        self, temp_theory_file, mock_lsp_client, monkeypatch,
+    ):
+        import asyncio
+        from isabelle_mcp import evaluation as ev
+        from isabelle_mcp.utils import IsabelleCatastrophe
+        evaluation_state.start(temp_theory_file, MCPLine(5))
+
+        async def _slow():
+            await asyncio.sleep(5)
+            return {"outcome": "nothing_running"}
+
+        monkeypatch.setattr(ev, "CANCEL_TOTAL_BUDGET", 0.05)
+        monkeypatch.setattr(mock_lsp_client, "force_interrupt", _slow)
+        with pytest.raises(IsabelleCatastrophe, match="budget"):
+            await cancel_evaluation(mock_lsp_client)
+        assert not evaluation_state.active
+
+    @pytest.mark.asyncio
+    async def test_wrap_up_failure_is_a_catastrophe(
+        self, temp_theory_file, mock_lsp_client, monkeypatch,
+    ):
+        from isabelle_mcp import debugger
+        from isabelle_mcp.utils import IsabelleCatastrophe
+        evaluation_state.start(temp_theory_file, MCPLine(5))
+
+        async def _boom(client, marked, payload):
+            raise RuntimeError("sweep exploded")
+
+        monkeypatch.setattr(debugger, "finish_cancel_sweep", _boom)
+        with pytest.raises(IsabelleCatastrophe, match="sweep exploded"):
+            await cancel_evaluation(mock_lsp_client)
+        assert not evaluation_state.active
+
+    @pytest.mark.asyncio
+    async def test_retired_reply_renders_lists(
+        self, temp_theory_file, mock_lsp_client, monkeypatch,
+    ):
+        from isabelle_mcp import evaluation as ev
+        evaluation_state.start(temp_theory_file, MCPLine(5))
+
+        async def _retired():
+            return {
+                "outcome": "retired",
+                "retired": [{"file": temp_theory_file, "line": 3, "command": "lemma"}],
+                "excluded": [{"file": temp_theory_file, "id": 7, "reason": "gone"}],
+                "waived": [],
+                "unloaded_from": [],
+            }
+
+        monkeypatch.setattr(mock_lsp_client, "force_interrupt", _retired)
+        result = await cancel_evaluation(mock_lsp_client)
+        lines = result.message.split("\n")
+        assert lines[0] == ev.CANCEL_MESSAGES["retired"]
+        assert lines[1].startswith("Reset to unevaluated: ") and ":3 (lemma)" in lines[1]
+        assert len(lines) == 2          # excluded commands are logged, not rendered
+        assert mock_lsp_client.process is not None   # no teardown on success
+
+
+class TestEvaluationTargetWhitelist:
+    """R-D3 (v): only .thy is an evaluation target; .ML/.sml redirect to a
+    unique load command; other suffixes are refused; queries never redirect."""
+
+    @pytest.mark.asyncio
+    async def test_other_suffix_refused(self, tmp_path, mock_lsp_client):
+        from isabelle_mcp import evaluation as ev
+        bib = str(tmp_path / "refs.bib")
+        with pytest.raises(IsabelleToolError) as exc:
+            await evaluate_to(mock_lsp_client, bib, 1)
+        assert str(exc.value) == ev.NON_THEORY_TARGET.format(file=bib)
+        assert bib not in mock_lsp_client.open_documents
+
+    @pytest.mark.asyncio
+    async def test_lowercase_ml_is_not_a_load_target(self, tmp_path, mock_lsp_client):
+        from isabelle_mcp import evaluation as ev
+        ml = str(tmp_path / "x.ml")
+        with pytest.raises(IsabelleToolError) as exc:
+            await evaluate_to(mock_lsp_client, ml, 1)
+        assert str(exc.value) == ev.NON_THEORY_TARGET.format(file=ml)
+
+    @pytest.mark.asyncio
+    async def test_ml_with_unique_loader_without_line_generic(
+        self, tmp_path, mock_lsp_client,
+    ):
+        ml = str(tmp_path / "Foo.ML")
+        mock_lsp_client.loaders = [
+            {"file": str(tmp_path / "A.thy"), "command": "ML_file",
+             "state": "unevaluated"},                  # no "line": not a model yet
+        ]
+        with pytest.raises(IsabelleToolError) as exc:
+            await evaluate_to(mock_lsp_client, ml, 1)
+        assert str(exc.value) == (
+            f"{ml} is a .ML file, which cannot be an evaluation target.")
+
+    @pytest.mark.asyncio
+    async def test_ml_without_loader_generic(self, tmp_path, mock_lsp_client):
+        ml = str(tmp_path / "Foo.ML")
+        mock_lsp_client.loaders = []
+        with pytest.raises(IsabelleToolError) as exc:
+            await evaluate_to(mock_lsp_client, ml, 1)
+        assert str(exc.value) == (
+            f"{ml} is a .ML file, which cannot be an evaluation target.")
+
+    @pytest.mark.asyncio
+    async def test_sml_with_two_loaders_points(self, tmp_path, mock_lsp_client):
+        sml = str(tmp_path / "Foo.sml")
+        a, b = str(tmp_path / "A.thy"), str(tmp_path / "B.thy")
+        mock_lsp_client.loaders = [
+            {"file": a, "line": 4, "command": "SML_file", "state": "unevaluated"},
+            {"file": b, "line": 9, "command": "SML_file", "state": "unevaluated"},
+        ]
+        with pytest.raises(IsabelleToolError) as exc:
+            await evaluate_to(mock_lsp_client, sml, 1)
+        assert str(exc.value) == (
+            f"{sml} is a .sml file, which cannot be an evaluation target. "
+            f"Evaluate to {a}:4 or {b}:9 (the SML_file commands that load this "
+            "file) instead.")
+
+    @pytest.mark.asyncio
+    async def test_ml_with_unique_loader_redirects(
+        self, temp_theory_file, mock_lsp_client,
+    ):
+        ml = str(Path(temp_theory_file).with_suffix(".ML"))
+        Path(temp_theory_file).write_text(
+            'theory Test\nimports Main\nbegin\nML_file "Test.ML"\nend\n')
+        mock_lsp_client._processing_trackers[temp_theory_file] = MockProcessingTracker(
+            all_processed=True,
+        )
+        mock_lsp_client.loaders = [
+            {"file": temp_theory_file, "line": 4, "command": "ML_file",
+             "state": "unevaluated"},
+        ]
+        # the caller's line and after_text are dropped (approved)
+        result = await evaluate_to(mock_lsp_client, ml, 42, after_text="ignored")
+        assert result.target_file == temp_theory_file
+        assert result.destination_line == 4
+        assert result.message.split("\n")[0] == (
+            f"Redirected: {ml} is a .ML file loaded by the ML_file command at "
+            f"{temp_theory_file}:4; evaluated through that command instead.")
+        assert temp_theory_file in mock_lsp_client.open_documents
+        assert ml not in mock_lsp_client.open_documents
+
+    @pytest.mark.asyncio
+    async def test_query_guard_refuses_without_redirect(
+        self, temp_theory_file, mock_lsp_client,
+    ):
+        from isabelle_mcp.evaluation import check_evaluation_guard
+        ml = str(Path(temp_theory_file).with_suffix(".ML"))
+        mock_lsp_client.loaders = [
+            {"file": temp_theory_file, "line": 3, "command": "ML_file",
+             "state": "unevaluated"},
+        ]
+        with pytest.raises(IsabelleToolError) as exc:
+            await check_evaluation_guard(mock_lsp_client, ml, MCPLine(1))
+        assert str(exc.value) == (
+            f"{ml} is a .ML file, which cannot be an evaluation target. "
+            f"Evaluate to {temp_theory_file}:3 (the ML_file command that loads "
+            "this file) instead.")

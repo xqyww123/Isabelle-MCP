@@ -45,7 +45,7 @@ error only when its fork joins).
 Watch for a stuck evaluation — a bad edit can make a command loop forever.
 A stuck command burns large amounts of CPU and can bog down the whole system, so
 cancel it promptly: cancel with `isabelle_cancel_evaluation`, fix the command,
-and evaluate again. Cancelling keeps everything already checked.
+and evaluate again. Other tool calls wait while a cancellation is in progress.
 
 **Errors do not stop the checking.** Isabelle checks every command up to your
 target even when an earlier one fails, unless some command gets stuck. A failed

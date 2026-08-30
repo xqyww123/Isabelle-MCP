@@ -951,8 +951,9 @@ async def test_probe7_cancellation_sweeps_the_hit(prover):
     await evaluate_to(client, path, -1)
     await _wait_for_hit(client)
 
-    # isabelle_cancel_evaluation's path: force_interrupt (synthetic edit).
-    await client.force_interrupt(path)
+    # isabelle_cancel_evaluation's path: one PIDE/cancel_evaluation request
+    # (stanch + retract + retire on the server).
+    await client.force_interrupt()
 
     # The parked thread must leave the hit table.
     resumed = await _wait_all_resumed(client, timeout=90.0)

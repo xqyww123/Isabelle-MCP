@@ -2,8 +2,12 @@
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import types
+
 import pytest
 import yaml
+
+from isabelle_mcp.lsp_client import IsabelleLSPClient
 
 from isabelle_mcp.server import (
     isabelle_cancel_evaluation,
@@ -201,6 +205,68 @@ class TestServerMain:
                 main()
 
 
+class TestCatastropheMiddleware:
+    """The one handler for IsabelleCatastrophe: log, tear the prover down through
+    the shared helper, answer with the fixed sentence."""
+
+    @pytest.mark.asyncio
+    async def test_catastrophe_tears_down_and_answers(self):
+        import isabelle_mcp.server as server_mod
+        from isabelle_mcp.server import CatastropheMiddleware
+        from isabelle_mcp.utils import CATASTROPHE_MESSAGE, IsabelleCatastrophe
+
+        client = _launch_mock(running=True)
+
+        async def call_next(_ctx):
+            raise IsabelleCatastrophe("budget exhausted")
+
+        with patch.object(server_mod, '_lsp_client', client):
+            result = await CatastropheMiddleware().on_call_tool(None, call_next)
+        client.shutdown.assert_awaited_once()
+        assert client.process is None
+        assert [c.text for c in result.content] == [CATASTROPHE_MESSAGE]
+
+    @pytest.mark.asyncio
+    async def test_reaches_the_handler_through_the_real_chain(self):
+        """FastMCP runs the tool body under ``except Exception: raise ToolError``
+        before any middleware sees it; only a FastMCPError gets through. This
+        drives a real server + client in production middleware order, which the
+        direct on_call_tool test above cannot cover."""
+        from fastmcp import Client, FastMCP
+        from fastmcp.tools.tool import ToolResult
+
+        import isabelle_mcp.server as server_mod
+        from isabelle_mcp.server import CatastropheMiddleware, UnicodeWarningMiddleware
+        from isabelle_mcp.utils import CATASTROPHE_MESSAGE, IsabelleCatastrophe
+
+        srv = FastMCP("probe")
+        srv.add_middleware(CatastropheMiddleware())
+        srv.add_middleware(UnicodeWarningMiddleware())
+
+        @srv.tool(output_schema=None)
+        async def boom() -> ToolResult:
+            raise IsabelleCatastrophe("probe: budget exhausted")
+
+        client = _launch_mock(running=True)
+        with patch.object(server_mod, '_lsp_client', client):
+            async with Client(srv) as c:
+                result = await c.call_tool("boom", {})
+        assert [b.text for b in result.content] == [CATASTROPHE_MESSAGE]
+        client.shutdown.assert_awaited_once()
+        assert client.process is None
+
+    @pytest.mark.asyncio
+    async def test_other_errors_pass_through(self):
+        from isabelle_mcp.server import CatastropheMiddleware
+        from isabelle_mcp.utils import IsabelleToolError
+
+        async def call_next(_ctx):
+            raise IsabelleToolError("ordinary")
+
+        with pytest.raises(IsabelleToolError, match="ordinary"):
+            await CatastropheMiddleware().on_call_tool(None, call_next)
+
+
 def _launch_mock(*, running: bool, logic: str = "HOL"):
     """A mock IsabelleLSPClient for the launch/terminate tests."""
     client = MagicMock()
@@ -213,6 +279,10 @@ def _launch_mock(*, running: bool, logic: str = "HOL"):
     client.debug = False
     client.extra_args = []
     client.isabelle_version = "Isabelle2024"
+    # the real teardown helper: launch (restart), terminate and the catastrophe
+    # handler all go through it; its steps are observable on the mock
+    client.file_watcher = None
+    client.teardown = types.MethodType(IsabelleLSPClient.teardown, client)
     client.start = AsyncMock()
     client.shutdown = AsyncMock()
     client.reap = AsyncMock()
@@ -425,7 +495,9 @@ class TestSessionManagement:
         with patch.object(server_mod, '_lsp_client', client):
             with pytest.raises(IsabelleToolError, match="Missing heap image"):
                 await isabelle_launch("HOL")
-        client.kill.assert_called_once()
+        # once from the crashed-server teardown before start(), once from the
+        # start-failure cleanup; kill() is a no-op on a dead process
+        assert client.kill.called
         assert client.process is None
 
     @pytest.mark.asyncio
@@ -451,8 +523,11 @@ class TestSessionManagement:
 
         client = _launch_mock(running=True)
         watcher = MagicMock()
-        with patch.object(server_mod, '_lsp_client', client), \
-                patch.object(server_mod, '_file_watcher', watcher):
+        # the real teardown helper on the mock: terminate shares it with the
+        # aborted cancellation outcome, and it is the helper that does the steps
+        client.file_watcher = watcher
+        client.teardown = types.MethodType(IsabelleLSPClient.teardown, client)
+        with patch.object(server_mod, '_lsp_client', client):
             result = await isabelle_terminate()
         client.shutdown.assert_awaited_once()
         assert client.process is None

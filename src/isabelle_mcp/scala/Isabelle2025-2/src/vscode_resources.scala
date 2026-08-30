@@ -11,6 +11,10 @@ import isabelle._
 
 import java.io.{File => JFile}
 
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
+
+import scala.collection.mutable
 import scala.util.parsing.input.Reader
 
 
@@ -22,7 +26,15 @@ object VSCode_Resources {
     caret: Option[(JFile, Line.Position)] = None,
     overlays: Document.Overlays = Document.Overlays.empty,
     pending_input: Set[JFile] = Set.empty,
-    pending_output: Set[JFile] = Set.empty
+    pending_output: Set[JFile] = Set.empty,
+    /* counts the session.update calls made under the monitor with a non-empty edit list:
+       the cancel request reads the document state outside the monitor and uses this to
+       tell whether that reading is still current once it is back inside */
+    update_serial: Long = 0,
+    /* counts the changes to the overlay table.  Two writers: change_overlay bumps this
+       when the table really changed; the cancel request's step 0 empties the table and
+       records the value, and asserts at the end that nobody touched overlays since */
+    overlay_serial: Long = 0
   ) {
     def update_models(changed: Iterable[(JFile, VSCode_Model)]): State =
       copy(
@@ -51,12 +63,130 @@ object VSCode_Resources {
         } yield (model.node_name -> blob)).toMap)
 
     def change_overlay(insert: Boolean, file: JFile,
-        command: Command, fn: String, args: List[String]): State =
+        command: Command, fn: String, args: List[String]): State = {
+      val overlays1 =
+        if (insert) overlays.insert(command, fn, args)
+        else overlays.remove(command, fn, args)
+      // Bumped only when the table really changed.  Document.Overlays always returns a
+      // fresh object, so identity says nothing; and a query finishing after the cancel
+      // request's step 0 emptied the table removes an entry that is already gone --
+      // that must not read as "someone touched the overlays".
+      val changed = overlays(command.node_name).dest != overlays1(command.node_name).dest
       copy(
-        overlays =
-          if (insert) overlays.insert(command, fn, args)
-          else overlays.remove(command, fn, args),
+        overlays = overlays1,
+        overlay_serial = if (changed) overlay_serial + 1 else overlay_serial,
         pending_input = pending_input + file)
+    }
+  }
+
+
+  /* cancellation (ISABELLE_MCP_CANCELLATION_REDESIGN_PLAN.md section 3.1.2)
+
+     Every failure of the cancel request is a Cancel_Failure with the reason for the log;
+     Language_Server turns any of them into the one catastrophic reply. */
+
+  final class Cancel_Failure(val reason: String) extends RuntimeException(reason)
+  def cancel_fail(reason: String): Nothing = throw new Cancel_Failure(reason)
+
+  /* a command retired this round: the zero-length edit (or the net-zero pair) is in the
+     batch; "waived" marks a first-of-file single-character command, whose net-zero pair
+     also re-mints the commands the same re-parse sweeps up (R8) */
+  sealed case class Retired(
+    exec_id: Document_ID.Exec,
+    name: Document.Node.Name,
+    command: Command,
+    start: Text.Offset,
+    waived: Boolean)
+
+  /* a target dropped from the retire set without an edit: "gone" (its exec is no longer in
+     any retained version) or "reassigned" (its command already has another exec on V, or
+     the command id is no longer in V's node at all -- a real edit re-minted it) */
+  sealed case class Excluded(
+    name: Document.Node.Name,
+    command_id: Document_ID.Command,
+    command: Option[Command],
+    reason: String)
+
+  /* step 0's result: the overlay serial recorded after emptying the table, and the
+     commit if a retraction batch was sent */
+  sealed case class Retraction(overlay_serial: Long, commit: Option[Commit])
+
+  /* a batch was sent (step 0 or step f): the stable tip's id before it, if any */
+  sealed case class Commit(tip_before: Option[Document_ID.Version])
+
+  /* one round of the retire loop, as seen from outside the monitor */
+  sealed abstract class Round
+  case object Stale extends Round                       // step a: the state reading aged; retake
+  case object No_Stable_Tip extends Round               // step c: wait a beat and retake
+  case class Flushed(commit: Commit) extends Round      // step b: unflushed edits went out alone
+  case class Retire(
+    version: Document.Version,
+    retired: List[Retired],
+    excluded: List[Excluded],
+    commit: Option[Commit])                             // step f: None if there was nothing to send
+  extends Round
+
+  /* The emptiness IS the point: Text.Edit.inserts/removes/replace all filter empty text,
+     so this reaches for the raw constructor deliberately.  Byte-identical source, fresh
+     command id.  A command of source length 1 has no interior, so it gets the net-zero
+     pair instead: remove its source and insert it back at the same offset, in this order
+     and adjacent in the batch (F20). */
+  def zero_length_edit(offset: Text.Offset): Text.Edit = Text.Edit.insert(offset, "")
+  def net_zero_edits(start: Text.Offset, source: String): List[Text.Edit] =
+    List(Text.Edit.remove(start, source), Text.Edit.insert(start, source))
+
+  /* the monitor: a re-entrant lock whose acquisition can be bounded by a deadline
+
+     Synchronized would do for everyone but the cancel request, which may not wait
+     unboundedly on anything (R-D9).  Re-entrant because node_perspective reads
+     visible_node -> get_model -> value while the cancel request holds the lock.  No
+     condition waiting: nobody uses timed_access/guarded_access on this state. */
+
+  final class Monitor[A](init: A) {
+    private val lock = new ReentrantLock
+    private var state: A = init
+
+    private def locked[B](body: => B): B = { lock.lock(); try { body } finally { lock.unlock() } }
+
+    def value: A = locked(state)
+    def change(f: A => A): Unit = locked { state = f(state) }
+    def change_result[B](f: A => (B, A)): B =
+      locked { val (result, state1) = f(state); state = state1; result }
+
+    def change_result_timed[B](deadline: Time)(f: A => (B, A)): B = {
+      val acquired =
+        try { lock.tryLock((deadline - Time.now()).ms max 0L, TimeUnit.MILLISECONDS) }
+        catch {
+          case _: InterruptedException =>
+            cancel_fail("interrupted while waiting for the document model monitor")
+        }
+      if (!acquired) {
+        cancel_fail("document model monitor held by another party for the rest of the budget")
+      }
+      try { val (result, state1) = f(state); state = state1; result }
+      finally { lock.unlock() }
+    }
+  }
+
+  /* session.update from inside the monitor: a short fixed bound, not the remaining budget,
+     because while the monitor is held the whole server is pinned.  A miss abandons the
+     state assignment with the exception; the Raw_Edits stays in the manager's mailbox and
+     lands whenever the manager gets to it -- abandoning the wait is not withdrawing it. */
+
+  def bounded_update(
+    session: VSCode_Session,
+    blobs: Document.Blobs,
+    edits: List[Document.Edit_Text],
+    bound: Time
+  ): Unit = {
+    val sent = Future.promise[Unit]
+    Isabelle_Thread.fork(name = "cancel_update", daemon = true) {
+      try { session.update(blobs, edits); sent.fulfill(()) }
+      catch { case exn: Throwable => sent.fulfill_result(Exn.Exn(exn)) }
+    }
+    if (Language_Server.await_promise(sent, Time.now() + bound).isEmpty) {
+      cancel_fail("session.update not acknowledged within " + bound)
+    }
   }
 
 
@@ -74,7 +204,7 @@ class VSCode_Resources(
 extends Resources(session_background, log = log) {
   resources =>
 
-  private val state = Synchronized(VSCode_Resources.State())
+  private val state = new VSCode_Resources.Monitor(VSCode_Resources.State())
 
 
   /* options */
@@ -279,11 +409,282 @@ extends Resources(session_background, log = log) {
             model.flush_edits(st.document_blobs, file, st.get_caret(file))
         } yield (edits, (file, model1))).toList
 
-      session.update(st.document_blobs, changed_models.flatMap(_._1))
+      val edits = changed_models.flatMap(_._1)
+      session.update(st.document_blobs, edits)
 
       st.copy(
         models = st.models ++ changed_models.iterator.map(_._2),
-        pending_input = Set.empty)
+        pending_input = Set.empty,
+        update_serial = if (edits.nonEmpty) st.update_serial + 1 else st.update_serial)
+    }
+  }
+
+
+  /* cancellation (ISABELLE_MCP_CANCELLATION_REDESIGN_PLAN.md section 3.1.2)
+
+     Language_Server drives the request: budget, the prover round trips, the retire loop.
+     What lives here is everything that touches the monitor.  Discipline while the cancel
+     request holds it: no session round trip except session.update under a short fixed
+     bound, no flush_input/flush_edits (they take the state through a round trip), every
+     entry through change_result_timed.  The document state is read OUTSIDE the monitor
+     (a manager round trip) and re-validated inside by update_serial. */
+
+  def has_pending_input(deadline: Time): Boolean =
+    state.change_result_timed(deadline)(st => (st.pending_input.nonEmpty, st))
+
+  def read_update_serial(deadline: Time): Long =
+    state.change_result_timed(deadline)(st => (st.update_serial, st))
+
+  private def cancel_required(model: VSCode_Model): Boolean =
+    model.node_required || model.editor.document_node_required(model.node_name)
+
+  /* The perspective a model would compute now, caret gone, with the two catastrophe
+     checks.  EVERY perspective the cancel request computes goes through here (step 0,
+     step b, step e, the final assertion): a required theory cannot be retracted (required
+     spreads through make_required to its imports), and Text.Perspective.full means a file
+     loaded by a load command is an open visible model, which pins the loading theory's
+     whole text (vscode_model.scala). */
+
+  private def cancel_perspective(
+    st: VSCode_Resources.State,
+    doc_state: Document.State,
+    pending_edits: Document.Pending_Edits,
+    model: VSCode_Model,
+    overlays: Document.Overlays
+  ): Document.Node.Perspective_Text.T = {
+    val (_, perspective) =
+      model.node_perspective(
+        doc_state.snapshot(node_name = model.node_name, pending_edits = pending_edits),
+        st.document_blobs, None, overlays(model.node_name), cancel_required(model))
+    if (perspective.required) {
+      VSCode_Resources.cancel_fail("theory " + model.node_name + " is marked required")
+    }
+    if (perspective.visible == Text.Perspective.full) {
+      VSCode_Resources.cancel_fail("load-command escape: a file loaded from " +
+        model.node_name + " is an open visible model")
+    }
+    perspective
+  }
+
+  /* the retraction half of a batch: every theory model whose held or recomputed
+     perspective is not empty gets the empty one */
+
+  private def retraction(
+    st: VSCode_Resources.State,
+    doc_state: Document.State,
+    overlays: Document.Overlays
+  ): (List[(JFile, VSCode_Model)], List[Document.Edit_Text]) = {
+    val pending_edits = Document.Pending_Edits.make(st.models.values)
+    val retracted =
+      (for {
+        (file, model) <- st.models.iterator
+        perspective = cancel_perspective(st, doc_state, pending_edits, model, overlays)
+        if !Document.Node.Perspective_Text.is_empty(model.last_perspective) ||
+          !Document.Node.Perspective_Text.is_empty(perspective)
+      } yield (file, model)).toList
+    val edits =
+      retracted.map({ case (_, model) =>
+        model.node_name -> Document.Node.Perspective_Text.empty: Document.Edit_Text })
+    (retracted.map({ case (file, model) =>
+        (file, model.copy(last_perspective = Document.Node.Perspective_Text.empty)) }),
+      edits)
+  }
+
+  /* the one way a retraction is written back: models replaced, the retracted files
+     whose edits are all flushed leave pending_input */
+
+  private def apply_retraction(
+    st: VSCode_Resources.State,
+    retracted: List[(JFile, VSCode_Model)]
+  ): VSCode_Resources.State = {
+    val touched = retracted.iterator.map(_._1).filter(f => st.models(f).pending_edits.isEmpty).toSet
+    st.copy(models = st.models ++ retracted, pending_input = st.pending_input -- touched)
+  }
+
+  /* step 0: once per request, before any flush.  The caret goes away, the overlay table is
+     emptied (written directly: change_overlay would put the file back into pending_input
+     and cancel the subtraction below), and every model gets the empty perspective.
+     Returns Some(tip id before the update) if a batch was sent, None if there was nothing
+     to retract. */
+
+  def cancel_retract(
+    session: VSCode_Session,
+    doc_state: Document.State,
+    deadline: Time,
+    update_bound: Time
+  ): VSCode_Resources.Retraction = {
+    state.change_result_timed(deadline) { st =>
+      val (retracted, edits) = retraction(st, doc_state, Document.Overlays.empty)
+      val st1 = apply_retraction(st, retracted).copy(caret = None, overlays = Document.Overlays.empty)
+      if (edits.isEmpty) (VSCode_Resources.Retraction(st1.overlay_serial, None), st1)
+      else {
+        val tip_before = doc_state.stable_tip_version.map(_.id)
+        val st2 = st1.copy(update_serial = st1.update_serial + 1)
+        VSCode_Resources.bounded_update(session, st.document_blobs, edits, update_bound)
+        (VSCode_Resources.Retraction(st2.overlay_serial, Some(VSCode_Resources.Commit(tip_before))),
+          st2)
+      }
+    }
+  }
+
+  /* one round of the retire loop, steps a(3) to f, under the monitor throughout.
+
+     serial0 was read under the monitor BEFORE doc_state was taken; if the counter moved
+     since, doc_state may predate a flush and its offsets are not trusted (Stale).  Unflushed
+     edits go out first and alone (Flushed).  Otherwise V is the stable tip of doc_state,
+     every target is located on V by command id, and the batch is: per node, the empty
+     perspective first, then the retire edits in ascending start order. */
+
+  def cancel_round(
+    session: VSCode_Session,
+    targets: Map[Document_ID.Exec, (Document.Node.Name, Document_ID.Command)],
+    doc_state: Document.State,
+    serial0: Long,
+    deadline: Time,
+    update_bound: Time
+  ): VSCode_Resources.Round = {
+    state.change_result_timed(deadline) { st =>
+      if (st.update_serial != serial0) (VSCode_Resources.Stale, st)
+      else if (st.models.values.exists(_.pending_edits.nonEmpty)) {
+        /* step b */
+        for ((file, model) <- st.models if model.pending_edits.nonEmpty && !st.pending_input(file)) {
+          VSCode_Resources.cancel_fail("model with unflushed edits outside pending_input: " + file)
+        }
+        val pending_edits = Document.Pending_Edits.make(st.models.values)
+        val changed =
+          (for {
+            file <- st.pending_input.iterator
+            model <- st.models.get(file)
+            perspective = cancel_perspective(st, doc_state, pending_edits, model, st.overlays)
+            if model.pending_edits.nonEmpty || model.last_perspective != perspective
+          } yield {
+            val edits = model.node_edits(model.node_header, model.pending_edits, perspective)
+            (edits, (file, model.copy(pending_edits = Nil, last_perspective = perspective)))
+          }).toList
+        val edits = changed.flatMap(_._1)
+        if (edits.isEmpty) VSCode_Resources.cancel_fail("unflushed edits produced no edit")
+        val tip_before = doc_state.stable_tip_version.map(_.id)
+        val st1 =
+          st.copy(
+            models = st.models ++ changed.map(_._2),
+            pending_input = Set.empty,
+            update_serial = st.update_serial + 1)
+        VSCode_Resources.bounded_update(session, st.document_blobs, edits, update_bound)
+        (VSCode_Resources.Flushed(VSCode_Resources.Commit(tip_before)), st1)
+      }
+      else {
+        doc_state.stable_tip_version match {
+          case None => (VSCode_Resources.No_Stable_Tip, st)
+          case Some(version) =>
+            /* step d */
+            val assignment = doc_state.the_assignment(version).check_finished
+            val retired = new mutable.ListBuffer[VSCode_Resources.Retired]
+            val excluded = new mutable.ListBuffer[VSCode_Resources.Excluded]
+            for ((name, node_targets) <- targets.groupBy(_._2._1)) {
+              val node = version.nodes(name)
+              val wanted = node_targets.values.map(_._2).toSet
+              val located: Map[Document_ID.Command, (Command, Text.Offset)] =
+                (for {
+                  (command, start) <- node.command_iterator()
+                  if wanted(command.id)
+                } yield command.id -> (command, start)).toMap
+              for ((exec_id, (_, command_id)) <- node_targets) {
+                val eval_exec = assignment.command_execs.getOrElse(command_id, Nil).headOption
+                if (!doc_state.execs.isDefinedAt(exec_id)) {
+                  excluded += VSCode_Resources.Excluded(name, command_id,
+                    located.get(command_id).map(_._1), "gone")
+                }
+                else if (!eval_exec.contains(exec_id)) {
+                  excluded += VSCode_Resources.Excluded(name, command_id,
+                    located.get(command_id).map(_._1), "reassigned")
+                }
+                else {
+                  located.get(command_id) match {
+                    case None =>
+                      excluded += VSCode_Resources.Excluded(name, command_id, None, "reassigned")
+                    case Some((command, start)) =>
+                      if (command.length == 0) {
+                        VSCode_Resources.cancel_fail("offset invalid: empty command " +
+                          command_id + " in " + name)
+                      }
+                      retired += VSCode_Resources.Retired(exec_id, name, command, start,
+                        waived = command.length == 1 && start == 0)
+                  }
+                }
+              }
+            }
+            val retire_edits: Map[Document.Node.Name, List[Text.Edit]] =
+              retired.toList.groupBy(_.name).map({ case (name, rs) =>
+                name ->
+                  rs.sortBy(_.start).flatMap(r =>
+                    if (r.command.length > 1) List(VSCode_Resources.zero_length_edit(r.start + 1))
+                    else VSCode_Resources.net_zero_edits(r.start, r.command.source))
+              })
+            /* pre-commit validation (F19): an edit outside every command of the node makes
+               Thy_Syntax.edit_text throw in the change parser and the session never produces
+               a version again.  Dry-run the real function on V's commands -- the same
+               sequential fold the pipeline performs; Command.unparsed mints no ids. */
+            for ((name, edits) <- retire_edits) {
+              Exn.capture { Thy_Syntax.edit_text(edits, version.nodes(name).commands) } match {
+                case Exn.Exn(exn) =>
+                  VSCode_Resources.cancel_fail(
+                    "offset invalid in " + name + ": " + Exn.message(exn))
+                case Exn.Res(_) =>
+              }
+            }
+            /* step e: the retraction half re-done every round (resolve_dependencies may have
+               added models since step 0), then the retire edits; per node the perspective
+               edit comes first */
+            val (retracted, perspective_edits) = retraction(st, doc_state, st.overlays)
+            val perspective_of = perspective_edits.groupBy(_._1)
+            val edits: List[Document.Edit_Text] =
+              (perspective_of.keysIterator ++ retire_edits.keysIterator).toList.distinct.flatMap(name =>
+                perspective_of.getOrElse(name, Nil) :::
+                retire_edits.get(name).toList.map(es =>
+                  name -> Document.Node.Edits[Text.Edit, Text.Perspective](es)))
+            if (edits.isEmpty) {
+              (VSCode_Resources.Retire(version, retired.toList, excluded.toList, None), st)
+            }
+            else {
+              /* step f */
+              val tip_before = doc_state.stable_tip_version.map(_.id)
+              val st1 = apply_retraction(st, retracted).copy(update_serial = st.update_serial + 1)
+              VSCode_Resources.bounded_update(session, st.document_blobs, edits, update_bound)
+              (VSCode_Resources.Retire(version, retired.toList, excluded.toList,
+                  Some(VSCode_Resources.Commit(tip_before))),
+                st1)
+            }
+        }
+      }
+    }
+  }
+
+  /* the post-retraction invariant (plan section 3.3), asserted after the monitor was
+     released for the last time: nothing the next flush could compute puts a perspective
+     back, the overlay table is as step 0 left it, and no unflushed edit is outside
+     pending_input */
+
+  def cancel_assert_retracted(
+    doc_state: Document.State,
+    overlay_serial0: Long,
+    deadline: Time
+  ): Unit = {
+    state.change_result_timed(deadline) { st =>
+      if (st.caret.isDefined) VSCode_Resources.cancel_fail("caret still set after retraction")
+      // step 0 emptied the table and recorded the serial; a change since is someone
+      // else's overlay, which can hand the prover work after the retraction
+      if (st.overlay_serial != overlay_serial0) {
+        VSCode_Resources.cancel_fail("overlay table changed after retraction")
+      }
+      for ((file, model) <- st.models if model.pending_edits.nonEmpty && !st.pending_input(file)) {
+        VSCode_Resources.cancel_fail("model with unflushed edits outside pending_input: " + file)
+      }
+      val (retracted, _) = retraction(st, doc_state, st.overlays)
+      if (retracted.nonEmpty) {
+        VSCode_Resources.cancel_fail("perspective not empty after retraction: " +
+          retracted.map(_._2.node_name).mkString(", "))
+      }
+      ((), st)
     }
   }
 

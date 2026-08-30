@@ -1,6 +1,8 @@
 from pathlib import Path
 from typing import Any
 
+import types
+
 import pytest
 
 from isabelle_mcp.lsp_client import DocumentState, IsabelleLSPClient
@@ -146,8 +148,9 @@ class MockLSPClient:
         self.debug = False
         self.initialized = True
         self.project_root = None
-        # Present so launch/terminate/guard tests can simulate a (not-)running prover.
-        self.process = None
+        # A running prover by default (evaluate_to reports "session gone" on
+        # ``process is None``); launch/terminate/guard tests set it themselves.
+        self.process = types.SimpleNamespace(returncode=None)
         self.isabelle_version = ""
         self.open_documents: dict[str, DocumentState] = {}
         self.diagnostics_cache: dict[str, list[dict[str, Any]]] = {}
@@ -214,8 +217,28 @@ class MockLSPClient:
     ) -> bool:
         return True
 
-    async def force_interrupt(self, file_path: str) -> None:
-        pass
+    async def force_interrupt(self) -> dict:
+        return {"outcome": "nothing_running", "retired": [], "excluded": [],
+                "waived": [], "unloaded_from": []}
+
+    async def teardown(self, reason: str = "The Isabelle session was terminated.") -> None:
+        # mirrors IsabelleLSPClient.teardown's observable effects
+        from isabelle_mcp.evaluation import evaluation_state
+        from isabelle_mcp.utils import IsabelleToolError
+        self._fail_pending_waiters(IsabelleToolError(reason))
+        await self.shutdown()
+        self.process = None
+        evaluation_state.cancel()
+        evaluation_state.auto_opened_files.clear()
+
+    def _fail_pending_waiters(self, exc: Exception) -> None:
+        self.failed_waiters_with = exc
+
+    # the load commands of a non-.thy file; tests set ``loaders`` per case
+    loaders: list[dict] = []
+
+    async def request_loaders(self, file_path: str) -> list[dict]:
+        return list(self.loaders)
 
     async def request_theory_status(self) -> list[dict]:
         theories = []

@@ -1,5 +1,6 @@
 """Isabelle LSP MCP Server — FastMCP entry point."""
 
+import anyio
 import asyncio
 import contextlib
 import contextvars
@@ -43,7 +44,12 @@ from isabelle_mcp.tools import (
     session_info,
 )
 from isabelle_mcp.unicode_guard import drain_warnings
-from isabelle_mcp.utils import IsabelleToolError, MCPLine
+from isabelle_mcp.utils import (
+    CATASTROPHE_MESSAGE,
+    IsabelleCatastrophe,
+    IsabelleToolError,
+    MCPLine,
+)
 from isabelle_mcp.utils.formatters import model_to_yaml
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -91,7 +97,7 @@ async def server_lifespan(_app: Any) -> AsyncGenerator[None]:
     finally:
         _file_watcher.stop()
         if _lsp_client.process is not None:
-            await _lsp_client.shutdown()
+            await _lsp_client.teardown("The MCP server is shutting down.")
 
 
 mcp = FastMCP(
@@ -170,6 +176,37 @@ class UnicodeWarningMiddleware(Middleware):
         return result
 
 
+class CatastropheMiddleware(Middleware):
+    """The one handler for IsabelleCatastrophe, at the tool boundary.
+
+    Any tool may raise it from anywhere (a cancellation out of budget, a prover
+    that stopped answering, a broken invariant). Here, and only here: log the
+    reason, tear the prover down through the same helper isabelle_terminate
+    uses -- under the evaluation-state lock, shielded from a cancelled tool
+    call, bounded by the teardown's own segments -- and answer with the one
+    fixed sentence. The agent must launch again.
+    """
+
+    async def on_call_tool(
+        self, context: MiddlewareContext, call_next: CallNext,
+    ) -> ToolResult:
+        try:
+            return await call_next(context)
+        except IsabelleCatastrophe as exc:
+            logger.error("catastrophe: %s; terminating the Isabelle session",
+                         exc.reason, exc_info=True)
+            client = _lsp_client
+            if client is not None:
+                with anyio.CancelScope(shield=True):
+                    async with _evaluation_state_lock:
+                        await client.teardown(
+                            "The Isabelle session was terminated after an internal failure.")
+            return ToolResult(content=[TextContent(type="text", text=CATASTROPHE_MESSAGE)])
+
+
+# Order: the catastrophe handler is outermost, so a catastrophe skips the
+# footer/notice decoration of a successful call.
+mcp.add_middleware(CatastropheMiddleware())
 mcp.add_middleware(UnicodeWarningMiddleware())
 
 
@@ -308,13 +345,11 @@ async def isabelle_launch(
     """Start (or restart) the Isabelle prover with the given session/logic.
 
     **Must be called before any evaluation or query tool** — the prover does not
-    auto-start. Returns the running session name and server version.
+    auto-start.
 
     Calling it again with the same session and the same `debug` value is a
     no-op; with a different session it restarts the prover (any in-progress
-    evaluation is discarded). Same session but a different `debug` value is an
-    error: call isabelle_terminate first, then launch with the wanted value —
-    a routine launch never silently kills a running debug session.
+    evaluation is discarded).
 
     No need to check whether the session is built — launch checks
     automatically: when its heap image (or any heap in its dependency chain)
@@ -342,7 +377,7 @@ async def isabelle_launch(
             newly compiled ML code gets breakable sites; code precompiled into
             the heap is unaffected, and no heap is invalidated. Off by default
             because instrumentation slows compiled ML. The value is part of the
-            launch identity (see above).
+            launch identity.
     """
     if _lsp_client is None:
         raise IsabelleToolError("LSP client not initialized")
@@ -366,8 +401,8 @@ async def isabelle_launch(
                 )
             # Switching sessions — or recovering from a crashed server (the
             # process object lingers with a returncode): tear down, start anew.
-            await _lsp_client.shutdown()
-            _lsp_client.process = None
+            # The same teardown isabelle_terminate and the catastrophe handler run.
+            await _lsp_client.teardown()
         _lsp_client.session_dirs = (
             session_dirs if session_dirs is not None else _default_session_dirs()
         )
@@ -439,10 +474,9 @@ async def isabelle_terminate() -> ToolResult:
             type="text", text="No Isabelle session is running.",
         )])
     async with _evaluation_state_lock:
-        await _lsp_client.shutdown()
-        _lsp_client.process = None
-        if _file_watcher is not None:
-            _file_watcher.clear_watches()
+        # the same teardown the catastrophe handler runs
+        # (client.file_watcher is the module's _file_watcher, server startup)
+        await _lsp_client.teardown()
     return ToolResult(content=[TextContent(
         type="text", text="Isabelle session terminated.",
     )])
@@ -505,7 +539,8 @@ async def isabelle_cancel_evaluation() -> ToolResult:
     """Cancel an ongoing evaluation.
 
     Stops Isabelle from processing further.  Already-processed results
-    remain valid for querying.
+    remain valid for querying.  Other tool calls wait while a cancellation
+    is in progress.
     """
     client = await _ensure_lsp_started()
     view = await cancel_evaluation(client)
@@ -752,9 +787,8 @@ async def isabelle_set_breakpoint(
     """Register a breakpoint and enable its breakable site.
 
     A breakable site exists only in ML code the prover has already compiled
-    with debugging on, at statement boundaries the compiler chooses — so
-    evaluate the file first, and use isabelle_list_breakable_sites to discover
-    where breakpoints can go.
+    with debugging on, at statement boundaries the compiler chooses — use
+    isabelle_list_breakable_sites to discover where breakpoints can go.
     After the breakpoint is set, it is hit the next time the armed code is
     executed. If the target command has already been evaluated, insert a
     space before it to force a re-evaluation so the command runs again and

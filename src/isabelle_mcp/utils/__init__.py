@@ -1,4 +1,6 @@
 from isabelle_mcp.utils.core import (
+    CATASTROPHE_MESSAGE,
+    IsabelleCatastrophe,
     IsabelleToolError,
     LSPCharacter,
     LSPLine,
@@ -33,6 +35,8 @@ from isabelle_mcp.utils.isabelle_tokens import (
 )
 
 __all__ = [
+    "CATASTROPHE_MESSAGE",
+    "IsabelleCatastrophe",
     "IsabelleToolError",
     "LSPCharacter",
     "LSPLine",

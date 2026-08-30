@@ -49,8 +49,9 @@ _last_edit_sent: float = float("-inf")
 def note_edit_sent() -> None:
     """Record that the server's document model just changed.
 
-    Call this when WE send content — didOpen, didChange (including
-    force_interrupt's synthetic edit) — and when Layer-3 dependency tracking
+    Call this when WE send content — didOpen, didChange — or when the server
+    changes the document on our behalf (cancel_evaluation's retirement edits and
+    perspective retraction), and when Layer-3 dependency tracking
     observes that an external import/.ML file changed on disk (those are synced
     by the server's own File_Watcher, not by our didChange).
 

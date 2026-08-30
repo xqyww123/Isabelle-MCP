@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from urllib.parse import quote, unquote
 
-from fastmcp.exceptions import ToolError
+from fastmcp.exceptions import FastMCPError, ToolError
 
 
 # MCP positions are 1-indexed; LSP positions are 0-indexed.
@@ -48,6 +48,35 @@ class IsabelleToolError(ToolError):
     delivered to the LLM (unaffected by ``mask_error_details``) and is kept
     semantically distinct from unexpected internal bugs.
     """
+
+
+# One sentence for every catastrophe, no cause: the cause goes to the server log.
+CATASTROPHE_MESSAGE = (
+    "The Isabelle session hit an internal failure and has been terminated; "
+    "call isabelle_launch to start a new one. Details are in the server log."
+)
+
+
+class IsabelleCatastrophe(FastMCPError):
+    """The system-wide catastrophe: the Isabelle session must be terminated and
+    the agent must launch again.
+
+    Raise it from anywhere -- a cancellation that ran out of its budget, a prover
+    that stopped answering, an invariant found broken. Exactly one handler exists,
+    at the tool boundary (server.py): it logs the reason, tears the prover down
+    through IsabelleLSPClient.teardown, and answers with CATASTROPHE_MESSAGE.
+
+    A FastMCPError, and this is load-bearing: FastMCP runs the tool body under
+    ``except Exception: raise ToolError(...)`` BEFORE any middleware sees the
+    result, and lets only FastMCPError through. A plain Exception here would be
+    masked into a generic tool error and the handler would never run (measured).
+    FastMCPError rather than ToolError so the reason is not delivered to the
+    agent if the handler were ever missing.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 def plural(n: int, noun: str) -> str:

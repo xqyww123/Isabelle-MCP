@@ -100,13 +100,45 @@ DEBUG_OFF = (
 NO_SITE_NOT_EVALUATED = (
     "There is no breakable site at {where} — that line has not been "
     "evaluated yet. Breakpoints can only be set on code the prover has "
-    "already compiled, so evaluate the file first."
+    "already compiled, so evaluate to that line first."
 )
+# The generic .ML sentence: the fallback when no load command is known
+# (R-D3 (iv) case D); cases A and C below point at the loader instead.
 NO_SITE_NOT_EVALUATED_ML = (
     "There is no breakable site at {where} — that line has not been "
     "evaluated yet. Breakpoints can only be set on code the prover has "
     "already compiled, and a .ML file is compiled by the ML_file command "
     "that loads it, so evaluate that ML_file command first."
+)
+# R-D3 (iv) case A: the load command has not been evaluated. Approved
+# verbatim; the listing variant ends with "first." instead of the
+# breakpoint tail.
+LOADER_NOT_EVALUATED = (
+    "There is no breakable site at {where} — this file's ML code has not "
+    "been compiled yet. Evaluate to {loader} (the ML_file command that loads "
+    "this file), then set the breakpoint again."
+)
+LOADER_NOT_EVALUATED_MANY = (
+    "There is no breakable site at {where} — this file's ML code has not "
+    "been compiled yet. Evaluate to {loaders} (the ML_file commands that "
+    "load this file), then set the breakpoint again."
+)
+LOADER_NOT_EVALUATED_LISTING = (
+    "There is no breakable site at {where} — this file's ML code has not "
+    "been compiled yet. Evaluate to {loader} (the ML_file command that loads "
+    "this file) first."
+)
+LOADER_NOT_EVALUATED_LISTING_MANY = (
+    "There is no breakable site at {where} — this file's ML code has not "
+    "been compiled yet. Evaluate to {loaders} (the ML_file commands that "
+    "load this file) first."
+)
+# R-D3 (iv) case C: the loading theory is precompiled into the heap.
+LOADER_PRECOMPILED = (
+    "There is no breakable site at {where} — this file is compiled into the "
+    "session heap, and precompiled ML carries no breakable sites. To debug "
+    "it, relaunch via isabelle_launch with a base session that does not "
+    "include {theory}."
 )
 NO_SITE_STILL_RUNNING = (
     "The command at {where} is still evaluating; a breakpoint can be set "
@@ -488,8 +520,36 @@ def _file_lines(client: IsabelleLSPClient, file_path: str) -> list[str]:
         return []
 
 
+async def loader_pointer(
+    client: IsabelleLSPClient, file_path: str, where: str, *,
+    listing: bool = False,
+) -> str | None:
+    """R-D3 (iv): the sentence pointing a .ML file at its load command —
+    case A (loader unevaluated) or case C (loading theory precompiled into
+    the heap). None when the loader is evaluated or running, or unknown
+    (case D: the caller's generic sentence stands)."""
+    from isabelle_mcp.evaluation import render_loader, render_loaders
+    loaders = await client.request_loaders(file_path)
+    if not loaders:
+        return None
+    for loader in loaders:
+        if os.path.realpath(loader.get("file", "")) in client.heap_sources:
+            return LOADER_PRECOMPILED.format(
+                where=where, theory=loader.get("theory", ""))
+    if any(x.get("state") != "unevaluated" for x in loaders):
+        return None
+    root = client.project_root
+    if len(loaders) == 1:
+        template = (LOADER_NOT_EVALUATED_LISTING if listing
+                    else LOADER_NOT_EVALUATED)
+        return template.format(where=where, loader=render_loader(loaders[0], root))
+    template = (LOADER_NOT_EVALUATED_LISTING_MANY if listing
+                else LOADER_NOT_EVALUATED_MANY)
+    return template.format(where=where, loaders=render_loaders(loaders, root))
+
+
 async def fetch_sites(
-    client: IsabelleLSPClient, file_path: str,
+    client: IsabelleLSPClient, file_path: str, *, listing: bool = False,
 ) -> tuple[list[Site], list[str]]:
     """One listing round trip with the bounded `outdated` retry (pending
     edits incorporate within moments; every other failure is surfaced).
@@ -508,9 +568,12 @@ async def fetch_sites(
         raise IsabelleToolError(LISTING_FAILED.format(
             file=display, status=reply.get("status", "nothing")))
     if reply.get("open") is not True:
-        template = (FILE_NOT_OPEN_IN_PROVER_ML if file_path.endswith(".ML")
-                    else FILE_NOT_OPEN_IN_PROVER)
-        raise FileNotOpenInProver(template.format(file=display))
+        if file_path.endswith(".ML"):
+            pointer = await loader_pointer(
+                client, file_path, display, listing=listing)
+            raise FileNotOpenInProver(
+                pointer or FILE_NOT_OPEN_IN_PROVER_ML.format(file=display))
+        raise FileNotOpenInProver(FILE_NOT_OPEN_IN_PROVER.format(file=display))
     lines = _file_lines(client, file_path)
     return sites_from_listing(reply, lines), lines
 
@@ -790,14 +853,26 @@ class DebuggerRegistry:
         real = os.path.realpath(file_path)
         return [e for e in self.entries if e.file_path == real]
 
-    def demote_all_armed(self, client: IsabelleLSPClient, tag: str) -> None:
-        """Wire-free demotion of every armed entry — for events where site
-        death is CERTAIN (cancellation: the synthetic edit invalidates every
-        serial, and the listing answers `outdated` until a re-evaluation, so
-        verifying by listing would only burn the retry budget)."""
+    def demote_unloaded(
+        self, client: IsabelleLSPClient, unloaded: list[dict], tag: str,
+    ) -> None:
+        """Wire-free demotion of the armed entries whose sites are certainly
+        dead after a cancellation that retired commands: in each affected
+        theory everything from the first retired command to the end of the
+        file is unloaded (R11), the ML files those commands load included.
+        ``unloaded`` is the reply's ``unloaded_from`` list. Sites elsewhere
+        keep their serials (F2: finished commands are never unloaded)."""
         for entry in self.entries:
-            if entry.state == ARMED:
-                self.demote(client, entry, tag)
+            if entry.state != ARMED:
+                continue
+            for u in unloaded:
+                file = os.path.realpath(u.get("file", ""))
+                line = u.get("line")
+                loads = {os.path.realpath(p) for p in u.get("loads", [])}
+                if (entry.file_path == file and line is not None
+                        and entry.line >= line) or entry.file_path in loads:
+                    self.demote(client, entry, tag)
+                    break
 
     # ── prover teardown (design: the hit table is cleared on EVERY
     #    prover teardown path; entries are retained and demoted) ──────
@@ -843,7 +918,7 @@ def _position_state(client: IsabelleLSPClient, file_path: str, line: int) -> str
     return tracker.position_state(line - 1)
 
 
-def _no_site_on_line_error(
+async def _no_site_on_line_error(
     client: IsabelleLSPClient, file_path: str, line: int,
     sites: list[Site], where: str,
 ) -> IsabelleToolError:
@@ -856,8 +931,19 @@ def _no_site_on_line_error(
         # Per-position evaluation status exists only for .thy documents
         # (section 3.4): with sites elsewhere in the file the code was
         # compiled and this line simply has none (message 3); with no sites
-        # at all the loading theory has likely not been evaluated.
+        # at all, ask the server for the load command (R-D3 (iv)): unevaluated
+        # or precompiled points there; unknown falls back to the generic
+        # sentence; a running loader is message 2.
         if not sites:
+            pointer = await loader_pointer(client, file_path, where)
+            if pointer is not None:
+                return IsabelleToolError(pointer)
+            loaders = await client.request_loaders(file_path)
+            if any(x.get("state") == "running" for x in loaders):
+                return IsabelleToolError(
+                    NO_SITE_STILL_RUNNING.format(where=where))
+            if loaders:
+                return _evaluated_no_site_error(sites, line, where)
             return IsabelleToolError(
                 NO_SITE_NOT_EVALUATED_ML.format(where=where))
         return _evaluated_no_site_error(sites, line, where)
@@ -919,7 +1005,8 @@ async def set_breakpoint(
         sites, lines = await fetch_sites(client, file_path)
         on_line = [s for s in sites if s.line == line]
         if not on_line:
-            raise _no_site_on_line_error(client, file_path, line, sites, where)
+            raise await _no_site_on_line_error(
+                client, file_path, line, sites, where)
         line_text = lines[line - 1] if line - 1 < len(lines) else ""
         site = resolve_site(on_line, line_text, at_text, where)
         if site.state == "unfinished":
@@ -1099,7 +1186,7 @@ async def list_breakable_sites(
         raise IsabelleToolError(
             f"invalid line range: start_line {start}, end_line {end}")
     async with registry.lock:
-        sites, _lines = await fetch_sites(client, file_path)
+        sites, _lines = await fetch_sites(client, file_path, listing=True)
         in_range = [s for s in sites if start <= s.line <= end]
         armed_serials = {
             e.serial: e for e in registry.entries
@@ -1897,7 +1984,8 @@ def mark_hits_swept(client: IsabelleLSPClient) -> list[Hit]:
     """Cancellation, before the interrupt: attribute the coming retirements
     (section 6.4) so they happen silently — the attributed-ending
     precedent; the ending clause survives only in the stale-id refusal.
-    Synchronous."""
+    Synchronous. finish_cancel_sweep rolls the attribution back for the
+    outcomes in which nothing was interrupted."""
     if not client.debug:
         return []
     registry.sync_hits(client)
@@ -1907,22 +1995,58 @@ def mark_hits_swept(client: IsabelleLSPClient) -> list[Hit]:
     return hits
 
 
+def withdraw_sweep_attribution(hits: list[Hit]) -> None:
+    """Undo mark_hits_swept for *hits* that still carry the attribution."""
+    for hit in hits:
+        if hit.pending_ending == ENDED_CANCELLED:
+            hit.pending_ending = None
+
+
 async def finish_cancel_sweep(
-    client: IsabelleLSPClient, marked: list[Hit],
+    client: IsabelleLSPClient, marked: list[Hit], payload: dict,
 ) -> str | None:
-    """Cancellation, after the interrupt: bounded wait for the swept
-    threads to leave the debugger map, then the certain-death demote-all
-    (wire-free — probe 7: the listing answers `outdated` until a
-    re-evaluation, so verifying by listing would only burn the retry
-    budget). Returns the swept-hits result line, or None when no hit was
-    actually swept (a still-stopped hit stays live; its attributed ending
-    stands for whenever the interrupt lands)."""
+    """Cancellation, after a request that produced a success outcome (plan
+    section 3.4):
+
+    - retired: the sites in the unloaded ranges are demoted (wire-free —
+      probe 7: the listing answers `outdated` until a re-evaluation, so
+      verifying by listing would only burn the retry budget);
+    - nothing running: the swept attribution is rolled back, no demotion.
+
+    The aborted outcome never comes here: the prover teardown retires every
+    hit and demotes every armed entry on its own (on_prover_teardown).
+
+    Then a bounded wait for the swept threads to leave the debugger map.
+    Returns the result line, or None when nothing is worth a line (a
+    still-stopped hit stays live; its attributed ending stands for whenever
+    the interrupt lands)."""
     if not client.debug:
         return None
-    # Demote FIRST (synchronously, before the wait): a cancel re-delivered
-    # on the wait below must not cost the demote-all its turn.
-    async with registry.lock:
-        registry.demote_all_armed(client, TAG_NOT_EVALUATED)
+    from isabelle_mcp import evaluation as ev
+    outcome = payload.get("outcome")
+    if outcome == ev.CANCEL_OUTCOME_NOTHING_RUNNING:
+        # nothing was interrupted: the attribution must not stand (no lock:
+        # mark_hits_swept set the same field without one)
+        withdraw_sweep_attribution(marked)
+        marked = []
+    elif outcome == ev.CANCEL_OUTCOME_RETIRED:
+        # Demote FIRST (before the wait below): a cancel re-delivered on that
+        # wait must not cost the demotion its turn. Bounded acquisition, and
+        # graceful on a miss: a breakpoint tool running concurrently can hold
+        # registry.lock across many prover round trips, and a successful
+        # retirement must not turn into a catastrophe over bookkeeping -- the
+        # next listing corrects the stale entries.
+        try:
+            await asyncio.wait_for(registry.lock.acquire(), timeout=CANCEL_SWEEP_WAIT)
+        except asyncio.TimeoutError:
+            logger.warning("cancel sweep: registry.lock not free within %ss; "
+                           "breakpoint demotion skipped", CANCEL_SWEEP_WAIT)
+        else:
+            try:
+                registry.demote_unloaded(
+                    client, payload.get("unloaded_from") or [], TAG_NOT_EVALUATED)
+            finally:
+                registry.lock.release()
     if marked:
         await client.wait_debugger_event(
             lambda c: all(
@@ -1932,8 +2056,7 @@ async def finish_cancel_sweep(
     swept = [h for h in marked if h.hit_id in registry.retired]
     if not swept:
         return None
-    return HITS_SWEPT_ONE if len(swept) == 1 \
-        else HITS_SWEPT.format(n=len(swept))
+    return HITS_SWEPT_ONE if len(swept) == 1 else HITS_SWEPT.format(n=len(swept))
 
 
 async def abort_eval_at_breakpoint(

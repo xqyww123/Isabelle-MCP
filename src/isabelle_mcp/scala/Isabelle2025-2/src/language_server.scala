@@ -29,36 +29,95 @@ object Language_Server {
      a request that hangs with no correlatable trace.  Bump this whenever mcp_prelude.ML's
      protocol changes. */
 
-  val prelude_version = "4"
+  val prelude_version = "6"
 
-  /* proof that the injected ML prelude is live
+  /* bounded wait on a promise, against a deadline; the polling idiom of await_pong, shared */
+
+  def await_promise[A](promise: Promise[A], deadline: Time): Option[A] = {
+    val step = Time.seconds(0.05)
+    while (!promise.is_finished && Time.now() < deadline) step.sleep()
+    if (promise.is_finished) Some(promise.join) else None
+  }
+
+
+  /* the prelude's cancel report: one protocol message per Isabelle_MCP.cancel_evaluation,
+     matched to its request by serial (see ML/mcp_prelude.ML).  "error" is set when any
+     step of the protocol command failed; the prover then reports the whole probe set as
+     alive. */
+
+  sealed case class Cancel_Report(alive: List[Document_ID.Exec], calls: Int, error: Option[String])
+
+  class Cancel_Handler extends Session.Protocol_Handler {
+    private val pending = Synchronized(Map.empty[String, Promise[Cancel_Report]])
+
+    def register(serial: String): Promise[Cancel_Report] = {
+      val promise = Future.promise[Cancel_Report]
+      pending.change(_ + (serial -> promise))
+      promise
+    }
+
+    def forget(serial: String): Unit = pending.change(_ - serial)
+
+    private def handle_report(msg: Prover.Protocol_Output): Boolean = {
+      // parse first, take the registration last: an exception in between would leave the
+      // request waiting on a promise nobody holds any more
+      for (serial <- Properties.get(msg.properties, "serial")) {
+        // exactly one body chunk (possibly empty); msg.text throws Malformed on anything
+        // else, leaving the promise unfulfilled -- the pong then reports the loss
+        val alive = space_explode(',', msg.text).filter(_.nonEmpty).map(Value.Long.parse)
+        val calls = Properties.get(msg.properties, "calls").map(Value.Int.parse).getOrElse(-1)
+        val report = Cancel_Report(alive, calls, Properties.get(msg.properties, "error"))
+        for (promise <- pending.change_result(map => (map.get(serial), map - serial))) {
+          promise.fulfill(report)
+        }
+      }
+      true
+    }
+
+    override def functions: Session.Protocol_Functions =
+      List("isabelle_mcp_cancel_report" -> handle_report)
+  }
+
+
+  /* proof that the injected ML prelude is live, and the ordering probe of a cancel
 
      An undefined protocol command is NOT fatal in ML -- the protocol loop downgrades it to a
      system message and carries on (isabelle_process.ML) -- so without this probe a prover
      without the prelude would happily accept every cancel request and cancel nothing.
      Isabelle_MCP.ping answers with an isabelle_mcp_pong protocol message carrying the
-     prelude's version. */
+     prelude's version in its body and, when the ping carried one, the serial in its
+     properties.  A pong without a serial, or with one nobody registered, fulfils the startup
+     handshake -- so a new jar with an old prelude still reaches the version diagnostic. */
 
   class Prelude_Handler extends Session.Protocol_Handler {
-    private val pong = Future.promise[String]
+    private val startup = Future.promise[String]
+    private val pending = Synchronized(Map.empty[String, Promise[String]])
+
+    def register(serial: String): Promise[String] = {
+      val promise = Future.promise[String]
+      pending.change(_ + (serial -> promise))
+      promise
+    }
+
+    def forget(serial: String): Unit = pending.change(_ - serial)
 
     private def handle_pong(msg: Prover.Protocol_Output): Boolean = {
-      if (!pong.is_finished) pong.fulfill(msg.text)
+      val text = msg.text
+      val taken =
+        Properties.get(msg.properties, "serial").flatMap(serial =>
+          pending.change_result(map => (map.get(serial), map - serial)))
+      taken match {
+        case Some(promise) => promise.fulfill(text)
+        case None => if (!startup.is_finished) startup.fulfill(text)
+      }
       true
     }
 
     override def functions: Session.Protocol_Functions =
       List("isabelle_mcp_pong" -> handle_pong)
 
-    def await_pong(timeout: Time): Option[String] = {
-      val step = Time.seconds(0.05)
-      var waited = Time.zero
-      while (!pong.is_finished && waited < timeout) {
-        step.sleep()
-        waited += step
-      }
-      if (pong.is_finished) Some(pong.join) else None
-    }
+    def await_pong(timeout: Time): Option[String] =
+      await_promise(startup, Time.now() + timeout)
   }
 
 
@@ -410,8 +469,8 @@ class Language_Server(
           case lines => "\nProver output:\n" + lines.mkString("\n")
         }
 
-      val prelude_handler = new Language_Server.Prelude_Handler
       session.init_protocol_handler(prelude_handler)
+      session.init_protocol_handler(cancel_handler)
       session.init_protocol_handler(query_handler)
       debugger_adapter.init()
       session.raw_output_messages += raw_output_capture
@@ -632,32 +691,370 @@ class Language_Server(
     channel.write(LSP.Theory_Status.reply(id, theories))
   }
 
-  /* Global cancel, on a stock Isabelle.
+  /* cancellation: PIDE/cancel_evaluation (ISABELLE_MCP_CANCELLATION_REDESIGN_PLAN.md section 3)
 
-     "Isabelle_MCP.cancel_execution" is defined by ML/mcp_prelude.ML, injected into the prover
-     at startup, and is built from the public EXECUTION API alone: discontinue the current
-     execution (so nothing not yet started ever starts), then cancel the Future groups of every
-     exec Scala knows about.  Document.State.execs spans ALL nodes, which is what lets this
-     reach a runaway proof in an imported theory -- the perspective-restriction fallback cannot.
+     One request, one reply, three outcomes: retired, nothing_running, aborted.  In order:
 
-     The prelude is a hard startup dependency: `init` below pings it and refuses to serve if it
-     is not there, so this cannot silently report a cancellation that never happened.
+       stanch + probe -- Isabelle_MCP.cancel_evaluation (ML/mcp_prelude.ML) discontinues the
+                   execution, probes which eval execs still have live tasks, and cancels every
+                   exec Scala knows.  A ping follows the cancel; the manager mailbox, the ML
+                   protocol loop and the ML message channel are all FIFO, so a pong that
+                   arrives without the report means the report was lost, not delayed (F18).
+       retract  -- step 0, once: caret gone, overlay table emptied, every model's perspective
+                   emptied.  The prover stops handing out work; nothing finished is lost (a
+                   finished exec keeps its command alive in the common prefix, F2).
+       retire   -- a loop: each exec still alive gets a zero-length edit inside its command
+                   on the stable tip V, so the command is re-minted under a fresh id and the
+                   prover cancels and purges the interrupted exec.  A round whose edit did not
+                   land is retried; the same target failing twice in a row is a failure of
+                   the request.
 
-     See docs/CANCELLATION.md for the design, the validation, and the stale-mirror analysis.
+     Everything waits against ONE deadline, 120 s from the moment the body starts; the
+     budget running out, the prover vanishing, a lost report, or any exception is the
+     aborted outcome, and the Python side then terminates the prover.  The body runs on its
+     own bare thread (not the fixed-size Future pool: an abandoned wait would occupy a pool
+     thread), and the reply is written at most once, from the finally -- a client that has
+     stopped reading gets none, and is covered by the Python side's 135 s gate. */
 
-     The alternative, used by vscode_server, is the pide_control ML patch, which adds a
-     "Document.cancel_execution" command that walks Execution's own private exec table.  It is
-     authoritative by construction, but applying the patch invalidates every session heap on the
-     machine.  Kept here for reference:
+  private val cancel_handler = new Language_Server.Cancel_Handler
+  private val prelude_handler = new Language_Server.Prelude_Handler
+  private val cancel_serial = Counter.make()
 
-       session.protocol_command("Document.cancel_execution")
-  */
-  def cancel_execution(id: LSP.Id): Unit = {
-    val execs = session.get_state().execs.keys.toList
-    session.protocol_command("Isabelle_MCP.cancel_execution",
-      List(XML.Text(execs.mkString(","))))
-    log("cancel_execution: " + execs.length + " execs")
-    channel.write(LSP.Cancel_Execution.reply(id))
+  private val cancel_budget = Time.seconds(120)
+  private val cancel_update_bound = Time.seconds(5)   // session.update under the monitor; Z14(b)
+  private val cancel_poll_step = Time.seconds(0.05)
+
+  private def cancel_aborted(reason: String): JSON.T =
+    JSON.Object("outcome" -> "aborted", "reason" -> reason)
+
+  def cancel_evaluation(id: LSP.Id): Unit = {
+    Isabelle_Thread.fork(name = "cancel_evaluation", daemon = true) {
+      val deadline = Time.now() + cancel_budget
+      var reply: JSON.T = cancel_aborted("no result")
+      try { reply = cancel_evaluation_body(deadline) }
+      catch {
+        case exn: VSCode_Resources.Cancel_Failure =>
+          log("cancel_evaluation aborted: " + exn.reason)
+          reply = cancel_aborted(exn.reason)
+        case exn: Throwable =>
+          log("cancel_evaluation failed: " + Exn.message(exn))
+          reply = cancel_aborted("internal failure: " + Exn.message(exn))
+      }
+      finally { channel.write(LSP.Cancel_Evaluation.reply(id, reply)) }
+    }
+  }
+
+  /* rendering off the version the command was found on: no document model, no monitor */
+
+  private def cancel_command_json(
+    name: Document.Node.Name,
+    command: Command,
+    version: Document.Version
+  ): JSON.Object.T = {
+    val lines =
+      version.nodes(name).command_start_line(command) match {
+        case Some(line) =>
+          JSON.Object("line" -> line, "end_line" -> (line + Library.count_newlines(command.source)))
+        case None => JSON.Object()
+      }
+    JSON.Object(
+      "file" -> name.node,
+      "command" -> command.span.name,
+      "id" -> command.id) ++ lines ++
+    JSON.Object("loads" -> command.blobs_names.map(_.node))
+  }
+
+  private def cancel_evaluation_body(deadline: Time): JSON.T = {
+    def fail(reason: String): Nothing = VSCode_Resources.cancel_fail(reason)
+
+    val session = try { this.session } catch { case ERROR(_) => fail("server inactive") }
+
+    def check_ready(): Unit =
+      session.phase match {
+        case Session.Ready =>
+        case Session.Inactive => fail("prover never started")
+        case Session.Startup => fail("prover still starting")
+        case Session.Shutdown => fail("prover shutting down")
+        case Session.Terminated(_) => fail("prover already terminated")
+      }
+    check_ready()
+    // a precondition of retraction: with 0 the caret branch is skipped and every visible
+    // model's perspective is its full text, never empty (vscode_model.scala)
+    if (options.int("vscode_caret_perspective") == 0) {
+      fail("vscode_caret_perspective is 0: no perspective can be retracted")
+    }
+
+    /* manager round trips, each on its own bare thread and awaited against the deadline;
+       a wait given up leaks its daemon thread until the JVM goes, and giving up a
+       session.update does not withdraw it */
+
+    def await_state(reason: String)(ready: Document.State => Boolean): Document.State = {
+      val promise = Future.promise[Document.State]
+      val stop = new java.util.concurrent.atomic.AtomicBoolean(false)
+      Isabelle_Thread.fork(name = "cancel_await_state", daemon = true) {
+        try {
+          while (!stop.get && !promise.is_finished) {
+            val st = session.get_state()
+            if (ready(st)) promise.fulfill(st) else cancel_poll_step.sleep()
+          }
+        }
+        catch { case exn: Throwable => promise.fulfill_result(Exn.Exn(exn)) }
+      }
+      val st =
+        Language_Server.await_promise(promise, deadline) getOrElse {
+          stop.set(true)
+          fail(reason)
+        }
+      // A manager that has shut down answers with Document.State.init (session.scala); so
+      // does a live session that has not seen a single update yet.  The phase tells them
+      // apart, up to the moment it flips; past that the budget does.
+      if (st eq Document.State.init) check_ready()
+      st
+    }
+
+    def get_state(): Document.State =
+      await_state("document state not readable within the budget")(_ => true)
+
+    // a version of ours has been assigned: the stable tip is no longer the one recorded
+    // before session.update, and not Version.init's id either (a dropped Raw_Edits --
+    // prover undefined -- leaves the old tip in place, so the ids must be compared)
+    def assigned_after(tip_before: Option[Document_ID.Version])(st: Document.State): Boolean =
+      st.stable_tip_version match {
+        case Some(v) => v.id != Document_ID.none && !tip_before.contains(v.id)
+        case None => false
+      }
+
+    def state_bits(st: Document.State): String =
+      " (removing_versions = " + st.removing_versions + ")"
+
+    def after_update(): Unit = {
+      // a stable retraction is a fixpoint of the next flush; files still carrying unflushed
+      // edits stayed in pending_input and need theirs
+      editor.revoke()
+      if (resources.has_pending_input(deadline)) editor.invoke()
+    }
+
+    /* stanch + probe, off one reading of the document state */
+
+    val st0 = get_state()
+    val cancel_ids = st0.execs.keys.toList
+    val v0 =
+      Exn.capture(st0.recent_stable.version.get_finished) match {
+        case Exn.Res(v) => v
+        case Exn.Exn(_) => fail("probe not performed: no stable version to read the eval execs from")
+      }
+    val assignment0 = st0.the_assignment(v0).check_finished
+    // eval exec ids only (execs also holds print entries); ids, never Command objects
+    val probe: Map[Document_ID.Exec, (Document.Node.Name, Document_ID.Command)] =
+      (for {
+        (name, node) <- v0.nodes.iterator
+        (command, _) <- node.command_iterator()
+        exec_id <- assignment0.command_execs.getOrElse(command.id, Nil).headOption
+      } yield exec_id -> (name, command.id)).toMap
+
+    val serial = cancel_serial().toString
+    val report_promise = cancel_handler.register(serial)
+    val pong_promise = prelude_handler.register(serial)
+    try {
+      check_ready()  // protocol_command is dropped on the floor when the prover is not defined
+      session.protocol_command("Isabelle_MCP.cancel_evaluation",
+        XML.string(serial), XML.string(cancel_ids.mkString(",")),
+        XML.string(probe.keys.mkString(",")))
+      session.protocol_command("Isabelle_MCP.ping", XML.string(serial))
+      log("cancel_evaluation " + serial + ": " + cancel_ids.length + " execs, " +
+        probe.size + " probed")
+
+      var report: Option[Language_Server.Cancel_Report] = None
+      while (report.isEmpty) {
+        if (report_promise.is_finished) report = Some(report_promise.join)
+        else if (pong_promise.is_finished) {
+          fail("cancel report lost: the prover answered the ping sent after the cancel command" +
+            " but never reported on the cancel")
+        }
+        else if (Time.now() >= deadline) {
+          fail("prover did not acknowledge the stop within the budget" +
+            " (backlog or dead: indistinguishable)")
+        }
+        else cancel_poll_step.sleep()
+      }
+      for (err <- report.get.error) fail("the prover failed while stopping: " + err)
+
+      val active: Map[Document_ID.Exec, (Document.Node.Name, Document_ID.Command)] =
+        (for (exec_id <- report.get.alive; target <- probe.get(exec_id)) yield exec_id -> target).toMap
+      log("cancel_evaluation " + serial + ": " + report.get.alive.length + " alive after " +
+        report.get.calls + " probe calls, " + active.size + " to retire")
+
+      /* step 0: retract */
+
+      val retraction = resources.cancel_retract(session, st0, deadline, cancel_update_bound)
+      for (VSCode_Resources.Commit(tip_before) <- retraction.commit) {
+        after_update()
+        await_state("retraction not assigned within the budget")(assigned_after(tip_before))
+      }
+
+      /* the retire loop */
+
+      var retire_set = active
+      var strikes = Map.empty[Document_ID.Exec, Text.Offset]   // offset of the failed round
+      val retired_all = new mutable.ListBuffer[(VSCode_Resources.Retired, Document.Version)]
+      val excluded_all = new mutable.ListBuffer[(VSCode_Resources.Excluded, Document.Version)]
+      var stale_rounds = 0
+      var flush_rounds = 0
+      var retire_rounds = 0
+      val execution_delay = options.seconds("editor_execution_delay")
+
+      def counters: String =
+        " (rounds: " + retire_rounds + " retire, " + flush_rounds + " flush, " +
+        stale_rounds + " stale)"
+
+      while (retire_set.nonEmpty) {
+        if (Time.now() >= deadline) {
+          fail("budget exhausted with " + retire_set.size + " commands still to retire" + counters)
+        }
+        val serial0 = resources.read_update_serial(deadline)
+        val st = get_state()
+        resources.cancel_round(session, retire_set, st, serial0, deadline, cancel_update_bound) match {
+          case VSCode_Resources.Stale =>
+            stale_rounds += 1
+            if (Time.now() >= deadline) {
+              fail("document state kept changing under the cancel" + counters + state_bits(st))
+            }
+            execution_delay.sleep()
+          case VSCode_Resources.No_Stable_Tip =>
+            if (Time.now() >= deadline) {
+              fail("no stable tip within the budget" + counters + state_bits(st))
+            }
+            execution_delay.sleep()
+          case VSCode_Resources.Flushed(VSCode_Resources.Commit(tip_before)) =>
+            flush_rounds += 1
+            after_update()
+            await_state("unflushed edits kept arriving" + counters + state_bits(st))(
+              assigned_after(tip_before))
+          case VSCode_Resources.Retire(version, retired, excluded, commit) =>
+            for (x <- excluded) {
+              excluded_all += ((x, version))
+            }
+            retire_set = retire_set.filter({ case (_, (name, command_id)) =>
+              !excluded.exists(x => x.name == name && x.command_id == command_id) })
+            for (VSCode_Resources.Commit(tip_before) <- commit) {
+              retire_rounds += 1
+              after_update()
+              val st1 =
+                await_state("assignment never arrived" + counters + state_bits(st))(
+                  assigned_after(tip_before))
+              val version1 = st1.stable_tip_version.get
+              for (r <- retired) {
+                val still_there = version1.nodes(r.name).commands.exists(_.id == r.command.id)
+                if (!still_there) {
+                  retire_set -= r.exec_id
+                  strikes -= r.exec_id
+                  retired_all += ((r, version))
+                }
+                else {
+                  strikes.get(r.exec_id) match {
+                    case Some(previous_start) =>
+                      fail("command " + r.command.id + " in " + r.name.node +
+                        " kept its id after two retire rounds (offsets " + previous_start +
+                        " and " + r.start + "): the version the edit was taken from was not" +
+                        " the tip at commit, the edit missed the command, or the prover" +
+                        " vanished mid-request" + counters)
+                    case None => strikes += (r.exec_id -> r.start)
+                  }
+                }
+              }
+            }
+            if (retire_set.nonEmpty) execution_delay.sleep()
+        }
+      }
+
+      /* the post-retraction invariant, after the monitor was released for the last time */
+
+      resources.cancel_assert_retracted(get_state(), retraction.overlay_serial, deadline)
+
+      /* reply */
+
+      val outcome = if (active.isEmpty) "nothing_running" else "retired"
+      val retired_json =
+        retired_all.toList.map({ case (r, v) => cancel_command_json(r.name, r.command, v) })
+      val waived_json =
+        retired_all.toList.filter(_._1.waived).map({ case (r, v) =>
+          cancel_command_json(r.name, r.command, v) })
+      // excluded entries carry no lines: the command may no longer exist on the current
+      // version, so Python renders them by file (and keyword when known) only
+      val excluded_json =
+        excluded_all.toList.map({ case (x, v) =>
+          (x.command match {
+            case Some(command) => cancel_command_json(x.name, command, v) - "line" - "end_line"
+            case None => JSON.Object("file" -> x.name.node, "id" -> x.command_id)
+          }) + ("reason" -> x.reason) })
+      // R11: everything from the first retired command of a node to its end is unloaded,
+      // the ML files those commands load included; the earliest start over all rounds
+      val unload_json =
+        retired_all.toList.groupBy(_._1.name).toList.map({ case (name, rs) =>
+          val (first, v) = rs.minBy(_._1.start)
+          val loads =
+            v.nodes(name).command_iterator(first.start).flatMap(_._1.blobs_names).map(_.node)
+              .toList.distinct
+          JSON.Object("file" -> name.node, "loads" -> loads) ++
+          (v.nodes(name).command_start_line(first.command) match {
+            case Some(line) => JSON.Object("line" -> line)
+            case None => JSON.Object()
+          })
+        })
+
+      JSON.Object(
+        "outcome" -> outcome,
+        "retired" -> retired_json,
+        "excluded" -> excluded_json,
+        "waived" -> waived_json,
+        "unloaded_from" -> unload_json)
+    }
+    finally {
+      cancel_handler.forget(serial)
+      prelude_handler.forget(serial)
+    }
+  }
+
+  /* the load commands of a file (R-D3 (iv)): a .ML file is never an evaluation target, so
+     the refusals and the breakpoint tools point at the ML_file command that loads it.
+     Nodes.commands_loading (document.scala) knows a loader only once the loading theory is
+     in the document model; early in a session the list is empty and the caller falls back
+     to the generic sentence. */
+
+  def loaders(id: LSP.Id, file: JFile): Unit = {
+    val name = resources.node_name(file)
+    // The commands come from the stable version, the line from the model's CURRENT text:
+    // the version offset is converted through every edit the version does not have yet
+    // (flushed-but-unassigned history edits and the models' unflushed ones), the way
+    // Snapshot.commands_loading_ranges does.  Without the conversion an edit above the
+    // load command reports a stale line (and an offset past the text length throws).
+    val snapshot =
+      session.snapshot(pending_edits = Document.Pending_Edits.make(resources.get_models()))
+    val version = snapshot.version
+    val result =
+      for {
+        command <- version.nodes.commands_loading(name)
+        (node_name, node) <- version.nodes.iterator.find(_._2.commands.contains(command)).toList
+        start <- node.command_start(command).toList
+      } yield {
+        val status = snapshot.state.command_status(version, command)
+        val state =
+          if (status.is_running) "running"
+          else if (status.is_finished || status.is_failed) "evaluated"
+          else "unevaluated"
+        JSON.Object(
+          "file" -> node_name.node,
+          "theory" -> node_name.theory,
+          "command" -> command.span.name,
+          "state" -> state) ++
+        (resources.get_model(node_name) match {
+          case Some(model) =>
+            val offset = snapshot.switch(node_name).convert(start)
+            JSON.Object("line" -> (model.content.doc.position(offset).line + 1))
+          case None => JSON.Object()
+        })
+      }
+    channel.write(LSP.Loaders.reply(id, result))
   }
 
   def command_at_position(id: LSP.Id, node_pos: Line.Node_Position): Unit = {
@@ -902,7 +1299,8 @@ class Language_Server(
           case LSP.Sledgehammer_Locate() => sledgehammer.locate()
           case LSP.Sledgehammer_Sendback(text) => sledgehammer.sendback(text)
           case LSP.Theory_Status(id) => theory_status(id)
-          case LSP.Cancel_Execution(id) => cancel_execution(id)
+          case LSP.Cancel_Evaluation(id) => cancel_evaluation(id)
+          case LSP.Loaders(id, file) => loaders(id, file)
           case LSP.Command_At_Position(id, node_pos) => command_at_position(id, node_pos)
           case LSP.Output_At_Position(id, node_pos) => output_at_position(id, node_pos)
           case LSP.Symbols(id) => symbols(id)
