@@ -151,6 +151,16 @@ COMPLETED_SENTENCE = "Evaluation has completed up to {target}:{line}."
 CHECK_PROGRESS_CALL = "Call isabelle_evaluation_status to check progress."
 FOOTER_DETAILS_CALL = "Call isabelle_evaluation_status for details."
 
+# isabelle_evaluation_status when no run is outstanding and nothing is running.
+# The first line says whether the sections below hold errors; {failed} is
+# ``1 command`` / ``2 commands``.
+IDLE_CLEAN_SENTENCE = (
+    "No evaluation in progress. Nothing is running and no errors remain."
+)
+IDLE_FAILED_SENTENCE = (
+    "No evaluation in progress. Nothing is running, but {failed} failed."
+)
+
 # ---- Agent-facing guard text -------------------------------------------------
 # Every string an agent can see when a query is refused or served with a caveat.
 # Kept together so the vocabulary stays consistent and reviewable.
@@ -1266,11 +1276,45 @@ def _no_pending_work(client: IsabelleLSPClient) -> bool:
     return not evaluation_state.active and not client.get_all_running_commands()
 
 
+def _idle_view(client: IsabelleLSPClient) -> EvaluationView:
+    """The status when no run is outstanding and nothing is running: every
+    open document that still shows errors or warnings, with line numbers.
+
+    theory_status is deliberately NOT requested: ``_build_status_snapshot``
+    auto-opens every not-ok theory into ``auto_opened_files``, which only the
+    end of a run clears -- with no run, those documents would leak for the
+    session. Without theory_status the snapshot has nothing to fall back on,
+    so it always takes the lined decoration branch. The first line's count is
+    taken from the very snapshots rendered below it, so the two cannot disagree.
+    """
+    files = [
+        fs for fs in (
+            _build_file_snapshot(client, path, {})
+            for path in list(client.open_documents)
+        )
+        if fs.error_count or fs.warning_count
+    ]
+    n_failed = sum(fs.error_count for fs in files)
+    message = (
+        IDLE_FAILED_SENTENCE.format(failed=plural(n_failed, "command"))
+        if n_failed else IDLE_CLEAN_SENTENCE
+    )
+    return EvaluationView(status="no_evaluation", message=message, files=files)
+
+
 async def evaluation_status(
     client: IsabelleLSPClient,
 ) -> EvaluationView:
     if _no_pending_work(client):
-        return _no_evaluation_view()
+        # The idle answer is read from the decoration cache, which describes
+        # the pre-edit document for DECORATION_GRACE after an edit (the tool
+        # entry's own resync may have just sent one). Neither lying with the
+        # stale picture nor hiding it: wait the window out, then judge afresh --
+        # what the wait reveals may be a command running, hence the re-check.
+        while (grace := _grace_remaining()) > 0:
+            await asyncio.sleep(grace)
+        if _no_pending_work(client):
+            return _idle_view(client)
 
     theories, running_commands = await _build_status_snapshot(
         client, evaluation_state,
@@ -1833,8 +1877,6 @@ def format_evaluation_result(
     *call_to_action* is False for ``isabelle_evaluation_status``: it is the tool
     being called, so pointing at it is a self-reference with no next step in it.
     """
-    if view.status == "no_evaluation":
-        return view.message or "No evaluation in progress."
     running_by_file: dict[str, list[RunningCommand]] = {}
     for cmd in view.running_commands:
         running_by_file.setdefault(cmd.file_path, []).append(cmd)

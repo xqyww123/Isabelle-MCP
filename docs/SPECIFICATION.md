@@ -609,9 +609,17 @@ after_text: Annotated[Optional[str], Field(
 
 #### 4.4.2 `isabelle_evaluation_status`
 
-**Description**: Check the progress of an ongoing evaluation. Returns the current
-per-file snapshot (errors / warnings / running line spans) and whether it finished.
-**Input Parameters**: None. Reports "No evaluation in progress." when idle.
+**Description**: Check the current evaluation state. **Input Parameters**: None.
+While a run is outstanding or a command is still running, the answer is the
+current per-file snapshot (errors / warnings / running line spans) and whether the
+run finished. When idle, the answer still reports the errors and warnings that
+remain in every open document, with line numbers, so the first line tells the
+agent whether the sections below hold errors: `No evaluation in progress. Nothing
+is running and no errors remain.` or `No evaluation in progress. Nothing is
+running, but N commands failed.` (`1 command failed.` in the singular). An edit
+within the last `ISABELLE_MCP_DECORATION_GRACE` seconds (default 2 s) makes the
+tool wait the remaining window out before judging, so the idle answer never
+describes the pre-edit document.
 
 #### 4.4.3 `isabelle_cancel_evaluation`
 

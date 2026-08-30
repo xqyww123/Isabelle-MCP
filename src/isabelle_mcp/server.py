@@ -520,11 +520,7 @@ async def isabelle_evaluate_to(
 
 @mcp.tool(output_schema=None)
 async def isabelle_evaluation_status() -> ToolResult:
-    """Check the progress of an ongoing evaluation.
-
-    Returns the current per-file snapshot (errors / warnings / running) and execution
-    position.
-    """
+    """Check the current evaluation state."""
     client = await _ensure_lsp_started()
     view = await evaluation_status(client)
     # No "call isabelle_evaluation_status" here: this IS that tool.

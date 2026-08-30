@@ -103,7 +103,9 @@ class TestMCPServerTools:
     async def test_evaluation_status_no_eval(self, mock_lsp_client):
         with _patch_ensure(mock_lsp_client):
             result = await isabelle_evaluation_status()
-        assert result.content[0].text == "No evaluation in progress."
+        assert result.content[0].text == (
+            "No evaluation in progress. Nothing is running and no errors remain."
+        )
 
     @pytest.mark.asyncio
     async def test_cancel_evaluation_no_eval(self, mock_lsp_client):
