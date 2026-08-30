@@ -492,9 +492,7 @@ async def isabelle_evaluate_to(
 ) -> ToolResult:
     """Start evaluating a theory file up to a location on a line.
 
-    Returns a per-file snapshot — errors / warnings / running command lines. The
-    result may indicate evaluation is still in progress; if so, call
-    ``evaluation_status`` to update the progress.
+    Returns a per-file snapshot — errors / warnings / running command lines.
 
     **Errors do not stop the checking.** Isabelle checks every command up to your
     target even when an earlier one fails, unless some command gets stuck. A failed

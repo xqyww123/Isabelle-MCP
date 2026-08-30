@@ -14,6 +14,7 @@ from isabelle_mcp.evaluation import (
     sync_file_locked,
 )
 from isabelle_mcp.evaluation import _arrival_message
+from isabelle_mcp.lsp_client import DocumentState
 from isabelle_mcp.models import EvaluationView, FileSnapshot, RunningCommand
 from isabelle_mcp.processing import ProcessingTracker, parse_decoration_ranges
 from isabelle_mcp.utils import IsabelleToolError, MCPLine
@@ -86,10 +87,25 @@ class TestEvaluateTo:
 
     @pytest.mark.asyncio
     async def test_negative_line(self, temp_theory_file, mock_lsp_client):
+        # The fixture is 11 real lines ending in "end\n"; -1 is that "end"
+        # line, not the empty string after the final newline.
         result = await evaluate_to(mock_lsp_client, temp_theory_file, -1)
         assert result.status == "complete"
-        assert result.destination_line is not None
-        assert result.destination_line >= 11
+        assert result.destination_line == 11
+
+    @pytest.mark.asyncio
+    async def test_negative_line_without_trailing_newline(self, tmp_path, mock_lsp_client):
+        path = tmp_path / "NoNl.thy"
+        path.write_text("theory NoNl\nimports Main\nbegin\nend")
+        result = await evaluate_to(mock_lsp_client, str(path), -1)
+        assert result.destination_line == 4
+
+    @pytest.mark.asyncio
+    async def test_negative_line_with_after_text(self, temp_theory_file, mock_lsp_client):
+        # after_text on the phantom empty line used to fail with "not found".
+        result = await evaluate_to(mock_lsp_client, temp_theory_file, -1, after_text="end")
+        assert result.status == "complete"
+        assert result.destination_line == 11
 
     @pytest.mark.asyncio
     async def test_after_text_same_line(self, temp_theory_file, mock_lsp_client):
@@ -317,6 +333,30 @@ class TestSnapshotCategorization:
         assert fs.errors == [(5, 5), (7, 7)]
         assert fs.warnings == [(9, 9)]
         assert fs.running == []
+
+    def test_end_of_document_decoration_survives_clipping(self, mock_lsp_client):
+        """An error anchored after the final newline (0-idx line == number of
+        newlines) is a real Isabelle position; the "+1" line count must keep it.
+        A count of real lines (as evaluate_to uses for -1) would drop it."""
+        from isabelle_mcp.evaluation import _build_file_snapshot, _failed_count
+        path = "/tmp/T.thy"
+        content = "theory T\nimports Main\nbegin\n"          # 3 newlines -> 0-idx line 3 exists for decorations
+        mock_lsp_client.open_documents[path] = DocumentState(
+            file_path=path, uri=f"file://{path}", version=1, content=content,
+        )
+        mock_lsp_client._processing_trackers[path] = MockProcessingTracker(
+            overview_error=[(3, 0, 3, 0)], bad=[(3, 0, 3, 0)],
+        )
+        fs = _build_file_snapshot(mock_lsp_client, path, {path: self._ts(path)})
+        assert fs.errors == [(4, 4)]
+        assert _failed_count(mock_lsp_client) == 1
+        # ...while a range starting further past EOF is still clipped away.
+        mock_lsp_client._processing_trackers[path] = MockProcessingTracker(
+            overview_error=[(4, 0, 4, 0)], bad=[(4, 0, 4, 0)],
+        )
+        fs = _build_file_snapshot(mock_lsp_client, path, {path: self._ts(path)})
+        assert fs.errors == []
+        assert _failed_count(mock_lsp_client) == 0
 
     def test_fallback_counts_when_no_tracker(self, mock_lsp_client):
         from isabelle_mcp.evaluation import _build_file_snapshot

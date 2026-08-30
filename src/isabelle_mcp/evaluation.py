@@ -603,6 +603,9 @@ def _build_file_snapshot(
     ts = ts_map.get(file_path)
     tracker = client.get_processing_tracker(file_path)
     doc = client.open_documents.get(file_path)
+    # "+1": a decoration anchored at the end of the document sits on the line
+    # after the final newline; this count keeps clip_line_range from dropping
+    # it. Do not unify with evaluate_to's count of real lines.
     n_lines = (doc.content.count("\n") + 1) if doc else None
 
     if tracker is not None:
@@ -977,7 +980,11 @@ async def evaluate_to(
         await client.open_document(file_path)
         heap_warning = client.heap_warning(file_path)
         doc = client.open_documents.get(file_path)
-        total_lines = (doc.content.count("\n") + 1) if doc else 1
+        # Lines that actually exist (a trailing newline ends the last line, it
+        # does not start another), so -1 resolves to the real last line. This is
+        # deliberately NOT the "+1" count used for clipping decorations in
+        # _build_file_snapshot / _failed_count.
+        total_lines = len(doc.content.removesuffix("\n").split("\n")) if doc else 1
         anchor_line = _resolve_line(line, total_lines)
         if anchor_line < 1:
             raise IsabelleToolError(f"line must be >= 1, got {anchor_line}")
@@ -1439,6 +1446,8 @@ def _failed_count(client: IsabelleLSPClient) -> int:
             continue
         # Clipped to the current content, exactly as the file sections clip: a
         # tracker outliving a file shrink must not contribute phantom failures.
+        # "+1" as in _build_file_snapshot: keeps an end-of-document decoration
+        # from being clipped away. Do not unify with evaluate_to's count.
         doc = client.open_documents.get(path)
         n_lines = (doc.content.count("\n") + 1) if doc else None
         total += len(_merge_spans(
