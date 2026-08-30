@@ -616,8 +616,8 @@ per-file snapshot (errors / warnings / running line spans) and whether it finish
 #### 4.4.3 `isabelle_cancel_evaluation`
 
 **Description**: Cancel an ongoing evaluation. Stops Isabelle from processing
-further; already-processed results remain valid for querying. **Input Parameters**:
-None.
+further. Results before the first unfinished command remain valid for querying.
+**Input Parameters**: None.
 
 **Output** (shared by all three): a **plain-text string** (no `output_schema`).
 Internally these tools return an `EvaluationView` dataclass (see

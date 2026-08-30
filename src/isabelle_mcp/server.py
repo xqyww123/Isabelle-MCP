@@ -543,9 +543,9 @@ async def isabelle_evaluation_status() -> ToolResult:
 async def isabelle_cancel_evaluation() -> ToolResult:
     """Cancel an ongoing evaluation.
 
-    Stops Isabelle from processing further.  Already-processed results
-    remain valid for querying.  Other tool calls wait while a cancellation
-    is in progress.
+    Stops Isabelle from processing further.  Results before the first
+    unfinished command remain valid for querying.  Other tool calls wait
+    while a cancellation is in progress.
     """
     client = await _ensure_lsp_started()
     view = await cancel_evaluation(client)
