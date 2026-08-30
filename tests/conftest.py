@@ -70,10 +70,12 @@ class MockProcessingTracker:
     the frontier edits ``unprocessed`` (the lists are live — a concurrent task
     can shrink them while an evaluation waits).
 
-    *all_processed=False* with no ranges means "nothing evaluated at all".
-    *frontier* / *quiet* force ``line_reached`` / ``range_processed`` outright
-    (for "frontier reached the target but a trailing fork in the prefix is
-    still in flight"); *state* forces ``position_state``.
+    Not modelled: the post-edit grace window (the real ``_fresh`` gate, under
+    which every predicate answers "not yet" / ``unknown``) and cancelled
+    ranges. *all_processed=False* (without ranges) means "nothing evaluated at
+    all". *frontier* / *quiet* force ``line_reached`` / ``range_processed``
+    outright (for "frontier reached the target but a trailing fork in the
+    prefix is still in flight"); *state* forces ``position_state``.
     """
 
     def __init__(
@@ -83,6 +85,8 @@ class MockProcessingTracker:
         bad=None, overview_error=None, overview_warning=None,
         running=None, unprocessed=None,
     ):
+        assert all_processed or not (running or unprocessed), \
+            "all_processed=False means no ranges at all; pass ranges instead"
         self._all_processed = all_processed
         self._frontier = frontier
         self._quiet = quiet
@@ -93,40 +97,46 @@ class MockProcessingTracker:
         self.running = list(running or [])
         self.unprocessed = list(unprocessed or [])
 
+    @staticmethod
+    def _overlaps(ranges, start_line: int, end_line: int) -> bool:
+        return any(sl <= end_line and start_line <= el for sl, _, el, _ in ranges)
+
+    def _range_reached(self, start_line: int, end_line: int) -> bool:
+        """No unprocessed range overlaps the span (running ranges do not count)."""
+        if self._frontier is not None:
+            return self._frontier
+        return self._all_processed and not self._overlaps(self.unprocessed, start_line, end_line)
+
     def range_processed(self, start_line: LSPLine, end_line: LSPLine) -> bool:
         if self._quiet is not None:
             return self._quiet
-        if not self._all_processed:
-            return False
-        return not any(
-            sl <= end_line and start_line <= el
-            for sl, _, el, _ in self.unprocessed + self.running
-        )
+        return (self._all_processed
+                and not self._overlaps(self.unprocessed + self.running, start_line, end_line))
 
     def line_reached(self, line: int) -> bool:
-        if self._frontier is not None:
-            return self._frontier
-        if not self._all_processed:
-            return False
-        return not any(sl <= line <= el for sl, _, el, _ in self.unprocessed)
+        return self._range_reached(line, line)
 
     def line_running(self, line: int) -> bool:
-        return any(sl <= line <= el for sl, _, el, _ in self.running)
+        return self._overlaps(self.running, line, line)
 
-    def position_state(self, line):
-        """Mirror ProcessingTracker.position_state from this stub's frontier/running.
+    def range_state(self, start_line: int, end_line: int) -> tuple[str, float]:
+        """Mirror ProcessingTracker.range_state (unprocessed before running;
+        elapsed time always 0.0).
 
         *state* forces an answer outright, so a tool-level test can reach the
         outcomes this stub cannot model — `unknown` (inside the post-edit grace
         window) and `cancelled` (an interrupted command)."""
         from isabelle_mcp import processing
         if self._state is not None:
-            return self._state
-        if not self.line_reached(line):
-            return processing.NOT_EVALUATED
-        if self.line_running(line):
-            return processing.RUNNING
-        return processing.PROCESSED
+            return (self._state, 0.0)
+        if not self._range_reached(start_line, end_line):
+            return (processing.NOT_EVALUATED, 0.0)
+        if self._overlaps(self.running, start_line, end_line):
+            return (processing.RUNNING, 0.0)
+        return (processing.PROCESSED, 0.0)
+
+    def position_state(self, line: int) -> str:
+        return self.range_state(line, line)[0]
 
     @property
     def all_processed(self) -> bool:
@@ -241,22 +251,11 @@ class MockLSPClient:
     ) -> None:
         pass
 
-    # The awaits an evaluation's wait loop actually hits yield the event loop
-    # once, so a concurrent task (another tool call, a frontier advance) gets
-    # to run. open_document / set_caret deliberately do not: evaluate_to awaits
-    # them inside its lock critical section, and yielding there would only
-    # manufacture lock contention.
-    async def wait_for_processing(
-        self, file_path: str, start_line: LSPLine, end_line: LSPLine | None = None,
-    ) -> None:
-        await asyncio.sleep(0)
-
-    async def wait_for_processing_bounded(
-        self, file_path: str, start_line: LSPLine, end_line: LSPLine, timeout: float,
-    ) -> bool:
-        await asyncio.sleep(0)
-        return True
-
+    # Where the real client blocks on prover I/O, the mock yields the event loop
+    # once, so a concurrent task (another tool call, a frontier advance) gets to
+    # run: resync_changed_open_documents and request_theory_status here, the two
+    # wait stubs on the tracker. open_document / set_caret stay silent stubs so
+    # evaluate_to's lock critical section is atomic in tests.
     async def resync_changed_open_documents(self) -> None:
         await asyncio.sleep(0)
 
@@ -404,30 +403,31 @@ _LOCK_HOLDERS = ("isabelle_mcp.evaluation", "isabelle_mcp.server")
 
 
 @pytest.fixture(autouse=True)
-def _fresh_evaluation_state_lock(monkeypatch):
+def _per_test_evaluation_state_lock(monkeypatch):
     """Give every test its own ``_evaluation_state_lock``.
 
     An asyncio.Lock binds itself to the running event loop on its first
     contended acquire, and pytest-asyncio runs each test on a new loop. Now
     that the mocks yield, two tests can each contend for the module-level
     lock, and the second one would die with "bound to a different event loop".
-    The lock is replaced in every module holding it by value; a holder that is
-    not listed in _LOCK_HOLDERS is reported rather than silently kept.
+    The lock is replaced in every module holding it by value; any already
+    imported module whose ``_evaluation_state_lock`` is not this test's lock
+    (a holder missing from _LOCK_HOLDERS) is reported rather than silently
+    kept. A holder first imported in the middle of a test is caught by the
+    next test.
     """
     import importlib
-    old = importlib.import_module(_LOCK_HOLDERS[0])._evaluation_state_lock
     new = asyncio.Lock()
     for name in _LOCK_HOLDERS:
         monkeypatch.setattr(importlib.import_module(name), "_evaluation_state_lock", new)
     stale = [
-        f"{name}.{attr}"
+        f"{name}._evaluation_state_lock"
         for name, module in list(sys.modules.items())
         if module is not None and name.startswith(("isabelle_mcp", "tests"))
-        for attr, value in vars(module).items()
-        if value is old
+        and getattr(module, "_evaluation_state_lock", new) is not new
     ]
     assert not stale, (
-        f"{stale} still hold the old _evaluation_state_lock; "
+        f"{stale} do not hold this test's _evaluation_state_lock; "
         "add the module to _LOCK_HOLDERS in tests/conftest.py"
     )
 

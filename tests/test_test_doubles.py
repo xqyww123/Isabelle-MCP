@@ -39,6 +39,9 @@ class TestTrackerStubContract:
         assert t.position_state(1) == PROCESSED
         assert t.position_state(2) == RUNNING
         assert t.position_state(6) == NOT_EVALUATED
+        assert t.range_state(0, 1) == (PROCESSED, 0.0)
+        assert t.range_state(1, 2) == (RUNNING, 0.0)
+        assert t.range_state(2, 6) == (NOT_EVALUATED, 0.0)   # least-finished wins
         assert not t.all_processed
 
     def test_all_processed_false_means_nothing_evaluated(self):
@@ -89,11 +92,12 @@ class TestRestatPathReachable:
     ):
         monkeypatch.setattr(ev, "_LONG_EVAL_RESTAT_INTERVAL", 0.0)
         resyncs = 0
+        mock_resync = mock_lsp_client.resync_changed_open_documents   # must exist
 
         async def counting_resync():
             nonlocal resyncs
             resyncs += 1
-            await asyncio.sleep(0)
+            await mock_resync()
         mock_lsp_client.resync_changed_open_documents = counting_resync
         mock_lsp_client._processing_trackers[temp_theory_file] = MockProcessingTracker(
             all_processed=False,
