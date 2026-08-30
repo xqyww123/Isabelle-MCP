@@ -102,19 +102,26 @@ class TestEvaluationGuard:
         mock_lsp_client._processing_trackers[temp_theory_file] = MockProcessingTracker(
             all_processed=False,
         )
-        evaluation_state.start(temp_theory_file, MCPLine(100))
-        with pytest.raises(IsabelleToolError, match="has not been evaluated yet") as exc:
+        # The prover is busy with ANOTHER file (a request for the file under
+        # evaluation is not refused — it joins that evaluation).
+        evaluation_state.start("/tmp/Other.thy", MCPLine(100))
+        with pytest.raises(IsabelleToolError, match="has not been evaluated") as exc:
             await hover_info(mock_lsp_client, temp_theory_file, MCPLine(5), "my_const")
-        assert "Test.thy:5" in str(exc.value)
-        assert "Test.thy:100" in str(exc.value)          # the evaluation target
+        assert str(exc.value) == (
+            f"{temp_theory_file}:5 has not been evaluated, and it cannot be while an "
+            "evaluation is running towards /tmp/Other.thy:100. Wait for it to "
+            "finish, or cancel it with isabelle_cancel_evaluation."
+        )
 
     @pytest.mark.asyncio
     async def test_unopened_file_is_refused_during_an_evaluation(
         self, mock_lsp_client, temp_theory_file,
     ):
-        evaluation_state.start(temp_theory_file, MCPLine(100))
-        with pytest.raises(IsabelleToolError, match="has not been opened yet"):
+        # Same sentence whether the file is unopened or merely unevaluated.
+        evaluation_state.start("/tmp/Other.thy", MCPLine(100))
+        with pytest.raises(IsabelleToolError, match="has not been evaluated") as exc:
             await hover_info(mock_lsp_client, temp_theory_file, MCPLine(5), "my_const")
+        assert "/tmp/Other.thy:100" in str(exc.value)
 
 
 class TestUnicodeHandling:

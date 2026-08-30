@@ -173,16 +173,21 @@ UNKNOWN_POSITION_MESSAGE = (
     "seconds."
 )
 
-NOT_EVALUATED_REFUSAL = (
-    "{file}:{line} has not been evaluated yet. "
-    "Evaluating towards {target}:{target_line}. "
-    "Call isabelle_evaluation_status to check progress."
+# Refusals while an evaluation of ANOTHER file is running (wording approved
+# verbatim). A request for the file under evaluation is never refused: it
+# advances the running evaluation's target (see EvaluationState.advance).
+# {activity} is _activity_clause's product: empty, or ", where …".
+EVALUATE_TO_REFUSAL = (
+    "An evaluation is running towards {target}:{target_line}{activity}. "
+    "You cannot evaluate another file until it finishes, or you cancel it with "
+    "isabelle_cancel_evaluation."
 )
-
-NOT_OPEN_REFUSAL = (
-    "{file} has not been opened yet, and opening it would disturb the evaluation "
-    "in progress. Evaluating towards {target}:{target_line}. "
-    "Call isabelle_evaluation_status to check progress."
+# The query tools' guard, for a file that is not open as much as for a line
+# that has not been evaluated.
+NOT_EVALUATED_REFUSAL = (
+    "{file}:{line} has not been evaluated, and it cannot be while an evaluation "
+    "is running towards {target}:{target_line}. Wait for it to finish, or cancel "
+    "it with isabelle_cancel_evaluation."
 )
 
 
@@ -374,6 +379,25 @@ def _activity_sentences(
     return sentences
 
 
+def _activity_clause(running_commands: list[RunningCommand]) -> str:
+    """The ``{activity}`` clause of EVALUATE_TO_REFUSAL: empty when no command
+    has run for RUNNING_REPORT_THRESHOLD yet; otherwise how many have, and the
+    longest. Whole seconds, rounded down."""
+    slow = sorted(
+        (int(c.elapsed_seconds) for c in running_commands
+         if c.elapsed_seconds >= RUNNING_REPORT_THRESHOLD),
+        reverse=True,
+    )
+    if not slow:
+        return ""
+    if len(slow) == 1:
+        return f", where one command has been running for {slow[0]}s"
+    return (
+        f", where {len(slow)} commands have been running for over "
+        f"{int(RUNNING_REPORT_THRESHOLD)}s, the longest for {slow[0]}s"
+    )
+
+
 def _arrival_message(
     target: str,
     dest: int,
@@ -425,6 +449,17 @@ class EvaluationState:
         self.auto_opened_files = set()
         self.current = Evaluation()
         return self.current
+
+    def advance(self, file_path: str, destination_line: MCPLine) -> None:
+        """Move the running evaluation's target forward — never back — for a
+        second request on the same file. The one writer of that monotonicity.
+
+        The caller must hold ``_evaluation_state_lock``: the footer's
+        "target unchanged, so stamp complete" decision relies on the target
+        not moving under it.
+        """
+        assert self.active and self.file_path == file_path and self.current is not None
+        self.destination_line = max(self.destination_line, destination_line)
 
     def owns(self, evaluation: Evaluation) -> bool:
         """Whether *evaluation* is still the run this state describes.
@@ -824,11 +859,17 @@ class _HitWatch:
 async def _evaluation_wait_loop(
     client: IsabelleLSPClient,
     file_path: str,
-    dest_line: MCPLine,
     state: EvaluationState,
     evaluation: Evaluation,
     timeout: float,
 ) -> tuple[str, list[TheoryStatus], list[RunningCommand]]:
+    """Wait until the frontier reaches the run's target, or *timeout*.
+
+    The target is ``state.destination_line``, read afresh each round right
+    before the frontier decision: a second request on the same file advances
+    it while this loop is waiting, and a copy taken at entry would judge the
+    old target.
+    """
     deadline = time.monotonic() + timeout
     last_restat = time.monotonic()
     theories: list[TheoryStatus] = []
@@ -859,6 +900,9 @@ async def _evaluation_wait_loop(
         # Decide the instant the frontier reaches dest: prefix quiet → complete;
         # otherwise return in_progress NOW (no grace). Trailing forks are reported
         # (running/pending lines), not waited on — the caller polls to convergence.
+        # No await between this read and the returns below, so the decision is
+        # about one target.
+        dest_line = state.destination_line
         if _frontier_reached(file_path, dest_line, client, theories):
             if _prefix_quiet(file_path, dest_line, client):
                 return "complete", theories, running_commands
@@ -970,12 +1014,12 @@ async def evaluate_to(
         hits_refusal = debugger.hits_live_refusal(client)
         if hits_refusal is not None:
             raise IsabelleToolError(hits_refusal)
-        if evaluation_state.active:
-            raise IsabelleToolError(
-                "An evaluation is already in progress. "
-                "Call cancel_evaluation to cancel so you can request "
-                "another evaluation.",
-            )
+        if evaluation_state.active and evaluation_state.file_path != file_path:
+            raise IsabelleToolError(EVALUATE_TO_REFUSAL.format(
+                target=relativize(evaluation_state.file_path, client.project_root),
+                target_line=int(evaluation_state.destination_line),
+                activity=_activity_clause(client.get_all_running_commands()),
+            ))
 
         await client.open_document(file_path)
         heap_warning = client.heap_warning(file_path)
@@ -1003,7 +1047,23 @@ async def evaluate_to(
         # queues itself as a debugger notice.
         fence_line = await debugger.forgotten_arming_fence(client, file_path)
 
-        evaluation = evaluation_state.start(file_path, dest_line)
+        if evaluation_state.active:
+            # Same file (any other was refused above): this request joins the
+            # running evaluation and can only move its target forward. It does
+            # NOT start() a new run — that would orphan the in-flight loop's
+            # _finish_if_owner and leak the auto-opened dependencies. Whoever
+            # observes completion first finishes the shared run; a second
+            # finish is a no-op.
+            evaluation = evaluation_state.current
+            assert evaluation is not None
+            # The caret moves only when this request is the target (ahead of or
+            # at the old one). A request behind the target leaves the caret
+            # alone: pulling it back would strand the run before its target.
+            send_caret = dest_line >= evaluation_state.destination_line
+            evaluation_state.advance(file_path, dest_line)
+        else:
+            evaluation = evaluation_state.start(file_path, dest_line)
+            send_caret = True
 
         # Sent under the lock, as its last act: cancel_evaluation writes
         # PIDE/cancel_evaluation only after taking THIS lock, so the caret
@@ -1014,17 +1074,19 @@ async def evaluate_to(
         # note_edit_sent (didOpen/didChange/dep change), and a caret-only move
         # cannot make stale decorations claim "processed" for work that isn't
         # (see note_edit_sent's docstring).
-        try:
-            await client.set_caret(file_path, dest_line.to_lsp(), lsp_char)
-        except BaseException:
-            # start() already flipped ``active``; the anti-wedge invariant needs
-            # it cleared on every failure path, as the handler below does.
-            await _finish_if_owner(client, evaluation, "cancelled")
-            raise
+        if send_caret:
+            try:
+                await client.set_caret(file_path, dest_line.to_lsp(), lsp_char)
+            except BaseException:
+                # start() already flipped ``active``; the anti-wedge invariant
+                # needs it cleared on every failure path, as the handler below
+                # does.
+                await _finish_if_owner(client, evaluation, "cancelled")
+                raise
 
     try:
         status, theories, running_commands = await _evaluation_wait_loop(
-            client, file_path, dest_line, evaluation_state, evaluation,
+            client, file_path, evaluation_state, evaluation,
             HEAP_POLL_INTERVAL if heap_warning else EVAL_POLL_INTERVAL,
         )
 
@@ -1039,7 +1101,7 @@ async def evaluate_to(
             grace = _grace_remaining()
             if grace > 0:
                 status, theories, running_commands = await _evaluation_wait_loop(
-                    client, file_path, dest_line, evaluation_state, evaluation,
+                    client, file_path, evaluation_state, evaluation,
                     grace + 0.2,
                 )
     except BaseException:
@@ -1051,9 +1113,18 @@ async def evaluate_to(
         # shields each close so it completes despite the re-delivered cancel and
         # cannot hang (bounded by _CLOSE_TIMEOUT). Mirrors isabelle_launch's
         # cancellation cleanup.
-        await _finish_if_owner(client, evaluation, "cancelled")
+        # Only the request whose caret is the run's target may end the shared
+        # run: a waiter behind the target, or a contributor since overtaken by
+        # a further advance, leaves the run (and its auto-opened dependencies)
+        # to the request that now drives it.
+        if send_caret and evaluation_state.destination_line == dest_line:
+            await _finish_if_owner(client, evaluation, "cancelled")
         raise
 
+    if evaluation_state.owns(evaluation):
+        # The target may have been advanced while this call waited; what was
+        # observed is the run's real target, so report that one.
+        dest_line = evaluation_state.destination_line
     dest = int(dest_line)
     # The stamp is authoritative. ``status`` is what the loop saw; the stamp is
     # what actually happened, including a terminal transition that landed inside
@@ -1510,10 +1581,13 @@ async def evaluation_footer(client: IsabelleLSPClient) -> str:
         if _is_evaluation_complete(target, dest, client, theories):
             # Under the lock, like every other terminal transition: the stamp, the
             # flag and the cleanup of the auto-opened dependencies travel together.
+            # The round trip above is where a same-file request can advance the
+            # target; a target that moved is only "arrived" for the old one
+            # (targets only move forward, so equality means unchanged).
             async with _evaluation_state_lock:
-                if evaluation is not None:
+                if evaluation is not None and evaluation_state.destination_line == dest:
                     await _finish_if_owner(client, evaluation, "complete")
-            return _target_sentence(COMPLETED_SENTENCE, target, int(dest), root)
+                    return _target_sentence(COMPLETED_SENTENCE, target, int(dest), root)
 
     return " ".join([
         _target_sentence(ARRIVED_SENTENCE, target, int(dest), root),
@@ -1578,16 +1652,14 @@ async def check_evaluation_guard(
             UNKNOWN_POSITION_MESSAGE.format(file=rel, line=int(line)),
         )
 
-    # NOT_EVALUATED or FILE_NOT_OPEN: work is needed. Only one evaluation may be
-    # outstanding at a time, so either start one or explain who has it.
+    # NOT_EVALUATED or FILE_NOT_OPEN: work is needed. An evaluation of another
+    # file has the prover; a request for the file under evaluation goes on to
+    # evaluate_to, which advances the running target when the line is beyond
+    # it and otherwise waits for it.
     async with _evaluation_state_lock:
-        if evaluation_state.active:
-            template = (
-                NOT_OPEN_REFUSAL if state == FILE_NOT_OPEN
-                else NOT_EVALUATED_REFUSAL
-            )
+        if evaluation_state.active and evaluation_state.file_path != file_path:
             raise IsabelleToolError(
-                template.format(
+                NOT_EVALUATED_REFUSAL.format(
                     file=rel,
                     line=int(line),
                     target=relativize(

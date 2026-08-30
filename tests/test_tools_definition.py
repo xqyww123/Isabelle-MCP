@@ -99,9 +99,10 @@ class TestDefinitionTool:
 
     @pytest.mark.asyncio
     async def test_evaluation_guard_blocks(self, mock_lsp_client, temp_theory_file):
-        # Not open, so the guard may not open it while an evaluation is outstanding.
-        evaluation_state.start(temp_theory_file, MCPLine(100))
-        with pytest.raises(IsabelleToolError, match="has not been opened yet"):
+        # Not open, so the guard may not open it while another file's evaluation
+        # is outstanding.
+        evaluation_state.start("/tmp/Other.thy", MCPLine(100))
+        with pytest.raises(IsabelleToolError, match="has not been evaluated"):
             await declaration_location(mock_lsp_client, temp_theory_file, MCPLine(5), "my_const")
 
     @pytest.mark.asyncio

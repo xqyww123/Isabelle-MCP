@@ -55,7 +55,9 @@ class TestEvaluateTo:
         )
 
     @pytest.mark.asyncio
-    async def test_while_active_fails(self, temp_theory_file, mock_lsp_client):
+    async def test_another_file_while_active_is_refused(
+        self, temp_theory_file, temp_theory_with_errors, mock_lsp_client,
+    ):
         mock_lsp_client._processing_trackers[temp_theory_file] = MockProcessingTracker(
             all_processed=False,
         )
@@ -63,11 +65,12 @@ class TestEvaluateTo:
         assert evaluation_state.active
 
         with pytest.raises(IsabelleToolError) as excinfo:
-            await evaluate_to(mock_lsp_client, temp_theory_file, 10)
-        # The refusal names the one thing that unblocks the agent, and why.
+            await evaluate_to(mock_lsp_client, temp_theory_with_errors, 3)
+        # The approved sentence: who has the prover, and the two ways out.
         assert str(excinfo.value) == (
-            "An evaluation is already in progress. Call cancel_evaluation to "
-            "cancel so you can request another evaluation."
+            f"An evaluation is running towards {temp_theory_file}:5. You cannot "
+            "evaluate another file until it finishes, or you cancel it with "
+            "isabelle_cancel_evaluation."
         )
 
     @pytest.mark.asyncio
@@ -598,7 +601,7 @@ class TestCancelSafety:
     ):
         import asyncio
 
-        async def fake_loop(client, file_path, dest_line, state, evaluation, timeout):
+        async def fake_loop(client, file_path, state, evaluation, timeout):
             state.auto_opened_files.add("/tmp/Dep_cancel.thy")
             raise asyncio.CancelledError()
 
@@ -615,7 +618,7 @@ class TestCancelSafety:
     ):
         import asyncio
 
-        async def fake_loop(client, file_path, dest_line, state, evaluation, timeout):
+        async def fake_loop(client, file_path, state, evaluation, timeout):
             state.auto_opened_files.add("/tmp/Dep_complete.thy")
             return "complete", [], []
 
@@ -646,7 +649,7 @@ class TestCancelSafety:
 
         calls = []
 
-        async def fake_loop(client, file_path, dest_line, state, evaluation, timeout):
+        async def fake_loop(client, file_path, state, evaluation, timeout):
             calls.append(1)
             if len(calls) == 1:
                 return "in_progress", [], []
@@ -899,8 +902,7 @@ class TestEvaluationLifecycle:
         run = evaluation_state.start(temp_theory_file, MCPLine(5))
         evaluation_state.complete()
         status, theories, running = await ev._evaluation_wait_loop(
-            mock_lsp_client, temp_theory_file, MCPLine(5),
-            evaluation_state, run, 1.0,
+            mock_lsp_client, temp_theory_file, evaluation_state, run, 1.0,
         )
         assert status == "complete"
 
@@ -916,8 +918,7 @@ class TestEvaluationLifecycle:
         )
         mock_lsp_client.get_all_running_commands = lambda: [cmd]
         status, theories, running = await ev._evaluation_wait_loop(
-            mock_lsp_client, temp_theory_file, MCPLine(5),
-            evaluation_state, run, 1.0,
+            mock_lsp_client, temp_theory_file, evaluation_state, run, 1.0,
         )
         assert status == "cancelled"
         assert running == [cmd]
@@ -929,7 +930,7 @@ class TestEvaluationLifecycle:
         """The defect this fix exists for: evaluation_status observes the run
         succeed, and evaluate_to used to answer "Evaluation in progress."."""
 
-        async def fake_loop(client, file_path, dest_line, state, evaluation, timeout):
+        async def fake_loop(client, file_path, state, evaluation, timeout):
             state.complete()                       # what evaluation_status does
             return "cancelled", [], []             # what the old loop guessed
 
@@ -943,7 +944,7 @@ class TestEvaluationLifecycle:
     async def test_evaluate_to_reports_a_concurrent_cancel_as_cancelled(
         self, temp_theory_file, mock_lsp_client, monkeypatch,
     ):
-        async def fake_loop(client, file_path, dest_line, state, evaluation, timeout):
+        async def fake_loop(client, file_path, state, evaluation, timeout):
             state.cancel()
             return "in_progress", [], []
 
@@ -963,7 +964,7 @@ class TestEvaluationLifecycle:
 
         mock_lsp_client.heap_sources = {os.path.realpath(temp_theory_file)}
 
-        async def fake_loop(client, file_path, dest_line, state, evaluation, timeout):
+        async def fake_loop(client, file_path, state, evaluation, timeout):
             state.cancel()
             return "in_progress", [], []
 
@@ -980,9 +981,9 @@ class TestEvaluationLifecycle:
         can start before the first one's tail runs."""
         closed = []
 
-        async def fake_loop(client, file_path, dest_line, state, evaluation, timeout):
+        async def fake_loop(client, file_path, state, evaluation, timeout):
             # A second evaluation starts while we were waiting.
-            state.start(file_path, dest_line)
+            state.start(file_path, state.destination_line)
             state.auto_opened_files.add("/tmp/Dep_of_run_two.thy")
             return "complete", [], []
 
