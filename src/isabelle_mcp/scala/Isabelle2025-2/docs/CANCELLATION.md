@@ -1,7 +1,13 @@
-# Patch-free global cancellation
+# Patch-free cancellation, and cancellation that leaves no corpse
 
 How `isabelle mcp_server` stops all running proofs **without patching the Isabelle
-distribution**, and the evidence that it works.
+distribution**, how it then puts every interrupted command back to *unevaluated* so that
+the next evaluation re-runs it, and the evidence that both work.
+
+The authoritative design is `ISABELLE_MCP_CANCELLATION_REDESIGN_PLAN.md` (rev 6) in the
+parent tree; this document is the component-level account that travels with the code.
+Sections 1, 3, 4, 6 and 8 are the original (2026-05/06) analysis of the stanch mechanism
+and are unchanged in substance; sections 2, 5, 7 and 9 describe the 2026-08-30 redesign.
 
 > **Reading the citations.** Line numbers refer to a **pristine** Isabelle2025-2. The checkout
 > in `contrib/Isabelle2025-2` is *patched* by `my_better_isabelle_prover`, so a few of the
@@ -34,6 +40,7 @@ table is **private to the `Execution` structure**, and the public `EXECUTION` si
 val discontinue: unit -> unit                      (* clear execution_id *)
 val cancel: Document_ID.exec -> unit               (* cancel ONE exec *)
 val peek: Document_ID.exec -> Future.group list
+val snapshot: Document_ID.exec list -> Future.task list   (* the live tasks of these execs *)
 val reset: unit -> Future.group list               (* returns ALL groups -- but see below *)
 ```
 
@@ -52,59 +59,42 @@ That patch is expensive to depend on:
   macOS / Windows-Cygwin is unverified;
 - it couples Isabelle-MCP to a second repository's release cycle.
 
-This document describes how to get the same behaviour with **zero distribution changes**.
+This document describes how to get the same behaviour with **zero distribution changes** — and
+then how to go further than the patch ever did.
 
 ---
 
-## 2. Why the fallback path is not enough
+## 2. Stopping is not enough: the corpse problem
 
-Isabelle-MCP's `force_interrupt` (`src/isabelle_mcp/lsp_client.py`) cancels, then moves the
-caret to line 0 and sends a `didChange`. It is worth being precise about what actually stops
-the prover there, because the obvious explanation is wrong.
-
-**A perspective change cannot cancel a running exec.** In `Document.update`, a command's exec
-is retained across versions when (`document.ML:676`):
+Cancelling an exec (§3) stops the CPU burn. It does **not** put the command back to
+"unevaluated": the interrupted exec keeps its entry in `Execution`'s table, its result is
+memoised as `Fail "Interrupt"`, and — this is the part that matters — the next `Document.update`
+**keeps it**. A command's exec is retained across versions when (`document.ML:674-675`):
 
 ```ml
 Command.eval_eq (eval0, eval) andalso (visible' orelse node_required orelse Command.eval_running eval)
 ```
 
-and `eval_running = Execution.is_running_exec o eval_exec_id` (`command.ML:159`) — "already
-registered in `Execution`'s table". **An already-running exec is therefore pinned inside the
-common prefix and cannot be dropped by a perspective or required-set change alone.**
+and `eval_running = Execution.is_running_exec o eval_exec_id` (`command.ML:159`) is "already
+registered in `Execution`'s table" — true for finished and for interrupted execs alike. **An
+interrupted exec is therefore pinned inside the common prefix**: no perspective change, no
+required-set change, no later evaluation will ever re-run that command. The agent sees an error
+with no content at that line, and the only way out is to edit the file. We call such an entry a
+*corpse*.
 
-**What does the stopping is the synthetic edit.** `force_interrupt` inserts a literal `" "` at
-the end of line 0 — *inside the theory-header command's span*. That command gets a new id,
-`lookup_entry node0` misses, the common prefix collapses, the whole node is re-assigned, and
-every old exec of that node lands in `removed`:
+The only PIDE primitive that re-mints a command is a **text edit inside it**: `Thy_Syntax.edit_text`
+replaces the hit command by `Command.unparsed`, `chop_common` cannot match it, and the re-parse
+gives it a fresh id (`thy_syntax.scala:128-141, :250-253`). The old exec then lands in `removed`
+and is cancelled and purged by the standard pipeline (`document.ML:724-725, :896-897`,
+`protocol.ML:136-141`). A *zero-length* edit — inserting the empty string at `start + 1` — does
+exactly that while leaving the text byte-identical (§5); a one-character command has no interior
+and gets a *net-zero pair* instead (remove its source, insert it back at the same offset).
 
-```ml
-(* document.ML:724-725 *)
-fun removed_execs node0 (command_id, exec_ids) =
-  subtract (op =) exec_ids (Command.exec_ids (lookup_entry node0 command_id));
-
-(* document.ML:896-897 *)
-val removed = maps (removed_execs node0) assign_result;
-val _ = List.app Execution.cancel removed;
-```
-
-So `document.ML:897` cancels **execs the new assignment supersedes** — execs invalidated by the
-*edit*. There is no code path that cancels an exec because its node left the required set.
-
-**Hence the fallback is scoped to the edited file, and only that file.** Measured (§7): with the
-cancel command disabled and the runaway proofs living in an *imported* theory, the synthetic
-edit to the importing file cannot reach them and the prover **keeps burning 3.08 cores for at
-least 30 seconds** — the tactics are non-terminating, so nothing will ever stop them. Editing a
-theory that imports other theories is the normal case for an agent, so relying on the fallback
-means a reproducible, silent, permanent CPU leak while the tool reports `cancelled`.
-
-**The cancel command is load-bearing.** The only question is how to get one.
-
-> **What cancellation means in PIDE.** It stops the *current* execution; it does not mark a
-> command as abandoned. Any later `Document.update` calls `Execution.start ()` and re-schedules
-> every required node, so a cancelled proof that is still in a still-required file will run
-> again on the next edit — anywhere in the document. This is PIDE semantics, identical under the
-> patch, and it is why a cancel is not a substitute for changing the source.
+> **History.** The first fork (2026-05) cancelled and then appended a space to line 0 of the
+> target file, re-minting the whole node and re-running everything after the header; a later
+> revision anchored that space at the first unfinished command. Both changed the text the user
+> sees and both were scoped to one file. The redesign replaces them with the mechanism above,
+> applied to exactly the interrupted commands, in whatever theories they live.
 
 ---
 
@@ -212,7 +202,7 @@ final case class State private(
 ```
 
 That map spans every node, not just the one holding the caret — which is precisely why it
-reaches the imported-theory case the fallback cannot.
+reaches the imported-theory case a single-file edit cannot.
 
 **Why ML never runs an exec Scala has not been told about.** The ML handler for `Document.update`
 emits the assignment *before* it starts executing (`protocol.ML`, `Document.update` handler):
@@ -228,65 +218,111 @@ Scala's set is therefore a *superset* of what is running (it also retains finish
 earlier versions — it is never pruned — for which `Execution.cancel` is a no-op). The one gap in
 that argument, and the experiment that probed it, are in §8.
 
+**The probe set.** Retirement (§5) needs to know which of those execs are *alive*, and only the
+*eval* execs (the map also holds print entries). Scala reads them off its most recent stable
+version: one pass over `V0.nodes × node.command_iterator()`, taking
+`the_assignment(V0).command_execs(cmd.id).headOption` — the eval exec is always the head
+(`command.ML:414-415`, `document.scala:1153`). ML then answers which of them still have live
+tasks: `Execution.snapshot` returns one flat task list for a whole id list, so a single call only
+says "some of these are alive"; the per-id answer comes from *binary narrowing* — split a
+non-empty list in half, recurse only into non-empty halves. Attribution is by ancestry (the same
+`fold_groups` registration as above), so a task forked inside a command body is seen under its
+command's exec. There is no cap on the number of calls: the protocol loop runs the probe inline
+and uninterruptibly, and the only bound is the Scala side's budget (§5).
+
 ---
 
-## 5. The implementation
+## 5. The implementation (rev 6, 2026-08-30)
 
-### ML — `ML/mcp_prelude.ML`
+One LSP request, `PIDE/cancel_evaluation`, no parameters, **one reply**, three outcomes:
+`retired`, `nothing_running`, `aborted`. The request runs on its own bare thread, against one
+120 s deadline; anything it cannot finish in time, or anything that throws, is `aborted`, and the
+Python side then terminates the prover (§5.4).
 
-Plain SML, injected via `use_prelude`. The barrier runs **first**, before anything that could
-raise:
+### 5.1 Stanch and probe — `ML/mcp_prelude.ML`, `Isabelle_MCP.cancel_evaluation serial cancel_ids probe_ids`
 
-```ml
-val _ =
-  Protocol_Command.define "Isabelle_MCP.cancel_execution"
-    (fn args =>
-      let
-        val _ = Execution.discontinue ();                                  (* cannot fail *)
-        val exec_ids = maps (map Document_ID.parse o space_explode ",") args;
-        val _ = List.app Execution.cancel exec_ids;
-      in
-        Output.system_message
-          ("Isabelle_MCP.cancel_execution: discontinued, cancelled " ^
-            string_of_int (length exec_ids) ^ " execs")
-      end);
+Three steps, in this order, all inside one `Exn.capture` after the serial has been stripped:
 
-val _ =
-  Protocol_Command.define "Isabelle_MCP.ping"
-    (fn _ =>
-      Output.protocol_message
-        [("function", "isabelle_mcp_pong")] [[XML.Text mcp_prelude_version]]);
-```
+1. `Execution.discontinue ()` — the barrier (§3.3). Nothing that has not started will start.
+2. **Probe** which of `probe_ids` still have live tasks (§4).
+3. `Execution.cancel` on every id in `cancel_ids` (every exec Scala knows).
 
-An exec id ML does not know is a silent no-op: `Execution.cancel` → `peek` → `exec_groups`
-returns `[]` for an unknown id, and `raise Fail (unregistered …)` occurs only in
-`Execution.fork` / `print`, which the prelude never calls.
+Probe **before** cancel: a cancelled task leaves its group before a later snapshot could see it,
+and an interrupted command nobody reports is exactly the corpse the design forbids.
 
-### Scala — `src/language_server.scala`
+The reply is one protocol message `isabelle_mcp_cancel_report` with properties `serial`,
+`calls` and, if any step failed, `error`; its single body chunk lists the live ids. On failure
+the whole probe set is reported alive — an exec nobody could examine must be retired, not
+forgotten. The report goes out after every step; only then is a failure re-raised.
 
-```scala
-def cancel_execution(id: LSP.Id): Unit = {
-  val execs = session.get_state().execs.keys.toList
-  session.protocol_command("Isabelle_MCP.cancel_execution", List(XML.Text(execs.mkString(","))))
-  log("cancel_execution: " + execs.length + " execs")
-  channel.write(LSP.Cancel_Execution.reply(id))
-}
-```
+**Ordering, not wall-clock, tells a lost report from a slow one.** Right after the cancel
+command Scala sends `Isabelle_MCP.ping serial`. The manager mailbox, the ML protocol loop and
+the ML message channel are all FIFO, so a pong that arrives *without* the report proves the
+report lost (→ `aborted`); a report arriving is the normal case; neither arriving is waited out
+to the deadline. The pong echoes the serial in its **properties** (the body stays the bare
+version string the startup handshake compares); a pong without a serial fulfils the startup
+handshake, so a new jar with an old prelude still reaches the version diagnostic.
 
-and at startup, the prelude is guarded, injected, and **proved live**:
+### 5.2 Retract — `VSCode_Resources.cancel_retract`
 
-```scala
-if (!prelude.is_file) error("Missing ML prelude: " + prelude + " …")
+Once, before anything else: the server-side caret goes away, the overlay table is emptied, and
+every document model gets the empty perspective. The prover stops handing out work; nothing
+finished is lost (a finished exec keeps its command alive in the common prefix, §2). With the
+caret gone and the overlay table empty, the next flush recomputes an empty perspective and sends
+nothing — retraction is a fixpoint (measured, §7).
 
-Isabelle_Process.start(options, session, session_background, session_heaps, modes = modes,
-  use_prelude = List(File.standard_path(prelude))).await_startup()
+### 5.3 Retire to completion — `VSCode_Resources.cancel_round`, driven by `Language_Server.cancel_evaluation_body`
 
-session.protocol_command("Isabelle_MCP.ping")
-if (!prelude_handler.await_pong(Time.seconds(10)))
-  error("The ML prelude did not answer: cancellation would silently do nothing. …")
-```
+Every exec the probe reported alive is a *target* `(exec_id, node, command_id)`. Each round:
 
-No file in the Isabelle distribution is touched.
+- **a.** read the monitor's `update_serial`; take `session.get_state()` *outside* the monitor
+  (a manager round trip under the monitor would pin the whole server); re-enter and check the
+  serial is unchanged — otherwise the reading is stale and the round is retaken;
+- **b.** if any model holds unflushed edits, flush them first (this round sends nothing else);
+- **c.** `V :=` the stable tip version; none → wait a beat, retake;
+- **d.** locate each target on **V** by command id: its exec no longer in `execs` → excluded
+  `gone`; its command has another eval exec on V, or the id is not in V's node → excluded
+  `reassigned` (a real edit already re-minted it); otherwise one zero-length edit at `start + 1`
+  (net-zero pair for a one-character command). Before commit the batch is dry-run through
+  `Thy_Syntax.edit_text` on V's commands — an edit outside every command would make the change
+  parser throw and the session would never produce a version again;
+- **e.** the batch = per node, the empty-perspective edit first, then the retire edits in
+  ascending order — one `session.update`, never split;
+- **g.** wait until the stable tip's id changed;
+- **h.** on that tip, a target whose command id is gone is done; one still present goes into the
+  next round; the same target failing twice in a row is `aborted`.
+
+The monitor is held from a(3) to the commit, so no flush can interleave with the offsets taken
+from V; every wait is against the one deadline; the monitor itself is a re-entrant lock with a
+timed acquisition (a flush holding it for the rest of the budget is `aborted`, not a hang).
+
+"Retired" claims exactly this: the version carrying the retire edits has been assigned and on it
+the target command ids have changed. It proves the Scala parse and assignment; it does not prove
+that ML's `Execution.purge` has finished (that runs in a forked task after the cancelled tasks
+are dead).
+
+### 5.4 The Python side — one budget, one catastrophe
+
+`IsabelleLSPClient.force_interrupt()` sends the request (135 s reply timeout: the server's 120 s
+plus dispatch queueing) and admits **only** the two success payloads; the server's `aborted`, a
+timeout, a transport failure or a reply outside the contract raise `IsabelleCatastrophe`.
+`cancel_evaluation` holds the evaluation-state lock for the whole request (every other tool
+call queues behind a cancellation) under **one** total budget (`anyio.move_on_after(150 s)`,
+with the scope's `cancel_called` as the witness — `fail_after` stays silent when the deadline
+passes inside a shielded segment); expiry raises the same exception.
+
+`IsabelleCatastrophe` is system-wide: exactly one handler, `CatastropheMiddleware` at the tool
+boundary, logs the reason, tears the prover down through the single `IsabelleLSPClient.teardown()`
+(shared with `isabelle_terminate`, relaunch and server shutdown; layered so that whatever
+`shutdown()` does, the process is killed and forgotten and every in-flight waiter is failed), and
+answers with one fixed sentence: *"The Isabelle session hit an internal failure and has been
+terminated; call isabelle_launch to start a new one. Details are in the server log."* The
+exception is a `FastMCPError` — FastMCP masks any other exception into a generic tool error
+before middleware sees it.
+
+The agent-facing reply on success is the main sentence plus the list of reset commands
+(`file:line (keyword)`); commands excluded as `gone`/`reassigned` are back to unevaluated all the
+same and are only logged.
 
 ---
 
@@ -314,15 +350,10 @@ If ML lacks the command, `Protocol_Command.run` raises, and the protocol loop tu
 *system message* and carries on (`isabelle_process.ML`). The prover survives, every cancel
 request is accepted, and **nothing is ever cancelled**. Nothing crashes; the cores just burn.
 
-That is why the server pings the prelude after startup and refuses to serve without a pong.
-Verified with a prelude that compiles but defines nothing:
-
-```
-LSP error: The ML prelude did not answer: cancellation would silently do nothing.
-Prover output:
-  a prelude that defines nothing
-  Undefined Isabelle protocol command "Isabelle_MCP.ping"
-```
+That is why the server pings the prelude after startup and refuses to serve without a pong, and
+why the pong carries a **prelude version** that must match the jar's (`Language_Server.prelude_version`,
+currently `"6"`): the two sides share the cancel report format, the query commands and the
+debugger eval wrapper, and a skew there is a request that hangs with no correlatable trace.
 
 ### 6.3 Do not block the protocol loop
 
@@ -332,68 +363,56 @@ blocks waiting for Scala's reply, which arrives as *another protocol command* (`
 that only the blocked loop could read. Any protocol command that waits on the other side must
 `Future.fork` its body — as Scala's own `Scala.Handler` does.
 
-`discontinue` and `cancel` never block, so the cancel command is safe as written. (This property
-also turns out to be why the stale-mirror race is closed — see §8.)
+`discontinue`, the probe and `cancel` never block on Scala. The probe *is* CPU work on the
+protocol thread, uninterruptible once dispatched — which is why the only bound on it is the
+request budget after which the prover is terminated.
 
 ---
 
 ## 7. Validation
 
-Cancellation is judged by **prover CPU time** (`utime + stime` over the whole process tree from
-`/proc/<pid>/stat`, re-walking the descendants at each sample), not by status strings.
+### 7.1 The stanch (2026-06, unchanged)
 
-Two confounds had to be removed before any measurement meant anything:
-
-1. **`force_interrupt` masks everything in a single file.** Its synthetic line-0 edit (§2) stops
-   work on its own there, so a single-file test cannot attribute the stop to the cancel command.
-   Control: with the command disabled, CPU still fell 2.44 → 0.12 cores.
-2. **A bare cancel is not the production path.** Sending only `PIDE/cancel_execution` with no
-   follow-up is unmasked but unrealistic: any later `Document.update` calls `Execution.start ()`,
-   minting a fresh execution id and voiding the earlier `discontinue`.
-
-The **multi-node scenario resolves both**: the burning proofs live in `Burn.thy`, *imported* by
-`Top.thy`. `force_interrupt` edits only `Top.thy`, so `Burn.thy`'s commands are never re-parsed,
-its execs never enter `removed`, and the synthetic-edit path provably cannot reach them. (`Top`
-stays visible, so `Burn` stays *required*; requiredness is not what cancels.) Whatever stops the
-burn there is the cancel command.
-
-`Burn.thy` holds non-terminating forked proofs:
-
-```isabelle
-ML ‹fun burn (i: int) : unit =
-  let val _ = String.size (Int.toString i) in if i = ~1 then () else burn (i + 1) end;›
-
-lemma bx1: "True" by (tactic ‹fn st => (burn 0; Seq.single st)›)
-```
-
-(the loop allocates, so it hits GC safe points and is genuinely interruptible).
-
-### Results
+Cancellation was first judged by **prover CPU time** (`utime + stime` over the whole process tree
+from `/proc/<pid>/stat`), not by status strings, in a multi-node scenario: the burning proofs
+live in `Burn.thy`, *imported* by `Top.thy`, so no edit to `Top.thy` can reach them and whatever
+stops the burn is the cancel command. `Burn.thy` holds non-terminating forked proofs built on an
+allocating loop (it hits GC safe points and is genuinely interruptible).
 
 | cancel mechanism | needs a patch? | CPU before | CPU after |
 |---|---|---|---|
 | `Document.cancel_execution` (the ML patch) | yes | 3.50 cores | **0.01** |
-| **`Isabelle_MCP.cancel_execution` (this design)** | **no** | 3.36 cores | **0.03** |
-| none — fallback path only | — | 4.59 cores | **3.08, steady for 30 s** |
+| **`discontinue` + `cancel` from the prelude (this design)** | **no** | 3.36 cores | **0.03** |
+| none — an edit to the importing file only | — | 4.59 cores | **3.08, steady for 30 s** |
 
-The fallback arm was produced by pointing the server at an *undefined* protocol command, which
-reproduces an unpatched prover's response to the cancel request exactly (`Symtab.lookup` → `NONE`
-→ `error` → system message → loop continues) without touching the distribution.
+### 7.2 The redesign — the Z series (2026-08-30, `tests/integration/test_cancel_z.py`)
 
-### Other coverage
+Device: a theory whose slow command is a time-bounded *allocating* loop (interruptible; left
+alone it finishes, so a re-run can complete), and file-append witnesses written by the commands
+themselves (a command that ran leaves its letter). Iron rule: every step ends with an
+`evaluate_to`, and the witness must move — a focus trap cannot fake a result.
 
-- Isabelle-MCP's own `pytest -m integration`: 6/6 against `mcp_server`.
-- `PIDE/find_theorems`, `theory_status`, `output_at_position`, `symbols`: exercised.
-- After a cancel the session stays healthy: a fresh theory evaluates to `complete` and
-  `command_output` still answers.
-- No `Unregistered execution` failure is possible from this design, and the argument is static,
-  not statistical: `Execution.cancel` on an id ML does not know goes `peek` → `exec_groups` → `[]`
-  (`execution.ML`), and `raise Fail (unregistered …)` lives only in `Execution.fork` / `print`,
-  which the prelude never calls.
+| Z | what | result |
+|---|---|---|
+| Z2/Z4/Z6/Z22 | cancel the target file | 0.43 s; reply `Reset to unevaluated: Z2.thy:6 (ML)`; the line reads `not_evaluated`, the prefix `processed`, witness `A`; idle 25 s → nothing re-runs; a second cancel is the early-exit reply and the server answers `nothing_running` when asked directly; re-evaluation completes with witness `ASC` (the interrupted command ran to its end); `goal` still answers |
+| Z3 | the interrupted command is in an imported theory | retired there; the importer stays unevaluated; re-evaluating the importer re-runs it |
+| Z5 | target whitelist | `.sml`/`.bib`/`.ml` refused and never opened; a `.ML` target is redirected to its `ML_file` command and the ML really ran |
+| Z11 | two forked proofs alive in one theory | one batch, ascending (`:4 (by), :5 (by)`), both re-run afterwards |
+| Z12 | retraction is a fixpoint | an edit pushed without a caret move reschedules nothing; the positive control (`evaluate_to`) does |
+| Z14(a) | ~2000 evaluated commands, one alive | 0.52 s end to end — the probe is not the cost |
+| Z17 | the file is edited while the cancel runs | retired; the session still produces versions; a full run completes |
+| Z19 | `SIGSTOP` the ML process | `aborted` at 120.0 s with the reason; teardown 10.2 s; no `poly` process left; a fresh launch works |
+| Z20/Z21 | 20 000 lines of output then cancel; a status call during the cancel | the report still arrives, retired; the status call completes after the cancel |
+
+Not measured yet: Z14(b) (manager round-trip latency under a heavy backlog, which is what the
+5 s bound on the monitor-held `session.update` rests on — only Z20's indirect evidence so far);
+the injected-fault cases (a second round forced by a missed edit, a monitor held for the rest
+of the budget, the hard-kill teardown branch). Every experiment uses the same allocating loop;
+`sledgehammer`, `auto` and external provers were never cancelled in a test.
 
 ---
 
-## 8. The stale-mirror race — probed, and closed
+## 8. The stale-mirror race — probed, and closed (2026-06, unchanged)
 
 The patch walks **ML's own table**; this design walks **Scala's mirror**. There is a window in
 which ML has already begun `Document.start_execution` while the `assign_update` message
@@ -430,21 +449,13 @@ structural, not luck: **the two conditions for a leak are mutually exclusive.**
 
 **Honest verdict: not reachable in this configuration, and the closure is structural — but not
 proven impossible.** The margin rests on Scala's apply being faster than ML's exec-forking, and
-only one document shape on one machine was probed.
-
-### Limits of the evidence
-
-- Every experiment used the same allocating ML loop, chosen *because* it is interruptible at GC
-  safe points. **`sledgehammer`, `auto`, and external provers were never cancelled in a test.**
-  This limitation is identical on the patched arm, so the two mechanisms' equivalence is
-  unaffected — but "it stops the things an agent actually needs to stop" is not yet evidence.
-- The end-to-end claim has not been run against a *pristine* Isabelle: this machine's
-  distribution is patched. Nothing in this design uses a patched symbol, but that is an argument,
-  not a measurement.
+only one document shape on one machine was probed. In the redesign this is boundary R3(vi):
+an exec ML registers during the window is neither stanched nor retired by that request; the
+"no corpse" claim is scoped to the probed set.
 
 ---
 
-## 9. Scope — what this does and does not replace
+## 9. Scope
 
 Retired for Isabelle-MCP, because the fork carries them as its own code:
 
@@ -459,7 +470,6 @@ Retired by this document's mechanism:
 
 - `register_thy`, `show_types_nv`, `expose_map_syn`, `expose_foreign`
 
-So **no Isabelle patch is technically required by Isabelle-MCP any more.** That is a statement
-about the *mechanism*. It is not yet true of the *product*: the Python client still gates every
-launch on `check_isabelle_patched()`, and the Scala component that provides `isabelle mcp_server`
-is not yet packaged or registered by the installer. Both are packaging work, tracked separately.
+**No Isabelle patch is required by Isabelle-MCP**, as a mechanism and as a product: the
+component ships a prebuilt jar (`no_build = true`, see `docs/COMPONENT_INSTALL_PLAN.md`) and the
+prelude, and the Python client no longer gates a launch on a patched distribution.

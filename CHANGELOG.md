@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+- **Cancellation leaves no corpse.** `isabelle_cancel_evaluation` is now one
+  server-side request that stops the prover, retracts every perspective and
+  *retires* each interrupted command — a zero-length edit on the stable version
+  re-mints its id, so the prover cancels and purges the old execution and the
+  command is genuinely back to unevaluated — repeating until none is left. The
+  interrupted commands re-run on the next evaluation that reaches them; nothing
+  finished is lost, the text on the prover stays byte-identical, and nothing is
+  written to disk (the old "append a space" edit is gone). Two outcomes:
+  `retired` (with the list of reset commands) and `nothing_running`. Other tool
+  calls wait while a cancellation is in progress. Breakpoint demotion after a
+  cancel is targeted: only sites from the first retired command of a theory
+  onward are demoted.
+- **One catastrophe for the whole server.** When the prover cannot be stopped
+  cleanly — the server's 120 s budget or the request's 150 s budget runs out,
+  the prover stops answering, or an internal failure — the session is
+  terminated through the single teardown path shared with `isabelle_terminate`,
+  and every tool answers with one sentence: *"The Isabelle session hit an
+  internal failure and has been terminated; call isabelle_launch to start a new
+  one. Details are in the server log."* An evaluation still in flight reports
+  *"Evaluation stopped: the Isabelle session is no longer running. Call
+  isabelle_launch to start a new one."*
+- **Evaluation targets must be `.thy` files.** A `.ML`/`.sml` target with exactly
+  one known load command is redirected to that command (the reply's first line
+  says so); otherwise it is refused with a pointer to the loading command(s).
+  Any other suffix is refused. Query tools refuse, never redirect. Load-command
+  positions are now converted through pending edits, so a pointer or redirect
+  is right even while the loading theory has unparsed edits.
+- Prelude version 6 (the jar checks it at launch); the prebuilt jar is rebuilt.
+
 ## 0.4.0
 
 - **ML breakpoint debugging.** `isabelle_launch(session, debug=true)` starts

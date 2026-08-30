@@ -14,7 +14,7 @@
 
 Isabelle-MCP is a Python-based MCP (Model Context Protocol) server that acts as a bridge between AI agents and Isabelle's Language Server Protocol (LSP) implementation.
 
-> **`isabelle mcp_server`** is *our* LSP server: an Isabelle Scala component that Isabelle-MCP ships (a fork of Isabelle2025-2's `vscode_server` sources, package `isabelle.mcp`). The stock `vscode_server` does not expose the PIDE requests this design needs — `PIDE/theory_status`, `PIDE/cancel_execution`, `PIDE/command_at_position`, `PIDE/output_at_position`, `PIDE/symbols`, `PIDE/find_theorems_*` — so they used to be patched into the Isabelle distribution. They are now our own code, and **no Isabelle patch is required**. See `docs/COMPONENT_INSTALL_PLAN.md` and `src/isabelle_mcp/scala/Isabelle2025-2/docs/CANCELLATION.md`. The architecture follows the proven patterns from `lean-lsp-mcp` while adapting to Isabelle's PIDE (Prover IDE) specific features.
+> **`isabelle mcp_server`** is *our* LSP server: an Isabelle Scala component that Isabelle-MCP ships (a fork of Isabelle2025-2's `vscode_server` sources, package `isabelle.mcp`). The stock `vscode_server` does not expose the PIDE requests this design needs — `PIDE/theory_status`, `PIDE/cancel_evaluation`, `PIDE/command_at_position`, `PIDE/output_at_position`, `PIDE/symbols`, `PIDE/find_theorems_*` — so they used to be patched into the Isabelle distribution. They are now our own code, and **no Isabelle patch is required**. See `docs/COMPONENT_INSTALL_PLAN.md` and `src/isabelle_mcp/scala/Isabelle2025-2/docs/CANCELLATION.md`. The architecture follows the proven patterns from `lean-lsp-mcp` while adapting to Isabelle's PIDE (Prover IDE) specific features.
 
 ### 1.1 High-Level Architecture
 
@@ -530,8 +530,10 @@ evaluation's theory set is a third exit condition of `evaluate_to`'s wait
 loop (the result leads with the hit report and the run stays paused);
 `evaluate_to` is refused while any hit is live; a fence line warns when the
 run cannot stop where the registry says it should; `cancel_evaluation`
-sweeps stopped threads and demotes every armed entry (cancellation
-invalidates every site serial). Site death from edits is observed by
+sweeps stopped threads and demotes the armed entries whose sites the
+retirement unloaded (from the first retired command of a theory to its end,
+the ML files those commands load included — sites in commands evaluated
+earlier keep their serials). Site death from edits is observed by
 dirty-marking synced files and verifying the marked files' serials against a
 fresh listing on the next tool call (the middleware), never by guessing.
 
@@ -556,8 +558,8 @@ target line has already been processed.
 IDLE ◄────────────────────── COMPLETE
   ▲                              │
   │  cancel_evaluation()         │
-  │  (force interrupt +          │
-  │   move caret to line 0)      │
+  │  (stanch, retract, retire    │
+  │   until no corpse is left)   │
   └──────────────────────────────┘
 ```
 
@@ -572,7 +574,7 @@ IDLE ◄────────────────────── COMPL
 |------|-----------|
 | ``evaluate_to(file, line)`` | Set PIDE caret → wait ``EVAL_POLL_INTERVAL`` (default 10 s) → return errors + status |
 | ``evaluation_status()`` | Wait another interval → return new errors + status |
-| ``cancel_evaluation()`` | ``force_interrupt``: ``PIDE/cancel_execution`` (global stop) → caret to line 0 → one ``didChange`` appending a space → return (see §3.5) |
+| ``cancel_evaluation()`` | one ``PIDE/cancel_evaluation`` request: the server stanches the prover, retracts every perspective and retires each interrupted command until none is left; two outcomes (``retired`` / ``nothing_running``), everything else is the catastrophe (see §3.5) |
 
 ### 3.4 Query Tool Guard
 
@@ -584,21 +586,30 @@ Each query tool calls ``check_evaluation_guard(client, file_path, line)``:
 
 ### 3.5 Cancel / Force-Interrupt Mechanism
 
-``cancel_evaluation`` calls ``IsabelleLSPClient.force_interrupt(file_path)``,
-which uses our ``PIDE/cancel_execution`` request (verified 2026-05-27):
+``cancel_evaluation`` calls ``IsabelleLSPClient.force_interrupt()``: one
+``PIDE/cancel_evaluation`` request, no parameters, one reply. The server does the
+whole job (design: ``ISABELLE_MCP_CANCELLATION_REDESIGN_PLAN.md`` rev 6; component
+account: ``src/isabelle_mcp/scala/Isabelle2025-2/docs/CANCELLATION.md``):
 
-1. ``PIDE/cancel_execution`` — atomically stops ALL processing globally (target
-   file and dependency theories) and interrupts running worker threads.
-2. ``PIDE/caret_update`` to line 0 — restricts the perspective so processing does
-   not immediately resume.
-3. A single ``textDocument/didChange`` (append a space on line 0) — triggers
-   ``Document.update`` with the restricted perspective; only the header re-processes.
-   The trailing space is self-healing: ``force_interrupt`` drops the document's
-   ``stat_sig`` so the next tool-call stat backstop re-reads disk and pushes the real
-   content (``open_document`` no longer re-reads an already-open doc — see §2.5).
+1. **Stanch + probe** — the injected ML prelude discontinues the execution, probes
+   which eval execs still have live tasks, and cancels every exec the server knows
+   (target file and dependency theories alike). A ping follows the cancel so a lost
+   report is told from a slow one.
+2. **Retract** — caret gone, overlay table emptied, every model's perspective
+   emptied: the prover stops handing out work; nothing finished is lost.
+3. **Retire to completion** — each interrupted command gets a zero-length edit on the
+   stable version (a net-zero remove/insert pair for a one-character command), which
+   re-mints its id so the prover cancels and purges the old exec; rounds repeat until
+   none is left. The text on the prover stays byte-identical; nothing is written to disk.
 
-``PIDE/cancel_execution`` replaced earlier approaches that did not reliably stop
-forked proofs (caret-move-only, edit-only, insert+delete pairs).
+Outcomes: ``retired`` (the interrupted commands are back to unevaluated and re-run
+on the next evaluation that reaches them) or ``nothing_running``. The server's
+budget is 120 s; the Python side runs the whole request under one 150 s budget and
+holds the evaluation-state lock throughout (other tool calls wait). Anything else —
+the server's ``aborted``, a timeout, a transport failure — is ``IsabelleCatastrophe``:
+one handler at the tool boundary (``CatastropheMiddleware``) tears the prover down
+through ``IsabelleLSPClient.teardown()`` and answers with one fixed sentence; the agent
+must ``isabelle_launch`` again.
 
 ## 3a. Tool Implementation Pattern (Query Tools)
 
