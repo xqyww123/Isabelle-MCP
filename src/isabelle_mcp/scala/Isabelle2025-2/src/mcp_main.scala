@@ -3,11 +3,12 @@
     Isabelle tool wrapper for "isabelle mcp_server": the PIDE language server
     driven by Isabelle-MCP.  Forked from Tools/VSCode/src/vscode_main.scala.
 
-    The Scala-side PIDE control requests (theory_status, cancel_execution,
+    The Scala-side PIDE control requests (theory_status, cancel_evaluation,
     command_at_position, output_at_position, symbols, find_theorems) and the
     caret-perspective EOF clamp live in this component, so the distribution needs
-    no Scala patch.  The ML side still does: "Document.cancel_execution" comes
-    from the pide_control patch (execution.ML + protocol.ML).
+    no Scala patch.  It needs no ML patch either: the ML that cancellation relies
+    on is a prelude (ML/mcp_prelude.ML) injected at prover startup through the
+    public use_prelude parameter (docs/CANCELLATION.md).
 */
 
 package isabelle.mcp

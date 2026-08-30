@@ -1146,7 +1146,7 @@ class Language_Server(
      These handlers must not block.  The main loop below reads one message, handles it
      inline, and only then reads the next, so waiting for the prover here would queue
      every later request behind this one -- including the theory_status that the client's
-     evaluation poll depends on, and cancel_execution.  And these queries are meant to be
+     evaluation poll depends on, and cancel_evaluation.  And these queries are meant to be
      usable DURING an evaluation, so that collision is the normal case, not an edge one.
      So: resolve, register, send, return.  The response is written later, from the
      protocol handler's callback or from the timer, whichever takes the request first. */
