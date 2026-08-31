@@ -397,6 +397,19 @@ class TestFooterGuard:
         assert evaluation_state.current.outcome == "cancelled"
         assert not evaluation_state.active
 
+    async def test_a_completion_stamped_by_a_concurrent_observer_still_says_completed(
+        self, mock_lsp_client, temp_theory_file,
+    ):
+        # One vocabulary in every interleaving: if another outlet stamped the
+        # SAME verdict during the round trip, this footer repeats it rather
+        # than downgrade to "arrived" (re-finishing an ended run it owns is a
+        # no-op). Only a run that ended for another reason blocks the sentence.
+        text = await self._footer_at_target(
+            mock_lsp_client, temp_theory_file,
+            lambda: evaluation_state.complete())
+        assert text == f"Evaluation has completed up to {temp_theory_file}:5."
+        assert evaluation_state.current.outcome == "complete"
+
 
 class TestGuardToEvaluateToGap:
     """Section 10A, unverified item 3: the query guard releases the lock before

@@ -1239,7 +1239,14 @@ async def evaluate_to(
             # sentence, whatever failed or still runs elsewhere. Failures are
             # below, per line, in the file sections; running commands keep
             # their running: rows. A second wording-level completion judgement
-            # is exactly problem 8 (D-B2).
+            # is exactly problem 8 (D-B2). The sentence is unconditional while
+            # the stamp is best-effort: judged_dest is the dest_line re-read
+            # under owns() above with no await since, so the guard's one job
+            # is to turn a run replaced meanwhile into a no-op — this reply
+            # keeps its own COMPLETED and its own target line (10A must-fix 1).
+            await _finish_if_owner(
+                client, evaluation, "complete", judged_dest=dest_line,
+            )
             message = _target_sentence(
                 COMPLETED_SENTENCE, file_path, dest, client.project_root,
             )
@@ -1254,13 +1261,6 @@ async def evaluate_to(
         else:
             message = _target_sentence(
                 TOWARDS_SENTENCE, file_path, dest, client.project_root,
-            )
-        if status == "complete":
-            # judged_dest: dest_line was re-read under owns() above with no
-            # await since, so an advanced target was already picked up; the
-            # guard turns a run replaced meanwhile into the no-op it must be.
-            await _finish_if_owner(
-                client, evaluation, "complete", judged_dest=dest_line,
             )
     if fence_line:
         message = message + "\n\n" + fence_line
@@ -1381,7 +1381,7 @@ async def evaluation_status(
         # tool's whole job is to report status, so it says something either way.
         # No call to action either: this IS the tool one would be pointed at.
         message = _still_running_sentence(running_commands)
-    elif _frontier_reached(target, evaluation_state.destination_line, client, theories):
+    elif _frontier_reached(target, dest_line, client, theories):
         message = _target_sentence(
             ARRIVED_SENTENCE, target, dest, client.project_root,
         )
@@ -1684,15 +1684,18 @@ async def evaluation_footer(client: IsabelleLSPClient) -> str:
         # their only notification (D-C3).
         n_failed = _failed_count(client)
         # Under the lock, like the other terminal transitions: the stamp, the
-        # flag and the cleanup travel together. Two gates on the sentence:
-        # ``not outcome`` — the run was cancelled during the round trip above,
-        # and a COMPLETED right after the cancel reply would be false; the
-        # _finish_if_owner verdict — the target moved on (a same-file advance
+        # flag and the cleanup travel together. Two gates on the sentence.
+        # The outcome test: the run already ended for another reason during
+        # the round trip above (a cancel, or any outcome a later step adds),
+        # and a COMPLETED sentence would contradict that reply; a completion
+        # stamped by a concurrent observer passes — same verdict, same
+        # sentence, and re-finishing an ended run it owns is a no-op. The
+        # _finish_if_owner verdict: the target moved on (a same-file advance
         # in that round trip) or the run was replaced, so the verdict belongs
-        # to the old target. Either way ARRIVED below is true for the target
-        # this footer judged, and the next footer names the new state.
+        # to the old target. Either gate failing falls to ARRIVED, true for
+        # the target this footer judged; the next footer names the new state.
         async with _evaluation_state_lock:
-            if (evaluation is not None and not evaluation.outcome
+            if (evaluation is not None and evaluation.outcome in ("", "complete")
                     and await _finish_if_owner(client, evaluation, "complete",
                                                judged_dest=dest)):
                 return " ".join([
@@ -1712,8 +1715,11 @@ def _footer_activity(
 ) -> list[str]:
     """The footer's suffix sentences, with the call to action that earns them.
 
-    *n_failed* is 0 when no evaluation is outstanding: the failure count belongs
-    to a run, and an error decoration outlives every run that produced it.
+    *n_failed* is 0 only on the ambient path with no run behind the footer (an
+    error decoration outlives every run that produced it, so repeating its
+    count forever would train the agent to stop reading); otherwise the count
+    belongs to the run this footer is judging or finishing — including the
+    instant that run ends.
     """
     sentences = _activity_sentences(running, n_failed)
     if sentences:

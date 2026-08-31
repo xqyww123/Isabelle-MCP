@@ -1365,6 +1365,55 @@ class TestEvaluationFooter:
         assert run.outcome == "complete" and not evaluation_state.active
 
     @pytest.mark.asyncio
+    async def test_an_import_not_done_says_towards(
+        self, mock_lsp_client, temp_theory_file,
+    ):
+        # D-B3's headline fix: the target line's decoration is reached, but an
+        # import is still checking, so the frontier is not. The old footer said
+        # a hollow "arrived"; the truth is "towards", and the run is unstamped.
+        client = await self._client(mock_lsp_client, temp_theory_file)
+        real_status = client.request_theory_status
+
+        async def with_unfinished_import():
+            theories = await real_status()
+            theories[0]["imports"] = [{"theory_name": "Dep_import"}]
+            theories.append({
+                "node_name": "/tmp/Dep_import.thy", "theory_name": "Dep_import",
+                "imports": [], "ok": True, "consolidated": False,
+                "running": 1, "unprocessed": 5,
+            })
+            return theories
+
+        client.request_theory_status = with_unfinished_import
+        run = evaluation_state.start(temp_theory_file, MCPLine(5))
+        assert await ev.evaluation_footer(client) == (
+            f"Evaluating towards {temp_theory_file}:5."
+        )
+        assert evaluation_state.active and run.outcome == ""
+
+    @pytest.mark.asyncio
+    async def test_a_dependency_only_failure_is_counted_before_the_close(
+        self, mock_lsp_client, temp_theory_file, tmp_path,
+    ):
+        # The count is taken BEFORE the finish: the finish closes the
+        # auto-opened dependency, and a closed document's failures leave
+        # _failed_count — this suffix is their only notification (D-C3).
+        client = await self._client(mock_lsp_client, temp_theory_file)
+        dep = str(tmp_path / "Dep_footer2.thy")
+        Path(dep).write_text("theory Dep_footer2\nimports Main\nbegin\nx\nend\n")
+        await client.open_document(dep)
+        client._processing_trackers[dep] = MockProcessingTracker(
+            bad=[(3, 0, 3, 1)],
+        )
+        evaluation_state.start(temp_theory_file, MCPLine(5))
+        evaluation_state.auto_opened_files.add(dep)
+        assert await ev.evaluation_footer(client) == (
+            f"Evaluation has completed up to {temp_theory_file}:5. "
+            "1 command failed. Call isabelle_evaluation_status for details."
+        )
+        assert dep not in client.open_documents
+
+    @pytest.mark.asyncio
     async def test_completion_is_observed_and_ends_the_evaluation(
         self, mock_lsp_client, temp_theory_file,
     ):
