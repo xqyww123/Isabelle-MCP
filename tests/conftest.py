@@ -1,5 +1,6 @@
 import asyncio
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -146,7 +147,8 @@ class MockProcessingTracker:
         return list(self.running)
 
     def get_running_ranges_with_onset(self) -> list[tuple[int, int, int, int, float]]:
-        return []
+        # Onset "now": elapsed reads as ~0 s, below every reporting threshold.
+        return [(*r, time.monotonic()) for r in self.running]
 
     def get_unprocessed_ranges(self) -> list[tuple[int, int, int, int]]:
         return list(self.unprocessed)
@@ -308,8 +310,12 @@ class MockLSPClient:
     async def cancel_execution(self) -> None:
         pass
 
-    def get_all_running_commands(self) -> list:
-        return []
+    # Reuse the real derivation (duck-typed on ._processing_trackers /
+    # .open_documents, like heap_warning): in production the running-command
+    # list and the tracker's running ranges are ONE source with ONE clipping --
+    # that is what makes "Nothing is running" unable to sit above a running:
+    # row -- and the mock must not be able to split them either.
+    get_all_running_commands = IsabelleLSPClient.get_all_running_commands
 
     def file_all_processed(self, file_path: str) -> bool:
         return self.processing_status.get(file_path, False)

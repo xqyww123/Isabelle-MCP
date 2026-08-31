@@ -4,8 +4,9 @@ that remain once the run has ended.
 
 The idle answer lists every open document that still shows errors or warnings,
 with line numbers, under a first line that says whether any errors remain. It
-is read from the decoration cache, so a recent edit makes the tool wait the
-grace window out first. The footer's rule (silence about old failures once no
+is read from the decoration cache, so a recent edit makes the tool wait until
+the edits have stopped (debounce; a further edit re-arms the window). The
+footer's rule (silence about old failures once no
 run is outstanding) and isabelle_cancel_evaluation's idle reply are untouched.
 """
 
@@ -22,7 +23,6 @@ from isabelle_mcp.evaluation import (
     evaluation_status,
     format_evaluation_result,
 )
-from isabelle_mcp.models import RunningCommand
 from isabelle_mcp.server import isabelle_evaluation_status, mcp
 from tests.conftest import MockProcessingTracker
 from tests.test_server import _patch_ensure
@@ -198,16 +198,42 @@ class TestIdleGraceWindow:
 
         async def command_starts():
             await asyncio.sleep(0.01)
-            mock_lsp_client.get_all_running_commands = lambda: [RunningCommand(
-                file_path=temp_theory_file, start_line=8, end_line=9,
-                text="lemma test_lemma", elapsed_seconds=0.5,
-            )]
+            # Through the tracker, as production would: the running-command
+            # list is derived from the same ranges the sections render.
+            mock_lsp_client._processing_trackers[temp_theory_file].running.append(
+                (7, 0, 8, 5),
+            )
 
         push = asyncio.ensure_future(command_starts())
         view = await evaluation_status(mock_lsp_client)
         await push
         assert view.status == "in_progress"
         assert view.message == "1 command is still running."
+
+    @pytest.mark.asyncio
+    async def test_an_edit_during_the_wait_re_arms_it(
+        self, temp_theory_file, mock_lsp_client,
+    ):
+        # Debounce: a further edit during the wait re-arms the window, so the
+        # tool answers only once the edits have stopped — and from the picture
+        # after the LAST edit.
+        await _open_with(mock_lsp_client, temp_theory_file, bad=[(2, 0, 2, 5)])
+        processing.note_edit_sent()
+
+        async def second_edit_then_fix():
+            await asyncio.sleep(0.03)
+            processing.note_edit_sent()
+            mock_lsp_client._processing_trackers[temp_theory_file] = (
+                MockProcessingTracker()
+            )
+
+        push = asyncio.ensure_future(second_edit_then_fix())
+        started = time.monotonic()
+        view = await evaluation_status(mock_lsp_client)
+        await push
+        # 0.03 s until the second edit, then a full re-armed 0.05 s window.
+        assert time.monotonic() - started >= 0.07
+        assert view.message == IDLE_CLEAN_SENTENCE
 
     @pytest.mark.asyncio
     async def test_without_a_recent_edit_it_answers_at_once(
@@ -218,6 +244,20 @@ class TestIdleGraceWindow:
         view = await evaluation_status(mock_lsp_client)
         assert time.monotonic() - started < 0.04
         assert "but 1 command failed." in view.message
+
+
+class TestIdleReport2:
+    @pytest.mark.asyncio
+    async def test_a_running_decoration_alone_takes_the_busy_path(
+        self, temp_theory_file, mock_lsp_client,
+    ):
+        # The running-command list is derived from the very tracker ranges the
+        # sections render, so a running decoration fails _no_pending_work:
+        # "Nothing is running" can never sit above a "running:" row.
+        await _open_with(mock_lsp_client, temp_theory_file, running=[(4, 0, 4, 5)])
+        view = await evaluation_status(mock_lsp_client)
+        assert view.status == "in_progress"
+        assert view.message == "1 command is still running."
 
 
 class TestNeighboursUnchanged:

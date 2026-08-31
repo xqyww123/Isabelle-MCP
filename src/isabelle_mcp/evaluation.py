@@ -760,6 +760,20 @@ def _build_file_snapshot(
     )
 
 
+def _open_document_snapshots(client: IsabelleLSPClient) -> list[FileSnapshot]:
+    """One snapshot per open document -- the single place that enumerates them
+    for a document-wide sweep.
+
+    Fully synchronous (no await anywhere in the sweep), so every snapshot is
+    read from the same tracker state: the sweep is atomic with respect to the
+    event loop.
+    """
+    return [
+        _build_file_snapshot(client, path, {})
+        for path in list(client.open_documents)
+    ]
+
+
 def _relevant_files(
     client: IsabelleLSPClient, target: str, auto_opened: set[str],
 ) -> list[str]:
@@ -1090,7 +1104,7 @@ async def evaluate_to(
         # Lines that actually exist (a trailing newline ends the last line, it
         # does not start another), so -1 resolves to the real last line. This is
         # deliberately NOT the "+1" count used for clipping decorations in
-        # _build_file_snapshot / _failed_count.
+        # _build_file_snapshot.
         total_lines = len(doc.content.removesuffix("\n").split("\n")) if doc else 1
         anchor_line = _resolve_line(line, total_lines)
         if anchor_line < 1:
@@ -1283,15 +1297,14 @@ def _idle_view(client: IsabelleLSPClient) -> EvaluationView:
     theory_status is deliberately NOT requested: ``_build_status_snapshot``
     auto-opens every not-ok theory into ``auto_opened_files``, which only the
     end of a run clears -- with no run, those documents would leak for the
-    session. Without theory_status the snapshot has nothing to fall back on,
-    so it always takes the lined decoration branch. The first line's count is
+    session. With an empty ts_map the theory_status fallback can never
+    contradict the decoration, so every file that has a tracker takes the lined
+    decoration branch; one that has never received a decoration contributes no
+    counts and drops out of the filter. The first line's count is
     taken from the very snapshots rendered below it, so the two cannot disagree.
     """
     files = [
-        fs for fs in (
-            _build_file_snapshot(client, path, {})
-            for path in list(client.open_documents)
-        )
+        fs for fs in _open_document_snapshots(client)
         if fs.error_count or fs.warning_count
     ]
     n_failed = sum(fs.error_count for fs in files)
@@ -1305,16 +1318,17 @@ def _idle_view(client: IsabelleLSPClient) -> EvaluationView:
 async def evaluation_status(
     client: IsabelleLSPClient,
 ) -> EvaluationView:
+    # Everything this tool answers is read from the decoration cache, which
+    # describes the pre-edit document for DECORATION_GRACE after an edit (the
+    # tool entry's own resync may have just sent one). Debounce: wait until the
+    # window has passed with no further edit -- under continuous editing the
+    # tool deliberately waits for the edits to stop rather than answer from a
+    # cache known to be stale. Polling during a run sends no edit, so it pays
+    # nothing here.
+    while (grace := _grace_remaining()) > 0:
+        await asyncio.sleep(grace)
     if _no_pending_work(client):
-        # The idle answer is read from the decoration cache, which describes
-        # the pre-edit document for DECORATION_GRACE after an edit (the tool
-        # entry's own resync may have just sent one). Neither lying with the
-        # stale picture nor hiding it: wait the window out, then judge afresh --
-        # what the wait reveals may be a command running, hence the re-check.
-        while (grace := _grace_remaining()) > 0:
-            await asyncio.sleep(grace)
-        if _no_pending_work(client):
-            return _idle_view(client)
+        return _idle_view(client)
 
     theories, running_commands = await _build_status_snapshot(
         client, evaluation_state,
@@ -1596,24 +1610,9 @@ async def _settled_position_state(
 
 
 def _failed_count(client: IsabelleLSPClient) -> int:
-    """Failed commands across every open document, counted the way the file
-    sections count them: the line-deduped union of the two error channels."""
-    total = 0
-    for path in list(client.open_documents):
-        tracker = client.get_processing_tracker(path)
-        if tracker is None:
-            continue
-        # Clipped to the current content, exactly as the file sections clip: a
-        # tracker outliving a file shrink must not contribute phantom failures.
-        # "+1" as in _build_file_snapshot: keeps an end-of-document decoration
-        # from being clipped away. Do not unify with evaluate_to's count.
-        doc = client.open_documents.get(path)
-        n_lines = (doc.content.count("\n") + 1) if doc else None
-        total += len(_merge_spans(
-            _line_spans(tracker.get_overview_error_ranges(), n_lines)
-            + _line_spans(tracker.get_bad_ranges(), n_lines),
-        ))
-    return total
+    """Failed commands across every open document, from the same snapshots the
+    file sections are rendered from."""
+    return sum(fs.error_count for fs in _open_document_snapshots(client))
 
 
 async def evaluation_footer(client: IsabelleLSPClient) -> str:

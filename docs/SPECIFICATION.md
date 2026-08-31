@@ -123,8 +123,8 @@ report `in_progress`; poll with `isabelle_evaluation_status`
 **Priority**: High (entry point for all checking)
 
 #### Tool: `isabelle_evaluation_status`
-**Purpose**: Check progress of an ongoing evaluation (per-file errors/warnings/running
-line spans, completion)
+**Purpose**: Check the current evaluation state (per-file errors/warnings/running
+line spans while busy; the errors and warnings that remain when idle)
 **Returns**: Plain-text per-file snapshot
 
 #### Tool: `isabelle_cancel_evaluation`
@@ -618,8 +618,10 @@ agent whether the sections below hold errors: `No evaluation in progress. Nothin
 is running and no errors remain.` or `No evaluation in progress. Nothing is
 running, but N commands failed.` (`1 command failed.` in the singular). An edit
 within the last `ISABELLE_MCP_DECORATION_GRACE` seconds (default 2 s) makes the
-tool wait the remaining window out before judging, so the idle answer never
-describes the pre-edit document.
+tool wait until that window has passed with no further edit — a further edit
+re-arms it — before judging, so the answer (idle or busy) never describes the
+pre-edit document; while a file is being edited continuously, the tool
+deliberately waits for the edits to stop.
 
 #### 4.4.3 `isabelle_cancel_evaluation`
 
