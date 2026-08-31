@@ -17,9 +17,7 @@ You should NEVER check whether the session is built — `isabelle_launch` checks
 
 When your call starts an evaluation, either by `isabelle_evaluate_to` or other query commands,
 the call may not wait for the evaluation to finish, but may return earlier with the current
-progress. You should keep polling `isabelle_evaluation_status` to watch it through:
-it reports progress (per-theory percentage and command counts), any new errors,
-and which commands are still running and for how long.
+progress. You should keep polling `isabelle_evaluation_status` to watch it through.
 
 During an evaluation you can still query any line it has already evaluated.
 
