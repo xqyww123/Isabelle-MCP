@@ -660,12 +660,14 @@ class EvaluationView:
 The rendered text leads with the status message and then one block per file, e.g.:
 
 ```
-Evaluation complete, arrived at line 42.
+Evaluation has completed up to Scratch.thy:42.
 
 Scratch.thy:
-  errors: 37, 40-41
-  warnings: 12
-  running: 55
+  running: line 55
+  errors: lines 37, 40-41
+  warnings: line 12
+
+Call isabelle_evaluation_status to check progress.
 ```
 
 A file with no problems renders as `Scratch.thy: clean`; an unopened dependency with
