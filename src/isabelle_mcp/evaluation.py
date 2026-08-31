@@ -1689,7 +1689,8 @@ async def evaluation_footer(client: IsabelleLSPClient) -> str:
         # the round trip above (a cancel, or any outcome a later step adds),
         # and a COMPLETED sentence would contradict that reply; a completion
         # stamped by a concurrent observer passes — same verdict, same
-        # sentence, and re-finishing an ended run it owns is a no-op. The
+        # sentence — re-finishing an ended run it owns re-stamps nothing
+        # (write-once) and only re-closes a dependency auto-opened since. The
         # _finish_if_owner verdict: the target moved on (a same-file advance
         # in that round trip) or the run was replaced, so the verdict belongs
         # to the old target. Either gate failing falls to ARRIVED, true for
@@ -1715,11 +1716,11 @@ def _footer_activity(
 ) -> list[str]:
     """The footer's suffix sentences, with the call to action that earns them.
 
-    *n_failed* is 0 only on the ambient path with no run behind the footer (an
-    error decoration outlives every run that produced it, so repeating its
-    count forever would train the agent to stop reading); otherwise the count
-    belongs to the run this footer is judging or finishing — including the
-    instant that run ends.
+    *n_failed* is hardwired to 0 only on the ambient path with no run behind
+    the footer (an error decoration outlives every run that produced it, so
+    repeating its count forever would train the agent to stop reading);
+    elsewhere the count — zero or not — belongs to the run this footer is
+    judging or finishing, including the instant that run ends.
     """
     sentences = _activity_sentences(running, n_failed)
     if sentences:

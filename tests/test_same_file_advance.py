@@ -389,7 +389,7 @@ class TestFooterGuard:
     ):
         # The theory_status round trip holds no lock; a cancel landing inside
         # it must not be followed by a COMPLETED sentence (the footer's
-        # ``not evaluation.outcome`` gate).
+        # outcome gate).
         text = await self._footer_at_target(
             mock_lsp_client, temp_theory_file,
             lambda: evaluation_state.cancel())
