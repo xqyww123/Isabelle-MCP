@@ -1133,11 +1133,17 @@ class TestPhaseDSentences:
 
     def test_refusal_and_collision_sentences(self):
         assert debugger.EVAL_TO_REFUSED == (
-            "Evaluation is paused at {at_breakpoints} — {hits}. "
-            "`isabelle_evaluate_to` cannot run while a hit is live. "
-            "Inspect with `isabelle_debug_state`, resume breakpoints with "
-            "`isabelle_continue_breakpoint`."
+            "Breakpoint hit: {hits}. `isabelle_evaluate_to` cannot run "
+            "while a thread is stopped at a breakpoint."
         )
+        assert debugger.EVAL_TO_REFUSED_MANY == (
+            "Breakpoints hit: {hits}. `isabelle_evaluate_to` cannot run "
+            "while a thread is stopped at a breakpoint."
+        )
+        # §7/T2 regression: the refusal must not carry the paused section's
+        # retired subject line — the two outlets can show up side by side.
+        assert "Evaluation is paused" not in debugger.EVAL_TO_REFUSED
+        assert "Evaluation is paused" not in debugger.EVAL_TO_REFUSED_MANY
         assert debugger.IMPLICIT_FETCH_RUNNING == (
             "An implicit locals fetch is still running on this hit — "
             "retry in a few seconds."
@@ -1163,12 +1169,10 @@ class TestPhaseDSentences:
 
     def test_paused_section_sentences(self):
         assert debugger.PAUSED_LEAD_ONE == (
-            "Evaluation is paused at a breakpoint; it will not progress "
-            "until the hit is resumed with `isabelle_continue_breakpoint`."
+            "Breakpoint hit: {hits}. The affected evaluation is paused."
         )
         assert debugger.PAUSED_LEAD_MANY == (
-            "Evaluation is paused at {n} breakpoints; it will not progress "
-            "until the hits are resumed with `isabelle_continue_breakpoint`."
+            "Breakpoints hit: {hits}. The affected evaluation is paused."
         )
         assert debugger.PAUSED_TAIL == (
             "Inspect with `isabelle_eval_at_breakpoint` / "
@@ -1252,19 +1256,16 @@ class TestHitsLiveRefusal:
         debugger.registry.sync_hits(client)
         debugger.registry.entries.append(_armed_entry())
         assert debugger.hits_live_refusal(client) == (
-            "Evaluation is paused at a breakpoint — hit id h1 at "
-            "DebugProbe.thy:7 before ‹val xs›. `isabelle_evaluate_to` "
-            "cannot run while a hit is live. Inspect with "
-            "`isabelle_debug_state`, resume breakpoints with "
-            "`isabelle_continue_breakpoint`."
+            "Breakpoint hit: hit id h1 at DebugProbe.thy:7 before "
+            "‹val xs›. `isabelle_evaluate_to` cannot run while a thread "
+            "is stopped at a breakpoint."
         )
 
     def test_plural_lead_enumerates(self, client):
         client.push_state({"worker-3": STACK, "worker-7": STACK})
         debugger.registry.sync_hits(client)
         msg = debugger.hits_live_refusal(client)
-        assert msg.startswith(
-            "Evaluation is paused at 2 breakpoints — hit id h1, hit id h2. ")
+        assert msg.startswith("Breakpoints hit: hit id h1, hit id h2. ")
 
     def test_consumes_the_named_hits_new_hit_notices(self, client):
         _hit(client)
@@ -1348,8 +1349,7 @@ class TestPausedSection:
     def test_single_hit(self, client):
         _hit(client)
         assert debugger.paused_section(client) == (
-            "Evaluation is paused at a breakpoint; it will not progress "
-            "until the hit is resumed with `isabelle_continue_breakpoint`."
+            "Breakpoint hit: h1. The affected evaluation is paused."
             "\n\n"
             "Hit id: h1\n"
             "thread worker-3\n"
@@ -1366,7 +1366,8 @@ class TestPausedSection:
         client.push_state({"worker-3": STACK, "worker-7": STACK})
         debugger.registry.sync_hits(client)
         out = debugger.paused_section(client)
-        assert out.startswith("Evaluation is paused at 2 breakpoints; ")
+        assert out.startswith(
+            "Breakpoints hit: h1, h2. The affected evaluation is paused.")
         assert out.count("Hit id:") == 2
 
 

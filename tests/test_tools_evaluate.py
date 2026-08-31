@@ -1340,6 +1340,22 @@ class TestEvaluationFooter:
         assert await ev.evaluation_footer(client) == ""
 
     @pytest.mark.asyncio
+    async def test_a_live_hit_replaces_the_activity_clause_with_the_pause_line(
+        self, mock_lsp_client, temp_theory_file, monkeypatch,
+    ):
+        """D-B15: while a hit is live, "has been running for Ns" is
+        misleading — the footer says the pause line instead."""
+        from isabelle_mcp import debugger
+
+        lead = "Breakpoint hit: h1. The affected evaluation is paused."
+        monkeypatch.setattr(debugger, "paused_lead", lambda client: lead)
+        client = await self._client(mock_lsp_client, temp_theory_file)
+        client.get_all_running_commands = lambda: [self._slow(temp_theory_file)]
+        footer = await ev.evaluation_footer(client)
+        assert lead in footer
+        assert "has been running" not in footer
+
+    @pytest.mark.asyncio
     async def test_nothing_outstanding_but_work_running_drops_the_main_sentence(
         self, mock_lsp_client, temp_theory_file,
     ):

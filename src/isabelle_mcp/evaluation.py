@@ -1670,13 +1670,23 @@ async def evaluation_footer(client: IsabelleLSPClient) -> str:
     finished quietly kept every query tool blocked until someone polled.
     """
     running = client.get_all_running_commands()
+    from isabelle_mcp import debugger
+    paused = debugger.paused_lead(client)
+
+    def activity(running_commands: list[RunningCommand], n_failed: int) -> list[str]:
+        # D-B15: while a hit is live, "has been running for Ns" is misleading —
+        # the pause line replaces the whole activity clause.
+        if paused is not None:
+            return [paused]
+        return _footer_activity(running_commands, n_failed)
+
     if not evaluation_state.active:
         # No target to name. The main sentence is dropped rather than paired with
         # a contradicting one: "Nothing is under evaluation." followed by
         # "2 commands have been running…" argues with itself. The call to action
         # stays: the agent is being told work is running, so it needs somewhere
         # to look.
-        return " ".join(_footer_activity(running, 0))
+        return " ".join(activity(running, 0))
 
     # Capture the handle HERE, with the target it belongs to and before any
     # await. Re-reading `current` at finish time would make _finish_if_owner's
@@ -1696,7 +1706,7 @@ async def evaluation_footer(client: IsabelleLSPClient) -> str:
 
     tracker = client.get_processing_tracker(target)
     if tracker is None or not tracker.line_reached(dest.to_lsp()):
-        return " ".join([towards, *_footer_activity(running, _failed_count(client))])
+        return " ".join([towards, *activity(running, _failed_count(client))])
 
     theories = [
         _parse_theory_status(t) for t in await client.request_theory_status()
@@ -1724,12 +1734,12 @@ async def evaluation_footer(client: IsabelleLSPClient) -> str:
                                                judged_dest=dest)):
                 return " ".join([
                     _target_sentence(COMPLETED_SENTENCE, target, int(dest), root),
-                    *_footer_activity([], n_failed),
+                    *activity([], n_failed),
                 ])
     if _frontier_reached(target, dest, client, theories):
         return " ".join([
             _target_sentence(ARRIVED_SENTENCE, target, int(dest), root),
-            *_footer_activity(running, _failed_count(client)),
+            *activity(running, _failed_count(client)),
         ])
     return " ".join([towards, *_footer_activity(running, _failed_count(client))])
 

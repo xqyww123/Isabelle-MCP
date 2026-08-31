@@ -362,15 +362,17 @@ LOCALS_FETCH_TIMEOUT = (
     "`isabelle_locals_at_breakpoint` to fetch them."
 )
 
-# evaluate_to refusal while hits are live (section 6.1; group 3).
-# {at_breakpoints} is "a breakpoint" / "2 breakpoints"; {hits} enumerates
-# "hit id h1 at Foo.thy:14 before ‹fold upd args›" rows (anchor and
-# position degrade exactly as the headline does), joined by ", ".
+# evaluate_to refusal while hits are live (section 6.1; group 3; D-C6).
+# {hits} enumerates "hit id h1 at Foo.thy:14 before ‹fold upd args›" rows
+# (anchor and position degrade exactly as the headline does), joined by
+# ", " — full detail on purpose: the refusal is all the agent gets.
 EVAL_TO_REFUSED = (
-    "Evaluation is paused at {at_breakpoints} — {hits}. "
-    "`isabelle_evaluate_to` cannot run while a hit is live. Inspect with "
-    "`isabelle_debug_state`, resume breakpoints with "
-    "`isabelle_continue_breakpoint`."
+    "Breakpoint hit: {hits}. `isabelle_evaluate_to` cannot run while a "
+    "thread is stopped at a breakpoint."
+)
+EVAL_TO_REFUSED_MANY = (
+    "Breakpoints hit: {hits}. `isabelle_evaluate_to` cannot run while a "
+    "thread is stopped at a breakpoint."
 )
 HIT_REF = "hit id {hit_id} at {where} before {anchor}"
 HIT_REF_NO_ANCHOR = "hit id {hit_id} at {where}"
@@ -399,15 +401,12 @@ ENDED_CANCELLED = "it was swept up by `isabelle_cancel_evaluation`."
 HITS_SWEPT = "{n} hits were swept up; their threads are no longer stopped."
 HITS_SWEPT_ONE = "1 hit was swept up; its thread is no longer stopped."
 
-# evaluation_status paused section (group 8)
-PAUSED_LEAD_ONE = (
-    "Evaluation is paused at a breakpoint; it will not progress until the "
-    "hit is resumed with `isabelle_continue_breakpoint`."
-)
-PAUSED_LEAD_MANY = (
-    "Evaluation is paused at {n} breakpoints; it will not progress until "
-    "the hits are resumed with `isabelle_continue_breakpoint`."
-)
+# evaluation_status paused section (group 8; D-C4). {hits} is the hit ids
+# only — the full blocks follow right below the lead, and "the affected
+# evaluation" is true by construction (which hit defines which run), unlike
+# the retired causal claim "it will not progress until …".
+PAUSED_LEAD_ONE = "Breakpoint hit: {hits}. The affected evaluation is paused."
+PAUSED_LEAD_MANY = "Breakpoints hit: {hits}. The affected evaluation is paused."
 PAUSED_TAIL = (
     "Inspect with `isabelle_eval_at_breakpoint` / "
     "`isabelle_locals_at_breakpoint`, or step with "
@@ -1750,10 +1749,8 @@ def hits_live_refusal(client: IsabelleLSPClient) -> str | None:
         return None
     for hit in hits:
         registry.consume_new_hit_notice(hit)
-    at_breakpoints = "a breakpoint" if len(hits) == 1 \
-        else f"{len(hits)} breakpoints"
-    return EVAL_TO_REFUSED.format(
-        at_breakpoints=at_breakpoints,
+    template = EVAL_TO_REFUSED if len(hits) == 1 else EVAL_TO_REFUSED_MANY
+    return template.format(
         hits=", ".join(_hit_ref(client, h) for h in hits))
 
 
@@ -1809,17 +1806,28 @@ async def hit_report(client: IsabelleLSPClient) -> str:
     return "\n\n".join(blocks)
 
 
-def paused_section(client: IsabelleLSPClient) -> str | None:
-    """The evaluation_status paused section (group 8): leads the result
-    whenever hits are live; None otherwise. Synchronous."""
+def paused_lead(client: IsabelleLSPClient) -> str | None:
+    """Just the paused lead sentence (D-C4) — hit ids, no blocks. Also the
+    evaluation footer's pause line (D-B15). None when no hit is live.
+    Synchronous."""
     if not client.debug:
         return None
     registry.sync_hits(client)
     hits = list(registry.hits.values())
     if not hits:
         return None
-    lead = PAUSED_LEAD_ONE if len(hits) == 1 \
-        else PAUSED_LEAD_MANY.format(n=len(hits))
+    ids = ", ".join(h.hit_id for h in hits)
+    return (PAUSED_LEAD_ONE if len(hits) == 1
+            else PAUSED_LEAD_MANY).format(hits=ids)
+
+
+def paused_section(client: IsabelleLSPClient) -> str | None:
+    """The evaluation_status paused section (group 8): leads the result
+    whenever hits are live; None otherwise. Synchronous."""
+    lead = paused_lead(client)
+    if lead is None:
+        return None
+    hits = list(registry.hits.values())
     return "\n\n".join([lead, *(_hit_block(h) for h in hits), PAUSED_TAIL])
 
 
