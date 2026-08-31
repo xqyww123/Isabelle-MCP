@@ -496,11 +496,9 @@ class CommandOutputResult(BaseModel):
 
 **Description**: Start (or restart) the Isabelle prover with the given
 session/logic. **Must be called before any evaluation or query tool** — the prover
-does not auto-start. Calling it with the same session and the same `debug` value is
-a no-op; a different session restarts the prover (any in-progress evaluation is
-discarded). Same session but a different `debug` value is an error: call
-`isabelle_terminate` first — a routine launch never silently kills a running debug
-session (the launch identity is the pair (session, debug)).
+does not auto-start. Same session and same `debug` is a no-op; any identity change
+restarts the prover (a live breakpoint hit refuses the restart, with the same
+refusal `isabelle_evaluate_to` uses).
 
 **Tool Annotations**:
 ```python
@@ -525,7 +523,16 @@ debug: Annotated[bool, Field(
 )] = False
 ```
 
-**Output Model**: `SessionInfo` (below) — the running session name and server version.
+**Output**: plain-text `ToolResult` (`output_schema=None`) — one sentence naming
+what happened:
+
+```
+Started Isabelle session 'HOL' (Isabelle2025-2, debug off).
+
+Isabelle session 'HOL' is already running (Isabelle2025-2, debug off). Nothing changed. Terminate the session first if you want to restart.
+
+Restarted the Isabelle prover: session 'HOL-Analysis' (Isabelle2025-2, debug on) replaces 'HOL' (debug off). Any evaluation that was in progress is discarded.
+```
 
 #### 4.3.2 `isabelle_terminate`
 

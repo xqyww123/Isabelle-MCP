@@ -269,6 +269,11 @@ class TestCatastropheMiddleware:
             await CatastropheMiddleware().on_call_tool(None, call_next)
 
 
+def _text(result):
+    """The plain-text payload of a ToolResult."""
+    return result.content[0].text
+
+
 def _launch_mock(*, running: bool, logic: str = "HOL"):
     """A mock IsabelleLSPClient for the launch/terminate tests."""
     client = MagicMock()
@@ -321,8 +326,9 @@ class TestSessionManagement:
         client.shutdown.assert_not_awaited()
         assert client.logic == "HOL"
         assert client.session_dirs == ["/root"]
-        assert _yaml(result)["current_session"] == "HOL"
-        assert _yaml(result)["version"] == "Isabelle2024"
+        assert _text(result) == (
+            "Started Isabelle session 'HOL' (Isabelle2024, debug off)."
+        )
 
     def test_default_session_dirs_with_root(self, tmp_path):
         import os
@@ -362,30 +368,55 @@ class TestSessionManagement:
             result = await isabelle_launch("HOL")
         client.start.assert_not_awaited()
         client.shutdown.assert_not_awaited()
-        assert _yaml(result)["current_session"] == "HOL"
+        assert _text(result) == (
+            "Isabelle session 'HOL' is already running (Isabelle2024, "
+            "debug off). Nothing changed. Terminate the session first if "
+            "you want to restart."
+        )
 
     @pytest.mark.asyncio
-    async def test_launch_debug_mismatch_errors_both_ways(self):
-        # The launch identity is (session, debug): same session, differing
-        # debug value → error, no restart, in BOTH directions — a routine
-        # launch must never silently kill a running debug session.
+    async def test_launch_debug_change_restarts_both_ways(self):
+        # §6B: any identity change (session or debug) restarts the prover.
         import isabelle_mcp.server as server_mod
-        from isabelle_mcp.utils import IsabelleToolError
 
         client = _launch_mock(running=True, logic="HOL")
         with patch.object(server_mod, '_lsp_client', client):
-            with pytest.raises(IsabelleToolError, match="isabelle_terminate"):
-                await isabelle_launch("HOL", debug=True)
-        client.shutdown.assert_not_awaited()
-        client.start.assert_not_awaited()
+            result = await isabelle_launch("HOL", debug=True)
+        client.shutdown.assert_awaited_once()
+        client.start.assert_awaited_once()
+        assert client.debug is True
+        assert _text(result) == (
+            "Restarted the Isabelle prover: session 'HOL' (Isabelle2024, "
+            "debug on) replaces 'HOL' (debug off). Any evaluation that was "
+            "in progress is discarded."
+        )
 
         client = _launch_mock(running=True, logic="HOL")
         client.debug = True
         with patch.object(server_mod, '_lsp_client', client):
-            with pytest.raises(IsabelleToolError, match="isabelle_terminate"):
-                await isabelle_launch("HOL", debug=False)
-        client.shutdown.assert_not_awaited()
-        client.start.assert_not_awaited()
+            result = await isabelle_launch("HOL", debug=False)
+        client.shutdown.assert_awaited_once()
+        client.start.assert_awaited_once()
+        assert client.debug is False
+        assert "debug off) replaces 'HOL' (debug on)" in _text(result)
+
+    @pytest.mark.asyncio
+    async def test_launch_restart_refused_while_a_hit_is_live(self):
+        # §6B guard: a restart (session or debug change) is refused while a
+        # breakpoint hit is live — same refusal evaluate_to uses.
+        import isabelle_mcp.server as server_mod
+        from isabelle_mcp.utils import IsabelleToolError
+
+        for kwargs in ({"debug": True}, {}):
+            session = "HOL" if kwargs else "HOL-Analysis"
+            client = _launch_mock(running=True, logic="HOL")
+            with patch.object(server_mod, '_lsp_client', client), \
+                    patch.object(server_mod.debugger, 'hits_live_refusal',
+                                 return_value="Evaluation is paused at a breakpoint — hit id h1."):
+                with pytest.raises(IsabelleToolError, match="paused at a breakpoint"):
+                    await isabelle_launch(session, **kwargs)
+            client.shutdown.assert_not_awaited()
+            client.start.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_launch_idempotent_same_session_same_debug(self):
@@ -396,7 +427,8 @@ class TestSessionManagement:
         with patch.object(server_mod, '_lsp_client', client):
             result = await isabelle_launch("HOL", debug=True)
         client.start.assert_not_awaited()
-        assert _yaml(result)["debug"] is True
+        assert "already running" in _text(result)
+        assert "debug on" in _text(result)
 
     @pytest.mark.asyncio
     async def test_launch_different_session_applies_debug(self):
@@ -410,7 +442,8 @@ class TestSessionManagement:
         client.shutdown.assert_awaited_once()
         client.start.assert_awaited_once()
         assert client.debug is True
-        assert _yaml(result)["debug"] is True
+        assert "Restarted the Isabelle prover" in _text(result)
+        assert "debug on) replaces 'HOL' (debug off)" in _text(result)
 
     @pytest.mark.asyncio
     async def test_launch_switches_session_restarts(self):
@@ -481,7 +514,7 @@ class TestSessionManagement:
             result = await isabelle_launch("Foo")
         client.start.assert_awaited_once()
         client.kill.assert_not_called()
-        assert _yaml(result)["version"] == "Isabelle2024"
+        assert "Isabelle2024" in _text(result)
 
     @pytest.mark.asyncio
     async def test_launch_start_failure_cleans_up(self):

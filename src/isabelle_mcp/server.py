@@ -59,6 +59,25 @@ _lsp_client: IsabelleLSPClient | None = None
 _file_watcher: FileWatcher | None = None
 _server_extra_args: list[str] = []
 
+# isabelle_launch's three replies (D-B19, approved verbatim): the reply itself
+# distinguishes a fresh start, a no-op and a restart, so the tool description
+# does not have to.
+LAUNCH_STARTED = "Started Isabelle session '{session}' ({version}, debug {debug})."
+LAUNCH_NOOP = (
+    "Isabelle session '{session}' is already running ({version}, "
+    "debug {debug}). Nothing changed. Terminate the session first if you "
+    "want to restart."
+)
+LAUNCH_RESTARTED = (
+    "Restarted the Isabelle prover: session '{session}' ({version}, "
+    "debug {debug}) replaces '{old_session}' (debug {old_debug}). "
+    "Any evaluation that was in progress is discarded."
+)
+
+
+def _onoff(debug: bool) -> str:
+    return "on" if debug else "off"
+
 
 async def _file_change_sink(path: str) -> None:
     """Event-driven sync sink: the FileWatcher schedules this on every relevant edit.
@@ -347,10 +366,6 @@ async def isabelle_launch(
     **Must be called before any evaluation or query tool** — the prover does not
     auto-start.
 
-    Calling it again with the same session and the same `debug` value is a
-    no-op; with a different session it restarts the prover (any in-progress
-    evaluation is discarded).
-
     No need to check whether the session is built — launch checks
     automatically: when its heap image (or any heap in its dependency chain)
     is missing or outdated, or the session name is undefined, it fails fast
@@ -383,26 +398,28 @@ async def isabelle_launch(
     if _lsp_client is None:
         raise IsabelleToolError("LSP client not initialized")
     async with _evaluation_state_lock:
+        replaced: tuple[str, bool] | None = None
         if _lsp_client.process is not None:
             alive = _lsp_client.process.returncode is None
-            if alive and _lsp_client.logic == session:
-                if _lsp_client.debug == debug:
-                    return _yaml_result(await session_info(_lsp_client))
-                # The launch identity is (session, debug): same session but a
-                # differing debug value errors BOTH ways instead of restarting,
-                # so a routine launch can never silently kill a running debug
-                # session. (A different session name already implies a
-                # relaunch; debug simply applies to the new prover.)
-                raise IsabelleToolError(
-                    f"Session {session!r} is already running with "
-                    f"debug={str(_lsp_client.debug).lower()}, but "
-                    f"debug={str(debug).lower()} was requested. This launch "
-                    f"does not restart the prover: call isabelle_terminate "
-                    f"first, then isabelle_launch with the wanted debug value."
-                )
-            # Switching sessions — or recovering from a crashed server (the
-            # process object lingers with a returncode): tear down, start anew.
-            # The same teardown isabelle_terminate and the catastrophe handler run.
+            if alive and _lsp_client.logic == session and _lsp_client.debug == debug:
+                return ToolResult(content=[TextContent(type="text", text=(
+                    LAUNCH_NOOP.format(
+                        session=session,
+                        version=_lsp_client.isabelle_version,
+                        debug=_onoff(debug),
+                    )))])
+            if alive:
+                # Any identity change (session or debug) restarts the prover.
+                # The one asset a restart silently destroys is a live
+                # breakpoint hit — refuse then, with the same refusal
+                # evaluate_to uses (section 6B).
+                refusal = debugger.hits_live_refusal(_lsp_client)
+                if refusal is not None:
+                    raise IsabelleToolError(refusal)
+                replaced = (_lsp_client.logic, _lsp_client.debug)
+            # Tear down the survivor — or a crashed server (the process
+            # object lingers with a returncode): start anew. The same teardown
+            # isabelle_terminate and the catastrophe handler run.
             await _lsp_client.teardown()
         _lsp_client.session_dirs = (
             session_dirs if session_dirs is not None else _default_session_dirs()
@@ -460,7 +477,18 @@ async def isabelle_launch(
                 await _lsp_client.reap()
             _lsp_client.process = None
             raise
-        return _yaml_result(await session_info(_lsp_client))
+        if replaced is not None:
+            text = LAUNCH_RESTARTED.format(
+                session=session, version=_lsp_client.isabelle_version,
+                debug=_onoff(debug), old_session=replaced[0],
+                old_debug=_onoff(replaced[1]),
+            )
+        else:
+            text = LAUNCH_STARTED.format(
+                session=session, version=_lsp_client.isabelle_version,
+                debug=_onoff(debug),
+            )
+        return ToolResult(content=[TextContent(type="text", text=text)])
 
 
 @mcp.tool(output_schema=None)

@@ -1046,9 +1046,31 @@ class TestEvaluationLifecycle:
             MockProcessingTracker(all_processed=False)
         )
         monkeypatch.setattr(ev, "HEAP_POLL_INTERVAL", 0.05)
+        with pytest.raises(IsabelleToolError):   # §6A: the decider raises D-C7
+            await evaluate_to(mock_lsp_client, temp_theory_file, 5)
+        assert ev.evaluation_state.current is not None
+        assert ev.evaluation_state.current.outcome == "abandoned"
+        assert ev.last_evaluation_was_cancelled() is False
+
+    @pytest.mark.asyncio
+    async def test_a_rider_that_reads_a_peers_abandon_stamp_does_not_raise(
+        self, temp_theory_file, mock_lsp_client, monkeypatch,
+    ):
+        """§6A landing note: only the request that made the abandonment
+        decision raises D-C7. One that merely read a peer's stamp keeps the
+        reporting shape — its own loop may have watched the target arrive."""
+        import os
+
+        mock_lsp_client.heap_sources = {os.path.realpath(temp_theory_file)}
+
+        async def fake_loop(client, file_path, state, evaluation, timeout):
+            state._finish("abandoned")   # a peer abandons while we wait
+            return "in_progress", [], []
+
+        monkeypatch.setattr(ev, "_evaluation_wait_loop", fake_loop)
         view = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
         assert view.status == "abandoned"
-        assert ev.last_evaluation_was_cancelled() is False
+        assert "never reprocess" in view.message
 
     @pytest.mark.asyncio
     async def test_a_finished_run_does_not_close_a_newer_runs_documents(

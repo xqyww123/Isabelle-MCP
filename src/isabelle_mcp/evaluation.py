@@ -21,7 +21,12 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Literal
 
-from isabelle_mcp.lsp_client import IsabelleLSPClient, _canon, _stat_sigs
+from isabelle_mcp.lsp_client import (
+    PRECOMPILED_MODIFIED_ERROR,
+    IsabelleLSPClient,
+    _canon,
+    _stat_sigs,
+)
 from isabelle_mcp.models import (
     EvaluationView,
     FileSnapshot,
@@ -1238,7 +1243,17 @@ async def evaluate_to(
     elif heap_warning and status != "complete":
         # The file differs from its precompiled copy, so PIDE will never
         # reprocess it — abandon the evaluation instead of leaving it pending.
+        # No-stamp-yet means THIS request makes the abandonment decision (the
+        # read and the stamp share one synchronous stretch, so exactly one
+        # rider is first): it refuses with the way out (D-C7). A rider that
+        # merely read a peer's stamp must not raise — its own loop may have
+        # watched the target arrive (section 6A landing note) — so it keeps
+        # the reporting shape.
+        first = not evaluation.outcome
         await _finish_if_owner(client, evaluation, "abandoned", judged_dest=None)
+        if first:
+            raise IsabelleToolError(PRECOMPILED_MODIFIED_ERROR.format(
+                file=file_path, logic=client.logic))
         status = "abandoned"
         message = (
             "Evaluation abandoned: the file differs from its precompiled copy "

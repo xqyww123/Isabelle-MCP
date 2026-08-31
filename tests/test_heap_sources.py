@@ -194,12 +194,59 @@ class TestEvaluateHeapFile:
         )
         mock_lsp_client.heap_sources = {os.path.realpath(temp_theory_file)}
         monkeypatch.setattr(ev, "HEAP_POLL_INTERVAL", 0.05)
-        view = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
-        # §6: abandoned, not cancelled — the message keeps its wording, but
-        # the status and the recorded outcome name the real ending.
-        assert view.status == "abandoned"
-        assert "never reprocess" in view.message
+        # §6A/D-C7: the request that decides the abandonment raises the
+        # precompiled-modified error; the outcome stamp still says abandoned.
+        with pytest.raises(IsabelleToolError, match="has not taken effect"):
+            await evaluate_to(mock_lsp_client, temp_theory_file, 5)
         assert ev.evaluation_state.current is not None
         assert ev.evaluation_state.current.outcome == "abandoned"
         # no evaluation left pending — the next evaluate_to must not be rejected
         assert not ev.evaluation_state.active
+
+
+class TestModifiedHeapFileSync:
+    """§6A/D-C7: the sync path refuses an edit to a heap-precompiled file —
+    no didChange goes out, and the error names the way out."""
+
+    @pytest.mark.asyncio
+    async def test_sync_refuses_an_edit_to_a_heap_file(self, tmp_path):
+        client = IsabelleLSPClient()
+        client.process = MagicMock()
+        client.notify = AsyncMock()
+        f = tmp_path / "IFOL.thy"
+        original = "theory IFOL imports Pure begin end\n"
+        f.write_text(original)
+        await client.open_document(str(f))
+        path = next(iter(client.open_documents))
+        client.heap_sources = {os.path.realpath(path)}
+
+        f.write_text(original + "(* edit *)\n")
+        with pytest.raises(IsabelleToolError, match="has not taken effect"):
+            await client.resync_changed_open_documents()
+        doc = client.open_documents[path]
+        assert doc.content == original          # the edit was not pushed
+        sent = [c.args[0] for c in client.notify.await_args_list]
+        assert "textDocument/didChange" not in sent
+        # stat_sig not refreshed: the next backstop re-detects and re-raises.
+        with pytest.raises(IsabelleToolError, match="has not taken effect"):
+            await client.resync_changed_open_documents()
+
+    @pytest.mark.asyncio
+    async def test_restoring_the_file_stops_the_error(self, tmp_path):
+        client = IsabelleLSPClient()
+        client.process = MagicMock()
+        client.notify = AsyncMock()
+        f = tmp_path / "IFOL.thy"
+        original = "theory IFOL imports Pure begin end\n"
+        f.write_text(original)
+        await client.open_document(str(f))
+        path = next(iter(client.open_documents))
+        client.heap_sources = {os.path.realpath(path)}
+
+        f.write_text(original + "(* edit *)\n")
+        with pytest.raises(IsabelleToolError):
+            await client.resync_changed_open_documents()
+        f.write_text(original)                  # put the old content back
+        await client.resync_changed_open_documents()   # no raise
+        sent = [c.args[0] for c in client.notify.await_args_list]
+        assert "textDocument/didChange" not in sent

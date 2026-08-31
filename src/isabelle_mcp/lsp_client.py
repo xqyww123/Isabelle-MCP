@@ -137,6 +137,18 @@ def _stat_sigs(paths: list[str]) -> dict[str, StatSig | None]:
     return {p: _stat_sig(p) for p in paths}
 
 
+# D-C7: modifying a heap-precompiled file is refused outright, with the one
+# way out. Raised by the sync path on detection and by evaluate_to's
+# heap-abandon branch (a modification that predates the open).
+PRECOMPILED_MODIFIED_ERROR = (
+    "{file} is precompiled into the running session '{logic}'. Modifying it "
+    "is not supported: your change has not taken effect, and the prover "
+    "still uses the old version compiled into the heap. If you really want "
+    "to modify this file and have Isabelle-MCP evaluate it, relaunch via "
+    "isabelle_launch with a base session that does not include it."
+)
+
+
 def _detect_isabelle_version() -> tuple[str, int | None]:
     """Probe the `isabelle` on PATH: ``(full version string, major year)``.
 
@@ -248,8 +260,8 @@ class IsabelleLSPClient:
         self.extra_args = extra_args or []
         # ML debugger instrumentation (design section 2.1): when set, start()
         # spawns the server with `-o ML_debugger=true`, so newly compiled ML is
-        # breakable. Part of the launch identity — isabelle_launch refuses to
-        # reuse a running prover whose debug value differs.
+        # breakable. Part of the launch identity — a differing debug value
+        # makes isabelle_launch restart the prover.
         self.debug = debug
         # Real paths of every source file precompiled into the running logic's
         # heap chain (filled by enumerate_heap_sources at launch). Such files
@@ -1395,6 +1407,15 @@ class IsabelleLSPClient:
             if self.open_documents.get(path) is not doc:
                 # Closed (or replaced) while we were off-loop: don't didChange it.
                 continue
+            if content != doc.content and os.path.realpath(path) in self.heap_sources:
+                # D-C7: refuse the edit — no didChange goes out, and stat_sig is
+                # not refreshed, so every later backstop re-detects the change
+                # and re-raises until the file is restored on disk or the
+                # session is relaunched without it. On the event-driven watcher
+                # path the raise is logged and swallowed; the tool-call backstop
+                # surfaces it on the next tool call.
+                raise IsabelleToolError(PRECOMPILED_MODIFIED_ERROR.format(
+                    file=path, logic=self.logic))
             if content != doc.content or doc.needs_full_sync:
                 # RANGED contentChanges preserve the server's evaluated prefix
                 # (a whole-document didChange is remove-all + insert-all server-
