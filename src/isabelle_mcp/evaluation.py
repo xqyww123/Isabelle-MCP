@@ -524,11 +524,12 @@ class EvaluationState:
     def _finish(self, outcome: Outcome) -> None:
         # The one terminal transition: flag down, stamp write-once (a later
         # cancel of a lingering fork must not rewrite a finished run's story).
-        # Folding the flag clear into the stamp is what lets _finish_if_owner
-        # record any outcome verbatim — with the flag cleared only by
-        # complete()/cancel(), an if/else there coerced the third outcome
-        # ("abandoned") into a cancel. Not a shape nicety: unfolding this
-        # back turns three tests red (D-B11).
+        # Folding the flag clear in here keeps the flag's single clearer and
+        # makes recording an outcome verbatim the shortest call. The
+        # load-bearing rule is that _finish_if_owner must never dispatch on
+        # the outcome: the old `if outcome == "complete" ... else cancel()`
+        # there coerced the third outcome ("abandoned") into a cancel —
+        # restoring it turns three tests red (D-B11).
         self.active = False
         cur = self.current
         if cur is not None and not cur.outcome:
@@ -846,11 +847,12 @@ async def _finish_if_owner(
     while it was waiting (evaluate_to holds no lock across the wait).
 
     *judged_dest* is keyword-only with no default on purpose: every new caller
-    must decide, because omitting it would silently disarm the guard. A
-    completion passes the target its verdict was computed against — a target
-    that advanced meanwhile means the verdict belongs to the old target while
-    the run drives on, so the stamp is refused. The cancel family passes
-    ``None``: a cancel ends the run wherever its target stands.
+    must decide, because omitting it would silently disarm the guard. Only a
+    completion passes a target — the target its verdict was computed against;
+    a target that advanced meanwhile means the verdict belongs to the old
+    target while the run drives on, so the stamp is refused. Every other
+    ending (the cancel family, a heap abandonment) passes ``None``: it ends
+    the run wherever its target stands.
     (``cancel_evaluation`` itself deliberately does not go through this path at
     all — it resets unconditionally in a ``finally``, otherwise a failed cancel
     would wedge every later evaluation.)

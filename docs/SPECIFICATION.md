@@ -650,7 +650,7 @@ class FileSnapshot:
 
 @dataclass
 class EvaluationView:
-    status: str   # complete | in_progress | no_evaluation | cancelled
+    status: str   # complete | in_progress | no_evaluation | cancelled | abandoned
     destination_line: int | None = None
     message: str = ""
     files: list[FileSnapshot] = field(default_factory=list)

@@ -1041,12 +1041,13 @@ class TestEvaluationLifecycle:
         import os
 
         mock_lsp_client.heap_sources = {os.path.realpath(temp_theory_file)}
-
-        async def fake_loop(client, file_path, state, evaluation, timeout):
-            return "in_progress", [], []
-
-        monkeypatch.setattr(ev, "_evaluation_wait_loop", fake_loop)
-        await evaluate_to(mock_lsp_client, temp_theory_file, 5)
+        # Real wait loop: the file never processes, so the heap budget expires.
+        mock_lsp_client._processing_trackers[temp_theory_file] = (
+            MockProcessingTracker(all_processed=False)
+        )
+        monkeypatch.setattr(ev, "HEAP_POLL_INTERVAL", 0.05)
+        view = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
+        assert view.status == "abandoned"
         assert ev.last_evaluation_was_cancelled() is False
 
     @pytest.mark.asyncio
