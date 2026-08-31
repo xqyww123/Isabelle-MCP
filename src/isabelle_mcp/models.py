@@ -267,7 +267,7 @@ class EvaluationView:
     evaluation functions return this so unit tests can assert on structured fields.
     """
 
-    status: str  # complete | in_progress | no_evaluation | cancelled
+    status: str  # complete | in_progress | no_evaluation | cancelled | abandoned
     # The evaluation target: the file and line the run is advancing toward. None
     # when no evaluation is outstanding (a lingering fork has no target).
     target_file: str | None = None

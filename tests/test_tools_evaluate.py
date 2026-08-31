@@ -916,6 +916,19 @@ class TestEvaluationLifecycle:
         evaluation_state.auto_opened_files = set()
 
     @pytest.mark.asyncio
+    async def test_finish_if_owner_stamps_the_outcome_it_is_given(
+        self, temp_theory_file, mock_lsp_client,
+    ):
+        """§6: the outcome lands verbatim. An if/else that folds everything
+        non-complete into cancel() would silently coerce the third outcome."""
+        run = evaluation_state.start(temp_theory_file, MCPLine(5))
+        assert await ev._finish_if_owner(
+            mock_lsp_client, run, "abandoned", judged_dest=None,
+        ) is True
+        assert run.outcome == "abandoned"
+        assert evaluation_state.active is False
+
+    @pytest.mark.asyncio
     async def test_cleanup_discards_from_the_set_it_bound(
         self, temp_theory_file, mock_lsp_client,
     ):
@@ -1017,6 +1030,24 @@ class TestEvaluationLifecycle:
         view = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
         assert view.status == "cancelled"
         assert view.message == ev.CANCELLED_MESSAGE
+
+    @pytest.mark.asyncio
+    async def test_an_abandoned_evaluation_is_not_reported_as_a_cancel(
+        self, temp_theory_file, mock_lsp_client, monkeypatch,
+    ):
+        """D-B5: after an abandonment the query tools must not fabricate
+        "the evaluation was cancelled" — last_evaluation_was_cancelled()
+        keys that sentence, so it must stay False."""
+        import os
+
+        mock_lsp_client.heap_sources = {os.path.realpath(temp_theory_file)}
+
+        async def fake_loop(client, file_path, state, evaluation, timeout):
+            return "in_progress", [], []
+
+        monkeypatch.setattr(ev, "_evaluation_wait_loop", fake_loop)
+        await evaluate_to(mock_lsp_client, temp_theory_file, 5)
+        assert ev.last_evaluation_was_cancelled() is False
 
     @pytest.mark.asyncio
     async def test_a_finished_run_does_not_close_a_newer_runs_documents(

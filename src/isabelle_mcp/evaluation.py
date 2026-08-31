@@ -19,6 +19,7 @@ import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Literal
 
 from isabelle_mcp.lsp_client import IsabelleLSPClient, _canon, _stat_sigs
 from isabelle_mcp.models import (
@@ -413,16 +414,23 @@ def _activity_clause(running_commands: list[RunningCommand]) -> str:
 # EvaluationState
 # ---------------------------------------------------------------------------
 
+# The recorded reasons an evaluation run can end. "abandoned" is the
+# heap-divergence ending: the target file differs from its precompiled copy,
+# so PIDE will never reprocess it (section 6 of the fix plan).
+Outcome = Literal["complete", "cancelled", "abandoned"]
+
+
 @dataclass(eq=False)
 class Evaluation:
     """One evaluation run. The object reference is its identity.
 
     ``outcome`` records WHY the run ended, which the shared ``active`` boolean
-    cannot: a cancel, a session teardown and an ``evaluation_status`` call that
-    observed the run *succeed* all merely clear that flag.
+    cannot: a cancel, a session teardown, a heap abandonment and an
+    ``evaluation_status`` call that observed the run *succeed* all merely
+    clear that flag.
     """
 
-    outcome: str = ""          # "" | "complete" | "cancelled"
+    outcome: Outcome | Literal[""] = ""
     # evaluate_to requests that joined this run and have not given up on it.
     # A request that returns in_progress has NOT given up: it will poll again,
     # so it keeps its place here and a later abort must not end the run under
@@ -513,20 +521,24 @@ class EvaluationState:
         """
         return self.current is evaluation
 
-    def _stamp(self, outcome: str) -> None:
-        # Write-once: a later cancel of a lingering fork must not rewrite a
-        # finished run's story.
+    def _finish(self, outcome: Outcome) -> None:
+        # The one terminal transition: flag down, stamp write-once (a later
+        # cancel of a lingering fork must not rewrite a finished run's story).
+        # Folding the flag clear into the stamp is what lets _finish_if_owner
+        # record any outcome verbatim — with the flag cleared only by
+        # complete()/cancel(), an if/else there coerced the third outcome
+        # ("abandoned") into a cancel. Not a shape nicety: unfolding this
+        # back turns three tests red (D-B11).
+        self.active = False
         cur = self.current
         if cur is not None and not cur.outcome:
             cur.outcome = outcome
 
     def complete(self) -> None:
-        self.active = False
-        self._stamp("complete")
+        self._finish("complete")
 
     def cancel(self) -> None:
-        self.active = False
-        self._stamp("cancelled")
+        self._finish("cancelled")
 
 
 evaluation_state = EvaluationState()
@@ -799,7 +811,7 @@ async def _cleanup_auto_opened(
     # Snapshot the paths synchronously, BEFORE the first await: anyio re-delivers the
     # cancel at every checkpoint and a concurrent evaluate_to may flip ``active`` and
     # re-register files via start() — neither must race the read. Callers flip active
-    # (cancel/complete) immediately before this call with no await in between, so the
+    # (via _finish) immediately before this call with no await in between, so the
     # snapshot is atomic w.r.t. the active flip.
     #
     # Each close is SHIELDED (anyio is level-triggered: a cancel is re-delivered at
@@ -823,7 +835,7 @@ async def _cleanup_auto_opened(
 
 
 async def _finish_if_owner(
-    client: IsabelleLSPClient, evaluation: Evaluation, outcome: str,
+    client: IsabelleLSPClient, evaluation: Evaluation, outcome: Outcome,
     *, judged_dest: MCPLine | None,
 ) -> bool:
     """End *evaluation* — flag, outcome stamp and cleanup — if it still owns the
@@ -851,10 +863,7 @@ async def _finish_if_owner(
         return False
     if judged_dest is not None and evaluation_state.destination_line != judged_dest:
         return False
-    if outcome == "complete":
-        evaluation_state.complete()
-    else:
-        evaluation_state.cancel()
+    evaluation_state._finish(outcome)
     await _cleanup_auto_opened(client, evaluation_state)
     return True
 
@@ -1154,8 +1163,8 @@ async def evaluate_to(
             HEAP_POLL_INTERVAL if heap_warning else EVAL_POLL_INTERVAL,
         )
 
-        # Own the state and carry no outcome stamp ⇒ still active: complete() and
-        # cancel() are the only writers of the flag and both stamp.
+        # Own the state and carry no outcome stamp ⇒ still active: _finish is
+        # the only clearer of the flag and it always stamps.
         if (heap_warning and status not in ("complete", "hit")
                 and not evaluation.outcome and evaluation_state.owns(evaluation)):
             # The miss may be only the post-edit grace gate (a concurrent edit
@@ -1227,8 +1236,8 @@ async def evaluate_to(
     elif heap_warning and status != "complete":
         # The file differs from its precompiled copy, so PIDE will never
         # reprocess it — abandon the evaluation instead of leaving it pending.
-        await _finish_if_owner(client, evaluation, "cancelled", judged_dest=None)
-        status = "cancelled"
+        await _finish_if_owner(client, evaluation, "abandoned", judged_dest=None)
+        status = "abandoned"
         message = (
             "Evaluation abandoned: the file differs from its precompiled copy "
             "and Isabelle will never reprocess it. Do not retry or poll."
@@ -1686,7 +1695,7 @@ async def evaluation_footer(client: IsabelleLSPClient) -> str:
         # Under the lock, like the other terminal transitions: the stamp, the
         # flag and the cleanup travel together. Two gates on the sentence.
         # The outcome test: the run already ended for another reason during
-        # the round trip above (a cancel, or any outcome a later step adds),
+        # the round trip above (a cancel or a heap abandonment),
         # and a COMPLETED sentence would contradict that reply; a completion
         # stamped by a concurrent observer passes — same verdict, same
         # sentence — re-finishing an ended run it owns re-stamps nothing

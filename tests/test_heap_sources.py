@@ -195,7 +195,11 @@ class TestEvaluateHeapFile:
         mock_lsp_client.heap_sources = {os.path.realpath(temp_theory_file)}
         monkeypatch.setattr(ev, "HEAP_POLL_INTERVAL", 0.05)
         view = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
-        assert view.status == "cancelled"
+        # §6: abandoned, not cancelled — the message keeps its wording, but
+        # the status and the recorded outcome name the real ending.
+        assert view.status == "abandoned"
         assert "never reprocess" in view.message
+        assert ev.evaluation_state.current is not None
+        assert ev.evaluation_state.current.outcome == "abandoned"
         # no evaluation left pending — the next evaluate_to must not be rejected
         assert not ev.evaluation_state.active
