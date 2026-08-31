@@ -1248,17 +1248,14 @@ async def evaluate_to(
         # rider is first): it refuses with the way out (D-C7). A rider that
         # merely read a peer's stamp must not raise — its own loop may have
         # watched the target arrive (section 6A landing note) — so it keeps
-        # the reporting shape.
+        # the reporting shape, with the same sentence: one event, one wording.
         first = not evaluation.outcome
         await _finish_if_owner(client, evaluation, "abandoned", judged_dest=None)
+        message = PRECOMPILED_MODIFIED_ERROR.format(
+            file=file_path, logic=client.logic)
         if first:
-            raise IsabelleToolError(PRECOMPILED_MODIFIED_ERROR.format(
-                file=file_path, logic=client.logic))
+            raise IsabelleToolError(message)
         status = "abandoned"
-        message = (
-            "Evaluation abandoned: the file differs from its precompiled copy "
-            "and Isabelle will never reprocess it. Do not retry or poll."
-        )
     else:
         if status == "complete":
             # One completion vocabulary: internal complete ⇒ the COMPLETED

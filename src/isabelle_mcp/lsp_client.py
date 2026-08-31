@@ -149,6 +149,12 @@ PRECOMPILED_MODIFIED_ERROR = (
 )
 
 
+def _read_text(path: str) -> str:
+    """Plain disk read, no unicode-guard rewrite — blocking, call via to_thread."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
 def _detect_isabelle_version() -> tuple[str, int | None]:
     """Probe the `isabelle` on PATH: ``(full version string, major year)``.
 
@@ -266,7 +272,8 @@ class IsabelleLSPClient:
         # Real paths of every source file precompiled into the running logic's
         # heap chain (filled by enumerate_heap_sources at launch). Such files
         # cannot be edited: PIDE ignores their changes and never reprocesses
-        # them, so tools warn instead of silently wedging.
+        # them, so the sync path refuses such edits outright (D-C7) instead of
+        # silently wedging.
         self.heap_sources: set[str] = set()
         # Build-status verdict from the launch-time `isabelle build -n -b` probe:
         # None = not probed, True = whole chain built and current, False = some
@@ -1393,11 +1400,19 @@ class IsabelleLSPClient:
             doc = self.open_documents.get(path)
             if doc is None:
                 continue
+            heap = path in self.heap_sources
             try:
-                # Unicode guard (off the event loop): may rewrite the file in
-                # Isabelle ASCII; the returned text matches disk afterwards, so
-                # the stat_sig refresh below stays coherent.
-                content, guard_warning = await asyncio.to_thread(sanitize_read, path)
+                if heap:
+                    # A precompiled file is never pushed, so the ASCII guard has
+                    # no work here — and the refusing path must not write to
+                    # the very file it declares untouchable.
+                    content = await asyncio.to_thread(_read_text, path)
+                    guard_warning = None
+                else:
+                    # Unicode guard (off the event loop): may rewrite the file in
+                    # Isabelle ASCII; the returned text matches disk afterwards, so
+                    # the stat_sig refresh below stays coherent.
+                    content, guard_warning = await asyncio.to_thread(sanitize_read, path)
             except OSError:
                 # Deleted/unreadable: drop the signature so a later recreate re-syncs.
                 doc.stat_sig = None
@@ -1407,13 +1422,16 @@ class IsabelleLSPClient:
             if self.open_documents.get(path) is not doc:
                 # Closed (or replaced) while we were off-loop: don't didChange it.
                 continue
-            if content != doc.content and os.path.realpath(path) in self.heap_sources:
-                # D-C7: refuse the edit — no didChange goes out, and stat_sig is
-                # not refreshed, so every later backstop re-detects the change
-                # and re-raises until the file is restored on disk or the
-                # session is relaunched without it. On the event-driven watcher
-                # path the raise is logged and swallowed; the tool-call backstop
-                # surfaces it on the next tool call.
+            if heap and content != doc.content:
+                # D-C7: refuse the edit — no didChange goes out, and stat_sig
+                # is not refreshed, so every later backstop re-detects and
+                # re-raises until the file on disk matches the text the prover
+                # was given (the content at didOpen), or the session is
+                # relaunched without the file. A file that was ALREADY modified
+                # when MCP opened it pushed that modification at didOpen, so
+                # for it only the relaunch clears the refusal. On the
+                # event-driven watcher path the raise is logged and swallowed;
+                # the tool-call backstop surfaces it on the next tool call.
                 raise IsabelleToolError(PRECOMPILED_MODIFIED_ERROR.format(
                     file=path, logic=self.logic))
             if content != doc.content or doc.needs_full_sync:

@@ -195,10 +195,10 @@ called before any evaluation/query tool (the prover does not auto-start)
 
 Breakpoint debugging of Isabelle/ML code, available when the session is
 launched with `debug=true` (Poly/ML debugger instrumentation; see §4.3.1).
-The authoritative specification — the addressing model, the breakpoint
-registry lifecycle, hits and debugger notices, and every agent-facing
-sentence — is [`docs/archive/DEBUGGER_DESIGN.md`](archive/DEBUGGER_DESIGN.md);
-it is not duplicated here.
+The authoritative specification for the addressing model, the breakpoint
+registry lifecycle, and hits and debugger notices is
+[`docs/archive/DEBUGGER_DESIGN.md`](archive/DEBUGGER_DESIGN.md); it is not
+duplicated here. (Its launch-identity passages are superseded by §4.3.1.)
 
 #### `isabelle_set_breakpoint` / `isabelle_del_breakpoints`
 **Purpose**: Register a breakpoint at a *breakable site* (a stopping location

@@ -392,8 +392,7 @@ async def isabelle_launch(
         debug: Launch with ML debugger instrumentation (`-o ML_debugger=true`):
             newly compiled ML code gets breakable sites; code precompiled into
             the heap is unaffected, and no heap is invalidated. Off by default
-            because instrumentation slows compiled ML. The value is part of the
-            launch identity.
+            because instrumentation slows compiled ML.
     """
     if _lsp_client is None:
         raise IsabelleToolError("LSP client not initialized")

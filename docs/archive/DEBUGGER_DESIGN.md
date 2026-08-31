@@ -92,6 +92,12 @@ infrastructure may deadlock, debugging is **opt-in per session**:
 
 - `isabelle_launch` gains `debug: bool = false`. When true, the server is
   spawned with an additional `-o ML_debugger=true`.
+- > **Superseded 2026-08-31 (§6B/D-B19; see SPECIFICATION.md §4.3.1)**: any
+  > identity change (session or `debug`) now restarts the prover, a live
+  > breakpoint hit refuses the restart, and `isabelle_launch` returns one
+  > sentence instead of `SessionInfo`. The error described below — and the
+  > `debug` parameter description quoted later in this document — no longer
+  > exist.
 - **`debug` is part of the launch identity.** When the requested session name
   matches the running one but the `debug` value differs, `isabelle_launch`
   **errors** — in both directions — telling the agent to call

@@ -1070,7 +1070,7 @@ class TestEvaluationLifecycle:
         monkeypatch.setattr(ev, "_evaluation_wait_loop", fake_loop)
         view = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
         assert view.status == "abandoned"
-        assert "never reprocess" in view.message
+        assert "has not taken effect" in view.message   # D-C7: one event, one wording
 
     @pytest.mark.asyncio
     async def test_a_finished_run_does_not_close_a_newer_runs_documents(

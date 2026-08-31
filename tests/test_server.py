@@ -465,9 +465,30 @@ class TestSessionManagement:
         client = _launch_mock(running=True, logic="HOL")
         client.process.returncode = 1
         with patch.object(server_mod, '_lsp_client', client):
-            await isabelle_launch("HOL")
+            result = await isabelle_launch("HOL")
         client.shutdown.assert_awaited_once()
         client.start.assert_awaited_once()
+        # D-B19 names the dead-prover case a fresh start, not a restart.
+        assert _text(result) == (
+            "Started Isabelle session 'HOL' (Isabelle2024, debug off)."
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_noop_launch_during_a_live_hit_is_not_refused(self):
+        # The no-op returns BEFORE the hits-live guard: a harmless repeat
+        # launch must neither be refused nor consume queued new-hit notices
+        # (hits_live_refusal consumes them as a side effect).
+        import isabelle_mcp.server as server_mod
+
+        client = _launch_mock(running=True, logic="HOL")
+        refusal = MagicMock(
+            return_value="Evaluation is paused at a breakpoint — hit id h1.")
+        with patch.object(server_mod, '_lsp_client', client), \
+                patch.object(server_mod.debugger, 'hits_live_refusal', refusal):
+            result = await isabelle_launch("HOL")
+        refusal.assert_not_called()
+        client.start.assert_not_awaited()
+        assert "already running" in _text(result)
 
     @pytest.mark.asyncio
     async def test_launch_rejects_unverified_heap(self):

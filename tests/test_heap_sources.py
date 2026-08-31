@@ -220,11 +220,23 @@ class TestModifiedHeapFileSync:
         path = next(iter(client.open_documents))
         client.heap_sources = {os.path.realpath(path)}
 
-        f.write_text(original + "(* edit *)\n")
-        with pytest.raises(IsabelleToolError, match="has not taken effect"):
+        edited = original + "(* edit ∀ *)\n"
+        f.write_text(edited)
+        with pytest.raises(IsabelleToolError, match="has not taken effect") as exc:
             await client.resync_changed_open_documents()
+        # The approved sentence, pinned verbatim as a LITERAL (A2-3) — pinning
+        # it against the constant would let an edit to the constant pass.
+        assert str(exc.value) == (
+            f"{path} is precompiled into the running session '{client.logic}'. "
+            "Modifying it is not supported: your change has not taken effect, "
+            "and the prover still uses the old version compiled into the heap. "
+            "If you really want to modify this file and have Isabelle-MCP "
+            "evaluate it, relaunch via isabelle_launch with a base session "
+            "that does not include it."
+        )
         doc = client.open_documents[path]
         assert doc.content == original          # the edit was not pushed
+        assert f.read_text() == edited          # ...and the disk was not rewritten
         sent = [c.args[0] for c in client.notify.await_args_list]
         assert "textDocument/didChange" not in sent
         # stat_sig not refreshed: the next backstop re-detects and re-raises.
@@ -250,3 +262,26 @@ class TestModifiedHeapFileSync:
         await client.resync_changed_open_documents()   # no raise
         sent = [c.args[0] for c in client.notify.await_args_list]
         assert "textDocument/didChange" not in sent
+
+    @pytest.mark.asyncio
+    async def test_a_file_already_modified_at_open_is_kept_refused_by_a_restore(
+        self, tmp_path,
+    ):
+        """A1-1: the refusal's baseline is the text the prover was given at
+        didOpen. For a file that was already divergent then, MCP cannot tell a
+        restore from a further edit — only the relaunch clears the refusal."""
+        client = IsabelleLSPClient()
+        client.process = MagicMock()
+        client.notify = AsyncMock()
+        heap_text = "theory IFOL imports Pure begin end\n"
+        f = tmp_path / "IFOL.thy"
+        f.write_text(heap_text + "(* edit made before MCP opened it *)\n")
+        await client.open_document(str(f))
+        path = next(iter(client.open_documents))
+        client.heap_sources = {os.path.realpath(path)}
+
+        f.write_text(heap_text)     # restore the pristine heap text
+        with pytest.raises(IsabelleToolError, match="has not taken effect"):
+            await client.resync_changed_open_documents()
+        with pytest.raises(IsabelleToolError, match="has not taken effect"):
+            await client.resync_changed_open_documents()
