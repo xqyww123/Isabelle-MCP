@@ -410,10 +410,14 @@ class TestSessionManagement:
         for kwargs in ({"debug": True}, {}):
             session = "HOL" if kwargs else "HOL-Analysis"
             client = _launch_mock(running=True, logic="HOL")
+            refusal = server_mod.debugger.EVAL_TO_REFUSED.format(
+                hits="hit id h1 at Foo.thy:14")
             with patch.object(server_mod, '_lsp_client', client), \
                     patch.object(server_mod.debugger, 'hits_live_refusal',
-                                 return_value="Evaluation is paused at a breakpoint — hit id h1."):
-                with pytest.raises(IsabelleToolError, match="paused at a breakpoint"):
+                                 return_value=refusal):
+                with pytest.raises(
+                        IsabelleToolError,
+                        match="cannot run while a thread is stopped at a breakpoint"):
                     await isabelle_launch(session, **kwargs)
             client.shutdown.assert_not_awaited()
             client.start.assert_not_awaited()
@@ -482,7 +486,8 @@ class TestSessionManagement:
 
         client = _launch_mock(running=True, logic="HOL")
         refusal = MagicMock(
-            return_value="Evaluation is paused at a breakpoint — hit id h1.")
+            return_value=server_mod.debugger.EVAL_TO_REFUSED.format(
+                hits="hit id h1 at Foo.thy:14"))
         with patch.object(server_mod, '_lsp_client', client), \
                 patch.object(server_mod.debugger, 'hits_live_refusal', refusal):
             result = await isabelle_launch("HOL")

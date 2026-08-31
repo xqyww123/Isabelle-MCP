@@ -1340,20 +1340,60 @@ class TestEvaluationFooter:
         assert await ev.evaluation_footer(client) == ""
 
     @pytest.mark.asyncio
-    async def test_a_live_hit_replaces_the_activity_clause_with_the_pause_line(
-        self, mock_lsp_client, temp_theory_file, monkeypatch,
+    @pytest.mark.parametrize("outlet", [
+        "no_target", "towards", "arrived", "completed", "import_not_done",
+    ])
+    async def test_a_live_hit_appends_the_pause_line_at_every_outlet(
+        self, mock_lsp_client, temp_theory_file, monkeypatch, outlet,
     ):
-        """D-B15: while a hit is live, "has been running for Ns" is
-        misleading — the footer says the pause line instead."""
+        """D-B15 (revised): every outlet keeps its status line minus the
+        running sentence; the pause line is appended as a second line."""
         from isabelle_mcp import debugger
 
         lead = "Breakpoint hit: h1. The affected evaluation is paused."
+        pause_line = lead + " " + ev.FOOTER_HIT_DETAILS_CALL
         monkeypatch.setattr(debugger, "paused_lead", lambda client: lead)
-        client = await self._client(mock_lsp_client, temp_theory_file)
+        ranges = {
+            "no_target": {},
+            "towards": {"unprocessed": [(5, 0, 30, 0)]},
+            "arrived": {"running": [(2, 0, 2, 9)]},
+            "completed": {"bad": [(3, 0, 3, 9)]},
+            "import_not_done": {},
+        }[outlet]
+        client = await self._client(mock_lsp_client, temp_theory_file, **ranges)
         client.get_all_running_commands = lambda: [self._slow(temp_theory_file)]
+        if outlet == "import_not_done":
+            real_status = client.request_theory_status
+
+            async def with_unfinished_import():
+                theories = await real_status()
+                theories[0]["imports"] = [{"theory_name": "Dep_import"}]
+                theories.append({
+                    "node_name": "/tmp/Dep_import.thy",
+                    "theory_name": "Dep_import", "imports": [], "ok": True,
+                    "consolidated": False, "running": 1, "unprocessed": 5,
+                })
+                return theories
+
+            client.request_theory_status = with_unfinished_import
+        if outlet != "no_target":
+            target = 20 if outlet == "towards" else 5
+            evaluation_state.start(temp_theory_file, MCPLine(target))
+
         footer = await ev.evaluation_footer(client)
-        assert lead in footer
+        assert footer == pause_line or footer.endswith("\n" + pause_line)
         assert "has been running" not in footer
+        if outlet == "towards":
+            # The ruling's worked example, verbatim.
+            assert footer == (
+                f"Evaluating towards {temp_theory_file}:20.\n" + pause_line)
+        if outlet == "completed":
+            # D-C3 survives: the failure suffix is a closed dependency's
+            # only notification.
+            assert footer.split("\n")[0] == (
+                f"Evaluation has completed up to {temp_theory_file}:5. "
+                "1 command failed. Call isabelle_evaluation_status for details."
+            )
 
     @pytest.mark.asyncio
     async def test_nothing_outstanding_but_work_running_drops_the_main_sentence(

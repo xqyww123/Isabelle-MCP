@@ -1806,29 +1806,36 @@ async def hit_report(client: IsabelleLSPClient) -> str:
     return "\n\n".join(blocks)
 
 
-def paused_lead(client: IsabelleLSPClient) -> str | None:
-    """Just the paused lead sentence (D-C4) — hit ids, no blocks. Also the
-    evaluation footer's pause line (D-B15). None when no hit is live.
-    Synchronous."""
+def _live_hits(client: IsabelleLSPClient) -> list[Hit]:
+    """The live hit table, freshly synced; empty when the debugger is off.
+    Synchronous, so the caller's later reads see this same list."""
     if not client.debug:
-        return None
+        return []
     registry.sync_hits(client)
-    hits = list(registry.hits.values())
-    if not hits:
-        return None
+    return list(registry.hits.values())
+
+
+def _lead(hits: list[Hit]) -> str:
+    """The paused lead sentence (D-C4) for a non-empty hit list."""
     ids = ", ".join(h.hit_id for h in hits)
     return (PAUSED_LEAD_ONE if len(hits) == 1
             else PAUSED_LEAD_MANY).format(hits=ids)
 
 
+def paused_lead(client: IsabelleLSPClient) -> str | None:
+    """Just the paused lead sentence — the evaluation footer's pause line
+    (D-B15). None when no hit is live. Synchronous."""
+    hits = _live_hits(client)
+    return _lead(hits) if hits else None
+
+
 def paused_section(client: IsabelleLSPClient) -> str | None:
     """The evaluation_status paused section (group 8): leads the result
     whenever hits are live; None otherwise. Synchronous."""
-    lead = paused_lead(client)
-    if lead is None:
+    hits = _live_hits(client)
+    if not hits:
         return None
-    hits = list(registry.hits.values())
-    return "\n\n".join([lead, *(_hit_block(h) for h in hits), PAUSED_TAIL])
+    return "\n\n".join([_lead(hits), *(_hit_block(h) for h in hits), PAUSED_TAIL])
 
 
 def _transitive_importers(

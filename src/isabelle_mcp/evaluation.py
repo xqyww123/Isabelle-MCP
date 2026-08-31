@@ -1651,6 +1651,9 @@ def _failed_count(client: IsabelleLSPClient) -> int:
     return sum(fs.error_count for fs in _open_document_snapshots(client))
 
 
+FOOTER_HIT_DETAILS_CALL = "Call isabelle_debug_state for the hit details."
+
+
 async def evaluation_footer(client: IsabelleLSPClient) -> str:
     """Ambient context for a query-tool result: what the server is working
     toward, and what the prover is doing around it. Empty when there is nothing
@@ -1669,24 +1672,34 @@ async def evaluation_footer(client: IsabelleLSPClient) -> str:
     only ``isabelle_evaluation_status`` makes it — so an evaluation that
     finished quietly kept every query tool blocked until someone polled.
     """
-    running = client.get_all_running_commands()
     from isabelle_mcp import debugger
     paused = debugger.paused_lead(client)
+    # D-B15 (revised 2026-08-31): a command stopped at a breakpoint still
+    # counts as running, so "has been running for Ns" would mislead — with a
+    # live hit the running list is emptied up here (every outlet at once; no
+    # call site can forget) and the pause line is appended as its own second
+    # line. Failure sentences survive: they are a closed dependency's only
+    # notification (D-C3).
+    running = [] if paused is not None else client.get_all_running_commands()
+    line = await _footer_status_line(client, running)
+    if paused is None:
+        return line
+    pause_line = f"{paused} {FOOTER_HIT_DETAILS_CALL}"
+    return f"{line}\n{pause_line}" if line else pause_line
 
-    def activity(running_commands: list[RunningCommand], n_failed: int) -> list[str]:
-        # D-B15: while a hit is live, "has been running for Ns" is misleading —
-        # the pause line replaces the whole activity clause.
-        if paused is not None:
-            return [paused]
-        return _footer_activity(running_commands, n_failed)
 
+async def _footer_status_line(
+    client: IsabelleLSPClient, running: list[RunningCommand],
+) -> str:
+    """The footer's status line: target sentence plus activity, built from
+    the caller's (possibly emptied) running-command list."""
     if not evaluation_state.active:
         # No target to name. The main sentence is dropped rather than paired with
         # a contradicting one: "Nothing is under evaluation." followed by
         # "2 commands have been running…" argues with itself. The call to action
         # stays: the agent is being told work is running, so it needs somewhere
         # to look.
-        return " ".join(activity(running, 0))
+        return " ".join(_footer_activity(running, 0))
 
     # Capture the handle HERE, with the target it belongs to and before any
     # await. Re-reading `current` at finish time would make _finish_if_owner's
@@ -1706,7 +1719,7 @@ async def evaluation_footer(client: IsabelleLSPClient) -> str:
 
     tracker = client.get_processing_tracker(target)
     if tracker is None or not tracker.line_reached(dest.to_lsp()):
-        return " ".join([towards, *activity(running, _failed_count(client))])
+        return " ".join([towards, *_footer_activity(running, _failed_count(client))])
 
     theories = [
         _parse_theory_status(t) for t in await client.request_theory_status()
@@ -1734,12 +1747,12 @@ async def evaluation_footer(client: IsabelleLSPClient) -> str:
                                                judged_dest=dest)):
                 return " ".join([
                     _target_sentence(COMPLETED_SENTENCE, target, int(dest), root),
-                    *activity([], n_failed),
+                    *_footer_activity([], n_failed),
                 ])
     if _frontier_reached(target, dest, client, theories):
         return " ".join([
             _target_sentence(ARRIVED_SENTENCE, target, int(dest), root),
-            *activity(running, _failed_count(client)),
+            *_footer_activity(running, _failed_count(client)),
         ])
     return " ".join([towards, *_footer_activity(running, _failed_count(client))])
 

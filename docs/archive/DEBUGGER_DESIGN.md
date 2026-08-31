@@ -1023,15 +1023,16 @@ isabelle_continue_breakpoint.
   teaches the concepts.
 
 `isabelle_evaluation_status` reports a "paused at a breakpoint" section
-whenever hits are live (wording refined by the decoration probe), so polling
+whenever hits are live, so polling
 never misreads a stop as a hang. **`isabelle_evaluate_to` is refused while
 any hit is live**: the frontier cannot advance, and `evaluate_to` still moves
-the caret. The refusal leads with the live hits and names the next actions:
+the caret. The refusal leads with the live hits:
 > **Superseded 2026-08-31 (D-C4/D-C6)**: the paused lead is now
 > "Breakpoint hit: h1. The affected evaluation is paused." and the refusal
 > "Breakpoint hit: hit id h1 at Foo.thy:14 before ‹fold upd args›.
 > `isabelle_evaluate_to` cannot run while a thread is stopped at a
 > breakpoint." — no tail sentence. The quote below is the retired wording.
+>
 > Evaluation is paused at a breakpoint — hit h1 at Foo.thy:14 before ‹fold
 > upd args›. isabelle_evaluate_to cannot run while a hit is live. Inspect
 > with isabelle_debug_state, resume with isabelle_continue_breakpoint.

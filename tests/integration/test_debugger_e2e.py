@@ -92,15 +92,17 @@ async def test_full_workflow_set_hit_locals_eval_continue(dbg):
     # The paused section leads evaluation_status while the hit lives.
     paused = debugger.paused_section(client)
     assert paused is not None
-    assert paused.startswith("Breakpoint hit: ")
+    assert paused.startswith(debugger.PAUSED_LEAD_ONE.format(hits="h1"))
     assert paused.rstrip().endswith(debugger.PAUSED_TAIL)
 
     # A second evaluate_to is refused, leading with the hit.
     with pytest.raises(IsabelleToolError) as exc:
         await evaluate_to(client, path, CALLER)
     assert str(exc.value).startswith(
-        "Evaluation is paused at a breakpoint — hit id h1 at "
-        "DebugProbe.thy:13 before ‹val total"), str(exc.value)
+        "Breakpoint hit: hit id h1 at DebugProbe.thy:13 before "
+        "‹val total"), str(exc.value)
+    assert str(exc.value).endswith(
+        "cannot run while a thread is stopped at a breakpoint."), str(exc.value)
 
     out = await debugger.locals_at_breakpoint(client, None, 0, 60.0)
     assert "xs =" in out and "shift =" in out, out

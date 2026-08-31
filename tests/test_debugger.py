@@ -1371,6 +1371,23 @@ class TestPausedSection:
         assert out.count("Hit id:") == 2
 
 
+class TestPausedLead:
+    """The footer's pause line (D-B15) through the real registry."""
+
+    def test_none_without_hits(self, client):
+        assert debugger.paused_lead(client) is None
+
+    def test_single_hit_sentence(self, client):
+        _hit(client)
+        assert debugger.paused_lead(client) == (
+            "Breakpoint hit: h1. The affected evaluation is paused.")
+
+    def test_debug_off_pays_nothing(self, client):
+        _hit(client)
+        client.debug = False
+        assert debugger.paused_lead(client) is None
+
+
 # ── D2: dirty marks and reconciliation (the reviewed Scheme A) ─────────
 
 
