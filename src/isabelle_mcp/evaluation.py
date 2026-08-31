@@ -778,7 +778,10 @@ def _relevant_files(
     client: IsabelleLSPClient, target: str, auto_opened: set[str],
 ) -> list[str]:
     """Target ∪ auto-opened deps ∪ open docs with any problem/running marker."""
-    files: list[str] = [target]
+    # A session that never evaluated has no target ("" -- only start() writes
+    # file_path): seeding it would snapshot the empty path, and relativize("")
+    # renders the project root as a file.
+    files: list[str] = [target] if target else []
     for f in auto_opened:
         if f not in files:
             files.append(f)

@@ -11,6 +11,7 @@ run is outstanding) and isabelle_cancel_evaluation's idle reply are untouched.
 """
 
 import asyncio
+import os
 import time
 
 import pytest
@@ -258,6 +259,31 @@ class TestIdleReport2:
         view = await evaluation_status(mock_lsp_client)
         assert view.status == "in_progress"
         assert view.message == "1 command is still running."
+
+    @pytest.mark.asyncio
+    async def test_a_session_that_never_evaluated_lists_no_file_for_its_absent_target(
+        self, temp_theory_file, mock_lsp_client, monkeypatch,
+    ):
+        # A save made the prover re-check a command, so the busy path is taken
+        # with no run on the books. ``evaluation_state.file_path`` is still the
+        # never-evaluated "" -- only start() ever writes it -- and there is no
+        # target to report. Setting it explicitly is the precondition, not a
+        # double: cancel() (which the autouse reset calls) leaves file_path
+        # alone, so an earlier test's target would otherwise stand in for it.
+        monkeypatch.setattr(evaluation_state, "file_path", "")
+        await _open_with(mock_lsp_client, temp_theory_file, running=[(4, 0, 4, 5)])
+        view = await evaluation_status(mock_lsp_client)
+        assert view.status == "in_progress"
+        assert view.message == "1 command is still running."
+        # The absent target must not be snapshotted: relativize("") renders the
+        # project root, so a section would name a DIRECTORY as a file in progress.
+        assert [fs.file_path for fs in view.files] == [temp_theory_file]
+        text = format_evaluation_result(view, os.getcwd(), call_to_action=False)
+        assert ".: in progress" not in text
+        assert text == (
+            "1 command is still running.\n\n"
+            f"{temp_theory_file}:\n  running: line 5"
+        )
 
 
 class TestNeighboursUnchanged:
