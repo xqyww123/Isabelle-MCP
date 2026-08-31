@@ -444,8 +444,8 @@ The trailing call-to-action appears when either count is non-zero.
 | Situation | Footer |
 |---|---|
 | An evaluation is outstanding, the target line is not reached | `Evaluating towards F:L.` + suffixes |
-| Outstanding, target reached, work still running or failed | `Evaluation has arrived at F:L.` + suffixes |
-| Outstanding, target reached, nothing running or failed, **and the authoritative check confirms completion** | `Evaluation has completed up to F:L.` — no suffixes |
+| Outstanding, target reached, the evaluated prefix still busy (running or unjoined forks), or an import not done | `Evaluation has arrived at F:L.` + suffixes |
+| Outstanding, target reached, **and the authoritative check confirms completion** | `Evaluation has completed up to F:L.` + `N commands failed. Call isabelle_evaluation_status for details.` when failures remain (D-C3); no other suffixes |
 | Outstanding, but the decoration cache is stale (a recent edit) | `Evaluating towards F:L.` — **no suffixes**, because the counts would come from the same untrusted cache |
 | No evaluation outstanding, but commands are running | suffixes only, no main sentence |
 | No evaluation outstanding, nothing running | nothing at all |

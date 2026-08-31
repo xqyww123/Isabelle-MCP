@@ -409,26 +409,6 @@ def _activity_clause(running_commands: list[RunningCommand]) -> str:
     )
 
 
-def _arrival_message(
-    target: str,
-    dest: int,
-    running_commands: list[RunningCommand],
-    files: list[FileSnapshot],
-    root: str | None,
-) -> str:
-    """Leading sentence for a run whose frontier reached the destination.
-
-    Reaching the destination is not the same as being done: the command at or
-    after it may still be running (a stuck tactic), and earlier commands may have
-    failed — errors do not halt checking. The counts themselves are NOT repeated
-    here; they are below, per line, in the file sections.
-    """
-    n_failed = sum(fs.error_count for fs in files)
-    if not running_commands and not n_failed:
-        return _target_sentence(COMPLETED_SENTENCE, target, dest, root)
-    return _target_sentence(ARRIVED_SENTENCE, target, dest, root)
-
-
 # ---------------------------------------------------------------------------
 # EvaluationState
 # ---------------------------------------------------------------------------
@@ -844,18 +824,32 @@ async def _cleanup_auto_opened(
 
 async def _finish_if_owner(
     client: IsabelleLSPClient, evaluation: Evaluation, outcome: str,
+    *, judged_dest: MCPLine | None,
 ) -> bool:
-    """End *evaluation* — flag, outcome stamp and cleanup — if it still owns the state.
+    """End *evaluation* — flag, outcome stamp and cleanup — if it still owns the
+    state and, for a completion, the target is still the one it was judged at.
 
     Only the run that started this state may end it. Without the ownership test a
     finishing run closes the auto-opened documents of a *later* run that started
     while it was waiting (evaluate_to holds no lock across the wait).
 
-    The test and the flag flip are synchronous with no await between them, so
+    *judged_dest* is keyword-only with no default on purpose: every new caller
+    must decide, because omitting it would silently disarm the guard. A
+    completion passes the target its verdict was computed against — a target
+    that advanced meanwhile means the verdict belongs to the old target while
+    the run drives on, so the stamp is refused. The cancel family passes
+    ``None``: a cancel ends the run wherever its target stands.
+    (``cancel_evaluation`` itself deliberately does not go through this path at
+    all — it resets unconditionally in a ``finally``, otherwise a failed cancel
+    would wedge every later evaluation.)
+
+    The tests and the flag flip are synchronous with no await between them, so
     _cleanup_auto_opened's atomicity guarantee and the "reset first, then close"
     cancellation discipline are preserved.
     """
     if not evaluation_state.owns(evaluation):
+        return False
+    if judged_dest is not None and evaluation_state.destination_line != judged_dest:
         return False
     if outcome == "complete":
         evaluation_state.complete()
@@ -1151,7 +1145,7 @@ async def evaluate_to(
                 # given up on it. A lone starter must end it — the anti-wedge
                 # invariant needs ``active`` cleared on every failure path.
                 if evaluation_state.leave(evaluation):
-                    await _finish_if_owner(client, evaluation, "cancelled")
+                    await _finish_if_owner(client, evaluation, "cancelled", judged_dest=None)
                 raise
 
     try:
@@ -1186,7 +1180,7 @@ async def evaluate_to(
         # leave() decides who may end the shared run: only the last request
         # that had not given up on it.
         if evaluation_state.leave(evaluation):
-            await _finish_if_owner(client, evaluation, "cancelled")
+            await _finish_if_owner(client, evaluation, "cancelled", judged_dest=None)
         raise
 
     if evaluation_state.owns(evaluation):
@@ -1211,7 +1205,7 @@ async def evaluate_to(
         # a relaunch, or the catastrophe handler. That fact, not
         # the recorded outcome, is what the agent needs; checked before the hit
         # and heap branches, which would report on a prover that no longer exists.
-        await _finish_if_owner(client, evaluation, "cancelled")
+        await _finish_if_owner(client, evaluation, "cancelled", judged_dest=None)
         status = "cancelled"
         message = SESSION_GONE_MESSAGE
     elif evaluation.outcome == "cancelled":
@@ -1219,7 +1213,7 @@ async def evaluate_to(
         # that; naming any other cause (a heap divergence, a timeout) would
         # fabricate one. The cleanup repeats because a dependency may have been
         # auto-opened after the canceller's own cleanup ran.
-        await _finish_if_owner(client, evaluation, "cancelled")
+        await _finish_if_owner(client, evaluation, "cancelled", judged_dest=None)
         message = CANCELLED_MESSAGE
     elif status == "hit":
         # The hit-led exit (section 6.1) — a DISTINCT internal outcome,
@@ -1233,7 +1227,7 @@ async def evaluate_to(
     elif heap_warning and status != "complete":
         # The file differs from its precompiled copy, so PIDE will never
         # reprocess it — abandon the evaluation instead of leaving it pending.
-        await _finish_if_owner(client, evaluation, "cancelled")
+        await _finish_if_owner(client, evaluation, "cancelled", judged_dest=None)
         status = "cancelled"
         message = (
             "Evaluation abandoned: the file differs from its precompiled copy "
@@ -1241,8 +1235,13 @@ async def evaluate_to(
         )
     else:
         if status == "complete":
-            message = _arrival_message(
-                file_path, dest, running_commands, files, client.project_root,
+            # One completion vocabulary: internal complete ⇒ the COMPLETED
+            # sentence, whatever failed or still runs elsewhere. Failures are
+            # below, per line, in the file sections; running commands keep
+            # their running: rows. A second wording-level completion judgement
+            # is exactly problem 8 (D-B2).
+            message = _target_sentence(
+                COMPLETED_SENTENCE, file_path, dest, client.project_root,
             )
         elif _frontier_reached(file_path, dest_line, client, theories):
             # The frontier passed the destination but the prefix is not quiet yet
@@ -1257,7 +1256,12 @@ async def evaluate_to(
                 TOWARDS_SENTENCE, file_path, dest, client.project_root,
             )
         if status == "complete":
-            await _finish_if_owner(client, evaluation, "complete")
+            # judged_dest: dest_line was re-read under owns() above with no
+            # await since, so an advanced target was already picked up; the
+            # guard turns a run replaced meanwhile into the no-op it must be.
+            await _finish_if_owner(
+                client, evaluation, "complete", judged_dest=dest_line,
+            )
     if fence_line:
         message = message + "\n\n" + fence_line
     if redirected_line:
@@ -1333,31 +1337,37 @@ async def evaluation_status(
     if _no_pending_work(client):
         return _idle_view(client)
 
+    # Capture the run handle BEFORE the await: the round trip below is the one
+    # window in which another run can take over, and the stamp must go to the
+    # run this call judged, never to a successor (D-B12).
+    evaluation = evaluation_state.current
     theories, running_commands = await _build_status_snapshot(
         client, evaluation_state,
     )
-    dest = int(evaluation_state.destination_line)
+    dest_line = evaluation_state.destination_line
+    dest = int(dest_line)
     target = evaluation_state.file_path
     auto_opened = set(evaluation_state.auto_opened_files)
 
-    complete = _is_evaluation_complete(
-        target, evaluation_state.destination_line, client, theories,
-    )
-    files = _snapshot_files(
-        client, target, theories, auto_opened, evaluation_state.destination_line,
-    )
+    complete = _is_evaluation_complete(target, dest_line, client, theories)
+    files = _snapshot_files(client, target, theories, auto_opened, dest_line)
     # Only the active evaluation owns the complete→cleanup transition; once
     # ``active`` is False the cleanup already ran and we are merely surfacing a
     # lingering fork, which must stay visible (not collapse back to "complete").
-    if evaluation_state.active and complete:
-        evaluation_state.complete()
-        await _cleanup_auto_opened(client, evaluation_state)
+    # _finish_if_owner is the ONE termination implementation (no hand-rolled
+    # complete()+cleanup here), and its verdict gates the sentence: a run
+    # replaced during the round trip is not stamped, and the in_progress
+    # branches below describe the current run truthfully — the next poll
+    # completes it.
+    if (evaluation_state.active and complete and evaluation is not None
+            and await _finish_if_owner(client, evaluation, "complete",
+                                       judged_dest=dest_line)):
         return EvaluationView(
             status="complete",
             target_file=target,
             destination_line=dest,
-            message=_arrival_message(
-                target, dest, running_commands, files, client.project_root,
+            message=_target_sentence(
+                COMPLETED_SENTENCE, target, dest, client.project_root,
             ),
             files=files,
             running_commands=running_commands,
@@ -1624,11 +1634,12 @@ async def evaluation_footer(client: IsabelleLSPClient) -> str:
     to say.
 
     Everything here is a read of the local decoration cache — no request, no
-    round trip — with **one** exception: when the local view says the target is
-    reached with nothing running and nothing failed, the verdict "complete" also
-    requires every recursively imported theory to be done, which only
-    ``theory_status`` knows. That check therefore runs exactly once per
-    evaluation, and ends it.
+    round trip — with **one** exception: once the target line is reached, the
+    verdict "complete" also requires every recursively imported theory to be
+    done, which only ``theory_status`` knows. That request runs on every footer
+    in the reached-but-not-complete window (one round trip per query — the same
+    request evaluation_status's poll sends anyway) until the completion is
+    stamped, which ends the run.
 
     That transition is not a display concern that happens to mutate: observing
     completion is a state change the server has to make somewhere, and today
@@ -1664,27 +1675,36 @@ async def evaluation_footer(client: IsabelleLSPClient) -> str:
     if tracker is None or not tracker.line_reached(dest.to_lsp()):
         return " ".join([towards, *_footer_activity(running, _failed_count(client))])
 
-    if not running and not _failed_count(client):
-        theories = [
-            _parse_theory_status(t) for t in await client.request_theory_status()
-        ]
-        if _is_evaluation_complete(target, dest, client, theories):
-            # Under the lock, like every other terminal transition: the stamp, the
-            # flag and the cleanup of the auto-opened dependencies travel together.
-            # The round trip above is where a same-file request can advance the
-            # target; a target that moved is only "arrived" for the old one
-            # (targets only move forward, so equality means unchanged).
-            async with _evaluation_state_lock:
-                if evaluation is not None and evaluation_state.destination_line == dest:
-                    await _finish_if_owner(client, evaluation, "complete")
-                    return _target_sentence(COMPLETED_SENTENCE, target, int(dest), root)
-            # The target moved on: say "arrived" for the target this footer
-            # judged (true), and let the next footer name the new one.
-
-    return " ".join([
-        _target_sentence(ARRIVED_SENTENCE, target, int(dest), root),
-        *_footer_activity(running, _failed_count(client)),
-    ])
+    theories = [
+        _parse_theory_status(t) for t in await client.request_theory_status()
+    ]
+    if _is_evaluation_complete(target, dest, client, theories):
+        # Count BEFORE finishing: the finish closes the auto-opened dependency
+        # documents, whose failures then leave _failed_count — this suffix is
+        # their only notification (D-C3).
+        n_failed = _failed_count(client)
+        # Under the lock, like the other terminal transitions: the stamp, the
+        # flag and the cleanup travel together. Two gates on the sentence:
+        # ``not outcome`` — the run was cancelled during the round trip above,
+        # and a COMPLETED right after the cancel reply would be false; the
+        # _finish_if_owner verdict — the target moved on (a same-file advance
+        # in that round trip) or the run was replaced, so the verdict belongs
+        # to the old target. Either way ARRIVED below is true for the target
+        # this footer judged, and the next footer names the new state.
+        async with _evaluation_state_lock:
+            if (evaluation is not None and not evaluation.outcome
+                    and await _finish_if_owner(client, evaluation, "complete",
+                                               judged_dest=dest)):
+                return " ".join([
+                    _target_sentence(COMPLETED_SENTENCE, target, int(dest), root),
+                    *_footer_activity([], n_failed),
+                ])
+    if _frontier_reached(target, dest, client, theories):
+        return " ".join([
+            _target_sentence(ARRIVED_SENTENCE, target, int(dest), root),
+            *_footer_activity(running, _failed_count(client)),
+        ])
+    return " ".join([towards, *_footer_activity(running, _failed_count(client))])
 
 
 def _footer_activity(

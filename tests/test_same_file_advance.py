@@ -384,6 +384,19 @@ class TestFooterGuard:
         assert evaluation_state.active                          # not stamped
         assert evaluation_state.destination_line == 9
 
+    async def test_a_run_cancelled_during_the_round_trip_is_not_stamped_complete(
+        self, mock_lsp_client, temp_theory_file,
+    ):
+        # The theory_status round trip holds no lock; a cancel landing inside
+        # it must not be followed by a COMPLETED sentence (the footer's
+        # ``not evaluation.outcome`` gate).
+        text = await self._footer_at_target(
+            mock_lsp_client, temp_theory_file,
+            lambda: evaluation_state.cancel())
+        assert text == f"Evaluation has arrived at {temp_theory_file}:5."
+        assert evaluation_state.current.outcome == "cancelled"
+        assert not evaluation_state.active
+
 
 class TestGuardToEvaluateToGap:
     """Section 10A, unverified item 3: the query guard releases the lock before

@@ -13,7 +13,6 @@ from isabelle_mcp.evaluation import (
     resync_changed_open_documents_locked,
     sync_file_locked,
 )
-from isabelle_mcp.evaluation import _arrival_message
 from isabelle_mcp.lsp_client import DocumentState
 from isabelle_mcp.models import EvaluationView, FileSnapshot, RunningCommand
 from isabelle_mcp.processing import ProcessingTracker, parse_decoration_ranges
@@ -219,9 +218,41 @@ class TestEvaluationStatus:
         fs = _file(r2, temp_theory_file)
         assert fs is not None and fs.errors == [(8, 8)]
         assert fs.state == "problems"
-        # The failure is reported by the file section above, with its line number;
-        # the sentence names the target and does not repeat the count.
-        assert r2.message == f"Evaluation has arrived at {temp_theory_file}:9."
+        # One completion vocabulary (problem 8): internal complete ⇒ COMPLETED,
+        # failures and all — they are above, per line, in the file section.
+        assert r2.message == f"Evaluation has completed up to {temp_theory_file}:9."
+
+    @pytest.mark.asyncio
+    async def test_a_restarted_run_is_not_stamped_by_the_old_observer(
+        self, temp_theory_file, mock_lsp_client,
+    ):
+        # Cancel + restart at the same file and line during the theory_status
+        # round trip: a bare line-equality check would pass, but the run this
+        # call judged is gone. The stamp is refused, the successor reports
+        # in_progress truthfully, and the next poll completes it.
+        mock_lsp_client._processing_trackers[temp_theory_file] = MockProcessingTracker(
+            all_processed=False,
+        )
+        await evaluate_to(mock_lsp_client, temp_theory_file, 5)
+        mock_lsp_client._processing_trackers[temp_theory_file] = MockProcessingTracker()
+        real_status = mock_lsp_client.request_theory_status
+
+        async def cancel_and_restart():
+            result = await real_status()
+            if evaluation_state.active and evaluation_state.current.outcome == "":
+                evaluation_state.cancel()
+                evaluation_state.start(temp_theory_file, MCPLine(5))
+            return result
+
+        mock_lsp_client.request_theory_status = cancel_and_restart
+        view = await evaluation_status(mock_lsp_client)
+        assert view.status == "in_progress"
+        assert evaluation_state.active
+        assert evaluation_state.current.outcome == ""
+
+        mock_lsp_client.request_theory_status = real_status
+        final = await evaluation_status(mock_lsp_client)
+        assert final.status == "complete"
 
 
 class TestCancelEvaluation:
@@ -403,49 +434,61 @@ class TestSnapshotCategorization:
         assert fs.pending == [] and fs.state == "clean"
 
 
-class TestLeadingSentence:
-    def _run(self, line, text="apply simp"):
-        return RunningCommand(
-            file_path="/proj/Foo.thy", start_line=line, end_line=line,
-            text=text, elapsed_seconds=42.0,
-        )
+class TestCompletionSentence:
+    """One completion vocabulary (problem 8, D-B2): internal complete ⇒ the
+    COMPLETED sentence at every outlet, whatever failed or still runs. The
+    wording holds no second completion judgement."""
 
-    def _fs(self, error_count=0):
-        return FileSnapshot(
-            "/proj/Foo.thy", lined=True,
-            state="problems" if error_count else "clean",
-            error_count=error_count,
+    @pytest.mark.asyncio
+    async def test_completed_with_failures_says_completed(
+        self, temp_theory_file, mock_lsp_client,
+    ):
+        mock_lsp_client._processing_trackers[temp_theory_file] = (
+            MockProcessingTracker(overview_error=[(2, 0, 2, 5)])
         )
+        view = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
+        assert view.status == "complete"
+        assert view.message == f"Evaluation has completed up to {temp_theory_file}:5."
+        # The failure is not hidden: it is below, per line, in the file section.
+        assert _file(view, temp_theory_file).errors == [(3, 3)]
 
-    def test_nothing_left(self):
-        assert _arrival_message("/proj/Foo.thy", 11, [], [self._fs()], "/proj") == (
-            "Evaluation has completed up to Foo.thy:11."
+    @pytest.mark.asyncio
+    async def test_completed_with_a_command_running_past_the_target_says_completed(
+        self, temp_theory_file, mock_lsp_client,
+    ):
+        # Running beyond the destination: the run *to the target* is done;
+        # saying "arrived" would deny the agent its terminal sentence forever.
+        # The running command keeps its running: row in the file section.
+        mock_lsp_client._processing_trackers[temp_theory_file] = (
+            MockProcessingTracker(running=[(9, 0, 9, 4)])
         )
+        view = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
+        assert view.status == "complete"
+        assert view.message == f"Evaluation has completed up to {temp_theory_file}:5."
+        assert _file(view, temp_theory_file).running == [(10, 10)]
 
-    def test_still_running(self):
-        msg = _arrival_message(
-            "/proj/Foo.thy", 11, [self._run(11)], [self._fs()], "/proj",
-        )
-        assert msg == "Evaluation has arrived at Foo.thy:11."
+    @pytest.mark.asyncio
+    async def test_a_successor_run_cannot_hijack_the_reply(
+        self, temp_theory_file, mock_lsp_client, monkeypatch,
+    ):
+        # 10A must-fix 1: while this call waited, a concurrent status observed
+        # the completion, and the agent started a run on ANOTHER file. The
+        # reply stays this run's — complete, with its own target line — and
+        # the successor is left unstamped and running.
+        async def loop_then_successor(client, file_path, state, evaluation, timeout):
+            state.complete()
+            state.start("/tmp/Other_successor.thy", MCPLine(3))
+            return "complete", [], []
 
-    def test_failed(self):
-        msg = _arrival_message(
-            "/proj/Foo.thy", 11, [], [self._fs(error_count=2)], "/proj",
-        )
-        assert msg == "Evaluation has arrived at Foo.thy:11."
-
-    def test_the_counts_are_not_repeated_in_the_sentence(self):
-        # They are below, per line, in the file sections.
-        files = [self._fs(error_count=1), self._fs(error_count=2)]
-        msg = _arrival_message(
-            "/proj/Foo.thy", 11, [self._run(11), self._run(11)], files, "/proj",
-        )
-        assert "2" not in msg and "3" not in msg
-
-    def test_absolute_path_without_a_project_root(self):
-        assert _arrival_message("/proj/Foo.thy", 11, [], [self._fs()], None) == (
-            "Evaluation has completed up to /proj/Foo.thy:11."
-        )
+        monkeypatch.setattr(ev, "_evaluation_wait_loop", loop_then_successor)
+        view = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
+        assert view.status == "complete"
+        assert view.message == f"Evaluation has completed up to {temp_theory_file}:5."
+        assert view.destination_line == 5
+        successor = evaluation_state.current
+        assert evaluation_state.active and successor is not None
+        assert evaluation_state.file_path == "/tmp/Other_successor.thy"
+        assert successor.outcome == ""
 
 
 class TestRendering:
@@ -863,7 +906,9 @@ class TestEvaluationLifecycle:
         second = evaluation_state.start(temp_theory_file, MCPLine(5))
         evaluation_state.auto_opened_files.add("/tmp/Dep_second.thy")
 
-        assert await ev._finish_if_owner(mock_lsp_client, first, "complete") is False
+        assert await ev._finish_if_owner(
+            mock_lsp_client, first, "complete", judged_dest=MCPLine(5),
+        ) is False
         # The second run's flag and its auto-opened set are untouched.
         assert evaluation_state.active is True
         assert evaluation_state.auto_opened_files == {"/tmp/Dep_second.thy"}
@@ -1288,8 +1333,11 @@ class TestEvaluationFooter:
 
     @pytest.mark.asyncio
     async def test_arrived_with_work_left(self, mock_lsp_client, temp_theory_file):
+        # The running command sits INSIDE the evaluated prefix, so the run is
+        # arrived-not-complete; one running past the target would be complete
+        # (see TestCompletionSentence).
         client = await self._client(
-            mock_lsp_client, temp_theory_file, running=[(7, 0, 7, 9)],
+            mock_lsp_client, temp_theory_file, running=[(2, 0, 2, 9)],
         )
         client.get_all_running_commands = lambda: [self._slow(temp_theory_file)]
         evaluation_state.start(temp_theory_file, MCPLine(5))
@@ -1298,6 +1346,23 @@ class TestEvaluationFooter:
             "1 command has been running for over 10s. "
             "Call isabelle_evaluation_status for details."
         )
+
+    @pytest.mark.asyncio
+    async def test_completion_with_failures_carries_the_failure_suffix(
+        self, mock_lsp_client, temp_theory_file,
+    ):
+        # D-C3: the footer hangs on another query's result, which has no file
+        # sections — this suffix is the failure count's last chance to appear
+        # with its run (and a closed dependency's only notification).
+        client = await self._client(
+            mock_lsp_client, temp_theory_file, bad=[(3, 0, 3, 9)],
+        )
+        run = evaluation_state.start(temp_theory_file, MCPLine(5))
+        assert await ev.evaluation_footer(client) == (
+            f"Evaluation has completed up to {temp_theory_file}:5. "
+            "1 command failed. Call isabelle_evaluation_status for details."
+        )
+        assert run.outcome == "complete" and not evaluation_state.active
 
     @pytest.mark.asyncio
     async def test_completion_is_observed_and_ends_the_evaluation(
