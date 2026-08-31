@@ -1,1 +1,2 @@
 recursive-include src/isabelle_mcp/scala *
+recursive-include src/isabelle_mcp/skills *

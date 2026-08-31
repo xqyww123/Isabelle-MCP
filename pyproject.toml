@@ -67,7 +67,7 @@ where = ["src"]
 # The Isabelle Scala component ships as a package asset and is registered in place — see
 # docs/COMPONENT_INSTALL_PLAN.md. It carries a prebuilt jar (no_build = true), so nothing is
 # ever compiled on the user's machine and site-packages may be read-only.
-isabelle_mcp = ["py.typed", "scala/**/*"]
+isabelle_mcp = ["py.typed", "scala/**/*", "skills/**/*"]
 
 [tool.black]
 line-length = 100

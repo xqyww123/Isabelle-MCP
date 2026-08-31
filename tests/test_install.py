@@ -58,6 +58,15 @@ class TestFindServerCommand:
 
 
 @pytest.fixture(autouse=True)
+def fake_home(monkeypatch, tmp_path):
+    """Skill install/uninstall writes under ``~``; tests must never touch the real home."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    return home
+
+
+@pytest.fixture(autouse=True)
 def _no_isabelle(monkeypatch):
     """`isabelle-mcp install` registers the Scala component; unit tests must not need Isabelle."""
     monkeypatch.setattr(
@@ -160,6 +169,125 @@ class TestMainNoServer:
         monkeypatch.setattr(subprocess, "run", run)
         assert install.main([]) == 1
         assert "no target client found" in capsys.readouterr().err
+
+
+SKILL = "isabelle-command-line"
+
+
+def _installed(home, client):
+    return home / client / "skills" / SKILL / "SKILL.md"
+
+
+class TestBundledSkills:
+    def test_the_bundled_skill_carries_the_marker(self):
+        skills = install._bundled_skills()
+        assert [s.parent.name for s in skills] == [SKILL]
+        assert install._skill_is_managed(skills[0])
+
+
+class TestInstallSkills:
+    def test_installs_into_both_selected_clients(self, fake_home, capsys):
+        install._install_skills(claude=True, codex=True)
+        source_text = install._bundled_skills()[0].read_text()
+        for client in (".claude", ".codex"):
+            assert _installed(fake_home, client).read_text() == source_text
+        out = capsys.readouterr().out
+        assert "✓ installed skill 'isabelle-command-line' into ~/.claude/skills" in out
+        assert "✓ installed skill 'isabelle-command-line' into ~/.codex/skills" in out
+
+    def test_follows_the_client_selection(self, fake_home):
+        install._install_skills(claude=False, codex=True)
+        assert not (fake_home / ".claude").exists()
+        assert _installed(fake_home, ".codex").is_file()
+
+    def test_a_managed_copy_is_overwritten(self, fake_home):
+        target = _installed(fake_home, ".claude")
+        target.parent.mkdir(parents=True)
+        target.write_text("---\nmanaged-by: isabelle-mcp\n---\nstale body\n")
+        install._install_skills(claude=True, codex=False)
+        assert target.read_text() == install._bundled_skills()[0].read_text()
+
+    def test_a_hand_edited_copy_is_skipped_with_a_warning(self, fake_home, capsys):
+        target = _installed(fake_home, ".claude")
+        target.parent.mkdir(parents=True)
+        target.write_text("my own skill now\n")
+        install._install_skills(claude=True, codex=False)
+        assert target.read_text() == "my own skill now\n"
+        captured = capsys.readouterr()
+        assert captured.err.strip() == (
+            "warn: left ~/.claude/skills/isabelle-command-line/SKILL.md alone: "
+            "it has been edited (its 'managed-by: isabelle-mcp' marker is gone)"
+        )
+        assert "installed skill" not in captured.out
+
+
+class TestUninstallSkills:
+    def test_removes_managed_copies_from_both_clients(self, fake_home, capsys):
+        install._install_skills(claude=True, codex=True)
+        capsys.readouterr()
+        install._uninstall_skills()
+        for client in (".claude", ".codex"):
+            assert not _installed(fake_home, client).exists()
+            assert not _installed(fake_home, client).parent.exists()
+        out = capsys.readouterr().out
+        assert "✓ removed skill 'isabelle-command-line' from ~/.claude/skills" in out
+        assert "✓ removed skill 'isabelle-command-line' from ~/.codex/skills" in out
+
+    def test_a_hand_edited_copy_survives_uninstall(self, fake_home, capsys):
+        target = _installed(fake_home, ".claude")
+        target.parent.mkdir(parents=True)
+        target.write_text("my own skill now\n")
+        install._uninstall_skills()
+        assert target.read_text() == "my own skill now\n"
+        err = capsys.readouterr().err
+        assert "warn: left ~/.claude/skills/isabelle-command-line/SKILL.md alone" in err
+
+    def test_nothing_installed_is_silent(self, capsys):
+        install._uninstall_skills()
+        captured = capsys.readouterr()
+        assert captured.out == "" and captured.err == ""
+
+    def test_extra_user_files_keep_the_directory(self, fake_home):
+        install._install_skills(claude=True, codex=False)
+        extra = _installed(fake_home, ".claude").parent / "notes.txt"
+        extra.write_text("mine\n")
+        install._uninstall_skills()
+        assert extra.read_text() == "mine\n"
+        assert not _installed(fake_home, ".claude").exists()
+
+
+@pytest.mark.usefixtures("server_cmd")
+class TestMainSkillWiring:
+    def test_skills_follow_the_registered_clients(self, monkeypatch):
+        monkeypatch.setattr(subprocess, "run", RecordingRun())
+        received = {}
+        monkeypatch.setattr(
+            install,
+            "_install_skills",
+            lambda claude, codex: received.update(claude=claude, codex=codex),
+        )
+        assert install.main(["--claude"]) == 0
+        assert received == {"claude": True, "codex": False}
+
+    def test_no_skills_opts_out(self, monkeypatch):
+        monkeypatch.setattr(subprocess, "run", RecordingRun())
+        monkeypatch.setattr(
+            install,
+            "_install_skills",
+            lambda *a, **k: pytest.fail("must not install skills"),
+        )
+        assert install.main(["--claude", "--no-skills"]) == 0
+
+    def test_main_installs_the_skill_end_to_end(self, monkeypatch, fake_home):
+        monkeypatch.setattr(subprocess, "run", RecordingRun())
+        assert install.main(["--claude"]) == 0
+        assert _installed(fake_home, ".claude").is_file()
+
+    def test_uninstall_removes_the_installed_skill(self, monkeypatch, fake_home):
+        monkeypatch.setattr(install, "unregister_component", lambda: None)
+        install._install_skills(claude=True, codex=False)
+        assert install.uninstall_main([]) == 0
+        assert not _installed(fake_home, ".claude").exists()
 
 
 class TestServerDispatch:

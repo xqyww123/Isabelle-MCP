@@ -12,6 +12,9 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterator
+from importlib.resources import files
+from pathlib import Path
 
 
 def _eprint(*lines: str) -> None:
@@ -51,6 +54,75 @@ def _run_add(add_cmd: list[str], client: str) -> None:
         raise SystemExit(proc.returncode)
 
 
+_SKILL_MARKER = "managed-by: isabelle-mcp"
+
+
+def _bundled_skills() -> list[Path]:
+    """The ``SKILL.md`` files shipped as package data, one per skill directory."""
+    root = Path(str(files("isabelle_mcp"))) / "skills"
+    return sorted(p / "SKILL.md" for p in root.iterdir() if (p / "SKILL.md").is_file())
+
+
+def _skill_is_managed(target: Path) -> bool:
+    """True when the installed copy still carries the managed-by marker.
+
+    The marker is the ownership test: a copy whose marker is gone was edited by
+    the user, and neither install nor uninstall touches it again.
+    """
+    text = target.read_text(encoding="utf-8")
+    return any(line.strip() == _SKILL_MARKER for line in text.splitlines())
+
+
+def _skill_targets(claude: bool, codex: bool) -> Iterator[tuple[Path, Path, str, str]]:
+    """Yield (source, target, display_dir, name) per bundled skill × selected client."""
+    dirs = []
+    if claude:
+        dirs.append((Path.home() / ".claude" / "skills", "~/.claude/skills"))
+    if codex:
+        dirs.append((Path.home() / ".codex" / "skills", "~/.codex/skills"))
+    for skills_dir, display in dirs:
+        for source in _bundled_skills():
+            name = source.parent.name
+            yield source, skills_dir / name / "SKILL.md", display, name
+
+
+def _warn_unmanaged(display: str, name: str) -> None:
+    _eprint(
+        f"warn: left {display}/{name}/SKILL.md alone: it has been edited "
+        f"(its '{_SKILL_MARKER}' marker is gone)"
+    )
+
+
+def _install_skills(claude: bool, codex: bool) -> None:
+    """Copy the bundled skills into the selected clients' user-level skill dirs.
+
+    A managed copy is overwritten (an upgrade); a hand-edited one is left alone.
+    """
+    for source, target, display, name in _skill_targets(claude, codex):
+        if target.exists() and not _skill_is_managed(target):
+            _warn_unmanaged(display, name)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"✓ installed skill '{name}' into {display}")
+
+
+def _uninstall_skills() -> None:
+    """Remove the installed skills from both clients; a hand-edited copy is kept."""
+    for _source, target, display, name in _skill_targets(claude=True, codex=True):
+        if not target.exists():
+            continue
+        if not _skill_is_managed(target):
+            _warn_unmanaged(display, name)
+            continue
+        target.unlink()
+        try:
+            target.parent.rmdir()  # keep the dir if the user put other files in it
+        except OSError:
+            pass
+        print(f"✓ removed skill '{name}' from {display}")
+
+
 def _register_claude(
     name: str, cmd: str, path_env: str | None, server_args: list[str]
 ) -> bool:
@@ -87,7 +159,8 @@ def _register_codex(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="isabelle-mcp install",
-        description="Register the isabelle-mcp server with Claude Code and/or Codex.",
+        description="Register the isabelle-mcp server with Claude Code and/or Codex, "
+        "and install its bundled skills.",
     )
     parser.add_argument(
         "--name",
@@ -105,6 +178,11 @@ def main(argv: list[str] | None = None) -> int:
         "--claude", action="store_true", help="register only into Claude Code"
     )
     parser.add_argument("--codex", action="store_true", help="register only into Codex")
+    parser.add_argument(
+        "--no-skills",
+        action="store_true",
+        help="do not install the bundled skills into ~/.claude/skills / ~/.codex/skills",
+    )
     args = parser.parse_args(argv)
 
     cmd = _find_server_command()
@@ -151,17 +229,17 @@ def main(argv: list[str] | None = None) -> int:
         do_claude = shutil.which("claude") is not None
         do_codex = shutil.which("codex") is not None
 
-    did = False
-    if do_claude:
-        did = _register_claude(args.name, cmd, path_env, server_args) or did
-    if do_codex:
-        did = _register_codex(args.name, cmd, path_env, server_args) or did
-    if not did:
+    did_claude = do_claude and _register_claude(args.name, cmd, path_env, server_args)
+    did_codex = do_codex and _register_codex(args.name, cmd, path_env, server_args)
+    if not (did_claude or did_codex):
         _eprint(
             "error: no target client found. Install Claude Code or Codex, "
             "or pass --claude / --codex."
         )
         return 1
+    # The bundled skills follow the same client selection as the registration.
+    if not args.no_skills:
+        _install_skills(did_claude, did_codex)
     print(
         "done. In your agent, call isabelle_launch(session=...) before any other tool"
         " — pick the session that fits the work."
@@ -170,7 +248,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def uninstall_main(argv: list[str] | None = None) -> int:
-    """Undo `isabelle-mcp install`: drop the Isabelle component registration.
+    """Undo `isabelle-mcp install`: remove the skills, drop the component registration.
 
     `pip uninstall` cannot run hooks, so the registration would otherwise outlive the package —
     harmless (Isabelle ignores a directory that is gone) but noisy: it warns on stderr of every
@@ -178,9 +256,13 @@ def uninstall_main(argv: list[str] | None = None) -> int:
     """
     parser = argparse.ArgumentParser(
         prog="isabelle-mcp uninstall",
-        description="Remove the Isabelle component registration made by `isabelle-mcp install`.",
+        description="Remove the skills and the Isabelle component registration "
+        "installed by `isabelle-mcp install`.",
     )
     parser.parse_args(argv)
+    # Skills first: the local file removal must not be blocked by a failing
+    # component unregistration (which needs a working `isabelle` on PATH).
+    _uninstall_skills()
     try:
         unregister_component()
     except IsabelleToolError as exc:
