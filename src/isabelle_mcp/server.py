@@ -1056,7 +1056,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Isabelle MCP Server (stdio; one dedicated server per agent)",
         usage="%(prog)s [-- ISABELLE_ARGS...]\n"
-        "       %(prog)s install [--name NAME] [--isabelle-bin BIN] [--claude] [--codex]\n"
+        "       %(prog)s install [--name NAME] [--isabelle-bin BIN] [--claude] [--codex]"
+        " [--no-skills]\n"
         "       %(prog)s uninstall",
     )
 

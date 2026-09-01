@@ -58,30 +58,47 @@ _SKILL_MARKER = "managed-by: isabelle-mcp"
 
 
 def _bundled_skills() -> list[Path]:
-    """The ``SKILL.md`` files shipped as package data, one per skill directory."""
+    """The ``SKILL.md`` files shipped as package data, one per skill directory.
+
+    A skill is exactly its ``SKILL.md`` — single-file by design.
+    """
     root = Path(str(files("isabelle_mcp"))) / "skills"
+    if not root.is_dir():
+        _eprint("warn: no bundled skills found in this isabelle-mcp installation; skipping skills")
+        return []
     return sorted(p / "SKILL.md" for p in root.iterdir() if (p / "SKILL.md").is_file())
 
 
 def _skill_is_managed(target: Path) -> bool:
-    """True when the installed copy still carries the managed-by marker.
+    """True when the installed copy still carries the managed-by marker in its frontmatter.
 
-    The marker is the ownership test: a copy whose marker is gone was edited by
-    the user, and neither install nor uninstall touches it again.
+    The marker is the ownership test: a copy whose frontmatter no longer carries
+    it was edited by the user, and neither install nor uninstall touches it
+    again. A quote of the marker in the body does not count — a user's own file
+    that merely mentions the marker must never be classified as ours.
     """
-    text = target.read_text(encoding="utf-8")
-    return any(line.strip() == _SKILL_MARKER for line in text.splitlines())
+    lines = target.read_text(encoding="utf-8").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return False
+    for line in lines[1:]:
+        if line.strip() == "---":
+            return False
+        if line.strip() == _SKILL_MARKER:
+            return True
+    return False
 
 
-def _skill_targets(claude: bool, codex: bool) -> Iterator[tuple[Path, Path, str, str]]:
-    """Yield (source, target, display_dir, name) per bundled skill × selected client."""
+def _skill_targets(
+    skills: list[Path], claude: bool, codex: bool
+) -> Iterator[tuple[Path, Path, str, str]]:
+    """Yield (source, target, display_dir, name) per given skill × selected client."""
     dirs = []
     if claude:
         dirs.append((Path.home() / ".claude" / "skills", "~/.claude/skills"))
     if codex:
         dirs.append((Path.home() / ".codex" / "skills", "~/.codex/skills"))
     for skills_dir, display in dirs:
-        for source in _bundled_skills():
+        for source in skills:
             name = source.parent.name
             yield source, skills_dir / name / "SKILL.md", display, name
 
@@ -93,29 +110,45 @@ def _warn_unmanaged(display: str, name: str) -> None:
     )
 
 
-def _install_skills(claude: bool, codex: bool) -> None:
-    """Copy the bundled skills into the selected clients' user-level skill dirs.
+def _install_skills(skills: list[Path], claude: bool, codex: bool) -> None:
+    """Copy the given bundled skills into the selected clients' user-level skill dirs.
 
     A managed copy is overwritten (an upgrade); a hand-edited one is left alone.
+    A target that fails (permissions, undecodable content, a directory in the
+    way) is warned about and skipped: the skills are an auxiliary step and must
+    never fail or abort the surrounding install.
     """
-    for source, target, display, name in _skill_targets(claude, codex):
-        if target.exists() and not _skill_is_managed(target):
-            _warn_unmanaged(display, name)
+    for source, target, display, name in _skill_targets(skills, claude, codex):
+        try:
+            if target.exists() and not _skill_is_managed(target):
+                _warn_unmanaged(display, name)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            _eprint(f"warn: could not install skill '{name}' into {display}: {exc}")
             continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
         print(f"✓ installed skill '{name}' into {display}")
 
 
-def _uninstall_skills() -> None:
-    """Remove the installed skills from both clients; a hand-edited copy is kept."""
-    for _source, target, display, name in _skill_targets(claude=True, codex=True):
-        if not target.exists():
+def _uninstall_skills(skills: list[Path]) -> None:
+    """Remove the installed skills from both clients; a hand-edited copy is kept.
+
+    Failures are warned about and skipped, per target, like in _install_skills —
+    in particular they must never prevent the component unregistration that
+    follows in uninstall_main.
+    """
+    for _source, target, display, name in _skill_targets(skills, claude=True, codex=True):
+        try:
+            if not target.exists():
+                continue
+            if not _skill_is_managed(target):
+                _warn_unmanaged(display, name)
+                continue
+            target.unlink()
+        except (OSError, UnicodeDecodeError) as exc:
+            _eprint(f"warn: could not remove skill '{name}' from {display}: {exc}")
             continue
-        if not _skill_is_managed(target):
-            _warn_unmanaged(display, name)
-            continue
-        target.unlink()
         try:
             target.parent.rmdir()  # keep the dir if the user put other files in it
         except OSError:
@@ -229,17 +262,23 @@ def main(argv: list[str] | None = None) -> int:
         do_claude = shutil.which("claude") is not None
         do_codex = shutil.which("codex") is not None
 
+    # Each client gets its skills right after its own registration succeeds, so a
+    # failing second client (mcp add exits the process) cannot cost the first its
+    # skills. The bundled skills follow the same client selection as the
+    # registration.
+    skills = [] if args.no_skills else _bundled_skills()
     did_claude = do_claude and _register_claude(args.name, cmd, path_env, server_args)
+    if did_claude and skills:
+        _install_skills(skills, claude=True, codex=False)
     did_codex = do_codex and _register_codex(args.name, cmd, path_env, server_args)
+    if did_codex and skills:
+        _install_skills(skills, claude=False, codex=True)
     if not (did_claude or did_codex):
         _eprint(
             "error: no target client found. Install Claude Code or Codex, "
             "or pass --claude / --codex."
         )
         return 1
-    # The bundled skills follow the same client selection as the registration.
-    if not args.no_skills:
-        _install_skills(did_claude, did_codex)
     print(
         "done. In your agent, call isabelle_launch(session=...) before any other tool"
         " — pick the session that fits the work."
@@ -262,7 +301,7 @@ def uninstall_main(argv: list[str] | None = None) -> int:
     parser.parse_args(argv)
     # Skills first: the local file removal must not be blocked by a failing
     # component unregistration (which needs a working `isabelle` on PATH).
-    _uninstall_skills()
+    _uninstall_skills(_bundled_skills())
     try:
         unregister_component()
     except IsabelleToolError as exc:
