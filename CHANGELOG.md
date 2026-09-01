@@ -30,6 +30,69 @@
   positions are now converted through pending edits, so a pointer or redirect
   is right even while the loading theory has unparsed edits.
 - Prelude version 6 (the jar checks it at launch); the prebuilt jar is rebuilt.
+- **`line=-1` resolves to the real last line.** It used to resolve to the
+  phantom empty line after a trailing newline, so `-1` with `after_text`
+  could never match anything. Line counting now agrees with `wc -l` and
+  editors.
+- **A second `isabelle_evaluate_to` on the file being evaluated joins the
+  run instead of being refused.** The target only moves forward (the max of
+  the two lines), and every joined request is answered against the run's
+  real target, not the line it happened to ask for. A run ends early only
+  when its last still-waiting request is aborted — a client interrupting one
+  of several waiters no longer kills the shared run. Query tools
+  (`isabelle_goal` etc.) on the file being evaluated are no longer refused
+  either; they use the same run, advancing it when they ask past its target.
+- **Honest cancellation caveat.** "Already-processed results remain valid
+  for querying" overstated what survives a cancel; the tool description and
+  the specification now read "Results before the first unfinished command
+  remain valid for querying."
+- **`isabelle_evaluation_status` no longer hides failures when idle.** After
+  a run ended it used to answer just "No evaluation in progress." even when
+  commands had failed. It now reports the errors and warnings of every open
+  document, with line numbers, leading with "No evaluation in progress.
+  Nothing is running and no errors remain." or "No evaluation in progress.
+  Nothing is running, but {N} command(s) failed."
+- **One completion verdict, one wording.** The moment an evaluation is
+  internally complete, every outlet (`isabelle_evaluate_to`,
+  `isabelle_evaluation_status`, the status footer) says "Evaluation has
+  completed up to …" — the old downgrade that kept saying "arrived at"
+  while unrelated commands still ran or old failures existed is gone. A
+  completion with failures appends "{N} command(s) failed. Call
+  isabelle_evaluation_status for details."
+- **Editing a heap-precompiled file is refused outright.** A file compiled
+  into the running session's heap cannot be re-evaluated by editing it — the
+  prover keeps using the heap version. Syncing such an edit now raises an
+  error saying exactly that and pointing at a relaunch with a smaller base
+  session, instead of evaluating stale text and warning after the fact.
+  Internally the affected evaluation ends as `abandoned`, a third outcome
+  besides complete/cancelled, so it is no longer misreported as a cancel.
+- **`isabelle_launch` restarts instead of refusing.** The launch identity is
+  the pair (session, debug). The same pair answers "… is already running …
+  Nothing changed."; a different session or debug value restarts the prover
+  and says what replaced what; a dead prover is simply started. A restart is
+  refused while a thread is stopped at a breakpoint — resume or terminate
+  first. (This supersedes 0.4.0's "changing `debug` needs
+  `isabelle_terminate` first".)
+- **Breakpoint pause messages lead with the cause.** A hit now leads with
+  "Breakpoint hit: {hits}. The affected evaluation is paused." (plural
+  "Breakpoints hit:" for several); `isabelle_evaluate_to` during a live hit
+  is refused with "… cannot run while a thread is stopped at a breakpoint.";
+  and the status footer appends the pause line plus "Call
+  isabelle_debug_state for the hit details." while a hit is live, instead of
+  the misleading "has been running for N s" activity.
+- **Leaner server instructions, plus an installable skill.** The
+  always-loaded server instructions were cut to fit the 2048-character
+  budget: four paragraphs moved verbatim into the docstrings of the tools
+  they describe, and the command-line section (getenv, ROOT/ROOTS,
+  components, settings, build flags) became the bundled agent skill
+  `isabelle-command-line`.
+- **`isabelle-mcp install` installs the bundled skills.** Every bundled
+  skill (currently `isabelle-command-line`) is copied into
+  `~/.claude/skills` and `~/.codex/skills` for each client the server was
+  registered into; `isabelle-mcp uninstall` removes them again. A copy still
+  carrying the `managed-by: isabelle-mcp` frontmatter marker is ours and is
+  overwritten on upgrade or deleted on uninstall; a hand-edited copy is left
+  alone with a warning. `--no-skills` opts out.
 
 ## 0.4.0
 
