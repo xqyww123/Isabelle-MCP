@@ -1,11 +1,37 @@
-"""Position conversion, URI handling, and error types."""
+"""Position conversion, URI handling, error types, and the bounded lock."""
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+from collections.abc import AsyncGenerator
 from pathlib import Path
 from urllib.parse import quote, unquote
 
 from fastmcp.exceptions import FastMCPError, ToolError
+
+
+@contextlib.asynccontextmanager
+async def acquire_within(lock: asyncio.Lock, timeout: float) -> AsyncGenerator[bool, None]:
+    """Hold *lock* for the block if it can be taken within *timeout* seconds.
+
+    Yields True with the lock held (released on exit, whatever the block does),
+    or False without it: the caller skips its work instead of blocking. The one
+    place that pairs a bounded acquire with a release-in-finally.
+
+    *timeout* must be positive: ``asyncio.wait_for`` with a timeout <= 0 cancels
+    the acquire before it runs, so even a free lock is never taken.
+    """
+    assert timeout > 0, "a non-positive timeout never acquires, even a free lock"
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=timeout)
+    except asyncio.TimeoutError:
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        lock.release()
 
 
 # MCP positions are 1-indexed; LSP positions are 0-indexed.

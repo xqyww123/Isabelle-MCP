@@ -41,23 +41,24 @@
   when its last still-waiting request is aborted — a client interrupting one
   of several waiters no longer kills the shared run. Query tools
   (`isabelle_goal` etc.) on the file being evaluated are no longer refused
-  either; they use the same run, advancing it when they ask past its target.
+  either: they wait for that run to reach the line. They never advance it — a
+  query past the run's target gets the not-evaluated error instead.
 - **Honest cancellation caveat.** "Already-processed results remain valid
   for querying" overstated what survives a cancel; the tool description and
   the specification now read "Results before the first unfinished command
   remain valid for querying."
 - **`isabelle_evaluation_status` no longer hides failures when idle.** After
   a run ended it used to answer just "No evaluation in progress." even when
-  commands had failed. It now reports the errors and warnings of every open
-  document, with line numbers, leading with "No evaluation in progress.
-  Nothing is running and no errors remain." or "No evaluation in progress.
-  Nothing is running, but {N} command(s) failed."
+  commands had failed. It now reports the errors that remain anywhere the
+  prover holds a theory, with line numbers, leading with "No evaluation in
+  progress. Nothing is running and no errors remain." or "No evaluation in
+  progress. Nothing is running, but {N} failed commands remain."
 - **One completion verdict, one wording.** The moment an evaluation is
   internally complete, every outlet (`isabelle_evaluate_to`,
   `isabelle_evaluation_status`, the status footer) says "Evaluation has
   completed up to …" — the old downgrade that kept saying "arrived at"
   while unrelated commands still ran or old failures existed is gone. A
-  completion with failures appends "{N} command(s) failed. Call
+  completion with failures appends "{N} failed commands remain. Call
   isabelle_evaluation_status for details."
 - **Editing a heap-precompiled file is refused outright.** A file compiled
   into the running session's heap cannot be re-evaluated by editing it — the
@@ -93,6 +94,83 @@
   carrying the `managed-by: isabelle-mcp` frontmatter marker is ours and is
   overwritten on upgrade or deleted on uninstall; a hand-edited copy is left
   alone with a warning. `--no-skills` opts out.
+- **Warnings are no longer reported.** The per-file snapshot had a `warnings:`
+  row beside `errors:`, the counts-only fallback said "2 warnings", and a file
+  whose only marks were warnings counted as worth mentioning. All of it is
+  gone: no report — `isabelle_evaluate_to`, `isabelle_evaluation_status`, or a
+  query tool's footer — mentions warnings at all, and a file whose only marks
+  are warnings now counts as clean. The prover's own `[warning]` output lines
+  are untouched; ask `isabelle_command_output` and you still get them.
+- **`sorry` shows up as `sorry`, not as an error.** A `sorry` used to be
+  indistinguishable from a failed proof — both landed in the `errors:` row,
+  both were counted as failed commands — so a theory full of `sorry` looked
+  broken and a real failure hid among them. `errors:` now means the
+  `text_overview_error` decoration and nothing else, and `sorry` gets a row of
+  its own: `sorry: line 5`, `sorry: lines 12, 40`. A `sorry` is never counted
+  as a failure, never keeps a file from being closed, and never earns a call to
+  action: an evaluation whose only mark is a `sorry` draws no call to action
+  and no failure sentence in the footer, an idle report still says `no errors
+  remain`, and the line is simply listed. A cancelled command is not an error
+  either — cancelling leaves no mark of any kind, so a killed command is back
+  to not evaluated. What stayed invisible stays invisible:
+  `Skip_Proof.cheat_tac` and `oops` leave no trace on any channel, and the
+  report cannot tell you about them.
+- **Failure counts say what remains.** `{N} command(s) failed.` became
+  `{N} failed commands remain.` (`1 failed command remains.` in the singular)
+  everywhere it appears — the completion sentence's suffix, the idle first
+  line, and the query footer. The count was never "this run's failures": it is
+  every failure still standing anywhere the server is looking, the same set the
+  all-clear sentence "… and no errors remain." reports as empty.
+- **Errors in dependencies are reported, and stay reported until fixed.** An
+  error in an imported theory used to be invisible — the file was never opened,
+  so it had no line numbers, and once a run finished the report forgot it
+  entirely. Every report now covers every theory the prover holds that has a
+  failure or a running command, not just the import closure of the current
+  target: with line numbers where the prover has published them, and a
+  counts-only line (`Imported.thy: 1 error (no line info)`) where it has not. A
+  broken dependency reappears in every idle report until the day it is fixed.
+- **Theories still to be processed are one line, not one block each.**
+  Reporting now covers every theory the prover holds, and while a session that
+  is not precompiled loads, that can be hundreds at once — during one
+  `HOL-Analysis.Analysis` import, 150 in a single poll. Rather than a block
+  each, they are counted: `{N} theories are not yet processed.` (`1 theory is
+  not yet processed.`). Theories with an actual failure or a running command
+  still get their own block.
+- **Open files look after themselves.** Tool calls now close the files that are
+  settled — no errors, no breakpoints registered in them, and not something you
+  evaluated yourself (a file you evaluated stays open for the rest of the
+  session) — so a long session no longer accumulates dependency documents
+  nobody is working on, and the errors that are left open are the report. A
+  file the prover still holds is silently reopened the first time a tool asks
+  about a position in it again: about two seconds, no proofs re-run, and the
+  caret does not move. (One exception: a file that still contains Unicode
+  symbols is normalised to ASCII on that first reopen, and that edit does cost
+  one re-check, once per file.) `isabelle_command_status`,
+  `isabelle_set_breakpoint` and `isabelle_list_breakable_sites` used to
+  dead-end on a theory the prover holds but this server does not have open — a
+  dependency you never opened by hand, and now also a file the sweep tidied
+  away: `command_status` answered `file not open`, `set_breakpoint` refused
+  with "not open in the prover", and `list_breakable_sites` reported fully
+  compiled ML code as not evaluated. All three reopen the file and answer.
+- **No tool starts an evaluation except `isabelle_evaluate_to`.** The six query
+  tools — `isabelle_goal`, `isabelle_hover`, `isabelle_definition`,
+  `isabelle_command_output`, `isabelle_find_theorems`,
+  `isabelle_local_occurrences` — used to evaluate the line for you when it had
+  not been evaluated, so a single query could spend minutes of prover time
+  nobody asked for, on a target nobody chose. They now answer only about
+  positions that have already been evaluated, and say so plainly when they
+  cannot: "{file}:{line} has not been evaluated. Evaluate up to that line with
+  isabelle_evaluate_to, then ask again." The one exception is a wait, not a
+  start: a query on the file an evaluation is already running towards, at a
+  line that run is already going to reach, waits for it (up to ten seconds,
+  then a progress report). The run's target does not move and neither does the
+  caret; a query past that target gets the error like any other. The debugger
+  tools also stop short of evaluating, in the wording they already had, and
+  they never wait. And `isabelle_command_status` needs no error for any of
+  this: "not evaluated" is one of its answers, and it is now the answer for a
+  `.thy` file the prover does not hold. The state-word list is unchanged;
+  `file not open` has simply become rare — no `.thy` the prover holds produces
+  it any more.
 
 ## 0.4.0
 

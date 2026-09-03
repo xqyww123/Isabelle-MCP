@@ -235,18 +235,23 @@ class FileSnapshot:
     """Per-file problem snapshot for an evaluation result.
 
     Two flavours:
-      - decoration source (``lined=True``): ``errors``/``warnings``/``running`` hold
-        1-indexed ``(start_line, end_line)`` spans (errors = line-deduped union of
-        text_overview_error and background_bad).
+      - decoration source (``lined=True``): ``errors``/``sorry``/``running`` hold
+        1-indexed ``(start_line, end_line)`` spans. ``errors`` is the
+        text_overview_error decoration and nothing else; ``sorry`` is the
+        background_sorry decoration — a `sorry` is not an error, is never
+        counted (no count sibling) and never makes the state "problems".
       - theory_status fallback (``lined=False``): spans are empty; the ``*_count``
         fields hold theory_status counts; ``state`` is "clean" / "in_progress".
+
+    Warnings are not reported anywhere (ruling: ignored throughout), so the
+    snapshot carries none.
     """
 
     file_path: str
     lined: bool
     state: str  # "clean" | "in_progress" | "problems"
     errors: list[tuple[int, int]] = field(default_factory=list)
-    warnings: list[tuple[int, int]] = field(default_factory=list)
+    sorry: list[tuple[int, int]] = field(default_factory=list)
     running: list[tuple[int, int]] = field(default_factory=list)
     # Unprocessed spans of the target file within the evaluated prefix [0, dest]:
     # commands not yet finished (forked-but-queued proofs, or lines the frontier has
@@ -254,7 +259,6 @@ class FileSnapshot:
     # while work remains. Only the evaluation target carries these (dest-clipped).
     pending: list[tuple[int, int]] = field(default_factory=list)
     error_count: int = 0
-    warning_count: int = 0
     running_count: int = 0
     pending_count: int = 0
 
@@ -275,6 +279,10 @@ class EvaluationView:
     message: str = ""
     files: list[FileSnapshot] = field(default_factory=list)
     running_commands: list[RunningCommand] = field(default_factory=list)
+    # Theories in the document model with unprocessed commands and nothing
+    # failed or running: not listed per file, only counted in the summary line
+    # ``N theories are not yet processed.``
+    unprocessed_theories: int = 0
     # Set when the target file is precompiled into the running session's heap
     # (edits to it are ignored by Isabelle); rendered as a prominent warning.
     heap_warning: str | None = None

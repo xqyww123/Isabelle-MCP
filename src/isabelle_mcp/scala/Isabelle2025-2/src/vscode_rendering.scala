@@ -66,6 +66,17 @@ object VSCode_Rendering {
     Markup.Elements(Markup.ENTITY, Markup.PATH, Markup.POSITION)
 
   private val breakpoint_elements = Markup.Elements(Markup.ML_BREAKPOINT)
+
+  /* sorry (fork-local): Markup.Bad ranges written by skip_proof.ML:22 -- the sole producer
+     of this message, for both `sorry` and `\<proof>`.  The other producers of Markup.Bad
+     (Pure.thy's `back`, syntax_ext.ML's raw-Unicode mixfix delimiter, the real errors) carry
+     a different body and are not classified. */
+
+  private val sorry_elements = Markup.Elements(Markup.BAD)
+
+  private val sorry_message = "Skipped proof"
+
+  val sorry_decoration_type = "background_sorry"
 }
 
 class VSCode_Rendering(snapshot: Document.Snapshot, val model: VSCode_Model)
@@ -211,6 +222,30 @@ extends Rendering(snapshot, model.session.resources.options, model.session) {
     message_underline_color(VSCode_Rendering.dotted_elements, range)
 
 
+  /* sorry ranges (fork-local)
+
+     The distribution's color path throws the Markup.Bad message body away
+     (rendering.scala:483); the tooltip path binds it in the very same cumulate callback
+     (:657-659).  This pass keeps the body and classifies by it, so that `sorry` can be
+     reported under its own name.  `background_bad` and the distribution rendering are
+     untouched: a sorry keeps being published as bad as well.
+
+     XML.content collects the text leaves and ignores the wrappers -- no pretty-printing
+     in the publish hot loop: the entry carries List.empty[XML.Body], so decoration_output
+     never formats it (that formatting was the cost of the rejected message-carrying
+     route). The pass itself is one more cumulate over the document, measured at about
+     12% of the rest of `decorations` (0.4 ms on a 7-line theory, 12 ms on a 754-line
+     theory with 250 sorries), paid on every publish. */
+
+  def sorry_ranges: List[Text.Range] =
+    snapshot.select[Unit](model.content.text_range, VSCode_Rendering.sorry_elements, _ =>
+      {
+        case Text.Info(_, XML.Elem(Markup.Bad(_), body))
+        if XML.content(body) == VSCode_Rendering.sorry_message => Some(())
+        case _ => None
+      }).map(_.range)
+
+
   /* decorations */
 
   def decorations: List[VSCode_Model.Decoration] = // list of canonical length and order
@@ -225,7 +260,12 @@ extends Rendering(snapshot, model.session.resources.options, model.session) {
       text_overview_color) :::
     VSCode_Rendering.color_decorations("dotted_", VSCode_Rendering.dotted_colors,
       dotted(model.content.text_range)) :::
-    List(VSCode_Spell_Checker.decoration(rendering))
+    List(VSCode_Spell_Checker.decoration(rendering)) :::
+    // fixed last position, produced UNCONDITIONALLY (empty content when there is no sorry):
+    // the differential publish zips this list against the published one by position
+    // (vscode_model.scala:214-227), so an entry that comes and goes would misalign the diff
+    // and the "sorry removed" clearing push would never be sent.
+    List(VSCode_Model.Decoration.ranges(VSCode_Rendering.sorry_decoration_type, sorry_ranges))
 
   def decoration_output(decos: List[VSCode_Model.Decoration]): LSP.Decoration =
     LSP.Decoration(decos.map(deco =>

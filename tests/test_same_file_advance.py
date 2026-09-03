@@ -189,47 +189,62 @@ class TestSameFileRequests:
         assert (await first).destination_line == 9
         assert evaluation_state.active
 
-    async def test_the_query_guard_lets_the_same_file_through(
+    async def test_a_query_past_the_target_is_refused_not_advanced(
         self, mock_lsp_client, temp_theory_file,
     ):
-        """A query beyond the target advances it instead of being refused."""
+        """Queries never evaluate: a query beyond the running target neither
+        advances it nor moves the caret — it gets the not-evaluated sentence,
+        and the run drives on to its own target."""
         await mock_lsp_client.open_document(temp_theory_file)
         tracker = MockProcessingTracker(unprocessed=[(4, 0, 9, 0)])
         mock_lsp_client._processing_trackers[temp_theory_file] = tracker
+        carets = []
+        mock_lsp_client.set_caret = (
+            lambda *a, **k: carets.append(a[1]) or asyncio.sleep(0))
         first = asyncio.create_task(evaluate_to(mock_lsp_client, temp_theory_file, 5))
         await _settle()
-        query = asyncio.create_task(
-            check_evaluation_guard(mock_lsp_client, temp_theory_file, MCPLine(8)))
-        await _settle()
-        assert evaluation_state.destination_line == 8
+        with pytest.raises(IsabelleToolError) as exc:
+            await check_evaluation_guard(mock_lsp_client, temp_theory_file, MCPLine(8))
+        assert str(exc.value) == ev.NOT_EVALUATED_MESSAGE.format(
+            file=temp_theory_file, line=8)
+        assert evaluation_state.destination_line == 5
+        assert carets == [4]                                    # the run's own caret only
         tracker.unprocessed.clear()
-        assert await query is None                              # served after completion
-        assert (await first).destination_line == 8
+        assert (await first).destination_line == 5
 
 
 class TestWhoMayEndTheRun:
     """On abort, only the last request that had not given up on the run ends
-    it. A request that returned in_progress has not given up: it will poll."""
+    it. A request that returned in_progress has not given up: it will poll.
 
-    async def _run_with_dep(self, mock_lsp_client, temp_theory_file, tracker):
+    The observable is the run's rider count: every request that has not given
+    up holds one place, and the run survives exactly while that count is
+    positive."""
+
+    async def _run(self, mock_lsp_client, temp_theory_file, tracker):
         mock_lsp_client._processing_trackers[temp_theory_file] = tracker
         driver = asyncio.create_task(evaluate_to(mock_lsp_client, temp_theory_file, 5))
         await _settle()
-        evaluation_state.auto_opened_files.add("/tmp/Dep.thy")
         return driver
+
+    @staticmethod
+    def _riders() -> int:
+        run = evaluation_state.current
+        assert run is not None
+        return run.riders
 
     async def test_an_aborted_waiter_behind_the_target_leaves_the_run(
         self, mock_lsp_client, temp_theory_file,
     ):
         tracker = MockProcessingTracker(unprocessed=[(4, 0, 9, 0)])
-        driver = await self._run_with_dep(mock_lsp_client, temp_theory_file, tracker)
+        driver = await self._run(mock_lsp_client, temp_theory_file, tracker)
         waiter = asyncio.create_task(evaluate_to(mock_lsp_client, temp_theory_file, 3))
         await _settle()
+        assert self._riders() == 2
         waiter.cancel()
         with pytest.raises(asyncio.CancelledError):
             await waiter
-        assert evaluation_state.active
-        assert evaluation_state.auto_opened_files == {"/tmp/Dep.thy"}
+        assert evaluation_state.active and self._riders() == 1
         tracker.unprocessed.clear()
         assert (await driver).status == "complete"
 
@@ -237,12 +252,11 @@ class TestWhoMayEndTheRun:
         self, mock_lsp_client, temp_theory_file,
     ):
         tracker = MockProcessingTracker(unprocessed=[(4, 0, 9, 0)])
-        driver = await self._run_with_dep(mock_lsp_client, temp_theory_file, tracker)
+        driver = await self._run(mock_lsp_client, temp_theory_file, tracker)
         driver.cancel()
         with pytest.raises(asyncio.CancelledError):
             await driver
-        assert not evaluation_state.active
-        assert evaluation_state.auto_opened_files == set()
+        assert not evaluation_state.active and self._riders() == 0
 
     async def _abort(self, task):
         task.cancel()
@@ -255,12 +269,11 @@ class TestWhoMayEndTheRun:
         """A drove to 5, B advanced to 9, A is aborted: the run survives and
         B gets its completion (blocking item 2 of the merged-tree review)."""
         tracker = MockProcessingTracker(unprocessed=[(4, 0, 9, 0)])
-        a = await self._run_with_dep(mock_lsp_client, temp_theory_file, tracker)
+        a = await self._run(mock_lsp_client, temp_theory_file, tracker)
         b = asyncio.create_task(evaluate_to(mock_lsp_client, temp_theory_file, 9))
         await _settle()
         await self._abort(a)
-        assert evaluation_state.active
-        assert evaluation_state.auto_opened_files == {"/tmp/Dep.thy"}
+        assert evaluation_state.active and self._riders() == 1
         tracker.unprocessed.clear()
         rb = await b
         assert (rb.status, rb.destination_line) == ("complete", 9)
@@ -270,12 +283,11 @@ class TestWhoMayEndTheRun:
     ):
         """The mirror case: A drove to 5, B advanced to 9, B is aborted."""
         tracker = MockProcessingTracker(unprocessed=[(4, 0, 9, 0)])
-        a = await self._run_with_dep(mock_lsp_client, temp_theory_file, tracker)
+        a = await self._run(mock_lsp_client, temp_theory_file, tracker)
         b = asyncio.create_task(evaluate_to(mock_lsp_client, temp_theory_file, 9))
         await _settle()
         await self._abort(b)
-        assert evaluation_state.active
-        assert evaluation_state.auto_opened_files == {"/tmp/Dep.thy"}
+        assert evaluation_state.active and self._riders() == 1
         tracker.unprocessed.clear()
         ra = await a
         assert (ra.status, ra.destination_line) == ("complete", 9)
@@ -287,16 +299,16 @@ class TestWhoMayEndTheRun:
         second evaluate_to at the same line; its timeout must not end the
         run for the first request."""
         tracker = MockProcessingTracker(unprocessed=[(4, 0, 9, 0)])
-        a = await self._run_with_dep(mock_lsp_client, temp_theory_file, tracker)
+        a = await self._run(mock_lsp_client, temp_theory_file, tracker)
         b = asyncio.create_task(evaluate_to(mock_lsp_client, temp_theory_file, 5))
         await _settle()
         await self._abort(b)
-        assert evaluation_state.active
-        assert evaluation_state.auto_opened_files == {"/tmp/Dep.thy"}
+        assert evaluation_state.active and self._riders() == 1
         c = asyncio.create_task(evaluate_to(mock_lsp_client, temp_theory_file, 5))
         await _settle()
+        assert self._riders() == 2
         await self._abort(a)                                    # the earlier one this time
-        assert evaluation_state.active
+        assert evaluation_state.active and self._riders() == 1
         tracker.unprocessed.clear()
         assert (await c).status == "complete"
 
@@ -304,15 +316,14 @@ class TestWhoMayEndTheRun:
         self, mock_lsp_client, temp_theory_file,
     ):
         tracker = MockProcessingTracker(unprocessed=[(4, 0, 9, 0)])
-        a = await self._run_with_dep(mock_lsp_client, temp_theory_file, tracker)
+        a = await self._run(mock_lsp_client, temp_theory_file, tracker)
 
         async def failing_caret(file_path, line, character=0):
             raise IsabelleToolError("transport down")
         mock_lsp_client.set_caret = failing_caret
         with pytest.raises(IsabelleToolError, match="transport down"):
             await evaluate_to(mock_lsp_client, temp_theory_file, 9)
-        assert evaluation_state.active
-        assert evaluation_state.auto_opened_files == {"/tmp/Dep.thy"}
+        assert evaluation_state.active and self._riders() == 1
         assert evaluation_state.destination_line == 9
         tracker.unprocessed.clear()
         assert (await a).status == "complete"
@@ -328,18 +339,18 @@ class TestWhoMayEndTheRun:
         mock_lsp_client._processing_trackers[temp_theory_file] = tracker
         a = await evaluate_to(mock_lsp_client, temp_theory_file, 9)
         assert a.status == "in_progress"
-        evaluation_state.auto_opened_files.add("/tmp/Dep.thy")
+        assert self._riders() == 1                              # A keeps its place
         b = asyncio.create_task(evaluate_to(mock_lsp_client, temp_theory_file, 9))
         await _settle()
+        assert self._riders() == 2
         await self._abort(b)
-        assert evaluation_state.active
-        assert evaluation_state.auto_opened_files == {"/tmp/Dep.thy"}
+        assert evaluation_state.active and self._riders() == 1
 
     async def test_three_requests_the_last_to_give_up_ends_the_run(
         self, mock_lsp_client, temp_theory_file,
     ):
         tracker = MockProcessingTracker(unprocessed=[(4, 0, 9, 0)])
-        a = await self._run_with_dep(mock_lsp_client, temp_theory_file, tracker)
+        a = await self._run(mock_lsp_client, temp_theory_file, tracker)
         b = asyncio.create_task(evaluate_to(mock_lsp_client, temp_theory_file, 7))
         c = asyncio.create_task(evaluate_to(mock_lsp_client, temp_theory_file, 9))
         await _settle()
@@ -350,7 +361,6 @@ class TestWhoMayEndTheRun:
         assert evaluation_state.active and run.riders == 1
         await self._abort(a)                  # the last one, though behind the target
         assert not evaluation_state.active and run.riders == 0
-        assert evaluation_state.auto_opened_files == set()
 
 
 class TestFooterGuard:
@@ -412,17 +422,16 @@ class TestFooterGuard:
 
 
 class TestGuardToEvaluateToGap:
-    """Section 10A, unverified item 3: the query guard releases the lock before
-    calling evaluate_to, and there is no await between the two. So the gap is
-    reachable only through the lock's fair queue: when a third holder (a file
+    """The gap that used to exist here is closed: the query guard never calls
+    evaluate_to any more, so whatever the lock's fair queue interleaves, the
+    query is answered in the guard's own voice. Here a third holder (a file
     sync push, a cancel) had both the query and another file's evaluate_to
-    waiting, the query passes its guard, releases, and the other request —
-    queued behind it — gets the lock before the query's evaluate_to does. The
-    query is then refused with EVALUATE_TO_REFUSAL (evaluate_to's sentence)
-    rather than NOT_EVALUATED_REFUSAL (the guard's). True in substance, wrong
-    voice; recorded, not fixed."""
+    waiting; the query's pure-wait probe takes the lock first and finds no run,
+    the other request starts its run next, and the query's busy test then
+    names that run — NOT_EVALUATED_REFUSAL, never EVALUATE_TO_REFUSAL — while
+    the run itself is untouched."""
 
-    async def test_which_sentence_the_gap_yields(
+    async def test_the_query_never_reaches_evaluate_to(
         self, mock_lsp_client, temp_theory_file, temp_theory_with_errors, monkeypatch,
     ):
         from isabelle_mcp.processing import NOT_EVALUATED
@@ -458,6 +467,7 @@ class TestGuardToEvaluateToGap:
             await queued(2)
         with pytest.raises(IsabelleToolError) as exc:
             await query
-        assert str(exc.value).startswith(
-            f"An evaluation is running towards {temp_theory_with_errors}:3")
+        assert str(exc.value) == ev.NOT_EVALUATED_REFUSAL.format(
+            file=temp_theory_file, line=5, target=temp_theory_with_errors, target_line=3)
         assert (await other).status == "in_progress"
+        assert evaluation_state.file_path == temp_theory_with_errors

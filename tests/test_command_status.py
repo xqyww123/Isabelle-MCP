@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from isabelle_mcp import processing
+from isabelle_mcp.evaluation import _parse_theory_status
 from isabelle_mcp.models import LinePosition
 from isabelle_mcp.processing import ProcessingTracker
 from isabelle_mcp.tools.command_status import (
@@ -26,21 +29,66 @@ def _range(start_line: int, end_line: int | None = None) -> dict:
             "end": {"line": end, "character": 40}}
 
 
+def _doc(evaluation_target: bool = False) -> SimpleNamespace:
+    """The shape the tool reads off an open document."""
+    return SimpleNamespace(content="", is_evaluation_target=evaluation_target)
+
+
 class FakeClient:
     """Enough of IsabelleLSPClient for the tool: which files are open, what the
-    server says the commands are, and one tracker per file."""
+    server says the commands are, one tracker per file, and — for the reopen
+    of a theory the prover holds — the entry theory_status and open_document.
+
+    ``commands`` lists the files that are open here AND held by the prover;
+    ``held`` lists files the prover holds that are NOT open here (their
+    commands become answerable once reopened); ``unheld_open`` lists files
+    open here that the prover answers ``open: false`` for (the residual path).
+    """
 
     project_root = "/proj"
+    STALL_TIMEOUT = 60.0
 
     def __init__(self, *, commands: dict[str, dict[int, list]] | None = None,
-                 trackers: dict[str, ProcessingTracker] | None = None):
-        self._commands = commands or {}
+                 trackers: dict[str, ProcessingTracker] | None = None,
+                 held: dict[str, dict[int, list]] | None = None,
+                 unheld_open: tuple[str, ...] = ()):
+        self._commands = dict(commands or {})
         self._trackers = trackers or {}
-        self.open_documents = dict.fromkeys(self._commands, object())
+        self._held = held or {}
+        self.open_documents = {p: _doc() for p in self._commands}
+        for path in unheld_open:
+            self.open_documents[path] = _doc()
+        self.entry_theories = [
+            _parse_theory_status({"node_name": p}) for p in [*self._commands, *self._held]
+        ]
         self.requests: list[tuple[str, list[int]]] = []
+        self.opened: list[tuple[str, bool]] = []
+
+    def _check_server_health(self, stall_timeout: float) -> None:
+        pass
 
     def get_processing_tracker(self, file_path):
+        if file_path not in self.open_documents:
+            return None
         return self._trackers.get(file_path)
+
+    async def open_document(self, file_path, *, evaluation_target=False, **_):
+        self.opened.append((file_path, evaluation_target))
+        doc = self.open_documents.get(file_path)
+        if doc is not None:                      # the real client: the mark only rises
+            doc.is_evaluation_target = doc.is_evaluation_target or evaluation_target
+            return
+        if file_path in self.unreadable:
+            raise OSError(f"cannot read {file_path}")
+        self.open_documents[file_path] = _doc(evaluation_target)
+        self._commands[file_path] = self._held.pop(file_path)
+        processing.note_edit_sent()              # didOpen raises the global grace gate
+
+    # Files the prover holds but the disk cannot give us (a reopen fails).
+    unreadable: frozenset[str] = frozenset()
+
+    async def set_caret(self, *a, **k):
+        raise AssertionError("isabelle_command_status moved the caret")
 
     async def get_commands_at_lines(self, file_path, lines):
         self.requests.append((file_path, [int(x) for x in lines]))
@@ -110,12 +158,131 @@ async def test_a_line_with_no_command_says_so():
     assert answer.state == NO_COMMAND
 
 
-async def test_a_file_the_server_does_not_hold_says_so():
+async def test_a_theory_the_prover_does_not_hold_is_not_evaluated():
+    # Not open here and not held by the prover — a mistyped path, or a file
+    # nothing has evaluated: nothing has been evaluated there, and that is
+    # the answer. Nothing is opened for it.
     client = FakeClient(commands={})
     [answer] = await command_status(
         client, [LinePosition(file_path="/proj/Missing.thy", line=3)])
+    assert answer.state == NOT_EVALUATED
+    assert format_command_status([answer], "/proj") == "Missing.thy:3 — not evaluated"
+    assert client.opened == [] and client.requests == []
+
+
+async def test_a_theory_the_prover_holds_but_we_closed_is_reopened_and_answered():
+    # The unified close tidied the file away; the prover still holds it. The
+    # tool reopens it (marked, so it stays open) and answers from the live
+    # tracker — never from nothing, never "not evaluated". Mutation control:
+    # drop the reopen step and the answer degrades to `not evaluated`.
+    client = FakeClient(
+        held={"/proj/Swept.thy": {41: [(_range(41), 'lemma foo: "P"')]}},
+    )
+    client._trackers["/proj/Swept.thy"] = await _tracker()
+    [answer] = await command_status(
+        client, [LinePosition(file_path="/proj/Swept.thy", line=42)])
+    assert client.opened == [("/proj/Swept.thy", True)]
+    assert answer.state == PROCESSED
+
+
+@pytest.fixture(autouse=True)
+def _short_grace(monkeypatch):
+    """A reopen raises the grace gate (the fake's open_document mirrors the
+    didOpen); the batch wait honours it, so keep the window short."""
+    monkeypatch.setattr(processing, "DECORATION_GRACE", 0.05)
+
+
+async def test_a_reopen_is_not_followed_by_an_unknown_answer(_short_grace):
+    # The reopen's didOpen raises the grace gate; without the one batch wait,
+    # the freshly reopened, fully processed position would be answered
+    # `unknown` for up to two seconds.
+    client = FakeClient(
+        held={"/proj/Swept.thy": {41: [(_range(41), "by auto")]}},
+    )
+    client._trackers["/proj/Swept.thy"] = await _tracker()
+    [answer] = await command_status(
+        client, [LinePosition(file_path="/proj/Swept.thy", line=42)])
+    assert answer.state == PROCESSED
+
+
+async def test_the_batch_wait_is_keyed_on_the_gate_not_on_a_position(_short_grace):
+    # One reopened file, two positions: one evaluated, one past the frontier.
+    # A wait keyed on the farthest position's verdict would return at once
+    # (`not evaluated` needs no gate) and leave the evaluated line answered
+    # `unknown`; the wait is keyed on the gate, so both answer truthfully,
+    # whatever order the positions are asked in.
+    for lines in ([42, 200], [200, 42]):
+        client = FakeClient(
+            held={"/proj/Half.thy": {
+                41: [(_range(41), "by auto")], 199: [(_range(199), "by auto")]}},
+        )
+        client._trackers["/proj/Half.thy"] = await _tracker(unprocessed=[(100, 0, 300, 0)])
+        answers = await command_status(
+            client, [LinePosition(file_path="/proj/Half.thy", line=n) for n in lines])
+        assert {a.line: a.state for a in answers} == {42: PROCESSED, 200: NOT_EVALUATED}
+
+
+async def test_the_batch_wait_covers_a_second_reopened_file(_short_grace):
+    # Two reopened files: the first entirely unevaluated, the second fully
+    # processed. One wait, keyed on the gate, serves both.
+    client = FakeClient(held={
+        "/proj/A.thy": {0: [(_range(0), "theory A")]},
+        "/proj/B.thy": {41: [(_range(41), "by auto")]},
+    })
+    client._trackers["/proj/A.thy"] = await _tracker(unprocessed=[(0, 0, 50, 0)])
+    client._trackers["/proj/B.thy"] = await _tracker()
+    answers = await command_status(client, [
+        LinePosition(file_path="/proj/A.thy", line=1),
+        LinePosition(file_path="/proj/B.thy", line=42),
+    ])
+    assert [a.state for a in answers] == [NOT_EVALUATED, PROCESSED]
+
+
+async def test_one_failed_reopen_never_ends_a_multi_position_call():
+    # A theory the prover holds but the disk cannot give back: its positions
+    # keep the not-open answer, every other position is answered, and the
+    # published contract — one line per asked position, in order — holds.
+    client = FakeClient(
+        commands={"/proj/Fine.thy": {41: [(_range(41), "by auto")]}},
+        held={"/proj/Gone.thy": {41: [(_range(41), "by auto")]}},
+        trackers={},
+    )
+    client._trackers["/proj/Fine.thy"] = await _tracker()
+    client.unreadable = frozenset({"/proj/Gone.thy"})
+    answers = await command_status(client, [
+        LinePosition(file_path="/proj/Gone.thy", line=42),
+        LinePosition(file_path="/proj/Fine.thy", line=42),
+        LinePosition(file_path="/proj/Gone.thy", line=43),
+    ])
+    assert [(a.file_path, a.line, a.state) for a in answers] == [
+        ("/proj/Gone.thy", 42, NOT_EVALUATED),
+        ("/proj/Fine.thy", 42, PROCESSED),
+        ("/proj/Gone.thy", 43, NOT_EVALUATED),
+    ]
+    assert "/proj/Gone.thy" not in client.open_documents
+
+
+async def test_file_not_open_is_produced_only_by_the_residual_path():
+    # Open here, yet the prover answers ``open: false``: the one bookkeeping
+    # mismatch the state word is left for. Nothing else produces it for a .thy.
+    client = FakeClient(unheld_open=("/proj/Odd.thy",))
+    [answer] = await command_status(
+        client, [LinePosition(file_path="/proj/Odd.thy", line=3)])
     assert answer.state == FILE_NOT_OPEN
-    assert format_command_status([answer], "/proj") == "Missing.thy:3 — file not open"
+    assert format_command_status([answer], "/proj") == "Odd.thy:3 — file not open"
+    assert client.opened == []
+
+
+async def test_an_ml_position_keeps_its_answer_of_old():
+    # A .ML blob is never a document of ours and is never reopened; its
+    # answer is byte for byte what it was.
+    client = FakeClient(commands={})
+    client.entry_theories = [_parse_theory_status({"node_name": "/proj/Blob.ML"})]
+    [answer] = await command_status(
+        client, [LinePosition(file_path="/proj/Blob.ML", line=3)])
+    assert answer.state == FILE_NOT_OPEN
+    assert format_command_status([answer], "/proj") == "Blob.ML:3 — file not open"
+    assert client.opened == []
 
 
 async def test_a_file_with_no_decoration_yet_is_not_evaluated():

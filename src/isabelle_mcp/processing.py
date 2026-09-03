@@ -76,7 +76,8 @@ def _grace_remaining() -> float:
 
 _TRACKED_TYPES = frozenset({
     "background_unprocessed1", "background_running1", "background_canceled",
-    "background_bad", "text_overview_error", "text_overview_warning",
+    "background_bad", "background_sorry", "text_overview_error",
+    "text_overview_warning",
 })
 
 # The state of the command(s) covering one position, judged from the decoration
@@ -147,10 +148,18 @@ class ProcessingTracker:
         self._running: list[tuple[int, int, int, int]] = []
         self._running_onset: dict[tuple[int, int, int, int], float] = {}
         # Problem decorations (full-replace per type, same as _unprocessed):
-        #   _bad           — background_bad      (failed/killed commands AND sorry)
-        #   _overview_error — text_overview_error (errors on the overview ruler)
-        #   _overview_warning — text_overview_warning (warnings on the ruler)
+        #   _bad           — background_bad      (the prover's "bad" commands: failed
+        #                    proofs, sorry, and benign members like `back`; read only
+        #                    as a sign of content, never rendered as errors)
+        #   _sorry         — background_sorry    (the fork's own type: the ranges of
+        #                    `sorry` / `\<proof>`, classified server-side by the
+        #                    "Skipped proof" message; rendered as the sorry row)
+        #   _overview_error — text_overview_error (errors on the overview ruler; THE
+        #                    error channel of every report)
+        #   _overview_warning — text_overview_warning (warnings on the ruler; never
+        #                    reported, kept as a sign of content)
         self._bad: list[tuple[int, int, int, int]] = []
+        self._sorry: list[tuple[int, int, int, int]] = []
         self._overview_error: list[tuple[int, int, int, int]] = []
         self._overview_warning: list[tuple[int, int, int, int]] = []
         # background_canceled — commands whose execution was interrupted
@@ -182,6 +191,8 @@ class ProcessingTracker:
                 self._canceled = parsed["background_canceled"]
             if "background_bad" in parsed:
                 self._bad = parsed["background_bad"]
+            if "background_sorry" in parsed:
+                self._sorry = parsed["background_sorry"]
             if "text_overview_error" in parsed:
                 self._overview_error = parsed["text_overview_error"]
             if "text_overview_warning" in parsed:
@@ -407,8 +418,15 @@ class ProcessingTracker:
         return list(self._canceled)
 
     def get_bad_ranges(self) -> list[tuple[int, int, int, int]]:
-        """Return a snapshot of background_bad ranges (failed/killed/sorry), 0-indexed."""
+        """Return a snapshot of background_bad ranges (the prover's "bad"
+        commands: failed proofs, sorry, benign members like `back`), 0-indexed.
+        A sign that the decoration carries content and that the file belongs
+        in a report — never the source of an error row."""
         return list(self._bad)
+
+    def get_sorry_ranges(self) -> list[tuple[int, int, int, int]]:
+        """Return a snapshot of background_sorry ranges (`sorry` sites), 0-indexed."""
+        return list(self._sorry)
 
     def get_overview_error_ranges(self) -> list[tuple[int, int, int, int]]:
         """Return a snapshot of text_overview_error ranges (0-indexed)."""
@@ -425,6 +443,7 @@ class ProcessingTracker:
             self._running.clear()
             self._running_onset.clear()
             self._bad.clear()
+            self._sorry.clear()
             self._canceled.clear()
             self._overview_error.clear()
             self._overview_warning.clear()

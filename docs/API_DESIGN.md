@@ -31,9 +31,10 @@ ARCHITECTURE.md.
 
 > The `publishDiagnostics` notification is still cached internally (consumed by
 > `isabelle_hover` to attach line diagnostics), but there is no longer a dedicated
-> `isabelle_diagnostics` tool. Error/warning *message text* is obtained via
-> `isabelle_command_output`; error/warning *line locations* come from the evaluation
-> snapshot (decoration channels). See §3.4.
+> `isabelle_diagnostics` tool. Error *message text* (and the prover's warning
+> output, as emitted) is obtained via `isabelle_command_output`; error and sorry
+> *line locations* come from the evaluation snapshot (decoration channels); warnings
+> are not reported in any snapshot. See §3.4.
 
 ### 2.2 PIDE Extension Methods
 
@@ -333,12 +334,12 @@ tool **omits the `kind` field** entirely.
 There is no `isabelle_diagnostics` MCP tool. The `publishDiagnostics` notification
 handler and the diagnostic cache (`DiagnosticMessage` model) still exist, but are
 **internal only**: `isabelle_hover` reads them to attach the line's diagnostics to a
-hover result. The two agent-facing paths to error/warning information are:
+hover result. The two agent-facing paths to error information are:
 
 - **Where** (line locations) → the evaluation snapshot (§4.4 in `SPECIFICATION.md`),
-  built from the `PIDE/decoration` channels (`text_overview_error` +
-  `background_bad` for errors, `text_overview_warning` for warnings) — not from the
-  diagnostics channel.
+  built from the `PIDE/decoration` channels (`text_overview_error` for errors,
+  the fork's `background_sorry` for `sorry` sites; warnings are not reported) — not
+  from the diagnostics channel.
 - **What** (full message text) → `isabelle_command_output` at the offending line.
 
 **LSP Notification (Server → Client), consumed internally:**

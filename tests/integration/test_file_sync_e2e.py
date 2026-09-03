@@ -123,7 +123,7 @@ async def test_file_sync_end_to_end(tmp_path):
         await client.start()
         assert client.vscode_load_delay > 0  # read from `isabelle options`
 
-        await client.open_document(host, wait_for_diagnostics=True, diagnostic_timeout=10.0)
+        await client.open_document(host, wait_for_decoration=True, decoration_timeout=10.0)
         await client.set_caret(host, LSPLine(7), LSPCharacter(0))
         # open_document registered the parent dir with the watcher.
         assert d in fw._watched_dirs

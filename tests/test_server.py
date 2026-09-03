@@ -34,6 +34,10 @@ def _yaml(result):
 
 
 class TestMCPServerTools:
+    @pytest.fixture(autouse=True)
+    async def _evaluated_up_front(self, evaluated_theory_file):
+        """Queries never evaluate: the file is evaluated up front."""
+
     @pytest.mark.asyncio
     async def test_hover(self, temp_theory_file, mock_lsp_client):
         mock_lsp_client.hover_response = {"contents": "test"}

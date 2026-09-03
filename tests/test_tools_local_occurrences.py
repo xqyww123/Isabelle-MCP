@@ -4,6 +4,11 @@ from isabelle_mcp.tools.local_occurrences import local_occurrences
 from isabelle_mcp.utils import IsabelleToolError, MCPLine
 
 
+@pytest.fixture(autouse=True)
+async def _evaluated_up_front(evaluated_theory_file):
+    """Queries never evaluate: every test here starts from an evaluated file."""
+
+
 class TestLocalOccurrencesTool:
     @pytest.mark.asyncio
     async def test_basic(self, mock_lsp_client, temp_theory_file, sample_highlights_response):
@@ -63,6 +68,7 @@ class TestLocalOccurrencesTool:
             'lemma l: "add_one (add_one n) = n"\n'
             'end\n'
         )
+        await mock_lsp_client.open_document(str(f), evaluation_target=True)
         mock_lsp_client.highlights_response = [
             {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 7}}, "kind": 2}
         ]

@@ -15,9 +15,10 @@ session's heap image); Isabelle can still load any other theory dynamically — 
 
 You should NEVER check whether the session is built — `isabelle_launch` checks automatically.
 
-When your call starts an evaluation, either by `isabelle_evaluate_to` or other query commands,
-the call may not wait for the evaluation to finish, but may return earlier with the current
-progress. You should keep polling `isabelle_evaluation_status` to watch it through.
+Only `isabelle_evaluate_to` evaluates. No other tool ever starts an evaluation: the
+query tools answer about lines that have already been evaluated. An `isabelle_evaluate_to`
+call may return before the evaluation finishes, with the progress so far — keep polling
+`isabelle_evaluation_status` to watch it through.
 
 During an evaluation you can still query any line it has already evaluated.
 

@@ -84,7 +84,11 @@ class FakeDebugClient:
     def __init__(self):
         self.debug = True
         self.project_root = None
-        self.open_documents = {THY: SimpleNamespace(content=CONTENT)}
+        self.open_documents = {
+            THY: SimpleNamespace(content=CONTENT, is_evaluation_target=False)}
+        # The entry theory_status: what the prover holds (the reopen reads it).
+        self.entry_theories = [_parse_theory_status({"node_name": THY})]
+        self.opened: list[tuple[str, bool]] = []
         self.debugger_state_history: list[dict] = []
         self.debugger_threads: dict[str, list[dict]] = {}
         self.tracker: FakeTracker | None = FakeTracker()
@@ -97,8 +101,35 @@ class FakeDebugClient:
         # Optional hook run when a continue/step verb is delivered.
         self.on_input = None
 
+    # Per-path trackers override the shared ``tracker``; ``tracker_on_reopen``
+    # is what a reopened document gets (a fresh tracker, as the real client's
+    # first decoration push builds one).
+    trackers: dict[str, object]
+    tracker_on_reopen: object | None = None
+
     def get_processing_tracker(self, file_path):
-        return self.tracker
+        # The real client's open check: a closed document's tracker is unreadable.
+        if file_path not in self.open_documents:
+            return None
+        return getattr(self, "trackers", {}).get(file_path, self.tracker)
+
+    async def open_document(self, file_path, *, evaluation_target=False, **_):
+        self.opened.append((file_path, evaluation_target))
+        self.open_documents[file_path] = SimpleNamespace(
+            content=CONTENT, is_evaluation_target=evaluation_target)
+        if self.tracker_on_reopen is not None:
+            self.trackers = {**getattr(self, "trackers", {}), file_path: self.tracker_on_reopen}
+        processing.note_edit_sent()              # didOpen raises the global grace gate
+
+    async def set_caret(self, *a, **k):
+        raise AssertionError("a breakpoint tool moved the caret")
+
+    # the load commands of a .ML file, when a test sets them
+    loaders: list[dict] = []
+
+    async def request_loaders(self, file_path):
+        self.calls.append(("loaders", file_path))
+        return list(self.loaders)
 
     def _pop(self, replies: list[dict]) -> dict:
         return replies.pop(0) if len(replies) > 1 else replies[0]
@@ -1489,7 +1520,8 @@ class TestReconcileDirty:
         thy_entry = _armed_entry(serial=99)
         ml_entry = _armed_entry(path=ML, serial=98)
         debugger.registry.entries += [thy_entry, ml_entry]
-        client.open_documents[ML] = SimpleNamespace(content="fun f x = x")
+        client.open_documents[ML] = SimpleNamespace(
+            content="fun f x = x", is_evaluation_target=False)
         debugger.registry.mark_dirty(ML)
         await debugger.reconcile_dirty(client)
         listed = [c[1] for c in client.calls if c[0] == "breakpoints"]
@@ -1503,7 +1535,8 @@ class TestReconcileDirty:
         ml_entry = _armed_entry(path=ML, serial=98)
         unrelated = _armed_entry(path="/fake/Other.thy", serial=97)
         debugger.registry.entries += [importer_entry, ml_entry, unrelated]
-        client.open_documents[ML] = SimpleNamespace(content="fun f x = x")
+        client.open_documents[ML] = SimpleNamespace(
+            content="fun f x = x", is_evaluation_target=False)
         client.theory_replies = [[
             _theory(upstream, "Base"),
             _theory(THY, "DebugProbe", imports=["Base"]),
@@ -1776,11 +1809,17 @@ def _parsed(raw: list[dict]):
 
 class TestEvaluationTheorySet:
     def test_target_alone(self):
-        assert evaluation_theory_set(THY, set(), []) == {THY}
+        assert evaluation_theory_set(THY, []) == {THY}
 
-    def test_auto_opened_ride_along(self):
-        assert evaluation_theory_set(THY, {"/fake/Dep.thy"}, []) == \
-            {THY, "/fake/Dep.thy"}
+    def test_an_open_file_outside_the_closure_does_not_ride_along(self):
+        # The set is the target, its import closure and the ML_file blobs —
+        # nothing else. A file that merely happens to be open (a failed
+        # theory the status report opened, say) keeps its notice identity.
+        theories = _parsed([
+            _theory(THY, "DebugProbe"),
+            _theory("/fake/Dep.thy", "Dep"),
+        ])
+        assert evaluation_theory_set(THY, theories) == {THY}
 
     def test_import_closure_node_names(self):
         theories = _parsed([
@@ -1789,7 +1828,7 @@ class TestEvaluationTheorySet:
             _theory(THY, "DebugProbe", imports=["Mid"]),
             _theory("/fake/Other.thy", "Other"),
         ])
-        assert evaluation_theory_set(THY, set(), theories) == \
+        assert evaluation_theory_set(THY, theories) == \
             {THY, "/fake/Mid.thy", "/fake/Base.thy"}
 
     def test_external_with_empty_theory_name_is_a_blob(self):
@@ -1798,13 +1837,12 @@ class TestEvaluationTheorySet:
             _theory(ML, "", external=True),           # ML_file blob: in
             _theory("/fake/Loaded.thy", "Loaded", external=True),  # out
         ])
-        assert evaluation_theory_set(THY, set(), theories) == {THY, ML}
+        assert evaluation_theory_set(THY, theories) == {THY, ML}
 
 
 class TestHitWatchThirdExit:
     def _watch(self, client):
-        state = SimpleNamespace(auto_opened_files=set())
-        return _HitWatch(client, THY, state)
+        return _HitWatch(client, THY)
 
     @pytest.mark.asyncio
     async def test_in_set_hit_ends_the_wait(self, client):
@@ -1869,3 +1907,249 @@ class TestHitWatchThirdExit:
         client.debug = True
         client.push_state({"worker-3": LOCATED_STACK})
         assert await watch.hit_led_exit([]) is False
+
+
+# ── Reopening a theory the unified close tidied away (plan item 12) ─────
+
+
+class TestReopenOfSweptTheories:
+    """The three site tools never evaluate. A .thy the prover still holds but
+    this client closed is reopened (marked, no evaluation, no caret) before its
+    sites are read; a theory the prover does not hold gets the listing's own
+    sentence; a .ML is never reopened. The reopen happens outside every lock."""
+
+    @pytest.fixture(autouse=True)
+    def _short_grace(self, monkeypatch):
+        # A reopen raises the grace gate and waits it out; keep the window short.
+        monkeypatch.setattr(processing, "DECORATION_GRACE", 0.05)
+
+    def _swept(self, client, held: bool = True) -> None:
+        del client.open_documents[THY]
+        if not held:
+            client.entry_theories = []
+            client.listing_replies = [_listing(open_=False)]
+
+    @pytest.mark.asyncio
+    async def test_set_breakpoint_reopens_a_held_theory_and_answers(self, client):
+        # Mutation control: drop the reopen and the tracker is unreadable, so
+        # the line is judged not evaluated and the site is refused.
+        self._swept(client)
+        out = await debugger.set_breakpoint(client, THY, VAL_XS, None)
+        assert client.opened == [(THY, True)]
+        assert out.startswith("Breakpoint set and armed:")
+        assert client.open_documents[THY].is_evaluation_target
+
+    @pytest.mark.asyncio
+    async def test_a_ghost_tracker_does_not_answer_for_a_swept_theory(self, client):
+        # The erase push after didClose leaves a tracker that says everything
+        # is processed (the ghost); the reopened document gets its own, which
+        # says the line is not evaluated. The answer must come from the new
+        # one: the not-evaluated refusal, never the ghost's "no site here".
+        self._swept(client)
+        client.trackers = {THY: FakeTracker(processing.PROCESSED)}     # the ghost
+        client.tracker_on_reopen = FakeTracker(processing.NOT_EVALUATED)
+        client.listing_replies = [_listing()]        # no site on the line
+        with pytest.raises(IsabelleToolError) as exc:
+            await debugger.set_breakpoint(client, THY, VAL_XS, None)
+        assert client.opened == [(THY, True)]
+        assert str(exc.value) == debugger.NO_SITE_NOT_EVALUATED.format(
+            where=f"{THY}:{VAL_XS}")
+
+    @pytest.mark.asyncio
+    async def test_a_reopened_theory_is_judged_after_the_grace_gate(
+        self, client, monkeypatch,
+    ):
+        # The reopen's own didOpen raises the grace gate; a long-evaluated
+        # line read under it says `unknown` and would be reported as "still
+        # evaluating" — about work that does not exist. The reopen waits the
+        # gate out (outside the lock) before the sites are judged.
+        monkeypatch.setattr(processing, "DECORATION_GRACE", 0.05)
+        tracker = processing.ProcessingTracker()
+        await tracker.update({"background_unprocessed1": [], "background_running1": []})
+        self._swept(client)
+        client.tracker_on_reopen = tracker
+        client.listing_replies = [_listing()]        # evaluated, but no site
+        with pytest.raises(IsabelleToolError) as exc:
+            await debugger.set_breakpoint(client, THY, VAL_XS, None)
+        assert str(exc.value).startswith(debugger.NO_SITE_ON_LINE.format(
+            where=f"{THY}:{VAL_XS}"))
+        assert "still evaluating" not in str(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_no_site_tool_writes_the_run_or_the_caret(self, client, monkeypatch):
+        # Ruling 22's structural invariant for the three site tools: with
+        # every run-writing entry point booby-trapped (and set_caret asserting
+        # on the fake), the reopen paths and the .ML paths all complete.
+        from isabelle_mcp import evaluation as ev
+
+        def trap(*a, **k):
+            raise AssertionError("a site tool wrote the evaluation state")
+
+        monkeypatch.setattr(ev.EvaluationState, "join_or_start", trap)
+        monkeypatch.setattr(ev.EvaluationState, "start", trap)
+        monkeypatch.setattr(ev.EvaluationState, "advance", trap)
+        self._swept(client)
+        await debugger.set_breakpoint(client, THY, VAL_XS, None)
+        assert client.opened == [(THY, True)]
+        await debugger.list_breakable_sites(client, THY, None, None)
+        debugger.registry.entries.append(Breakpoint(
+            file_path=THY, line=VAL_SHIFT, anchor="val shift", state=PENDING,
+            serial=None, reason=debugger.TAG_NOT_EVALUATED))
+        await debugger.enable_all_breakpoints(client, None)
+        client.listing_replies = [_listing(open_=False)]
+        client.loaders = []
+        with pytest.raises(IsabelleToolError):
+            await debugger.set_breakpoint(client, ML, 3, None)
+        assert not ev.evaluation_state.active
+
+    @pytest.mark.asyncio
+    async def test_set_breakpoint_on_a_theory_the_prover_does_not_hold(self, client):
+        self._swept(client, held=False)
+        with pytest.raises(IsabelleToolError) as exc:
+            await debugger.set_breakpoint(client, THY, VAL_XS, None)
+        assert str(exc.value) == debugger.FILE_NOT_OPEN_IN_PROVER.format(file=THY)
+        assert client.opened == []
+
+    @pytest.mark.asyncio
+    async def test_list_breakable_sites_reopens_a_held_theory(self, client):
+        self._swept(client)
+        out = await debugger.list_breakable_sites(client, THY, None, None)
+        assert client.opened == [(THY, True)]
+        assert "line 7 before" in out
+        assert "not_evaluated" not in out
+
+    @pytest.mark.asyncio
+    async def test_an_ml_file_is_never_reopened(self, client):
+        client.entry_theories.append(_parse_theory_status({"node_name": ML}))
+        client.listing_replies = [_listing(open_=False)]
+        client.loaders = []
+        with pytest.raises(IsabelleToolError) as exc:
+            await debugger.set_breakpoint(client, ML, 3, None)
+        assert str(exc.value) == debugger.FILE_NOT_OPEN_IN_PROVER_ML.format(file=ML)
+        assert client.opened == []
+
+    @pytest.mark.asyncio
+    async def test_the_reopen_happens_outside_the_registry_lock(self, client):
+        self._swept(client)
+        real_open = client.open_document
+
+        async def open_checking_lock(file_path, **kw):
+            assert not debugger.registry.lock.locked()
+            await real_open(file_path, **kw)
+
+        client.open_document = open_checking_lock
+        await debugger.set_breakpoint(client, THY, VAL_XS, None)
+        assert client.opened == [(THY, True)]
+
+    @pytest.mark.asyncio
+    async def test_enable_all_reopens_and_arms(self, client):
+        debugger.registry.entries.append(Breakpoint(
+            file_path=THY, line=VAL_XS, anchor="val xs = map", state=PENDING,
+            serial=None, reason=debugger.TAG_NOT_EVALUATED))
+        self._swept(client)
+        out = await debugger.enable_all_breakpoints(client, None)
+        assert client.opened == [(THY, True)]
+        assert debugger.registry.entries[0].state == ARMED
+        assert out.startswith("Armed 1")
+
+    @pytest.mark.asyncio
+    async def test_enable_all_writes_enabled_only_after_the_reopen(self, client):
+        # First stage reads, second stage reopens (lock-free), third stage
+        # writes: an entry disabled during the reopen window is not left
+        # saying "enabled" over a site that was never armed for it — the
+        # flag is written in the third stage, together with the arming.
+        entry = Breakpoint(file_path=THY, line=VAL_XS, anchor="val xs = map",
+                           state=PENDING, serial=None, enabled=False,
+                           reason=debugger.TAG_NOT_EVALUATED)
+        debugger.registry.entries.append(entry)
+        self._swept(client)
+        seen_during_reopen = []
+        real_open = client.open_document
+
+        async def open_and_observe(file_path, **kw):
+            seen_during_reopen.append(entry.enabled)
+            await real_open(file_path, **kw)
+
+        client.open_document = open_and_observe
+        await debugger.enable_all_breakpoints(client, None)
+        assert seen_during_reopen == [False]
+        assert entry.enabled and entry.state == ARMED
+
+    @pytest.mark.asyncio
+    async def test_enable_all_skips_an_entry_deleted_during_the_reopen(self, client):
+        entry = Breakpoint(file_path=THY, line=VAL_XS, anchor="val xs = map",
+                           state=PENDING, serial=None,
+                           reason=debugger.TAG_NOT_EVALUATED)
+        debugger.registry.entries.append(entry)
+        self._swept(client)
+        real_open = client.open_document
+
+        async def open_and_delete(file_path, **kw):
+            debugger.registry.entries.remove(entry)
+            await real_open(file_path, **kw)
+
+        client.open_document = open_and_delete
+        out = await debugger.enable_all_breakpoints(client, None)
+        assert out == "No breakpoints are registered."
+        assert entry.state == PENDING and entry not in debugger.registry.entries
+        assert not any(c[0] == "toggle" for c in client.calls)
+
+    @pytest.mark.asyncio
+    async def test_one_reopen_failure_never_ends_a_multi_file_call(self, client):
+        other = "/fake/Other.thy"
+        debugger.registry.entries.append(Breakpoint(
+            file_path=THY, line=VAL_XS, anchor="val xs = map", state=PENDING,
+            serial=None, reason=debugger.TAG_NOT_EVALUATED))
+        debugger.registry.entries.append(Breakpoint(
+            file_path=other, line=3, anchor="val y", state=PENDING,
+            serial=None, reason=debugger.TAG_NOT_EVALUATED))
+        self._swept(client)
+        client.entry_theories.append(_parse_theory_status({"node_name": other}))
+        real_open = client.open_document
+
+        async def open_or_fail(file_path, **kw):
+            if file_path == other:
+                raise OSError("pipe broken")
+            await real_open(file_path, **kw)
+
+        client.open_document = open_or_fail
+        out = await debugger.enable_all_breakpoints(client, None)
+        assert debugger.registry.entries[0].state == ARMED
+        assert debugger.registry.entries[1].reason == debugger.TAG_WIRE_FAILURE
+        assert "Still pending: 1 (state unknown, internal failure)" in out
+
+
+class TestArmingFailureTag:
+    """When no site resolves for an entry, the tag says why: `not evaluated
+    yet` when the recorded line has not been evaluated (or was interrupted),
+    `code not found` when it has and the compiler placed nothing there."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("state, tag", [
+        (processing.NOT_EVALUATED, debugger.TAG_NOT_EVALUATED),
+        (processing.CANCELLED, debugger.TAG_NOT_EVALUATED),
+        (processing.PROCESSED, debugger.TAG_CODE_NOT_FOUND),
+        (processing.RUNNING, debugger.TAG_CODE_NOT_FOUND),
+    ])
+    async def test_thy_tag_follows_the_position_state(self, client, state, tag):
+        debugger.registry.entries.append(Breakpoint(
+            file_path=THY, line=VAL_XS, anchor="val nothing_like_this", state=PENDING,
+            serial=None, reason=debugger.TAG_NOT_EVALUATED))
+        client.tracker = FakeTracker(state)
+        out = await debugger.enable_all_breakpoints(client, None)
+        assert debugger.registry.entries[0].reason == tag
+        assert f"Still pending: 1 ({tag})" in out
+
+    @pytest.mark.asyncio
+    async def test_ml_keeps_code_not_found(self, client):
+        # A .ML has no per-position verdict: with the file held by the prover
+        # and no site for this entry, the tag stays `code not found` whatever
+        # a tracker would say.
+        debugger.registry.entries.append(Breakpoint(
+            file_path=ML, line=3, anchor="val nothing_like_this", state=PENDING,
+            serial=None, reason=debugger.TAG_NOT_EVALUATED))
+        client.listing_replies = [_listing()]
+        client.tracker = FakeTracker(processing.NOT_EVALUATED)
+        out = await debugger.enable_all_breakpoints(client, None)
+        assert debugger.registry.entries[0].reason == debugger.TAG_CODE_NOT_FOUND
+        assert "Still pending: 1 (code not found)" in out

@@ -25,12 +25,15 @@ class TestInvalidInput:
 
     @pytest.mark.asyncio
     async def test_nonexistent_file(self, mock_lsp_client):
-        with pytest.raises(FileNotFoundError):
+        # Queries never evaluate: a path nothing evaluated is refused with the
+        # not-evaluated sentence, and is not opened (which is where a missing
+        # file would have surfaced).
+        with pytest.raises(IsabelleToolError, match="has not been evaluated"):
             await hover_info(mock_lsp_client, "/nonexistent/file.thy", MCPLine(1), "x")
 
     @pytest.mark.asyncio
     async def test_empty_file_path(self, mock_lsp_client):
-        with pytest.raises((FileNotFoundError, IsabelleToolError)):
+        with pytest.raises(IsabelleToolError):
             await hover_info(mock_lsp_client, "", MCPLine(1), "x")
 
 
@@ -58,6 +61,10 @@ class TestModelValidation:
 
 
 class TestConcurrency:
+    @pytest.fixture(autouse=True)
+    async def _evaluated_up_front(self, evaluated_theory_file):
+        """Queries never evaluate: the file is evaluated up front."""
+
     @pytest.mark.asyncio
     async def test_concurrent_hover(self, mock_lsp_client, temp_theory_file):
         mock_lsp_client.hover_response = {"contents": "test"}
@@ -129,6 +136,7 @@ class TestUnicodeHandling:
     async def test_hover_unicode(self, tmp_path, mock_lsp_client):
         f = tmp_path / "unicode.thy"
         f.write_text('lemma "∀x. P x ⟹ Q x"\n', encoding='utf-8')
+        await mock_lsp_client.open_document(str(f), evaluation_target=True)
         mock_lsp_client.hover_response = {"contents": "Universal quantifier: ∀"}
         result = await hover_info(mock_lsp_client, str(f), MCPLine(1), "P")
         assert len(result.results) >= 1
@@ -137,6 +145,7 @@ class TestUnicodeHandling:
     async def test_hover_unicode_symbol(self, tmp_path, mock_lsp_client):
         f = tmp_path / "unicode2.thy"
         f.write_text('lemma "P ⟹ Q"\n', encoding='utf-8')
+        await mock_lsp_client.open_document(str(f), evaluation_target=True)
         mock_lsp_client.hover_response = {"contents": "implication"}
         result = await hover_info(mock_lsp_client, str(f), MCPLine(1), "⟹")
         assert len(result.results) >= 1
@@ -144,6 +153,10 @@ class TestUnicodeHandling:
 
 
 class TestEmptyResponses:
+    @pytest.fixture(autouse=True)
+    async def _evaluated_up_front(self, evaluated_theory_file):
+        """Queries never evaluate: the file is evaluated up front."""
+
     @pytest.mark.asyncio
     async def test_hover_empty_contents(self, mock_lsp_client, temp_theory_file):
         mock_lsp_client.hover_response = {"contents": ""}
@@ -164,6 +177,7 @@ class TestLargeData:
     async def test_very_long_line(self, tmp_path, mock_lsp_client):
         f = tmp_path / "long.thy"
         f.write_text("x " * 50000 + "\n")
+        await mock_lsp_client.open_document(str(f), evaluation_target=True)
         mock_lsp_client.hover_response = {"contents": "test"}
         result = await hover_info(mock_lsp_client, str(f), MCPLine(1), "x")
         assert len(result.results) >= 1

@@ -172,9 +172,9 @@ async def find_theorems(
     if line < 1:
         raise IsabelleToolError(f"line must be >= 1, got {line}")
 
-    # NOT opened here: the guard decides whether opening is allowed. A didOpen
-    # globally invalidates decoration freshness, so it must not happen while an
-    # evaluation is outstanding; on the paths that may open, evaluate_to does it.
+    # NOT opened here: the guard reopens a theory the prover still holds and
+    # refuses everything else — a query never opens a file on its own, and it
+    # never evaluates.
     guard = await check_evaluation_guard(client, file_path, line)
     if isinstance(guard, EvaluationView):
         raise IsabelleToolError(format_evaluation_result(guard, client.project_root))

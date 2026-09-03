@@ -11,11 +11,172 @@ import isabelle._
 
 import java.io.{File => JFile}
 
+import java.util.{List => JList}
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
+import java.nio.file.FileSystems
+import java.nio.file.{WatchKey, WatchEvent, Path => JPath}
+import java.nio.file.StandardWatchEventKinds.{ENTRY_CREATE, ENTRY_DELETE, ENTRY_MODIFY}
 
 import scala.collection.mutable
+import scala.jdk.CollectionConverters._
 import scala.util.parsing.input.Reader
+
+
+/* File_Watcher with a trigger filter (fork-local)
+
+   The distribution's File_Watcher cannot be subclassed -- its primary constructor is
+   private[File_Watcher] (Pure/General/file_watcher.scala:19) -- so this is an independent
+   class in package isabelle.mcp; Pure is untouched.
+
+   It differs from the distribution in exactly one respect: which batches restart the
+   debounce timer.  The single Delay.last is restarted by *every* event, so any file being
+   written at a sub-delay rate anywhere under a watched directory postpones disk pickup
+   indefinitely -- measured: a dependency edit never landed while a log file was being
+   appended to.  A batch now restarts the timer only if it mentions a .thy/.ML/.sml file
+   (nobody writes those at that rate) or a file the prover actually holds (the registered
+   path table below).
+
+   IRON RULE: the filter changes the trigger boolean ONLY.  Every event is still accumulated
+   into st.changed exactly as upstream does it -- moving the filter into the accumulation
+   would turn "delayed" into "lost for good". */
+
+class MCP_File_Watcher private[MCP_File_Watcher] {
+  // dummy template
+  def register(dir: JFile): Unit = {}
+  def register_parent(file: JFile): Unit = {}
+  def deregister(dir: JFile): Unit = {}
+  def purge(retain: Set[JFile]): Unit = {}
+  def shutdown(): Unit = {}
+}
+
+object MCP_File_Watcher {
+  val none: MCP_File_Watcher = new MCP_File_Watcher {
+    override def toString: String = "MCP_File_Watcher.none"
+  }
+
+  def apply(handle: Set[JFile] => Unit, delay: => Time = Time.seconds(0.5)): MCP_File_Watcher =
+    if (Platform.is_windows) none else new Impl(handle, delay)
+
+  private val trigger_extensions = List(".thy", ".ml", ".sml")
+
+  private def trigger_extension(name: String): Boolean = {
+    val lower = Word.lowercase(name)
+    trigger_extensions.exists(lower.endsWith)
+  }
+
+
+  /* proper implementation */
+
+  sealed case class State(
+    dirs: Map[JFile, WatchKey] = Map.empty,
+    /* the registered path table: the plain file names register_parent was asked about,
+       grouped by the directory object it computed.  Both sides of the lookup use that same
+       directory object and the bare event.context name -- NO canonicalization anywhere
+       (measured: canonicalizing pulls the two spellings apart again).  Grows only: models
+       are never dropped and purge has no caller. */
+    registered: Map[JFile, Set[String]] = Map.empty,
+    changed: Set[JFile] = Set.empty)
+
+  class Impl private[MCP_File_Watcher](handle: Set[JFile] => Unit, delay: Time)
+  extends MCP_File_Watcher {
+    private val state = Synchronized(MCP_File_Watcher.State())
+    private val watcher = FileSystems.getDefault.newWatchService()
+
+    override def toString: String =
+      state.value.dirs.keySet.mkString("MCP_File_Watcher(", ", ", ")")
+
+
+    /* registered directories */
+
+    override def register(dir: JFile): Unit =
+      state.change(st =>
+        st.dirs.get(dir) match {
+          case Some(key) if key.isValid => st
+          case _ =>
+            val key = dir.toPath.register(watcher, ENTRY_CREATE, ENTRY_DELETE, ENTRY_MODIFY)
+            st.copy(dirs = st.dirs + (dir -> key))
+        })
+
+    override def register_parent(file: JFile): Unit = {
+      val dir = file.getParentFile
+      if (dir != null && dir.isDirectory) {
+        // record the file identity FIRST: register(dir) short-circuits on an existing
+        // WatchKey, and the table must not be skipped along with it.
+        state.change(st =>
+          st.copy(registered =
+            st.registered + (dir -> (st.registered.getOrElse(dir, Set.empty) + file.getName))))
+        register(dir)
+      }
+    }
+
+    override def deregister(dir: JFile): Unit =
+      state.change(st =>
+        st.dirs.get(dir) match {
+          case None => st
+          case Some(key) =>
+            key.cancel()
+            st.copy(dirs = st.dirs - dir)
+        })
+
+    override def purge(retain: Set[JFile]): Unit =
+      state.change(st =>
+        st.copy(dirs = st.dirs --
+          (for ((dir, key) <- st.dirs.iterator if !retain(dir)) yield { key.cancel(); dir })))
+
+
+    /* changed directory entries */
+
+    private val delay_changed = Delay.last(delay) {
+      val changed = state.change_result(st => (st.changed, st.copy(changed = Set.empty)))
+      handle(changed)
+    }
+
+    private val watcher_thread = Isabelle_Thread.fork(name = "file_watcher", daemon = true) {
+      try {
+        while (true) {
+          val key = watcher.take
+          val trigger =
+            state.change_result { st =>
+              val (remove, changed, trigger) =
+                st.dirs.collectFirst({ case (dir, key1) if key == key1 => dir }) match {
+                  case Some(dir) =>
+                    val events: Iterable[WatchEvent[JPath]] =
+                      key.pollEvents.asInstanceOf[JList[WatchEvent[JPath]]].asScala
+                    val remove = if (key.reset) None else Some(dir)
+                    val changed =
+                      events.iterator.foldLeft(Set.empty[JFile]) {
+                        case (set, event) => set + dir.toPath.resolve(event.context).toFile
+                      }
+                    val registered = st.registered.getOrElse(dir, Set.empty)
+                    val trigger =
+                      events.iterator.map(_.context.toString).exists(name =>
+                        trigger_extension(name) || registered(name))
+                    (remove, changed, trigger)
+                  case None =>
+                    key.pollEvents
+                    key.reset
+                    (None, Set.empty[JFile], false)
+                }
+              (changed.nonEmpty && trigger,
+                st.copy(dirs = st.dirs -- remove, changed = st.changed ++ changed))
+            }
+          if (trigger) delay_changed.invoke()
+        }
+      }
+      catch { case Exn.Interrupt() => }
+    }
+
+
+    /* shutdown */
+
+    override def shutdown(): Unit = {
+      watcher_thread.interrupt()
+      watcher_thread.join()
+      delay_changed.revoke()
+    }
+  }
+}
 
 
 object VSCode_Resources {
@@ -323,8 +484,18 @@ extends Resources(session_background, log = log) {
   ): Unit = {
     state.change { st =>
       val model = st.models.getOrElse(file, VSCode_Model.init(session, editor, node_name(file)))
+      // A model coming back from external_file (a reopen) must forget its published baseline:
+      // the decoration publish is differential (vscode_model.scala:214-227), so for a clean
+      // file whose content did not change it would send nothing at all and the client would
+      // never see any decoration for the reopened file.  The clearing has to happen here, on
+      // the reopen side -- on the close side it would suppress the erase push instead.
+      val model0 =
+        if (model.external_file) {
+          model.copy(published_decorations = Nil, published_diagnostics = Nil)
+        }
+        else model
       val model1 =
-        (model.change_text(text, range) getOrElse model).set_version(version).external(false)
+        (model0.change_text(text, range) getOrElse model0).set_version(version).external(false)
       st.update_models(Some(file -> model1))
     }
   }
@@ -366,7 +537,7 @@ extends Resources(session_background, log = log) {
   def resolve_dependencies(
     session: VSCode_Session,
     editor: Language_Server.Editor,
-    file_watcher: File_Watcher
+    file_watcher: MCP_File_Watcher
   ): (Boolean, Boolean) = {
     state.change_result { st =>
       val stable_tip_version = session.stable_tip_version(st.models.values)

@@ -8,7 +8,8 @@ import types
 
 import pytest
 
-from isabelle_mcp.lsp_client import DocumentState, IsabelleLSPClient
+from isabelle_mcp.lsp_client import DocumentState, IsabelleLSPClient, _canon
+from isabelle_mcp.models import TheoryStatus
 from isabelle_mcp.utils import LSPCharacter, LSPLine, set_symbols_text
 
 
@@ -83,7 +84,7 @@ class MockProcessingTracker:
         self, *, all_processed: bool = True,
         frontier: bool | None = None, quiet: bool | None = None,
         state: str | None = None,
-        bad=None, overview_error=None, overview_warning=None,
+        bad=None, sorry=None, overview_error=None, overview_warning=None,
         running=None, unprocessed=None,
     ):
         assert all_processed or not (running or unprocessed), \
@@ -93,6 +94,7 @@ class MockProcessingTracker:
         self._quiet = quiet
         self._state = state
         self._bad = bad or []
+        self._sorry = sorry or []
         self._oerr = overview_error or []
         self._owarn = overview_warning or []
         self.running = list(running or [])
@@ -156,6 +158,9 @@ class MockProcessingTracker:
     def get_bad_ranges(self) -> list[tuple[int, int, int, int]]:
         return list(self._bad)
 
+    def get_sorry_ranges(self) -> list[tuple[int, int, int, int]]:
+        return list(self._sorry)
+
     def get_overview_error_ranges(self) -> list[tuple[int, int, int, int]]:
         return list(self._oerr)
 
@@ -203,6 +208,9 @@ class MockLSPClient:
         self.processing_status: dict[str, bool] = {}
         self._processing_trackers: dict[str, Any] = {}
         self.heap_sources: set[str] = set()
+        # The tool-call entry's parsed theory_status (see the real client);
+        # tests preset it for the paths that read it without a round trip.
+        self.entry_theories: list[TheoryStatus] = []
 
         self.hover_response = None
         self.definition_response = None
@@ -232,9 +240,17 @@ class MockLSPClient:
         file_path: str,
         content: str | None = None,
         *,
-        wait_for_diagnostics: bool = True,
-        diagnostic_timeout: float = 2.0,
+        wait_for_decoration: bool = True,
+        decoration_timeout: float = 2.0,
+        evaluation_target: bool = False,
     ):
+        # The real client's shape: canonical key, an already-open document is
+        # left as it is except that the evaluation-target mark may only rise.
+        file_path = _canon(file_path)
+        doc = self.open_documents.get(file_path)
+        if doc is not None:
+            doc.is_evaluation_target = doc.is_evaluation_target or evaluation_target
+            return
         if not Path(file_path).exists():
             raise FileNotFoundError(f"File not found: {file_path}")
         if content is None:
@@ -242,6 +258,7 @@ class MockLSPClient:
                 content = f.read()
         self.open_documents[file_path] = DocumentState(
             file_path=file_path, uri=f"file://{file_path}", version=1, content=content,
+            is_evaluation_target=evaluation_target,
         )
         if file_path not in self.processing_status:
             self.processing_status[file_path] = False
@@ -273,7 +290,6 @@ class MockLSPClient:
         await self.shutdown()
         self.process = None
         evaluation_state.cancel()
-        evaluation_state.auto_opened_files.clear()
 
     def _fail_pending_waiters(self, exc: Exception) -> None:
         self.failed_waiters_with = exc
@@ -321,10 +337,21 @@ class MockLSPClient:
         return self.processing_status.get(file_path, False)
 
     def get_processing_tracker(self, file_path: str) -> Any:
+        # The real client's open check: a closed document's tracker is unreadable.
+        if file_path not in self.open_documents:
+            return None
         return self._processing_trackers.get(file_path)
 
     async def close_document(self, file_path: str):
-        self.open_documents.pop(file_path, None)
+        # Mirrors the real close: the mark guard, and the tracker goes with
+        # the document (a test that wants a ghost tracker re-installs one).
+        file_path = _canon(file_path)
+        doc = self.open_documents.get(file_path)
+        if doc is None:
+            return
+        assert not doc.is_evaluation_target, f"closing an evaluation target: {file_path}"
+        del self.open_documents[file_path]
+        self._processing_trackers.pop(file_path, None)
 
     async def get_hover(self, file_path: str, line: LSPLine, character: LSPCharacter) -> Any:
         if callable(self.hover_response):
@@ -396,12 +423,26 @@ def mock_lsp_client():
     return MockLSPClient()
 
 
+@pytest.fixture
+async def evaluated_theory_file(mock_lsp_client, temp_theory_file) -> str:
+    """``temp_theory_file`` evaluated up front on the mock: opened with the
+    evaluation-target mark, its tracker all-processed. Queries never evaluate,
+    so a query-tool test starts from here or expects the not-evaluated error."""
+    await mock_lsp_client.open_document(temp_theory_file, evaluation_target=True)
+    return temp_theory_file
+
+
 @pytest.fixture(autouse=True)
 def _reset_evaluation_state():
+    """Every test starts with no run outstanding and no run on record: a run
+    a test left behind would be stamped cancelled here and then read by the
+    next test as "the last evaluation was cancelled"."""
     from isabelle_mcp.evaluation import evaluation_state
     evaluation_state.cancel()
+    evaluation_state.current = None
     yield
     evaluation_state.cancel()
+    evaluation_state.current = None
 
 
 # Modules that imported the lock by value (``from ... import _evaluation_state_lock``).
@@ -436,6 +477,15 @@ def _per_test_evaluation_state_lock(monkeypatch):
         f"{stale} do not hold this test's _evaluation_state_lock; "
         "add the module to _LOCK_HOLDERS in tests/conftest.py"
     )
+
+
+@pytest.fixture(autouse=True)
+def _per_test_registry_lock(monkeypatch):
+    """Give every test its own breakpoint ``registry.lock`` (same reason as
+    ``_per_test_evaluation_state_lock``: the unified close contends for it at
+    every tool entry, and a lock bound to an earlier test's loop would die)."""
+    from isabelle_mcp import debugger
+    monkeypatch.setattr(debugger.registry, "lock", asyncio.Lock())
 
 
 @pytest.fixture(autouse=True)

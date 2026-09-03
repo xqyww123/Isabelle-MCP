@@ -1,8 +1,18 @@
 import pytest
 
-from isabelle_mcp.evaluation import evaluation_state
+from isabelle_mcp.evaluation import NOT_EVALUATED_MESSAGE, evaluation_state
 from isabelle_mcp.tools.definition import declaration_location
 from isabelle_mcp.utils import IsabelleToolError, MCPLine
+
+
+@pytest.fixture(autouse=True)
+async def _evaluated_up_front(evaluated_theory_file):
+    """Queries never evaluate: every test here starts from an evaluated file."""
+
+
+async def _evaluated(client, path: str) -> str:
+    await client.open_document(path, evaluation_target=True)
+    return path
 
 
 class TestDefinitionTool:
@@ -67,6 +77,7 @@ class TestDefinitionTool:
     async def test_multi_occurrence_dedup(self, mock_lsp_client, tmp_path):
         f = tmp_path / "Dedup.thy"
         f.write_text("x = x\n")
+        await _evaluated(mock_lsp_client, str(f))
         mock_lsp_client.definition_response = [{
             "uri": "file:///a.thy",
             "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
@@ -83,9 +94,11 @@ class TestDefinitionTool:
         assert result.locations == []
 
     @pytest.mark.asyncio
-    async def test_file_not_found(self, mock_lsp_client):
-        with pytest.raises(FileNotFoundError):
+    async def test_a_path_that_does_not_exist_is_not_evaluated(self, mock_lsp_client):
+        with pytest.raises(IsabelleToolError) as exc:
             await declaration_location(mock_lsp_client, "/nonexistent/file.thy", MCPLine(1), "x")
+        assert str(exc.value) == NOT_EVALUATED_MESSAGE.format(
+            file="/nonexistent/file.thy", line=1)
 
     @pytest.mark.asyncio
     async def test_negative_line(self, mock_lsp_client, temp_theory_file):
@@ -98,12 +111,13 @@ class TestDefinitionTool:
             await declaration_location(mock_lsp_client, temp_theory_file, MCPLine(0), "x")
 
     @pytest.mark.asyncio
-    async def test_evaluation_guard_blocks(self, mock_lsp_client, temp_theory_file):
-        # Not open, so the guard may not open it while another file's evaluation
-        # is outstanding.
+    async def test_evaluation_guard_blocks(self, mock_lsp_client, temp_theory_with_errors):
+        # Not evaluated, and another file's evaluation is outstanding: the
+        # refusal names that evaluation.
         evaluation_state.start("/tmp/Other.thy", MCPLine(100))
         with pytest.raises(IsabelleToolError, match="has not been evaluated"):
-            await declaration_location(mock_lsp_client, temp_theory_file, MCPLine(5), "my_const")
+            await declaration_location(
+                mock_lsp_client, temp_theory_with_errors, MCPLine(5), "lemma")
 
     @pytest.mark.asyncio
     async def test_malformed_location_ignored(self, mock_lsp_client, temp_theory_file):
@@ -118,6 +132,7 @@ class TestDefinitionTool:
     async def test_lsp_error_skips_occurrence(self, mock_lsp_client, tmp_path):
         f = tmp_path / "Err.thy"
         f.write_text("x = x\n")
+        await _evaluated(mock_lsp_client, str(f))
         call_count = 0
 
         def error_on_first(fp, line, char):
@@ -135,6 +150,7 @@ class TestDefinitionTool:
     async def test_isabelle_tool_error_propagates(self, mock_lsp_client, tmp_path):
         f = tmp_path / "Fatal.thy"
         f.write_text("x = x\n")
+        await _evaluated(mock_lsp_client, str(f))
 
         def fatal_error(fp, line, char):
             raise IsabelleToolError("LSP process crashed")

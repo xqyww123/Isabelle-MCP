@@ -118,13 +118,13 @@ Evaluation drives Isabelle's processing; the query tools below read its results.
 
 #### Tool: `isabelle_evaluate_to`
 **Purpose**: Start checking a theory file up to a target line (requires a launched session)
-**Returns**: Plain-text per-file snapshot (errors / warnings / running lines) — may
+**Returns**: Plain-text per-file snapshot (running / errors / sorry lines) — may
 report `in_progress`; poll with `isabelle_evaluation_status`
 **Priority**: High (entry point for all checking)
 
 #### Tool: `isabelle_evaluation_status`
-**Purpose**: Check the current evaluation state (per-file errors/warnings/running
-line spans while busy; the errors and warnings that remain when idle)
+**Purpose**: Check the current evaluation state (per-file running/errors/sorry
+line spans while busy; the errors that remain anywhere when idle)
 **Returns**: Plain-text per-file snapshot
 
 #### Tool: `isabelle_cancel_evaluation`
@@ -377,7 +377,8 @@ class LocalOccurrencesResult(BaseModel):
 **Description**: Get the Isar command enclosing a position and the proof state
 (remaining subgoals) **after** that command runs. **MOST IMPORTANT tool for theorem
 proving — use often!** An empty `subgoals` list means the proof is finished at that
-command. Auto-evaluates the line first if needed (requires a launched session).
+command. Queries never evaluate: evaluate up to the line with `isabelle_evaluate_to`
+first (requires a launched session).
 
 Without `after_text`, the command at the end of the line is used. Pass `after_text`
 to target the command right after that snippet on the line. To see a tactic's
@@ -445,8 +446,9 @@ class GoalState(BaseModel):
 #### 4.2.2 `isabelle_command_output`
 
 **Description**: Get the Isar command enclosing a position and the prover output it
-produced. Auto-evaluates the line first if needed (requires a launched session).
-Targeting follows the same `after_text` rule as `isabelle_goal`.
+produced. Queries never evaluate: evaluate up to the line with `isabelle_evaluate_to`
+first (requires a launched session). Targeting follows the same `after_text` rule as
+`isabelle_goal`.
 
 **Tool Annotations**:
 ```python
@@ -586,17 +588,27 @@ then reports that evaluation is still in progress, and the agent polls
 **not** halt checking: every command up to the target is checked even if an earlier
 one fails.
 
-The snapshot lists each relevant file with up to three columns — **errors** /
-**warnings** / **running** — as 1-indexed line spans. `errors` is the line-deduped
-union of the `text_overview_error` and `background_bad` decorations, so a `sorry`, a
-failed proof, and a killed command all show up as errors (there is no separate
-"sorry" category). `warnings` is `text_overview_warning`; `running` is
-`background_running1` (still-executing forked proofs). Classification is
-decoration-only — no diagnostics channel is read for the snapshot. For a file with
-no decoration (e.g. an unopened dependency) the snapshot falls back to
-`theory_status` **counts** (failed→errors, warned→warnings, no line numbers) and
-uses `unprocessed`/`consolidated` to show "in progress" vs "clean". Full
-error/warning message *text* is fetched separately via `isabelle_command_output`.
+The snapshot lists each relevant file with its problem rows — **running**,
+**pending**, **errors** and **sorry** — as 1-indexed line spans; a row with nothing
+to say is omitted, and `pending` (unfinished commands inside the evaluated prefix)
+appears only for the evaluation target. `errors` is the `text_overview_error`
+decoration and nothing else. A `sorry` is not an error: the `background_sorry`
+decoration gets a row of its own (`sorry: line 5`, `sorry: lines 12, 40`), is never
+counted as a failed command, and never blocks anything — a file whose only mark is a
+`sorry` still counts as `clean`, and the report lists the line and says nothing
+more: no failure count, no call to action. A cancelled command is not an error
+either: cancelling leaves no decoration at all, so a killed command is simply back
+to not evaluated. `running` is `background_running1` (still-executing forked
+proofs). Warnings are not reported anywhere: no warning row, no warning count, in
+any report or footer. Classification is decoration-only — no diagnostics channel is
+read for the snapshot. For a file with no decoration (e.g. an unopened dependency)
+the snapshot falls back to `theory_status` **counts** (failed→errors, no line
+numbers) and uses `unprocessed`/`consolidated` to show "in progress" vs "clean";
+only files with a failure or a running command get such a line, while theories that
+are merely still to be processed are summarised in one `{N} theories are not yet
+processed.` line. Full error message *text* is fetched separately via
+`isabelle_command_output`, which does still show the prover's `[warning]` output
+lines — the blanket removal is about status reports, not about that transcript.
 
 #### 4.4.1 `isabelle_evaluate_to`
 
@@ -618,12 +630,16 @@ after_text: Annotated[Optional[str], Field(
 
 **Description**: Check the current evaluation state. **Input Parameters**: None.
 While a run is outstanding or a command is still running, the answer is the
-current per-file snapshot (errors / warnings / running line spans) and whether the
-run finished. When idle, the answer still reports the errors and warnings that
-remain in every open document, with line numbers, so the first line tells the
-agent whether the sections below hold errors: `No evaluation in progress. Nothing
-is running and no errors remain.` or `No evaluation in progress. Nothing is
-running, but N commands failed.` (`1 command failed.` in the singular). An edit
+current per-file snapshot (running / pending / errors / sorry line spans) and
+whether the run finished. When idle, the answer still reports the errors that
+remain anywhere the prover holds a theory — dependencies included, whether or not
+they were ever opened by hand — with line numbers where the prover has published
+them and a counts-only line where it has not, so the first line tells the agent
+whether the sections below hold errors: `No evaluation in progress. Nothing is
+running and no errors remain.` or `No evaluation in progress. Nothing is
+running, but {N} failed commands remain.` (`1 failed command remains.` in the
+singular). A dependency error reappears in every idle report until it is fixed.
+An edit
 within the last `ISABELLE_MCP_DECORATION_GRACE` seconds (default 2 s) makes the
 tool wait until that window has passed with no further edit — a further edit
 re-arms it — before judging, so the answer (idle or busy) never describes the
@@ -649,11 +665,12 @@ class FileSnapshot:
     lined: bool   # True = decoration spans; False = theory_status-count fallback
     state: str    # "clean" | "in_progress" | "problems"
     errors: list[tuple[int, int]] = field(default_factory=list)    # (start, end) line spans
-    warnings: list[tuple[int, int]] = field(default_factory=list)
+    sorry: list[tuple[int, int]] = field(default_factory=list)     # `sorry` sites; no count sibling
     running: list[tuple[int, int]] = field(default_factory=list)
+    pending: list[tuple[int, int]] = field(default_factory=list)   # target only: unfinished commands
     error_count: int = 0
-    warning_count: int = 0
     running_count: int = 0
+    pending_count: int = 0
 
 @dataclass
 class EvaluationView:
@@ -672,7 +689,7 @@ Evaluation has completed up to Scratch.thy:42.
 Scratch.thy:
   running: line 55
   errors: lines 37, 40-41
-  warnings: line 12
+  sorry: line 12
 
 Call isabelle_evaluation_status to check progress.
 ```
@@ -811,7 +828,7 @@ Documentation must not mark future/design-target behavior as implemented.
 | List wrapper | `items` field | `items` field | ✅ Consistent |
 | Goal query | `lean_goal` | `isabelle_goal` | ✅ Same pattern |
 | Position targeting | Optional column | `symbol` / `after_text` snippet | Snippet-based (agents miscount columns) |
-| Diagnostics | `lean_diagnostic_messages` | evaluation snapshot + `isabelle_command_output` | Snapshot lists error/warning lines; message text via `command_output` |
+| Diagnostics | `lean_diagnostic_messages` | evaluation snapshot + `isabelle_command_output` | Snapshot lists error and sorry lines; message text via `command_output` |
 | Edit | ❌ (external tool) | Not implemented | Design target only |
 | File outline | `lean_file_outline` | ❌ Not in MVP | LSP doesn't support |
 | Code actions | `lean_code_actions` | ❌ Not in MVP | LSP doesn't support |

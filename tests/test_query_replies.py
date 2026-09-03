@@ -20,9 +20,10 @@ CMD = ("by simp", {"start": {"line": 8, "character": 2}, "end": {"line": 8, "cha
 
 
 @pytest.fixture(autouse=True)
-def _rooted(mock_lsp_client, temp_theory_file):
-    """Positions render relative to the project root, as everywhere else."""
-    mock_lsp_client.project_root = os.path.dirname(temp_theory_file)
+async def _rooted(mock_lsp_client, evaluated_theory_file):
+    """Positions render relative to the project root, as everywhere else; and
+    queries never evaluate, so the file is evaluated up front."""
+    mock_lsp_client.project_root = os.path.dirname(evaluated_theory_file)
 
 
 async def _goal_raising(client, path, reply):

@@ -1,13 +1,13 @@
-"""isabelle_evaluation_status when nothing is outstanding (fix plan section 9A,
-item 17): the tool the agent calls to ask for status must not hide the failures
-that remain once the run has ended.
+"""isabelle_evaluation_status when nothing is outstanding: the tool the agent
+calls to ask for status must not hide the failures that remain once the run
+has ended — in the files it evaluated and in their dependencies alike.
 
-The idle answer lists every open document that still shows errors or warnings,
-with line numbers, under a first line that says whether any errors remain. It
-is read from the decoration cache, so a recent edit makes the tool wait until
-the edits have stopped (debounce; a further edit re-arms the window). The
-footer's rule (silence about old failures once no
-run is outstanding) and isabelle_cancel_evaluation's idle reply are untouched.
+The idle answer walks the same data path as the busy one: one theory_status
+pulled after the debounce, every failed theory auto-opened, every file with
+something wrong listed with line numbers, under a first line that says whether
+any errors remain. A recent edit makes the tool wait until the edits have
+stopped (debounce; a further edit re-arms the window). Warnings are never
+reported. isabelle_cancel_evaluation's idle reply is untouched.
 """
 
 import asyncio
@@ -25,6 +25,7 @@ from isabelle_mcp.evaluation import (
     format_evaluation_result,
 )
 from isabelle_mcp.server import isabelle_evaluation_status, mcp
+from isabelle_mcp.utils import MCPLine
 from tests.conftest import MockProcessingTracker
 from tests.test_server import _patch_ensure
 
@@ -44,6 +45,18 @@ def _second_file(tmp_path, name: str) -> str:
     return str(path)
 
 
+def _theory_row(path: str, **kw) -> dict:
+    """One raw theory_status row, settled unless *kw* says otherwise."""
+    row = {
+        "node_name": path, "theory_name": os.path.basename(path)[:-4],
+        "external": False, "imports": [], "ok": True, "total": 10,
+        "unprocessed": 0, "running": 0, "warned": 0, "failed": 0,
+        "finished": 10, "canceled": False, "consolidated": True, "percentage": 100,
+    }
+    row.update(kw)
+    return row
+
+
 class TestIdleReport:
     @pytest.mark.asyncio
     async def test_nothing_open_is_clean(self, mock_lsp_client):
@@ -59,12 +72,12 @@ class TestIdleReport:
     ):
         await _open_with(
             mock_lsp_client, temp_theory_file,
-            overview_error=[(2, 0, 2, 5)], bad=[(7, 0, 7, 3)],
+            overview_error=[(2, 0, 2, 5), (7, 0, 7, 3)], bad=[(2, 0, 2, 5), (7, 0, 7, 3)],
         )
         view = await evaluation_status(mock_lsp_client)
         assert view.status == "no_evaluation"
         assert view.message == (
-            "No evaluation in progress. Nothing is running, but 2 commands failed."
+            "No evaluation in progress. Nothing is running, but 2 failed commands remain."
         )
         (fs,) = view.files
         assert fs.file_path == temp_theory_file and fs.lined
@@ -75,10 +88,13 @@ class TestIdleReport:
 
     @pytest.mark.asyncio
     async def test_one_failure_is_singular(self, temp_theory_file, mock_lsp_client):
-        await _open_with(mock_lsp_client, temp_theory_file, bad=[(2, 0, 2, 5)])
+        await _open_with(
+            mock_lsp_client, temp_theory_file,
+            overview_error=[(2, 0, 2, 5)], bad=[(2, 0, 2, 5)],
+        )
         view = await evaluation_status(mock_lsp_client)
         assert view.message == (
-            "No evaluation in progress. Nothing is running, but 1 command failed."
+            "No evaluation in progress. Nothing is running, but 1 failed command remains."
         )
 
     @pytest.mark.asyncio
@@ -92,23 +108,40 @@ class TestIdleReport:
             overview_error=[(2, 0, 2, 5)], bad=[(2, 2, 2, 4)],
         )
         view = await evaluation_status(mock_lsp_client)
-        assert "but 1 command failed." in view.message
+        assert "but 1 failed command remains." in view.message
         assert view.files[0].errors == [(3, 3)]
 
     @pytest.mark.asyncio
-    async def test_a_file_with_only_warnings_is_listed_under_the_clean_line(
+    async def test_a_file_with_only_a_sorry_gets_a_sorry_row_under_the_clean_line(
         self, temp_theory_file, mock_lsp_client,
     ):
-        # Warnings are reported as they are while a run is busy; the first line
-        # still speaks only of errors, and the section's own label says the rest.
+        # A sorry is not an error: the first line still says no errors remain,
+        # the file snapshot lists the sorry, and nothing is counted or chased.
+        await _open_with(
+            mock_lsp_client, temp_theory_file,
+            bad=[(4, 0, 4, 5)], sorry=[(4, 0, 4, 5)],
+        )
+        view = await evaluation_status(mock_lsp_client)
+        assert view.message == IDLE_CLEAN_SENTENCE
+        (fs,) = view.files
+        assert fs.state == "clean" and fs.errors == [] and fs.sorry == [(5, 5)]
+        assert format_evaluation_result(view, None, call_to_action=False) == (
+            IDLE_CLEAN_SENTENCE + f"\n\n{temp_theory_file}:\n  sorry: line 5"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_file_with_only_warnings_is_not_listed(
+        self, temp_theory_file, mock_lsp_client,
+    ):
+        # Warnings are ignored throughout: a file whose only mark is a warning
+        # is clean for every purpose, and no row ever says "warnings:".
         await _open_with(
             mock_lsp_client, temp_theory_file, overview_warning=[(4, 0, 4, 3)],
         )
         view = await evaluation_status(mock_lsp_client)
         assert view.message == IDLE_CLEAN_SENTENCE
-        (fs,) = view.files
-        assert fs.warnings == [(5, 5)] and fs.errors == []
-        assert "warnings: line 5" in format_evaluation_result(view, None)
+        assert view.files == []
+        assert "warning" not in format_evaluation_result(view, None)
 
     @pytest.mark.asyncio
     async def test_a_clean_open_file_is_not_listed(
@@ -116,7 +149,10 @@ class TestIdleReport:
     ):
         clean = _second_file(tmp_path, "Clean.thy")
         await _open_with(mock_lsp_client, clean)
-        await _open_with(mock_lsp_client, temp_theory_file, bad=[(2, 0, 2, 5)])
+        await _open_with(
+            mock_lsp_client, temp_theory_file,
+            overview_error=[(2, 0, 2, 5)], bad=[(2, 0, 2, 5)],
+        )
         view = await evaluation_status(mock_lsp_client)
         assert [fs.file_path for fs in view.files] == [temp_theory_file]
 
@@ -125,35 +161,145 @@ class TestIdleReport:
         self, temp_theory_file, mock_lsp_client, tmp_path,
     ):
         other = _second_file(tmp_path, "Other.thy")
-        await _open_with(mock_lsp_client, other, bad=[(4, 0, 4, 5)])
+        await _open_with(
+            mock_lsp_client, other, overview_error=[(4, 0, 4, 5)], bad=[(4, 0, 4, 5)],
+        )
         await _open_with(
             mock_lsp_client, temp_theory_file,
-            overview_error=[(2, 0, 2, 5)], bad=[(7, 0, 7, 3)],
+            overview_error=[(2, 0, 2, 5), (7, 0, 7, 3)], bad=[(2, 0, 2, 5), (7, 0, 7, 3)],
         )
         view = await evaluation_status(mock_lsp_client)
-        assert "but 3 commands failed." in view.message
+        assert "but 3 failed commands remain." in view.message
         assert sum(fs.error_count for fs in view.files) == 3
 
     @pytest.mark.asyncio
-    async def test_no_theory_status_and_nothing_auto_opened(
+    async def test_a_failed_dependency_is_auto_opened_and_reported(
+        self, temp_theory_file, mock_lsp_client, tmp_path,
+    ):
+        # The idle report walks the busy report's data path: theory_status is
+        # pulled once, every failed theory is opened (whether or not any run
+        # ever touched it), and its failure is listed — by count until its
+        # decoration arrives. A failed import must never fall out of sight
+        # just because no run is outstanding.
+        dep = _second_file(tmp_path, "Dep.thy")
+        calls = []
+
+        async def status():
+            calls.append(True)
+            return [_theory_row(temp_theory_file),
+                    _theory_row(dep, ok=False, failed=1, finished=9)]
+
+        mock_lsp_client.request_theory_status = status
+        await _open_with(mock_lsp_client, temp_theory_file)
+        view = await evaluation_status(mock_lsp_client)
+        assert calls == [True]
+        assert dep in mock_lsp_client.open_documents
+        assert not mock_lsp_client.open_documents[dep].is_evaluation_target
+        assert view.message == (
+            "No evaluation in progress. Nothing is running, but 1 failed command remains."
+        )
+        (fs,) = view.files
+        assert fs.file_path == dep and not fs.lined and fs.error_count == 1
+        assert f"{dep}: 1 error (no line info)" in format_evaluation_result(view, None)
+        assert not evaluation_state.active
+
+    @pytest.mark.asyncio
+    async def test_a_never_evaluated_open_file_still_leaves_the_session_idle(
         self, temp_theory_file, mock_lsp_client,
     ):
-        # theory_status auto-opens every not-ok theory into auto_opened_files,
-        # which only a run's end clears: with no run, that would leak. The idle
-        # report must therefore be built from the decoration cache alone.
-        calls = []
-        original = mock_lsp_client.request_theory_status
+        # An open file nothing ever evaluated has unprocessed commands forever.
+        # That must not put the session on the busy path (only running work
+        # does); it is counted in the summary line instead.
+        async def status():
+            return [_theory_row(temp_theory_file, unprocessed=10, finished=0,
+                                consolidated=False, percentage=0)]
 
-        async def counting():
-            calls.append(True)
-            return await original()
+        mock_lsp_client.request_theory_status = status
+        await _open_with(mock_lsp_client, temp_theory_file, all_processed=False)
+        view = await evaluation_status(mock_lsp_client)
+        assert view.status == "no_evaluation"
+        assert view.message == IDLE_CLEAN_SENTENCE
+        assert view.files == []
+        assert view.unprocessed_theories == 1
+        assert format_evaluation_result(view, None) == (
+            IDLE_CLEAN_SENTENCE + "\n\n1 theory is not yet processed."
+        )
 
-        mock_lsp_client.request_theory_status = counting
-        await _open_with(mock_lsp_client, temp_theory_file, bad=[(2, 0, 2, 5)])
-        await evaluation_status(mock_lsp_client)
-        assert calls == []
-        assert evaluation_state.auto_opened_files == set()
-        assert not evaluation_state.active
+    @pytest.mark.asyncio
+    async def test_a_dependency_running_in_a_closed_file_is_busy(
+        self, temp_theory_file, mock_lsp_client,
+    ):
+        # Nothing is open with a running range, yet theory_status says an
+        # import is still running: the answer is busy, and the count comes
+        # from theory_status — never "0 commands are still running". No run
+        # is outstanding, so the last run's target (temp_theory_file, half
+        # evaluated) neither seeds a file snapshot nor clips a pending row —
+        # the picture is session-level, exactly as when idle.
+        evaluation_state.start(temp_theory_file, MCPLine(5))
+        evaluation_state.complete()
+
+        async def status():
+            return [_theory_row(temp_theory_file, unprocessed=4, finished=6,
+                                consolidated=False),
+                    _theory_row("/tmp/Dep_running.thy", running=2, unprocessed=3,
+                                finished=5, consolidated=False)]
+
+        mock_lsp_client.request_theory_status = status
+        await _open_with(mock_lsp_client, temp_theory_file, unprocessed=[(6, 0, 9, 0)])
+        view = await evaluation_status(mock_lsp_client)
+        assert view.status == "in_progress"
+        assert view.message == "2 commands are still running."
+        assert view.target_file is None and view.destination_line is None
+        assert [fs.file_path for fs in view.files] == ["/tmp/Dep_running.thy"]
+        assert format_evaluation_result(view, None, call_to_action=False) == (
+            "2 commands are still running.\n\n"
+            "/tmp/Dep_running.thy: in progress (2 running so far)\n\n"
+            "1 theory is not yet processed."
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_settled_old_target_is_not_listed_as_clean(
+        self, temp_theory_file, mock_lsp_client,
+    ):
+        # The last run's target, now settled: with no run outstanding it must
+        # not be seeded into the report — a lone "Test.thy: clean" block is
+        # not approved output.
+        evaluation_state.start(temp_theory_file, MCPLine(5))
+        evaluation_state.complete()
+
+        async def status():
+            return [_theory_row(temp_theory_file),
+                    _theory_row("/tmp/Dep_running.thy", running=1, unprocessed=0,
+                                finished=9, consolidated=False)]
+
+        mock_lsp_client.request_theory_status = status
+        await _open_with(mock_lsp_client, temp_theory_file)
+        view = await evaluation_status(mock_lsp_client)
+        assert [fs.file_path for fs in view.files] == ["/tmp/Dep_running.thy"]
+        assert "clean" not in format_evaluation_result(view, None, call_to_action=False)
+
+    @pytest.mark.asyncio
+    async def test_the_report_and_the_first_line_count_the_same_failures(
+        self, temp_theory_file, mock_lsp_client, tmp_path,
+    ):
+        # A failed dependency whose decoration has not arrived: the first line
+        # and the file snapshot below it are computed from one source, so the
+        # count above can never disagree with the rows below.
+        from isabelle_mcp.evaluation import _failed_count, _parse_theory_status
+        dep = _second_file(tmp_path, "Dep_count.thy")
+        rows = [_theory_row(temp_theory_file),
+                _theory_row(dep, ok=False, failed=1, finished=9)]
+
+        async def status():
+            return rows
+
+        mock_lsp_client.request_theory_status = status
+        await _open_with(mock_lsp_client, temp_theory_file)
+        view = await evaluation_status(mock_lsp_client)
+        theories = [_parse_theory_status(r) for r in rows]
+        assert _failed_count(mock_lsp_client, theories) == 1
+        assert "1 failed command remains." in view.message
+        assert sum(fs.error_count for fs in view.files) == 1
 
 
 class TestIdleGraceWindow:
@@ -171,7 +317,10 @@ class TestIdleGraceWindow:
     ):
         # Before the edit, the tracker shows an error; the edit fixed it, and the
         # server's fresh decoration lands inside the window.
-        await _open_with(mock_lsp_client, temp_theory_file, bad=[(2, 0, 2, 5)])
+        await _open_with(
+            mock_lsp_client, temp_theory_file,
+            overview_error=[(2, 0, 2, 5)], bad=[(2, 0, 2, 5)],
+        )
         processing.note_edit_sent()
 
         async def fresh_decoration_arrives():
@@ -218,7 +367,10 @@ class TestIdleGraceWindow:
         # Debounce: a further edit during the wait re-arms the window, so the
         # tool answers only once the edits have stopped — and from the picture
         # after the LAST edit.
-        await _open_with(mock_lsp_client, temp_theory_file, bad=[(2, 0, 2, 5)])
+        await _open_with(
+            mock_lsp_client, temp_theory_file,
+            overview_error=[(2, 0, 2, 5)], bad=[(2, 0, 2, 5)],
+        )
         processing.note_edit_sent()
 
         async def second_edit_then_fix():
@@ -240,11 +392,14 @@ class TestIdleGraceWindow:
     async def test_without_a_recent_edit_it_answers_at_once(
         self, temp_theory_file, mock_lsp_client,
     ):
-        await _open_with(mock_lsp_client, temp_theory_file, bad=[(2, 0, 2, 5)])
+        await _open_with(
+            mock_lsp_client, temp_theory_file,
+            overview_error=[(2, 0, 2, 5)], bad=[(2, 0, 2, 5)],
+        )
         started = time.monotonic()
         view = await evaluation_status(mock_lsp_client)
         assert time.monotonic() - started < 0.04
-        assert "but 1 command failed." in view.message
+        assert "but 1 failed command remains." in view.message
 
 
 class TestIdleReport2:
@@ -293,7 +448,10 @@ class TestNeighboursUnchanged:
     ):
         # Cancelling has nothing to report about old failures: that is the
         # status tool's job.
-        await _open_with(mock_lsp_client, temp_theory_file, bad=[(2, 0, 2, 5)])
+        await _open_with(
+            mock_lsp_client, temp_theory_file,
+            overview_error=[(2, 0, 2, 5)], bad=[(2, 0, 2, 5)],
+        )
         view = await cancel_evaluation(mock_lsp_client)
         assert view.status == "no_evaluation"
         assert format_evaluation_result(view, None) == "No evaluation in progress."
@@ -306,13 +464,13 @@ class TestTool:
     ):
         await _open_with(
             mock_lsp_client, temp_theory_file,
-            overview_error=[(2, 0, 2, 5)], bad=[(7, 0, 7, 3)],
+            overview_error=[(2, 0, 2, 5), (7, 0, 7, 3)], bad=[(2, 0, 2, 5), (7, 0, 7, 3)],
         )
         with _patch_ensure(mock_lsp_client):
             result = await isabelle_evaluation_status()
         text = result.content[0].text
         assert text.startswith(
-            "No evaluation in progress. Nothing is running, but 2 commands failed."
+            "No evaluation in progress. Nothing is running, but 2 failed commands remain."
         )
         assert "errors: lines 3, 8" in text
         assert "Call isabelle_evaluation_status" not in text

@@ -206,6 +206,11 @@ keeps only `background_unprocessed1`/`background_running1`).
 
 ### 3.1 Categorization scheme — verified reliable
 
+> **Update (2026-09-02).** The subtraction below is historical: the shipped
+> classification names `sorry` lines directly through the fork's `background_sorry`
+> decoration (the `Skipped proof` message, classified in Scala), and warnings are
+> not reported. See the update note in §7 and the CHANGELOG.
+
 A theory with 2 sorries, 2 errors (one **failed proof** = `Bad` markup, one
 **type error** = `ERROR` markup), and 2 plain warnings was processed; decoration
 and diagnostic channels were captured and classified:
@@ -396,10 +401,15 @@ Still open:
    `dotted_information` (info messages)?
 
 > **Update (what actually shipped).** The plan in §6–§7 below is the historical
-> design; two of its decisions were reversed at implementation time:
-> 1. **No separate `sorry` category.** `errors` is the line-deduped **union** of
->    `text_overview_error` and `background_bad`, so a `sorry`, a failed proof, and a
->    killed command all count as errors. `warnings = text_overview_warning`; the new
+> design; two of its decisions were reversed at implementation time, and the
+> first reversal was itself reversed later:
+> 1. **`sorry` is its own row, classified server-side.** For a while `errors` was
+>    the line-deduped union of `text_overview_error` and `background_bad`, so a
+>    `sorry` counted as an error. Now `errors = text_overview_error` alone; the
+>    Scala fork classifies a `sorry` by its `Skipped proof` message and publishes
+>    the fork-local `background_sorry` decoration, rendered as `sorry: line N` and
+>    never counted (§3.1's subtraction is not used — `background_bad` also holds
+>    benign members such as `back`). Warnings are not reported at all. The
 >    `running = background_running1` column surfaces still-executing forked proofs.
 > 2. **Completion stays on `line_reached`, not `diagnostics_settled`** (see the §5.2
 >    update). The snapshot is decoration-only — no diagnostics channel is read for it.
@@ -436,6 +446,8 @@ Still open:
   per-file snapshot each call.
 - Categorize (§3.1): `errors = text_overview_error` (≡ diagnostic error lines),
   `warnings = text_overview_warning`, `sorry = background_bad − errors`.
+  *(2026-09-02: shipped as `errors = text_overview_error`, `sorry =
+  background_sorry` from the fork, no warnings — see the update note above §6.)*
 - Gate `complete` on diagnostics/decoration having **settled** (`diagnostics_settled`),
   not just the processing tracker reaching the line (§5.2 race).
 - Per-file cache of the `(errors, sorry, warnings)` signature → print

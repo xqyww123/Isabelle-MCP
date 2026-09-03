@@ -460,7 +460,7 @@ synchronous access.
 **Solution:** Cache diagnostics from `publishDiagnostics` notifications. There is no
 longer an `isabelle_diagnostics` tool that exposes this cache; the only consumer is
 `isabelle_hover`, which attaches the queried line's `DiagnosticMessage`s to its
-result. Error/warning *locations* for the evaluation snapshot come from the
+result. Error and sorry *locations* for the evaluation snapshot come from the
 `PIDE/decoration` channels instead, and *message text* comes from
 `isabelle_command_output` — neither path reads this cache.
 
@@ -578,11 +578,25 @@ IDLE ◄────────────────────── COMPL
 
 ### 3.4 Query Tool Guard
 
-Each query tool calls ``check_evaluation_guard(client, file_path, line)``:
+Each query tool calls ``check_evaluation_guard(client, file_path, line)``. Queries
+never evaluate; the guard dispatches on the requested position, in this order:
 
-1. If evaluation **active** → raise ``IsabelleToolError`` (call ``evaluation_status``).
-2. If target line **not processed** and no evaluation active → auto-start evaluation.
-3. If target line **processed** → return ``None`` (proceed to query).
+1. The position has been evaluated → served (``None``; a still-running or
+   interrupted command is served with a note; an untrustworthy cache is refused
+   with the retry sentence).
+2. An evaluation is running towards this file and its target covers the line →
+   a pure wait of at most ``EVAL_POLL_INTERVAL`` for the frontier to reach it,
+   then judged again; on timeout the evaluation's progress is returned as an
+   ``EvaluationView`` (the caller renders and raises it). The wait adds a rider
+   to the run and nothing else: no target moves, no caret moves, no run is
+   started or ended.
+3. The prover holds the theory but this client closed it (the unified close) →
+   reopened with the evaluation-target mark, the grace gate waited out, judged
+   again. No proof re-runs.
+4. Still not evaluated while another file is under evaluation →
+   ``NOT_EVALUATED_REFUSAL``, naming that evaluation.
+5. Otherwise → ``NOT_EVALUATED_MESSAGE``: evaluate up to the line with
+   ``isabelle_evaluate_to`` first.
 
 ### 3.5 Cancel / Force-Interrupt Mechanism
 
@@ -618,14 +632,17 @@ Query tools follow this pattern:
 ```python
 async def hover_info(client, file_path, line, symbol):
     validate_position(line, 1)
-    await client.open_document(file_path)
 
+    # NOT opened here: the guard reopens a theory the prover still holds and
+    # refuses everything else — a query never opens a file on its own, and it
+    # never evaluates.
     guard = await check_evaluation_guard(client, file_path, line)
-    if guard is not None:
-        raise IsabelleToolError(guard.message)
+    if isinstance(guard, EvaluationView):      # the pure wait ran out: progress
+        raise IsabelleToolError(format_evaluation_result(guard, client.project_root))
+    note = guard if isinstance(guard, str) else None   # running / interrupted
 
     # ... LSP query (fast, line already processed) ...
-    return HoverInfo(...)
+    return HoverInfo(..., note=note)
 ```
 
 ---
@@ -661,9 +678,10 @@ AI Agent calls isabelle_goal(file, line)
          │
          ├─→ Get LSP client from context
          │
-         ├─→ Ensure document is open + check_evaluation_guard
+         ├─→ check_evaluation_guard (§3.4): served, waited for, reopened, or refused
          │   │
-         │   └─→ If not open: send textDocument/didOpen
+         │   └─→ Only a theory the prover already holds is reopened (didOpen);
+         │       nothing is evaluated here
          │
          ├─→ resolve_caret(after_text or end-of-line) → (caret_line, caret_char)
          ├─→ get_command_at_position → CommandSpan
@@ -981,12 +999,10 @@ MCP Server
    │ Get LSP client from context
    │
    ▼
-Document Manager
-   │ ensure_document_open(file)
-   │ Check if file in open_documents
-   │
-   ├─→ Not open: send textDocument/didOpen
-   │             wait for processing
+Evaluation guard (§3.4)
+   │ check_evaluation_guard(file, line)
+   │ Served if evaluated; a theory the prover holds but the unified close
+   │ closed is reopened (didOpen, no evaluation); otherwise refused
    │
    ▼
 LSP Client

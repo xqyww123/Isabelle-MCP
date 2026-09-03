@@ -9,15 +9,19 @@ server knows where one command stops and the next begins.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 from collections import OrderedDict
 
 from isabelle_mcp import processing
-from isabelle_mcp.evaluation import relativize
+from isabelle_mcp.evaluation import _wait_out_grace, relativize, reopen_held_theory
 from isabelle_mcp.lsp_client import IsabelleLSPClient
 from isabelle_mcp.models import CommandStatusLine, CommandStatusPosition, LinePosition
 from isabelle_mcp.processing import ProcessingTracker
 from isabelle_mcp.utils import IsabelleToolError, LSPLine, MCPLine, plural
+
+logger = logging.getLogger(__name__)
 
 # The state vocabulary, fixed and used nowhere else with another meaning. Two of
 # them carry a hint, and for the same reason: they are the states where a bare
@@ -27,6 +31,10 @@ NOT_EVALUATED = "not evaluated"
 CANCELLED = "cancelled, re-evaluate to get a result"
 UNKNOWN = "unknown, retry in a few seconds"
 NO_COMMAND = "no command"
+# Produced by exactly one path: a document this client has open that the
+# prover answers ``open: false`` for — a rare bookkeeping mismatch — and by a
+# .ML/.sml position, which is never a document of ours. A .thy the prover
+# does not hold is `not evaluated`, which is what it is.
 FILE_NOT_OPEN = "file not open"
 
 
@@ -62,6 +70,13 @@ async def command_status(
 
     Positions are grouped by file and each file is asked once, so a bulk call
     costs one round trip per distinct file however many lines it names.
+
+    "Not evaluated" is one of this tool's ANSWERS, so nothing here refuses,
+    waits for an evaluation, or starts one. The one thing done before asking
+    is bookkeeping: a ``.thy`` the prover still holds but the unified close
+    tidied away is reopened (about two seconds, no proof re-runs), so its
+    positions are answered from a live decoration tracker rather than from
+    nothing.
     """
     if not positions:
         raise IsabelleToolError("positions must not be empty")
@@ -75,17 +90,49 @@ async def command_status(
     for pos in positions:
         by_file.setdefault(os.path.realpath(pos.file_path), []).append(pos)
 
+    reopened: dict[str, int] = {}
+    for file_path, group in by_file.items():
+        try:
+            if await reopen_held_theory(client, file_path):
+                reopened[file_path] = max(pos.line for pos in group)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # One file's reopen failing (unreadable on disk, a pipe fault)
+            # must never end a multi-position call: the file stays not open
+            # and its positions get the answer for that below; the rest of
+            # the batch is answered as usual.
+            logger.warning("reopen of %s failed", file_path, exc_info=True)
+    if reopened:
+        # The reopens' own didOpen raised the global grace gate, under which
+        # every state word would read `unknown` for up to two seconds — the
+        # opposite of what this tool is for. One wait for the whole batch
+        # (the gate is global, so one wait covers every file), keyed on the
+        # gate itself and waking early once the farthest asked line of the
+        # first reopened file is reached.
+        path, line = next(iter(reopened.items()))
+        await _wait_out_grace(client, path, MCPLine(line))
+
     answers: dict[int, CommandStatusLine] = {}
     for file_path, group in by_file.items():
         lines = [LSPLine(int(MCPLine(pos.line).to_lsp())) for pos in group]
+        if file_path not in client.open_documents:
+            # Not a document of ours, and — for a .thy — not held by the prover
+            # either, else it would have been reopened just now: nothing has
+            # been evaluated. A .ML/.sml position keeps its answer of old.
+            state = NOT_EVALUATED if file_path.endswith(".thy") else FILE_NOT_OPEN
+            for pos in group:
+                answers[id(pos)] = CommandStatusLine(
+                    file_path=pos.file_path, line=pos.line, state=state, commands=[],
+                )
+            continue
         # A file with no tracker has had no decoration, and an untouched tracker
         # answers NOT_EVALUATED for everything — which is exactly right, and is
         # the same rule position_state follows.
         tracker = client.get_processing_tracker(file_path) or ProcessingTracker()
-        commands = None
-        if file_path in client.open_documents:
-            commands = await client.get_commands_at_lines(file_path, lines)
-
+        # None: the prover answered ``open: false`` for a document we hold —
+        # the residual `file not open`.
+        commands = await client.get_commands_at_lines(file_path, lines)
         for pos, lsp_line in zip(group, lines, strict=True):
             answers[id(pos)] = _answer(pos, lsp_line, commands, tracker)
 

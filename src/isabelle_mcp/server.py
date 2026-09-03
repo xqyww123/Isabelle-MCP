@@ -261,8 +261,9 @@ async def _ensure_lsp_started(*, footer: bool = False) -> IsabelleLSPClient:
         # progress." instead of reporting the completion it just observed.
         #
         # This also fixes the footer's place in the order: it runs before the
-        # guard, so a query about a still-unprocessed position auto-starts a new
-        # evaluation rather than being refused by a flag that is no longer true.
+        # guard, so a completion it observes is stamped before the guard reads
+        # the evaluation state — the guard's wait-on-this-run and busy-with-
+        # another-file branches must never judge against a run that is over.
         _pending_footer.set(await evaluation_footer(_lsp_client))
     return _lsp_client
 
@@ -519,13 +520,10 @@ async def isabelle_evaluate_to(
 ) -> ToolResult:
     """Start evaluating a theory file up to a location on a line.
 
-    Returns a per-file snapshot — errors / warnings / running command lines.
-
-    **Errors do not stop the checking.** Isabelle checks every command up to your
-    target even when an earlier one fails, unless some command gets stuck. A failed
-    command reports an error at its location. So `isabelle_evaluate_to` still
-    reaches your target line when there are errors before it — you get those errors
-    back, not a halt.
+    **Errors do not stop the checking — they slow it down.** Isabelle still checks
+    every command up to your target when earlier ones fail. But many errors can
+    make the evaluation crawl: watch it using isabelle_evaluation_status, and when
+    errors pile up, cancel it with isabelle_cancel_evaluation.
 
     Args:
         file_path: Absolute path to .thy file
@@ -587,8 +585,8 @@ async def isabelle_hover(file_path: str, line: int, symbol: str) -> ToolResult:
     Finds all occurrences of the symbol on the line (up to 10), queries each,
     and deduplicates results. Accepts both ASCII and Unicode symbol forms.
 
-    Auto-evaluates the line first if needed; requires a launched session
-    (see isabelle_launch).
+    Queries never evaluate: evaluate up to the line with isabelle_evaluate_to
+    first. Requires a launched session (see isabelle_launch).
 
     Args:
         file_path: Absolute path to .thy file
@@ -608,8 +606,8 @@ async def isabelle_definition(file_path: str, line: int, symbol: str) -> ToolRes
     Finds all occurrences of the symbol on the line (up to 10), queries each,
     and deduplicates locations. Accepts both ASCII and Unicode symbol forms.
 
-    Auto-evaluates the line first if needed; requires a launched session
-    (see isabelle_launch).
+    Queries never evaluate: evaluate up to the line with isabelle_evaluate_to
+    first. Requires a launched session (see isabelle_launch).
 
     Args:
         file_path: Absolute path to .thy file
@@ -634,8 +632,8 @@ async def isabelle_local_occurrences(file_path: str, line: int, symbol: str) -> 
     references to global constants from imported theories, and plain free/bound
     variables, return no occurrences.
 
-    Auto-evaluates the line first if needed; requires a launched session
-    (see isabelle_launch).
+    Queries never evaluate: evaluate up to the line with isabelle_evaluate_to
+    first. Requires a launched session (see isabelle_launch).
 
     Args:
         file_path: Absolute path to .thy file
@@ -655,8 +653,9 @@ async def isabelle_goal(
     """Get the Isar command at a position and the proof state after it executes.
 
     Returns the command enclosing the position — its full source text and range —
-    together with the subgoals remaining after that command runs. Auto-evaluates
-    the line first if needed; requires a launched session (see isabelle_launch).
+    together with the subgoals remaining after that command runs. Queries never
+    evaluate: evaluate up to the line with isabelle_evaluate_to first. Requires
+    a launched session (see isabelle_launch).
 
     Args:
         file_path: Absolute path to .thy file
@@ -691,8 +690,9 @@ async def isabelle_find_theorems(
 
     The search runs in the proof/theory context at the given position (resolved
     like isabelle_goal: ``line`` + optional ``after_text``). Criteria are combined
-    conjunctively; each returns matching theorems as name + statement. Auto-
-    evaluates the line first if needed; requires a launched session.
+    conjunctively; each returns matching theorems as name + statement. Queries
+    never evaluate: evaluate up to the line with isabelle_evaluate_to first.
+    Requires a launched session.
 
     IMPORTANT — position matters: the goal-relative criteria (``intro``/``elim``/
     ``dest``/``solves`` and bare ``patterns`` that use schematic ``_`` against the
@@ -741,8 +741,9 @@ async def isabelle_command_output(
 
     Returns the command enclosing the position — its full source text and range —
     together with the prover output it emitted (normal/tracing/warning/error/
-    information/state messages). Auto-evaluates the line first if needed; requires
-    a launched session (see isabelle_launch).
+    information/state messages). Queries never evaluate: evaluate up to the line
+    with isabelle_evaluate_to first. Requires a launched session
+    (see isabelle_launch).
 
     Args:
         file_path: Absolute path to .thy file
@@ -824,10 +825,12 @@ async def isabelle_set_breakpoint(
 
     The usual workflow: evaluate up to the end of the ML block that defines the
     code, or the `ML_file` command that loads it, then set the breakpoint and
-    evaluate onward so the code runs and hits. If the code to hit has already been evaluated, insert a space
-    before it and re-evaluate to run it again. After an edit at or before the
-    defining block, its breakpoints stop working: evaluate up to that block
-    again, call `isabelle_enable_all_breakpoints`, then evaluate onward.
+    evaluate onward so the code runs and hits. This tool never evaluates: the
+    defining block must be evaluated before the site exists. If the code to hit
+    has already been evaluated, insert a space before it and re-evaluate to run
+    it again. After an edit at or before the defining block, its breakpoints
+    stop working: evaluate up to that block again, call
+    `isabelle_enable_all_breakpoints`, then evaluate onward.
 
     Args:
         file_path: Absolute path to the .thy or .ML file
@@ -875,7 +878,8 @@ async def isabelle_list_breakable_sites(
     file_path: str, start_line: int | None = None, end_line: int | None = None,
 ) -> ToolResult:
     """List the breakable sites — the places where a breakpoint can be set —
-    in a file's evaluated ML code.
+    in a file's evaluated ML code. This tool never evaluates: lines beyond the
+    evaluated part of the file are reported as not evaluated.
 
     Do not guess breakpoint positions from the source — lines you would
     expect to be breakable often are not. Call this first, then set
@@ -900,7 +904,8 @@ async def isabelle_enable_all_breakpoints(
     When the code of a breakpoint is recompiled, when the breakpoint is
     disabled, or when the prover is relaunched, the breakpoint may not
     work. This tool re-arms these no-longer-working breakpoints if their
-    code has been evaluated.
+    code has been evaluated. It never evaluates: a breakpoint whose code has
+    not been evaluated stays pending, tagged `not evaluated yet`.
 
     Breakpoints stop working when their code is recompiled or the prover is
     relaunched; `isabelle_enable_all_breakpoints` re-arms them. Nothing

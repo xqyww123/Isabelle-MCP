@@ -288,8 +288,8 @@ class Language_Server(
 
   /* input from client or file-system */
 
-  private val file_watcher: File_Watcher =
-    File_Watcher(sync_documents, options.seconds("vscode_load_delay"))
+  private val file_watcher: MCP_File_Watcher =
+    MCP_File_Watcher(sync_documents, options.seconds("vscode_load_delay"))
 
   private val delay_load: Delay =
     Delay.last(options.seconds("vscode_load_delay"), channel.Error_Logger) {

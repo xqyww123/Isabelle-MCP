@@ -52,14 +52,12 @@ class TestIsabelleLSPClient:
         from isabelle_mcp.evaluation import evaluation_state
 
         evaluation_state.start("/tmp/x.thy", MCPLine(5))
-        evaluation_state.auto_opened_files.add("/tmp/y.thy")
         assert evaluation_state.active
 
         client = IsabelleLSPClient()  # process is None → shutdown skips teardown
         await client.shutdown()
 
         assert evaluation_state.active is False
-        assert evaluation_state.auto_opened_files == set()
 
     @pytest.mark.asyncio
     async def test_start_is_reentrant_noop_when_running(self):
@@ -273,16 +271,64 @@ class TestIsabelleLSPClient:
         assert len(client.diagnostic_cache.diagnostics["/test.thy"]) == 1
 
     @pytest.mark.asyncio
-    async def test_diagnostics_notification_sets_event(self):
+    async def test_diagnostics_notification_is_not_the_readiness_signal(self):
+        # A clean file never gets publishDiagnostics, so the first decoration
+        # push is what open_document waits for — diagnostics wake nobody.
         client = IsabelleLSPClient()
         event = asyncio.Event()
-        client._first_diagnostic_event["/test.thy"] = event
+        client._first_decoration_event["/test.thy"] = event
 
         await client._handle_notification("textDocument/publishDiagnostics", {
             "uri": "file:///test.thy", "diagnostics": [],
         })
 
+        assert not event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_decoration_notification_sets_event_after_the_tracker_is_filled(self):
+        client = IsabelleLSPClient()
+
+        class SnapshotAtSet(asyncio.Event):
+            """What the tracker held at the instant the waiter was woken."""
+            seen = None
+
+            def set(self):
+                tracker = client._processing_trackers.get("/test.thy")
+                self.seen = tracker.get_unprocessed_ranges() if tracker else None
+                super().set()
+
+        event = SnapshotAtSet()
+        client._first_decoration_event["/test.thy"] = event
+
+        await client._handle_notification("PIDE/decoration", {
+            "uri": "file:///test.thy",
+            "entries": [{"type": "background_unprocessed1",
+                         "content": [{"range": [3, 0, 9, 0]}]}],
+        })
+
         assert event.is_set()
+        # Whoever wakes finds the tracker built and filled — already at the
+        # moment of the wake-up, not merely afterwards (mutation control: set
+        # the event before tracker.update and `seen` is None).
+        assert event.seen == [(3, 0, 9, 0)]
+        tracker = client._processing_trackers["/test.thy"]
+        assert tracker.get_unprocessed_ranges() == [(3, 0, 9, 0)]
+
+    @pytest.mark.asyncio
+    async def test_a_push_with_no_tracked_type_wakes_nobody(self):
+        # No tracker is built for it, so the wait must not wake into a
+        # tracker-less document; it falls to the timeout backstop instead.
+        client = IsabelleLSPClient()
+        event = asyncio.Event()
+        client._first_decoration_event["/test.thy"] = event
+
+        await client._handle_notification("PIDE/decoration", {
+            "uri": "file:///test.thy",
+            "entries": [{"type": "dotted_information", "content": []}],
+        })
+
+        assert not event.is_set()
+        assert "/test.thy" not in client._processing_trackers
 
     @pytest.mark.asyncio
     async def test_malformed_diagnostics_notification_is_ignored(self):
@@ -311,7 +357,7 @@ class TestIsabelleLSPClient:
             temp_file = f.name
 
         try:
-            await client.open_document(temp_file, wait_for_diagnostics=False)
+            await client.open_document(temp_file, wait_for_decoration=False)
             assert temp_file in client.open_documents
             assert client.open_documents[temp_file].version == 1
         finally:
@@ -331,9 +377,9 @@ class TestIsabelleLSPClient:
             temp_file = f.name
 
         try:
-            await client.open_document(temp_file, wait_for_diagnostics=False)
+            await client.open_document(temp_file, wait_for_decoration=False)
             v1 = client.open_documents[temp_file].version
-            await client.open_document(temp_file, wait_for_diagnostics=False)
+            await client.open_document(temp_file, wait_for_decoration=False)
             v2 = client.open_documents[temp_file].version
             assert v1 == v2
         finally:
@@ -367,7 +413,7 @@ class TestIsabelleLSPClient:
 
         try:
             with pytest.raises(asyncio.CancelledError):
-                await client.open_document(temp_file, wait_for_diagnostics=False)
+                await client.open_document(temp_file, wait_for_decoration=False)
             assert _canon(temp_file) in client.open_documents
         finally:
             Path(temp_file).unlink()
@@ -386,7 +432,7 @@ class TestIsabelleLSPClient:
             temp_file = f.name
 
         try:
-            await client.open_document(temp_file, wait_for_diagnostics=False)
+            await client.open_document(temp_file, wait_for_decoration=False)
             assert temp_file in client.open_documents
             await client.close_document(temp_file)
             assert temp_file not in client.open_documents
@@ -407,16 +453,16 @@ class TestIsabelleLSPClient:
             temp_file = f.name
 
         try:
-            await client.open_document(temp_file, wait_for_diagnostics=False)
+            await client.open_document(temp_file, wait_for_decoration=False)
             client.diagnostic_cache.diagnostics[temp_file] = [{"message": "old"}]
             client.diagnostic_cache.last_update[temp_file] = time.time()
-            client._first_diagnostic_event[temp_file] = asyncio.Event()
+            assert temp_file in client._first_decoration_event   # minted by the open
 
             await client.close_document(temp_file)
 
             assert temp_file not in client.diagnostic_cache.diagnostics
             assert temp_file not in client.diagnostic_cache.last_update
-            assert temp_file not in client._first_diagnostic_event
+            assert temp_file not in client._first_decoration_event
         finally:
             Path(temp_file).unlink()
 
@@ -431,30 +477,60 @@ class TestIsabelleLSPClient:
         client = IsabelleLSPClient()
         client.diagnostic_cache.diagnostics["/test.thy"] = [{"message": "old"}]
         client.diagnostic_cache.last_update["/test.thy"] = time.time()
-        client._first_diagnostic_event["/test.thy"] = asyncio.Event()
+        client._first_decoration_event["/test.thy"] = asyncio.Event()
 
         await client.shutdown()
 
         assert client.diagnostic_cache.diagnostics == {}
         assert client.diagnostic_cache.last_update == {}
-        assert client._first_diagnostic_event == {}
+        assert client._first_decoration_event == {}
 
     @pytest.mark.asyncio
-    async def test_wait_for_first_diagnostics_returns_false_without_stale_cache(self):
+    async def test_wait_for_first_decoration_returns_false_without_an_open(self):
         client = IsabelleLSPClient()
-        assert await client.wait_for_first_diagnostics("/test.thy", timeout=0.01) is False
+        assert await client.wait_for_first_decoration("/test.thy", timeout=0.01) is False
 
     @pytest.mark.asyncio
-    async def test_wait_for_first_diagnostics_returns_true_when_event_is_set(self):
+    async def test_wait_for_first_decoration_returns_true_when_the_push_lands(self):
         client = IsabelleLSPClient()
+        client._first_decoration_event["/test.thy"] = asyncio.Event()
         wait_task = asyncio.create_task(
-            client.wait_for_first_diagnostics("/test.thy", timeout=1)
+            client.wait_for_first_decoration("/test.thy", timeout=1)
         )
 
         await asyncio.sleep(0)
-        client._first_diagnostic_event["/test.thy"].set()
+        await client._handle_notification("PIDE/decoration", {
+            "uri": "file:///test.thy",
+            "entries": [{"type": "background_unprocessed1", "content": []}],
+        })
 
         assert await wait_task is True
+
+    @pytest.mark.asyncio
+    async def test_a_reopen_mints_a_fresh_event(self):
+        # A stray push set the old event long ago; the reopen must not wake
+        # at once on it.
+        client = IsabelleLSPClient()
+        client.process = MagicMock()
+        client.process.stdin = MagicMock()
+        client.process.stdin.write = MagicMock()
+        client.process.stdin.drain = AsyncMock()
+
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.thy', delete=False) as f:
+            f.write("theory Test imports Main begin end")
+            temp_file = f.name
+
+        try:
+            await client.open_document(temp_file, wait_for_decoration=False)
+            first = client._first_decoration_event[temp_file]
+            first.set()
+            await client.close_document(temp_file)
+            await client.open_document(temp_file, wait_for_decoration=False)
+            second = client._first_decoration_event[temp_file]
+            assert second is not first and not second.is_set()
+        finally:
+            Path(temp_file).unlink()
 
     def test_diagnostics_cache_empty(self):
         client = IsabelleLSPClient()
@@ -705,7 +781,7 @@ class TestStatSigAndResync:
         client = _mock_process_client()
         f = tmp_path / "Foo.thy"
         f.write_text("theory Foo begin end")
-        await client.open_document(str(f), wait_for_diagnostics=False)
+        await client.open_document(str(f), wait_for_decoration=False)
         doc = client.open_documents[str(f)]
         assert doc.stat_sig is not None
         assert doc.stat_sig == _stat_sig(str(f))
@@ -716,11 +792,11 @@ class TestStatSigAndResync:
         client = _mock_process_client()
         f = tmp_path / "Foo.thy"
         f.write_text("theory Foo begin end")
-        await client.open_document(str(f), wait_for_diagnostics=False)
+        await client.open_document(str(f), wait_for_decoration=False)
         v1 = client.open_documents[str(f)].version
         f.write_text("theory Foo begin (*changed on disk*) end")
         client.notify = AsyncMock()
-        await client.open_document(str(f), wait_for_diagnostics=False)
+        await client.open_document(str(f), wait_for_decoration=False)
         # No didChange, version unchanged, cached content still the OLD content.
         client.notify.assert_not_called()
         assert client.open_documents[str(f)].version == v1
@@ -731,7 +807,7 @@ class TestStatSigAndResync:
         client = _mock_process_client()
         f = tmp_path / "Foo.thy"
         f.write_text("theory Foo\nimports Main\nbegin\nend\n")
-        await client.open_document(str(f), wait_for_diagnostics=False)
+        await client.open_document(str(f), wait_for_decoration=False)
         v1 = client.open_documents[str(f)].version
         f.write_text("theory Foo\nimports Main\nbegin\n(*v2*)\nend\n")
         client.notify = AsyncMock()
@@ -762,7 +838,7 @@ class TestStatSigAndResync:
         client = _mock_process_client()
         f = tmp_path / "Foo.thy"
         f.write_text("theory Foo\nbegin\nend\n")
-        await client.open_document(str(f), wait_for_diagnostics=False)
+        await client.open_document(str(f), wait_for_decoration=False)
         doc = client.open_documents[str(f)]
 
         client._surface_server_message(
@@ -787,7 +863,7 @@ class TestStatSigAndResync:
         client = _mock_process_client()
         f = tmp_path / "Foo.thy"
         f.write_text("theory Foo begin end")
-        await client.open_document(str(f), wait_for_diagnostics=False)
+        await client.open_document(str(f), wait_for_decoration=False)
         f.write_text("theory Foo begin (*older-but-different*) end")
         os.utime(str(f), (1_000_000.0, 1_000_000.0))  # mtime far in the PAST
         client.notify = AsyncMock()
@@ -802,7 +878,7 @@ class TestStatSigAndResync:
         client = _mock_process_client()
         f = tmp_path / "Foo.thy"
         f.write_text("theory Foo begin end")
-        await client.open_document(str(f), wait_for_diagnostics=False)
+        await client.open_document(str(f), wait_for_decoration=False)
         os.utime(str(f), None)  # touch: new mtime, identical content
         client.notify = AsyncMock()
         from isabelle_mcp import debugger
@@ -818,7 +894,7 @@ class TestStatSigAndResync:
         client = _mock_process_client()
         f = tmp_path / "Foo.thy"
         f.write_text("theory Foo begin end")
-        await client.open_document(str(f), wait_for_diagnostics=False)
+        await client.open_document(str(f), wait_for_decoration=False)
         f.unlink()
         client.notify = AsyncMock()
         await client.resync_changed_open_documents()  # must not raise
@@ -831,7 +907,7 @@ class TestStatSigAndResync:
         client = _mock_process_client()
         thy = tmp_path / "Foo.thy"
         thy.write_text("theory Foo begin end")
-        await client.open_document(str(thy), wait_for_diagnostics=False)
+        await client.open_document(str(thy), wait_for_decoration=False)
         ml = tmp_path / "Helper.ML"          # a dependency, NOT in open_documents
         ml.write_text("val x = 1;")
         client.notify = AsyncMock()
@@ -847,7 +923,7 @@ class TestStatSigAndResync:
         real.write_text("theory Foo begin end")
         link = tmp_path / "Link.thy"
         os.symlink(real, link)
-        await client.open_document(str(link), wait_for_diagnostics=False)
+        await client.open_document(str(link), wait_for_decoration=False)
         assert os.path.realpath(str(link)) in client.open_documents
         # set_caret via the symlink path resolves to the same DocumentState (no error).
         await client.set_caret(str(link), LSPLine(0))
@@ -875,7 +951,7 @@ class TestEditStampWiring:
         f = tmp_path / "Foo.thy"
         f.write_text("theory Foo begin end")
         self._reset_clock(monkeypatch)
-        await client.open_document(str(f), wait_for_diagnostics=False)
+        await client.open_document(str(f), wait_for_decoration=False)
         assert self._clock_running()
 
     @pytest.mark.asyncio
@@ -885,7 +961,7 @@ class TestEditStampWiring:
         client = _mock_process_client()
         f = tmp_path / "Foo.thy"
         f.write_text("theory Foo begin end")
-        await client.open_document(str(f), wait_for_diagnostics=False)
+        await client.open_document(str(f), wait_for_decoration=False)
 
         self._reset_clock(monkeypatch)
         await client.sync_dirty_files({str(f)})   # content unchanged: no didChange
@@ -900,7 +976,7 @@ class TestEditStampWiring:
         client = _mock_process_client()
         f = tmp_path / "Foo.thy"
         f.write_text("theory Foo begin end")
-        await client.open_document(str(f), wait_for_diagnostics=False)
+        await client.open_document(str(f), wait_for_decoration=False)
         client.request = AsyncMock(               # PIDE/cancel_evaluation
             return_value={"outcome": "nothing_running"})
         self._reset_clock(monkeypatch)
@@ -915,9 +991,9 @@ class TestEditStampWiring:
         client = _mock_process_client()
         f = tmp_path / "Foo.thy"
         f.write_text("theory Foo begin end")
-        await client.open_document(str(f), wait_for_diagnostics=False)
+        await client.open_document(str(f), wait_for_decoration=False)
         self._reset_clock(monkeypatch)
-        await client.open_document(str(f), wait_for_diagnostics=False)
+        await client.open_document(str(f), wait_for_decoration=False)
         assert not self._clock_running()
 
 

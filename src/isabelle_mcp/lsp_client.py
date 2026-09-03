@@ -15,7 +15,7 @@ from typing import Any, ClassVar
 
 from isabelle_mcp import query
 from isabelle_mcp.document_diff import ranged_content_changes
-from isabelle_mcp.models import RunningCommand
+from isabelle_mcp.models import RunningCommand, TheoryStatus
 from isabelle_mcp.query import QueryReply
 from isabelle_mcp.processing import (
     ProcessingTracker,
@@ -231,6 +231,13 @@ class DocumentState:
     # a didChange, which is a silent drop server-side): the next sync must push the
     # FULL text, because a ranged diff against a wrong base corrupts the document.
     needs_full_sync: bool = False
+    # The evaluation-target mark: the file was evaluated by isabelle_evaluate_to,
+    # or reopened for a query after the unified close had closed it. It only ever
+    # becomes True (open_document: ``doc.is_evaluation_target or evaluation_target``)
+    # and dies with the record when the session state is cleared — the unified
+    # close, the sole closer, never closes a marked document, so "closed but still
+    # marked" is not representable.
+    is_evaluation_target: bool = False
 
 
 @dataclass
@@ -295,7 +302,12 @@ class IsabelleLSPClient:
 
         self.open_documents: dict[str, DocumentState] = {}
         self.diagnostic_cache = DiagnosticCache()
-        self._first_diagnostic_event: dict[str, asyncio.Event] = {}
+        # Per open document: set by the first PIDE/decoration push after its
+        # didOpen — the readiness signal open_document waits for. A clean file
+        # never gets publishDiagnostics (the server sends nothing when there is
+        # nothing to say), so diagnostics cannot be the signal; every open
+        # file gets a decoration push.
+        self._first_decoration_event: dict[str, asyncio.Event] = {}
 
         # Optional FileWatcher (set by the server). open_document/close_document
         # register/deregister the file's parent directory for event-driven sync.
@@ -304,6 +316,11 @@ class IsabelleLSPClient:
         # Dependency-freshness (Layer 3): last-seen stat signatures of server-owned
         # dependency files (external imports + .ML blobs), keyed by node_name.
         self._dep_stat_sigs: dict[str, StatSig | None] = {}
+        # The theory_status pulled at the last tool-call entry (Layer 3), parsed
+        # and path-canonical. Read by the unified close and by the paths that must
+        # answer synchronously with no fresh data in hand (cancel_evaluation under
+        # the long-held lock, the footer's ambient line) — never re-requested there.
+        self.entry_theories: list[TheoryStatus] = []
         # The server File_Watcher's debounce; refreshed from options at start().
         self.vscode_load_delay: float = 0.5
 
@@ -703,10 +720,11 @@ class IsabelleLSPClient:
         self._handshake_done = False
         self.open_documents.clear()
         self._dep_stat_sigs.clear()
+        self.entry_theories.clear()
         self.pending_requests.clear()
         self.diagnostic_cache.diagnostics.clear()
         self.diagnostic_cache.last_update.clear()
-        self._first_diagnostic_event.clear()
+        self._first_decoration_event.clear()
         self._preview_waiters.clear()
         self._processing_trackers.clear()
         # Debugger state must not survive its prover: thread names restart
@@ -725,7 +743,6 @@ class IsabelleLSPClient:
         # import cycle with evaluation.py (which imports this module).
         from isabelle_mcp.evaluation import evaluation_state
         evaluation_state.cancel()
-        evaluation_state.auto_opened_files.clear()
 
     # ── JSON-RPC transport ──────────────────────────────────────────────
 
@@ -945,9 +962,6 @@ class IsabelleLSPClient:
             file_path = uri_to_file_path(uri)
             self.diagnostic_cache.diagnostics[file_path] = diagnostics
             self.diagnostic_cache.last_update[file_path] = time.time()
-            event = self._first_diagnostic_event.get(file_path)
-            if event is not None and not event.is_set():
-                event.set()
         elif method == "PIDE/decoration":
             await self._handle_decoration(params)
         elif method == "PIDE/preview_response":
@@ -1016,7 +1030,8 @@ class IsabelleLSPClient:
         if not isinstance(entries, list):
             return
         parsed = parse_decoration_ranges(entries)
-        file_path = uri_to_file_path(uri)
+        # Canonical key, like open_documents: the getters compare the two.
+        file_path = _canon(uri_to_file_path(uri))
         tracker = self._processing_trackers.get(file_path)
         if tracker is None:
             if not parsed:
@@ -1024,6 +1039,13 @@ class IsabelleLSPClient:
             tracker = ProcessingTracker()
             self._processing_trackers[file_path] = tracker
         await tracker.update(parsed)
+        # The ONE set point, after the tracker is filled: whoever wakes from
+        # open_document's wait finds the tracker built. A push carrying no
+        # tracked type builds no tracker and wakes nobody (the wait falls to
+        # its timeout, as before).
+        event = self._first_decoration_event.get(file_path)
+        if event is not None and not event.is_set():
+            event.set()
 
     def _handle_debugger_state(self, params: Any) -> None:
         if not isinstance(params, dict):
@@ -1113,8 +1135,9 @@ class IsabelleLSPClient:
         file_path: str,
         content: str | None = None,
         *,
-        wait_for_diagnostics: bool = True,
-        diagnostic_timeout: float = 2.0,
+        wait_for_decoration: bool = True,
+        decoration_timeout: float = 2.0,
+        evaluation_target: bool = False,
     ) -> None:
         """Ensure *file_path* is open (didOpen once); never re-sync content here.
 
@@ -1124,10 +1147,17 @@ class IsabelleLSPClient:
         :meth:`sync_dirty_files`), which run via the tool-call backstop before any
         ``open_document`` in a tool body. This removes the only unlocked didChange
         path and the version race it caused.
+
+        *evaluation_target* sets the document's evaluation-target mark
+        (:attr:`DocumentState.is_evaluation_target`). Every exit only ever raises
+        the mark, never lowers it: an auto-open of an already-marked file passes
+        the default False and must not erase the mark.
         """
         file_path = _canon(file_path)
 
-        if file_path in self.open_documents:
+        doc = self.open_documents.get(file_path)
+        if doc is not None:
+            doc.is_evaluation_target = doc.is_evaluation_target or evaluation_target
             return
 
         if content is None:
@@ -1139,14 +1169,18 @@ class IsabelleLSPClient:
             content, guard_warning = await asyncio.to_thread(sanitize_read, file_path)
             if guard_warning is not None:
                 record_warning(file_path, guard_warning)
-            if file_path in self.open_documents:
+            doc = self.open_documents.get(file_path)
+            if doc is not None:
                 # Another coroutine opened it while we were off-loop.
+                doc.is_evaluation_target = doc.is_evaluation_target or evaluation_target
                 return
 
         uri = file_path_to_uri(file_path)
 
+        # A NEW event per open: a reopened file's old event may have been set
+        # by a stray push long ago and would wake the wait at once.
         event = asyncio.Event()
-        self._first_diagnostic_event[file_path] = event
+        self._first_decoration_event[file_path] = event
 
         # Register in open_documents BEFORE didOpen: notify -> _send awaits stdin.drain(),
         # a cancel checkpoint. If registration lagged the didOpen, a re-delivered cancel
@@ -1155,7 +1189,7 @@ class IsabelleLSPClient:
         # an orphan. Registering first keeps the two in sync under cancellation.
         self.open_documents[file_path] = DocumentState(
             file_path=file_path, uri=uri, version=1, content=content,
-            stat_sig=_stat_sig(file_path),
+            stat_sig=_stat_sig(file_path), is_evaluation_target=evaluation_target,
         )
         await self.notify("textDocument/didOpen", {
             "textDocument": {
@@ -1168,30 +1202,27 @@ class IsabelleLSPClient:
         note_edit_sent()  # didOpen pushes content: an edit-send like any other
         self._add_file_watch(file_path)
 
-        if wait_for_diagnostics:
-            received = await self.wait_for_first_diagnostics(
-                file_path,
-                timeout=diagnostic_timeout,
+        if wait_for_decoration:
+            received = await self.wait_for_first_decoration(
+                file_path, timeout=decoration_timeout,
             )
             if not received:
                 logger.debug(
-                    "No diagnostics received for %s within %.1fs",
-                    file_path,
-                    diagnostic_timeout,
+                    "No decoration received for %s within %.1fs",
+                    file_path, decoration_timeout,
                 )
 
-    async def wait_for_first_diagnostics(self, file_path: str, timeout: float = 2.0) -> bool:
-        if file_path in self.diagnostic_cache.last_update:
-            return True
+    async def wait_for_first_decoration(self, file_path: str, timeout: float = 2.0) -> bool:
+        """Wait for the first decoration push after *file_path*'s didOpen.
 
-        event = self._first_diagnostic_event.get(file_path)
+        True once the push has been folded into the file's tracker (so a caller
+        that wakes here can read it); False at the timeout — the 2.0 s backstop
+        for a push that carries no tracked type, or a file so large its first
+        push takes longer.
+        """
+        event = self._first_decoration_event.get(_canon(file_path))
         if event is None:
-            event = asyncio.Event()
-            self._first_diagnostic_event[file_path] = event
-
-        if event.is_set():
-            return True
-
+            return False
         try:
             await asyncio.wait_for(event.wait(), timeout=max(0.0, timeout))
         except asyncio.TimeoutError:
@@ -1214,13 +1245,19 @@ class IsabelleLSPClient:
 
     async def close_document(self, file_path: str) -> None:
         file_path = _canon(file_path)
-        doc = self.open_documents.pop(file_path, None)
+        doc = self.open_documents.get(file_path)
         if doc is None:
             return
+        # The unified close (evaluation.close_settled_documents) is the only
+        # closer, and it never closes a marked document; the mark's lifetime
+        # argument rests on that. A second closer that reaches here with a
+        # marked record is a bug, not a policy choice.
+        assert not doc.is_evaluation_target, f"closing an evaluation target: {file_path}"
+        del self.open_documents[file_path]
         await self.notify("textDocument/didClose", {"textDocument": {"uri": doc.uri}})
         self.diagnostic_cache.diagnostics.pop(file_path, None)
         self.diagnostic_cache.last_update.pop(file_path, None)
-        self._first_diagnostic_event.pop(file_path, None)
+        self._first_decoration_event.pop(file_path, None)
         tracker = self._processing_trackers.pop(file_path, None)
         if tracker is not None:
             await tracker.reset()
@@ -1356,14 +1393,33 @@ class IsabelleLSPClient:
         return result
 
     def file_all_processed(self, file_path: str) -> bool:
-        """True if the entire file has been processed (no unprocessed/running)."""
-        tracker = self._processing_trackers.get(file_path)
+        """True if the entire file has been processed (no unprocessed/running).
+
+        No production caller today; kept as the second reader of the tracker
+        dict so it inherits the same open check as :meth:`get_processing_tracker`.
+        """
+        tracker = self.get_processing_tracker(file_path)
         if tracker is None:
             return False
         return tracker.all_processed
 
     def get_processing_tracker(self, file_path: str) -> ProcessingTracker | None:
-        """Return the ProcessingTracker for *file_path*, or None."""
+        """Return the ProcessingTracker for *file_path*, or None.
+
+        A tracker is readable only while its document is open (same key form
+        as ``open_documents``): closing a document drops its tracker, but the
+        server's erase push after didClose rebuilds an all-empty one, which
+        would read as "fully processed" — a ghost. Answering None for a closed
+        document here means every reader, present and future, says "nothing
+        known" instead.
+
+        ``open_documents`` never holds a false value (its one writer stores a
+        DocumentState), so ``path in open_documents`` and
+        ``open_documents.get(path) is not None`` are the same test; both
+        spellings occur and either is fine.
+        """
+        if file_path not in self.open_documents:
+            return None
         return self._processing_trackers.get(file_path)
 
     async def resync_changed_open_documents(self) -> None:

@@ -15,7 +15,7 @@ def test_instructions_fit_claude_code_budget():
 
 
 @pytest.mark.parametrize("tool, sentence", [
-    ("isabelle_evaluate_to", "Errors do not stop the checking."),
+    ("isabelle_evaluate_to", "Errors do not stop the checking"),
     ("isabelle_enable_all_breakpoints", "Nothing\nre-arms in the background."),
     ("isabelle_debug_state", "frame 0 is the innermost"),
     ("isabelle_set_breakpoint", "The usual workflow:"),

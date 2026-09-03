@@ -1,7 +1,18 @@
 import pytest
 
+from isabelle_mcp.evaluation import NOT_EVALUATED_MESSAGE
 from isabelle_mcp.tools.hover import hover_info
 from isabelle_mcp.utils import IsabelleToolError, MCPLine
+
+
+@pytest.fixture(autouse=True)
+async def _evaluated_up_front(evaluated_theory_file):
+    """Queries never evaluate: every test here starts from an evaluated file."""
+
+
+async def _evaluated(client, path: str) -> str:
+    await client.open_document(path, evaluation_target=True)
+    return path
 
 
 class TestHoverTool:
@@ -36,11 +47,18 @@ class TestHoverTool:
         assert result.results[0].info == ""
 
     @pytest.mark.asyncio
-    async def test_auto_opens_document(self, mock_lsp_client, temp_theory_file):
-        assert temp_theory_file not in mock_lsp_client.open_documents
+    async def test_an_unevaluated_file_is_not_opened_but_refused(
+        self, mock_lsp_client, temp_theory_with_errors,
+    ):
+        # Queries never evaluate — and never open a file the prover does not
+        # hold. The answer is the one approved sentence.
+        assert temp_theory_with_errors not in mock_lsp_client.open_documents
         mock_lsp_client.hover_response = {"contents": "test"}
-        await hover_info(mock_lsp_client, temp_theory_file, MCPLine(5), "my_const")
-        assert temp_theory_file in mock_lsp_client.open_documents
+        with pytest.raises(IsabelleToolError) as exc:
+            await hover_info(mock_lsp_client, temp_theory_with_errors, MCPLine(5), "lemma")
+        assert str(exc.value) == NOT_EVALUATED_MESSAGE.format(
+            file=temp_theory_with_errors, line=5)
+        assert temp_theory_with_errors not in mock_lsp_client.open_documents
 
     @pytest.mark.asyncio
     async def test_with_diagnostics(self, mock_lsp_client, temp_theory_file):
@@ -64,9 +82,14 @@ class TestHoverTool:
         assert result.line_context == ""
 
     @pytest.mark.asyncio
-    async def test_file_not_found(self, mock_lsp_client):
-        with pytest.raises(FileNotFoundError):
+    async def test_a_path_that_does_not_exist_is_not_evaluated(self, mock_lsp_client):
+        # A mistyped path is, truthfully, a position nothing has evaluated;
+        # the missing-file signal comes back at the isabelle_evaluate_to the
+        # sentence points to.
+        with pytest.raises(IsabelleToolError) as exc:
             await hover_info(mock_lsp_client, "/nonexistent/file.thy", MCPLine(1), "x")
+        assert str(exc.value) == NOT_EVALUATED_MESSAGE.format(
+            file="/nonexistent/file.thy", line=1)
 
     @pytest.mark.asyncio
     async def test_array_contents(self, mock_lsp_client, temp_theory_file):
@@ -87,6 +110,7 @@ class TestHoverTool:
     async def test_multi_occurrence_dedup(self, mock_lsp_client, tmp_path):
         f = tmp_path / "Multi.thy"
         f.write_text("lemma x_y: x = x\n")
+        await _evaluated(mock_lsp_client, str(f))
         mock_lsp_client.hover_response = {"contents": "same info"}
         result = await hover_info(mock_lsp_client, str(f), MCPLine(1), "x")
         assert len(result.results) == 1
@@ -97,6 +121,7 @@ class TestHoverTool:
     async def test_multi_occurrence_different_info(self, mock_lsp_client, tmp_path):
         f = tmp_path / "Diff.thy"
         f.write_text("x = x\n")
+        await _evaluated(mock_lsp_client, str(f))
 
         def position_hover(fp, line, char):
             if int(char) == 0:
@@ -111,6 +136,7 @@ class TestHoverTool:
     async def test_lsp_error_skips_occurrence(self, mock_lsp_client, tmp_path):
         f = tmp_path / "Err.thy"
         f.write_text("x = x\n")
+        await _evaluated(mock_lsp_client, str(f))
         call_count = 0
 
         def error_on_first(fp, line, char):
@@ -129,6 +155,7 @@ class TestHoverTool:
     async def test_isabelle_tool_error_propagates(self, mock_lsp_client, tmp_path):
         f = tmp_path / "Fatal.thy"
         f.write_text("x = x\n")
+        await _evaluated(mock_lsp_client, str(f))
 
         def fatal_error(fp, line, char):
             raise IsabelleToolError("LSP process crashed")

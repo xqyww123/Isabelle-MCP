@@ -9,6 +9,11 @@ RANGE = {"start": {"line": 8, "character": 2}, "end": {"line": 8, "character": 9
 OUT = ("by simp", RANGE, '<div class="writeln">Success</div>')
 
 
+@pytest.fixture(autouse=True)
+async def _evaluated_up_front(evaluated_theory_file):
+    """Queries never evaluate: every test here starts from an evaluated file."""
+
+
 class TestCommandOutputTool:
     @pytest.mark.asyncio
     async def test_command_and_messages(self, mock_lsp_client, temp_theory_file):

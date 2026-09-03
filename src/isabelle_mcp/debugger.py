@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from isabelle_mcp.lsp_client import IsabelleLSPClient, _stat_sig
-from isabelle_mcp.utils.core import IsabelleToolError, plural
+from isabelle_mcp.utils.core import IsabelleToolError, acquire_within, plural
 from isabelle_mcp.utils.formatters import (
     cartouche,
     format_call_stack,
@@ -917,6 +917,27 @@ def _position_state(client: IsabelleLSPClient, file_path: str, line: int) -> str
     return tracker.position_state(line - 1)
 
 
+async def _reopen_if_swept(client: IsabelleLSPClient, file_path: str) -> None:
+    """The site tools' one piece of bookkeeping before they read the prover,
+    outside every lock: a ``.thy`` the prover holds but the unified close
+    tidied away is reopened (about two seconds, no evaluation, no caret
+    move). The prover keeps the model of a closed file, so the listing itself
+    never notices — but the decoration tracker these tools judge positions by
+    goes with the document, and an armed breakpoint must live on a document we
+    hold. A ``.ML``/``.sml`` is never a document of ours and is left alone;
+    a theory the prover does not hold is left alone too, and the listing then
+    says so in its own words.
+
+    After a reopen the grace gate its didOpen raised is waited out here, still
+    outside the lock: the reads under the lock (the no-site verdict, the
+    arming tag) judge positions from the decoration cache, and under the gate
+    a long-evaluated line would read ``unknown`` and be reported as "still
+    evaluating" — a sentence about work that does not exist."""
+    from isabelle_mcp.evaluation import _wait_out_grace, reopen_held_theory
+    if await reopen_held_theory(client, file_path):
+        await _wait_out_grace(client, file_path)
+
+
 async def _no_site_on_line_error(
     client: IsabelleLSPClient, file_path: str, line: int,
     sites: list[Site], where: str,
@@ -1000,6 +1021,7 @@ async def set_breakpoint(
         raise IsabelleToolError(f"line must be >= 1, got {line}")
     file_path = os.path.realpath(file_path)
     where = f"{_display_path(client, file_path)}:{line}"
+    await _reopen_if_swept(client, file_path)
     async with registry.lock:
         sites, lines = await fetch_sites(client, file_path)
         on_line = [s for s in sites if s.line == line]
@@ -1184,6 +1206,7 @@ async def list_breakable_sites(
     if start < 1 or end < start:
         raise IsabelleToolError(
             f"invalid line range: start_line {start}, end_line {end}")
+    await _reopen_if_swept(client, file_path)
     async with registry.lock:
         sites, _lines = await fetch_sites(client, file_path, listing=True)
         in_range = [s for s in sites if start <= s.line <= end]
@@ -1273,11 +1296,44 @@ async def enable_all_breakpoints(
     """section 4.6: set every (scoped) entry enabled AND arm every entry
     whose site currently exists — THE re-arming action of the manual model.
     An entry is recorded armed only on the toggle's positive
-    acknowledgement."""
+    acknowledgement.
+
+    Three stages. First, under the lock and writing nothing, the scoped
+    entries are collected. Second, outside the lock, every file they name is
+    reopened if the unified close had tidied it away (a reopen costs about
+    two seconds and must not be paid under the registry lock: the cancel
+    sweep's bounded acquire would silently skip its demotion). Third, back
+    under the lock, each entry still in the registry — by identity, since a
+    concurrent delete may have removed it — is flipped enabled and armed. A
+    concurrent disable_all lands in one of the states the serial order could
+    have produced: the flag is written only in the third stage, so the
+    lock-free window cannot leave a registry that says disabled over a site
+    that is live."""
     require_debug(client)
     registry.sync_hits(client)
     async with registry.lock:
         entries = registry.scoped_entries(file_path)
+        if not entries:
+            return ENABLE_NONE_REGISTERED
+    files = list(dict.fromkeys(e.file_path for e in entries))
+    reopen_failures: dict[str, BaseException] = {}
+    for path, outcome in zip(
+        files,
+        await asyncio.gather(
+            *(_reopen_if_swept(client, p) for p in files), return_exceptions=True,
+        ),
+        strict=True,
+    ):
+        if isinstance(outcome, asyncio.CancelledError):
+            raise outcome
+        if isinstance(outcome, BaseException):
+            # One file's reopen failing (a pipe fault, a vanished file) must
+            # never end a multi-file call: that file's entries are reported
+            # with the unknown-state tag below, the others proceed.
+            logger.warning("reopen of %s failed", path, exc_info=outcome)
+            reopen_failures[path] = outcome
+    async with registry.lock:
+        entries = [e for e in entries if e in registry.entries]
         if not entries:
             return ENABLE_NONE_REGISTERED
         for entry in entries:
@@ -1289,6 +1345,11 @@ async def enable_all_breakpoints(
         for entry in entries:
             by_file.setdefault(entry.file_path, []).append(entry)
         for path, group in by_file.items():
+            if path in reopen_failures:
+                for entry in group:
+                    registry.demote(client, entry, TAG_WIRE_FAILURE)
+                    _count(pending_counts, TAG_WIRE_FAILURE)
+                continue
             try:
                 sites, _lines = await fetch_sites(client, path)
             except FileNotOpenInProver:
@@ -1353,10 +1414,20 @@ async def _arm_entry(
 ) -> str | None:
     """Try to arm one entry; returns its listing row when armed, else None
     after tagging it pending. Caller holds the lock."""
+    from isabelle_mcp import processing
     site = _resolve_entry_site(entry, sites)
     if site is None:
-        registry.demote(client, entry, TAG_CODE_NOT_FOUND)
-        _count(pending_counts, TAG_CODE_NOT_FOUND)
+        # No site for it: either the code was never compiled up to here
+        # (the recorded position is not evaluated — the tag says so, and
+        # says what to do), or it was and the compiler placed nothing there.
+        # A .ML has no per-position verdict; it keeps the second tag.
+        tag = TAG_CODE_NOT_FOUND
+        if entry.file_path.endswith(".thy") and _position_state(
+            client, entry.file_path, entry.line,
+        ) in (processing.NOT_EVALUATED, processing.CANCELLED):
+            tag = TAG_NOT_EVALUATED
+        registry.demote(client, entry, tag)
+        _count(pending_counts, tag)
         return None
     if site.state == "unfinished":
         registry.demote(client, entry, TAG_STILL_EVALUATING)
@@ -1965,8 +2036,9 @@ async def forgotten_arming_fence(
     entries except `code not found` (their arming attempt ran and failed)
     plus enabled armed entries whose recorded position is no longer
     processed. Emits the warning as the returned result line AND as a
-    debugger notice (the query tools' auto-start path discards a
-    promptly-completed view, the notice still delivers). None when quiet."""
+    debugger notice (a reply may be dropped by its caller — a rider that
+    abandons a promptly-completed view — while the notice still delivers).
+    None when quiet."""
     if not client.debug:
         return None
     candidates = [
@@ -1986,7 +2058,7 @@ async def forgotten_arming_fence(
         logger.warning("fence skipped: theory_status failed")
         return None
     theories = [_parse_theory_status(t) for t in raw]
-    theory_set = evaluation_theory_set(target_file, set(), theories)
+    theory_set = evaluation_theory_set(target_file, theories)
     n = sum(1 for e in candidates if e.file_path in theory_set)
     if not n:
         return None
@@ -2051,17 +2123,13 @@ async def finish_cancel_sweep(
         # registry.lock across many prover round trips, and a successful
         # retirement must not turn into a catastrophe over bookkeeping -- the
         # next listing corrects the stale entries.
-        try:
-            await asyncio.wait_for(registry.lock.acquire(), timeout=CANCEL_SWEEP_WAIT)
-        except asyncio.TimeoutError:
-            logger.warning("cancel sweep: registry.lock not free within %ss; "
-                           "breakpoint demotion skipped", CANCEL_SWEEP_WAIT)
-        else:
-            try:
+        async with acquire_within(registry.lock, CANCEL_SWEEP_WAIT) as held:
+            if held:
                 registry.demote_unloaded(
                     client, payload.get("unloaded_from") or [], TAG_NOT_EVALUATED)
-            finally:
-                registry.lock.release()
+            else:
+                logger.warning("cancel sweep: registry.lock not free within %ss; "
+                               "breakpoint demotion skipped", CANCEL_SWEEP_WAIT)
     if marked:
         await client.wait_debugger_event(
             lambda c: all(

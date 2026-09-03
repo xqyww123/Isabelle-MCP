@@ -223,7 +223,8 @@ async def test_two_distant_edits_arrive_as_one_multi_hunk_didchange(prover, capl
 
     # The server's copy evaluates without a single failed command (a hunk
     # misapplied into ML text would break compilation server-side).
-    assert ev._failed_count(client) == 0, "failed commands after the two-hunk sync"
+    theories = [ev._parse_theory_status(t) for t in await client.request_theory_status()]
+    assert ev._failed_count(client, theories) == 0, "failed commands after the two-hunk sync"
 
     # Client-model hygiene only (witnesses no server state): the model equals
     # the on-disk text after the sync round trips.

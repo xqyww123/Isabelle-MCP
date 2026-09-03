@@ -7,6 +7,11 @@ from isabelle_mcp.utils import IsabelleToolError, MCPLine
 CMD = ("by simp", {"start": {"line": 8, "character": 2}, "end": {"line": 8, "character": 9}})
 
 
+@pytest.fixture(autouse=True)
+async def _evaluated_up_front(evaluated_theory_file):
+    """Queries never evaluate: every test here starts from an evaluated file."""
+
+
 class TestGoalTool:
     @pytest.mark.asyncio
     async def test_default_end_of_line(self, mock_lsp_client, temp_theory_file):
