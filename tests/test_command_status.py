@@ -170,7 +170,7 @@ async def test_a_theory_the_prover_does_not_hold_is_not_evaluated():
     assert client.opened == [] and client.requests == []
 
 
-async def test_a_theory_the_prover_holds_but_we_closed_is_reopened_and_answered():
+async def test_a_theory_the_prover_holds_but_we_closed_is_reopened_and_answered(_short_grace):
     # The unified close tidied the file away; the prover still holds it. The
     # tool reopens it (marked, so it stays open) and answers from the live
     # tracker — never from nothing, never "not evaluated". Mutation control:
@@ -185,10 +185,11 @@ async def test_a_theory_the_prover_holds_but_we_closed_is_reopened_and_answered(
     assert answer.state == PROCESSED
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def _short_grace(monkeypatch):
     """A reopen raises the grace gate (the fake's open_document mirrors the
-    didOpen); the batch wait honours it, so keep the window short."""
+    didOpen); the batch wait honours it, so a test that reopens keeps the
+    window short."""
     monkeypatch.setattr(processing, "DECORATION_GRACE", 0.05)
 
 
@@ -236,6 +237,46 @@ async def test_the_batch_wait_covers_a_second_reopened_file(_short_grace):
         LinePosition(file_path="/proj/B.thy", line=42),
     ])
     assert [a.state for a in answers] == [NOT_EVALUATED, PROCESSED]
+
+
+async def test_the_batch_wait_outlasts_a_gate_rearmed_meanwhile(monkeypatch):
+    # An edit landing during the batch wait re-arms the global gate; the
+    # wait keeps going until the gate has really closed, so no evaluated
+    # position is answered `unknown`.
+    import asyncio
+    monkeypatch.setattr(processing, "DECORATION_GRACE", 0.3)
+    client = FakeClient(
+        held={"/proj/Swept.thy": {41: [(_range(41), "by auto")]}},
+    )
+    client._trackers["/proj/Swept.thy"] = await _tracker()
+
+    async def rearm_mid_wait():
+        await asyncio.sleep(0.2)
+        processing.note_edit_sent()
+
+    rearm = asyncio.create_task(rearm_mid_wait())
+    [answer] = await command_status(
+        client, [LinePosition(file_path="/proj/Swept.thy", line=42)])
+    await rearm
+    assert answer.state == PROCESSED
+
+
+async def test_no_position_query_writes_the_run_or_the_caret(_short_grace, trap_run_writes):
+    # Ruling 22's structural invariant for isabelle_command_status: the
+    # reopen branch and the not-open branch both complete with every
+    # run-writing entry point booby-trapped (set_caret asserts on the fake).
+    from isabelle_mcp import evaluation as ev
+    client = FakeClient(
+        held={"/proj/Swept.thy": {41: [(_range(41), "by auto")]}},
+    )
+    client._trackers["/proj/Swept.thy"] = await _tracker()
+    answers = await command_status(client, [
+        LinePosition(file_path="/proj/Swept.thy", line=42),
+        LinePosition(file_path="/proj/Ghost.thy", line=3),
+    ])
+    assert [a.state for a in answers] == [PROCESSED, NOT_EVALUATED]
+    assert client.opened == [("/proj/Swept.thy", True)]
+    assert not ev.evaluation_state.active
 
 
 async def test_one_failed_reopen_never_ends_a_multi_position_call():

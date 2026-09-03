@@ -35,6 +35,7 @@ from isabelle_mcp.models import (
 )
 from isabelle_mcp.processing import (
     CANCELLED,
+    DECORATION_GRACE,
     NOT_EVALUATED,
     PROCESSED,
     RUNNING,
@@ -860,9 +861,11 @@ def _unprocessed_theory_count(
     """The summary line's N: theories with unprocessed commands that the
     report does not show per file — neither listed by theory_status (nothing
     failed, nothing running) nor rendered for another reason (*rendered*: this
-    run's target, a decoration-scanned open document). What the reader sees
-    above is not counted again below. Over the whole document model, the same
-    set the per-file listing draws from."""
+    run's target, a decoration-scanned open document). A file with its own
+    section is never also counted here; note that only the target's section
+    states its unprocessed prefix (the ``pending`` row), so for a
+    decoration-scanned entrant the fact is dropped, not relocated. Over the
+    whole document model, the same set the per-file listing draws from."""
     return sum(
         1 for t in theories
         if t.unprocessed > 0 and not _listed_by_theory_status(t)
@@ -880,10 +883,12 @@ def _relevant_files(
 ) -> list[str]:
     """The files a report shows, in order — the explicit union of three parts:
 
-    1. this run's target file (empty for the idle report — a session that never
-       evaluated has no target, and only ``start()`` writes ``file_path``;
-       seeding "" would snapshot the empty path, and relativize("") renders the
-       project root as a file);
+    1. this run's target file (empty whenever no run is outstanding — the
+       idle report and the busy report on a lingering fork alike: only
+       ``start()`` writes ``file_path`` and it is never reset, so an ended
+       run's target must not seed the report; and seeding "" would snapshot
+       the empty path, since relativize("") renders the project root as a
+       file);
     2. every theory_status row with something failed or running, over the WHOLE
        document model, not just the target's import closure (a broken library
        import is reported until it is fixed) — node_names are canonical from
@@ -1261,11 +1266,12 @@ async def evaluate_to(
                 # given up on it. Only isabelle_evaluate_to's own requests can
                 # end a run: a query riding the pure-wait channel only counts
                 # itself in and out. So a lone starter ends the run here, while
-                # a starter aborting with a query still riding leaves it
-                # active (riders reach 0 when the query steps off); that run
-                # is honest — the caret is on the wire and the prover is
-                # working towards it — and evaluation_status's terminal
-                # transition or an explicit cancel closes it out.
+                # the last evaluate_to request aborting with a query still
+                # riding leaves it active (riders reach 0 when the query steps
+                # off); that run is honest — an earlier request's caret is on
+                # the wire and the prover is working towards it — and
+                # evaluation_status's terminal transition or an explicit
+                # cancel closes it out.
                 if evaluation_state.leave(evaluation):
                     await _finish_if_owner(client, evaluation, "cancelled", judged_dest=None)
                 raise
@@ -1488,7 +1494,9 @@ async def evaluation_status(
     dest_line = evaluation_state.destination_line if active else None
     dest = int(dest_line) if dest_line is not None else None
 
-    complete = active and _is_evaluation_complete(target, dest_line, client, theories)
+    complete = dest_line is not None and _is_evaluation_complete(
+        target, dest_line, client, theories,
+    )
     files = _snapshot_files(client, target, theories, dest_line)
     n_unprocessed = _summary_count(theories, files)
     # Only the active evaluation owns the completion; once ``active`` is False
@@ -1849,31 +1857,35 @@ async def _settled_position_state(
 async def _wait_out_grace(
     client: IsabelleLSPClient, file_path: str, line: MCPLine | None = None,
 ) -> None:
-    """Wait the post-edit grace window out, once: at most the remaining
-    DECORATION_GRACE (plus a tick), whatever the position under it says.
+    """Wait until the post-edit grace window has really closed, whatever
+    the position under it says — bounded: an edit landing during the wait
+    re-arms the gate and is waited for too, up to one extra window in all
+    (DECORATION_GRACE past the first expiry), then the caller reads what it
+    can. Not for ``evaluation_status``, whose entry debounce deliberately
+    waits for the edits to STOP, with no bound.
 
-    The one implementation behind every "the gate is open, wait it out"
-    step — the settled read above, command_status's batch wait after its
-    reopens, the site tools' wait after theirs. The predicate is the GATE,
-    never a position's verdict: ``range_state`` scans the unprocessed ranges
-    before it consults the gate, so a position past the frontier answers at
-    once and a wait keyed on it would skip the window while every other
-    position still reads ``unknown``. With *line* and a tracker in hand the
-    wait wakes early once the frontier passes the line — ``line_reached``
-    itself requires a fresh cache, so that is never before the gate closes.
+    The one implementation behind the "the gate is open, wait it out" step
+    of the settled read above, of command_status's batch wait after its
+    reopens and of the site tools' wait after theirs. The predicate is the
+    GATE, never a position's verdict: ``range_state`` scans the unprocessed
+    ranges before it consults the gate, so a position past the frontier
+    answers at once and a wait keyed on it would skip the window while every
+    other position still reads ``unknown``. With *line* and a tracker in
+    hand each pass wakes early once the frontier passes the line —
+    ``line_reached`` itself requires a fresh cache, so that is never before
+    the gate closes.
     """
-    grace = _grace_remaining()
-    if grace <= 0:
-        return
-    tracker = client.get_processing_tracker(file_path)
-    if tracker is not None and line is not None:
-        await tracker.wait_until_line_reached_bounded(
-            line.to_lsp(),
-            timeout=grace + 0.1,
-            health_check=lambda: client._check_server_health(client.STALL_TIMEOUT),
-        )
-    else:
-        await asyncio.sleep(grace)
+    deadline = time.monotonic() + DECORATION_GRACE + 0.1
+    while (grace := _grace_remaining()) > 0 and time.monotonic() < deadline:
+        tracker = client.get_processing_tracker(file_path)
+        if tracker is not None and line is not None:
+            await tracker.wait_until_line_reached_bounded(
+                line.to_lsp(),
+                timeout=grace + 0.1,
+                health_check=lambda: client._check_server_health(client.STALL_TIMEOUT),
+            )
+        else:
+            await asyncio.sleep(grace)
 
 
 def _failed_count(client: IsabelleLSPClient, theories: list[TheoryStatus]) -> int:

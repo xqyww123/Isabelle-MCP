@@ -479,6 +479,22 @@ def _per_test_evaluation_state_lock(monkeypatch):
     )
 
 
+@pytest.fixture
+def trap_run_writes(monkeypatch):
+    """Ruling 22's structural invariant, as a booby trap: every entry point
+    that writes the run — starting one, joining and advancing one — raises.
+    A tool path that walks its branches under this fixture never evaluates
+    (the fakes' ``set_caret`` asserts on its own)."""
+    from isabelle_mcp import evaluation as ev
+
+    def trap(*a, **k):
+        raise AssertionError("a tool path wrote the evaluation state")
+
+    monkeypatch.setattr(ev.EvaluationState, "join_or_start", trap)
+    monkeypatch.setattr(ev.EvaluationState, "start", trap)
+    monkeypatch.setattr(ev.EvaluationState, "advance", trap)
+
+
 @pytest.fixture(autouse=True)
 def _per_test_registry_lock(monkeypatch):
     """Give every test its own breakpoint ``registry.lock`` (same reason as

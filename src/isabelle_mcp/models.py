@@ -279,9 +279,10 @@ class EvaluationView:
     message: str = ""
     files: list[FileSnapshot] = field(default_factory=list)
     running_commands: list[RunningCommand] = field(default_factory=list)
-    # Theories in the document model with unprocessed commands and nothing
-    # failed or running: not listed per file, only counted in the summary line
-    # ``N theories are not yet processed.``
+    # Theories in the document model with unprocessed commands that this
+    # report does not show per file — nothing failed or running there, and not
+    # rendered for another reason (the run's target, a decoration-scanned open
+    # document). Rendered as ``N theories are not yet processed.``
     unprocessed_theories: int = 0
     # Set when the target file is precompiled into the running session's heap
     # (edits to it are ignored by Isabelle); rendered as a prominent warning.

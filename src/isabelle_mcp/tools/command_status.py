@@ -98,10 +98,13 @@ async def command_status(
         except asyncio.CancelledError:
             raise
         except Exception:
-            # One file's reopen failing (unreadable on disk, a pipe fault)
-            # must never end a multi-position call: the file stays not open
-            # and its positions get the answer for that below; the rest of
-            # the batch is answered as usual.
+            # One file's reopen failing must never end a multi-position call.
+            # A read failure — the .thy unreadable or gone from disk — raises
+            # before the didOpen registers the document, so the file stays
+            # not open and its positions get that answer below; a failure
+            # after registration leaves the path registered and its positions
+            # are answered from the open branch. Either way the rest of the
+            # batch is answered as usual.
             logger.warning("reopen of %s failed", file_path, exc_info=True)
     if reopened:
         # The reopens' own didOpen raised the global grace gate, under which

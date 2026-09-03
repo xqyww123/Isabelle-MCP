@@ -115,6 +115,10 @@ class FakeDebugClient:
 
     async def open_document(self, file_path, *, evaluation_target=False, **_):
         self.opened.append((file_path, evaluation_target))
+        doc = self.open_documents.get(file_path)
+        if doc is not None:                      # the real client: the mark only rises
+            doc.is_evaluation_target = doc.is_evaluation_target or evaluation_target
+            return
         self.open_documents[file_path] = SimpleNamespace(
             content=CONTENT, is_evaluation_target=evaluation_target)
         if self.tracker_on_reopen is not None:
@@ -801,7 +805,8 @@ class TestListBreakableSites:
         many = [_bp(100 + i, VAL_XS, 4 + i) for i in range(45)]
         client.open_documents[THY] = SimpleNamespace(
             content="\n".join(CONTENT.split("\n")[:VAL_XS - 1]
-                              + ["x" * 60] + CONTENT.split("\n")[VAL_XS:]))
+                              + ["x" * 60] + CONTENT.split("\n")[VAL_XS:]),
+            is_evaluation_target=False)
         client.listing_replies = [_listing(*many)]
         out = await debugger.list_breakable_sites(client, THY, None, None)
         assert (f"truncated: showing 40 of 45 sites, line {VAL_XS}"
@@ -1556,7 +1561,7 @@ class TestReconcileDirty:
         unrelated = _armed_entry(path="/fake/Other.thy", serial=97)
         debugger.registry.entries += [entry, unrelated]
         client.open_documents["/fake/Other.thy"] = SimpleNamespace(
-            content="")
+            content="", is_evaluation_target=False)
 
         async def failing_theory_status():
             raise IsabelleToolError("boom")
@@ -1778,7 +1783,7 @@ class TestForgottenArmingFence:
         blob.write_text("fun probe n = n\n")
         path = str(blob)
         client.open_documents[path] = SimpleNamespace(
-            content=blob.read_text())
+            content=blob.read_text(), is_evaluation_target=False)
         client.listing_replies = [_listing(_bp(31, 1, 0))]
         await debugger.set_breakpoint(client, path, 1, None)
         [entry] = debugger.registry.entries
@@ -1976,18 +1981,37 @@ class TestReopenOfSweptTheories:
         assert "still evaluating" not in str(exc.value)
 
     @pytest.mark.asyncio
-    async def test_no_site_tool_writes_the_run_or_the_caret(self, client, monkeypatch):
+    async def test_the_reopen_wait_outlasts_a_gate_rearmed_meanwhile(
+        self, client, monkeypatch,
+    ):
+        # The gate is global: an edit landing while the reopen waits re-arms
+        # it. The wait keeps going until the gate has really closed (bounded),
+        # so the site verdict is still judged after it — not "still
+        # evaluating" about work that does not exist.
+        monkeypatch.setattr(processing, "DECORATION_GRACE", 0.3)
+        tracker = processing.ProcessingTracker()
+        await tracker.update({"background_unprocessed1": [], "background_running1": []})
+        self._swept(client)
+        client.tracker_on_reopen = tracker
+        client.listing_replies = [_listing()]
+
+        async def rearm_mid_wait():
+            await asyncio.sleep(0.2)
+            processing.note_edit_sent()
+
+        rearm = asyncio.create_task(rearm_mid_wait())
+        with pytest.raises(IsabelleToolError) as exc:
+            await debugger.set_breakpoint(client, THY, VAL_XS, None)
+        await rearm
+        assert str(exc.value).startswith(debugger.NO_SITE_ON_LINE.format(
+            where=f"{THY}:{VAL_XS}"))
+
+    @pytest.mark.asyncio
+    async def test_no_site_tool_writes_the_run_or_the_caret(self, client, trap_run_writes):
         # Ruling 22's structural invariant for the three site tools: with
         # every run-writing entry point booby-trapped (and set_caret asserting
         # on the fake), the reopen paths and the .ML paths all complete.
         from isabelle_mcp import evaluation as ev
-
-        def trap(*a, **k):
-            raise AssertionError("a site tool wrote the evaluation state")
-
-        monkeypatch.setattr(ev.EvaluationState, "join_or_start", trap)
-        monkeypatch.setattr(ev.EvaluationState, "start", trap)
-        monkeypatch.setattr(ev.EvaluationState, "advance", trap)
         self._swept(client)
         await debugger.set_breakpoint(client, THY, VAL_XS, None)
         assert client.opened == [(THY, True)]

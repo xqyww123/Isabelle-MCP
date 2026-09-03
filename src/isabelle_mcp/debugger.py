@@ -2036,9 +2036,9 @@ async def forgotten_arming_fence(
     entries except `code not found` (their arming attempt ran and failed)
     plus enabled armed entries whose recorded position is no longer
     processed. Emits the warning as the returned result line AND as a
-    debugger notice (a reply may be dropped by its caller — a rider that
-    abandons a promptly-completed view — while the notice still delivers).
-    None when quiet."""
+    debugger notice: the request can end by raising instead of returning a
+    view — the heap-abandonment refusal, or a cancellation of the call — and
+    the notice is what still delivers. None when quiet."""
     if not client.debug:
         return None
     candidates = [
