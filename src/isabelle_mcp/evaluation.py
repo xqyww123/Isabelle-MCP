@@ -33,9 +33,9 @@ from isabelle_mcp.models import (
     RunningCommand,
     TheoryStatus,
 )
+from isabelle_mcp import processing
 from isabelle_mcp.processing import (
     CANCELLED,
-    DECORATION_GRACE,
     NOT_EVALUATED,
     PROCESSED,
     RUNNING,
@@ -182,12 +182,14 @@ IDLE_FAILED_SENTENCE = (
 FAILED_REMAIN_ONE = "1 failed command remains."
 FAILED_REMAIN = "{n} failed commands remain."
 
-# The summary line for theories with unprocessed commands and nothing failed or
-# running (loading imports, nodes retracted by a cancel, open files never
-# evaluated): they are counted here instead of listed per file. Approved
-# verbatim; a state wording, true of all three kinds of member.
-UNPROCESSED_THEORIES_ONE = "1 theory is not yet processed."
-UNPROCESSED_THEORIES = "{n} theories are not yet processed."
+# The summary line for the imports of the open documents that still have
+# unprocessed commands and nothing failed or running (they are loading; the
+# prover processes an open document's imports in full, so the count recedes on
+# its own): they are counted here instead of listed per file. Approved
+# verbatim (2026-09-03); the wording names the one kind of member the count
+# admits — see _unprocessed_theory_count.
+UNPROCESSED_THEORIES_ONE = "1 imported theory is not yet processed."
+UNPROCESSED_THEORIES = "{n} imported theories are not yet processed."
 
 
 def failed_remain_sentence(n: int) -> str:
@@ -856,26 +858,44 @@ def _listed_by_theory_status(t: TheoryStatus) -> bool:
 
 
 def _unprocessed_theory_count(
-    theories: list[TheoryStatus], rendered: set[str],
+    client: IsabelleLSPClient, theories: list[TheoryStatus], rendered: set[str],
 ) -> int:
-    """The summary line's N: theories with unprocessed commands that the
-    report does not show per file — neither listed by theory_status (nothing
-    failed, nothing running) nor rendered for another reason (*rendered*: this
-    run's target, a decoration-scanned open document). A file with its own
-    section is never also counted here; note that only the target's section
-    states its unprocessed prefix (the ``pending`` row), so for a
-    decoration-scanned entrant the fact is dropped, not relocated. Over the
-    whole document model, the same set the per-file listing draws from."""
+    """The summary line's N: the imported theories with unprocessed commands
+    that the report does not show per file.
+
+    "Imported" is the literal translation of the approved wording: a theory in
+    the import closure of some open document (the ``imports`` of the
+    theory_status rows, walked transitively). Such a theory is being loaded —
+    the prover processes an open document's imports in full — so the count
+    recedes on its own. A theory that is NOT imported by an open document is
+    never counted, whatever its ``unprocessed``: a target evaluated to a
+    mid-file line (the caret perspective leaves the rest unprocessed for
+    good), a target retracted by a cancel, an open file nothing evaluated.
+    Their unprocessed rest is a fact about them, not about their imports, and
+    the summary line does not speak of it.
+
+    Not counted either: a row listed by theory_status (something failed or
+    running — it has its own file snapshot) and a file *rendered* for another
+    reason (this run's target, a decoration-scanned open document). A file with
+    its own section is never also counted here.
+    """
+    imported: set[str] = set()
+    for path in client.open_documents:
+        name = _find_theory_name(path, theories)
+        if name is not None:
+            imported |= _get_recursive_dependencies(name, theories)
     return sum(
         1 for t in theories
-        if t.unprocessed > 0 and not _listed_by_theory_status(t)
-        and t.node_name not in rendered
+        if t.unprocessed > 0 and t.theory_name in imported
+        and not _listed_by_theory_status(t) and t.node_name not in rendered
     )
 
 
-def _summary_count(theories: list[TheoryStatus], files: list[FileSnapshot]) -> int:
+def _summary_count(
+    client: IsabelleLSPClient, theories: list[TheoryStatus], files: list[FileSnapshot],
+) -> int:
     """:func:`_unprocessed_theory_count` for the snapshots a report renders."""
-    return _unprocessed_theory_count(theories, {fs.file_path for fs in files})
+    return _unprocessed_theory_count(client, theories, {fs.file_path for fs in files})
 
 
 def _relevant_files(
@@ -1403,7 +1423,7 @@ async def evaluate_to(
         message=message,
         files=files,
         running_commands=running_commands,
-        unprocessed_theories=_summary_count(theories, files),
+        unprocessed_theories=_summary_count(client, theories, files),
         heap_warning=heap_warning,
     )
 
@@ -1457,7 +1477,7 @@ def _idle_view(client: IsabelleLSPClient, theories: list[TheoryStatus]) -> Evalu
     )
     return EvaluationView(
         status="no_evaluation", message=message, files=files,
-        unprocessed_theories=_summary_count(theories, files),
+        unprocessed_theories=_summary_count(client, theories, files),
     )
 
 
@@ -1498,7 +1518,7 @@ async def evaluation_status(
         target, dest_line, client, theories,
     )
     files = _snapshot_files(client, target, theories, dest_line)
-    n_unprocessed = _summary_count(theories, files)
+    n_unprocessed = _summary_count(client, theories, files)
     # Only the active evaluation owns the completion; once ``active`` is False
     # we are merely surfacing a lingering fork, which must stay visible (not
     # collapse back to "complete"). _finish_if_owner is the ONE termination
@@ -1571,7 +1591,7 @@ async def _progress_view(client: IsabelleLSPClient) -> EvaluationView:
         message=_progress_sentence(client, target, dest_line, theories),
         files=files,
         running_commands=running_commands,
-        unprocessed_theories=_summary_count(theories, files),
+        unprocessed_theories=_summary_count(client, theories, files),
     )
 
 
@@ -1604,6 +1624,13 @@ async def _dependency_freshness_wait(client: IsabelleLSPClient) -> float:
     delay so the caller waits before querying; otherwise return ``0``. Stat'ing runs
     off the event loop. The dep set is bounded to the document model's non-heap nodes.
 
+    A dep seen for the first time counts as changed: we have no record to compare
+    against, and the edit that matters may be the one made just before it came
+    into view (a theory loaded by the last evaluation and edited since; a file
+    the unified close turned into a dep). The only way a first sighting is not
+    charged the grace window is a record written ahead of it — ``close_document``
+    seeds one, so the common case, a closed file that was not touched, is not.
+
     The parsed theory_status is stashed on the client (``entry_theories``) for
     the unified close that follows and for the paths that must answer without
     a fresh round trip.
@@ -1624,10 +1651,11 @@ async def _dependency_freshness_wait(client: IsabelleLSPClient) -> float:
     need_wait = False
     for node, sig in sigs.items():
         prev = client._dep_stat_sigs.get(node, _UNSEEN)
-        if prev is not _UNSEEN and sig != prev:
-            # A dep changed — or was deleted (sig None) — on disk: the server's
-            # File_Watcher will didChange it internally; an edit like any other,
-            # so start the decoration grace.
+        if prev is _UNSEEN or sig != prev:
+            # A dep changed — or was deleted (sig None), or is seen for the
+            # first time — on disk: the server's File_Watcher will didChange
+            # it internally; an edit like any other, so start the decoration
+            # grace.
             note_edit_sent()
             # Phase D bookkeeping: the blob's serials may be dead — mark it
             # for the next reconciliation pass.
@@ -1842,50 +1870,38 @@ async def _settled_position_state(
     ``DECORATION_GRACE`` seconds, so the cache cannot be trusted yet. Refusing on
     it would be unhelpful (the agent can do nothing but retry) and re-evaluating
     on it would be wasteful (the line may have finished minutes ago), so the
-    guard simply waits the window out — at most two seconds — and asks again.
-    The tracker's own wait wakes at expiry, or earlier if the line is reached.
+    guard simply waits the window out and asks again.
     """
     async with _evaluation_state_lock:
         state = position_state(client, file_path, line)
     if state != UNKNOWN:
         return state
-    await _wait_out_grace(client, file_path, line)
+    await wait_out_grace(client)
     async with _evaluation_state_lock:
         return position_state(client, file_path, line)
 
 
-async def _wait_out_grace(
-    client: IsabelleLSPClient, file_path: str, line: MCPLine | None = None,
-) -> None:
-    """Wait until the post-edit grace window has really closed, whatever
-    the position under it says — bounded: an edit landing during the wait
-    re-arms the gate and is waited for too, up to one extra window in all
-    (DECORATION_GRACE past the first expiry), then the caller reads what it
-    can. Not for ``evaluation_status``, whose entry debounce deliberately
-    waits for the edits to STOP, with no bound.
+async def wait_out_grace(client: IsabelleLSPClient) -> None:
+    """Sleep until the post-edit grace window has closed — bounded: an edit
+    landing during the wait re-arms the gate and is waited for too. The
+    deadline is one whole window past the FIRST expiry, and every re-arm
+    landing before it is waited out in full, so the call can return up to one
+    further window later; past the deadline the caller reads what it can.
+    Not for ``evaluation_status``, whose entry debounce deliberately waits for
+    the edits to STOP, with no bound.
 
-    The one implementation behind the "the gate is open, wait it out" step
-    of the settled read above, of command_status's batch wait after its
-    reopens and of the site tools' wait after theirs. The predicate is the
-    GATE, never a position's verdict: ``range_state`` scans the unprocessed
-    ranges before it consults the gate, so a position past the frontier
-    answers at once and a wait keyed on it would skip the window while every
-    other position still reads ``unknown``. With *line* and a tracker in
-    hand each pass wakes early once the frontier passes the line —
-    ``line_reached`` itself requires a fresh cache, so that is never before
-    the gate closes.
+    The one implementation behind the "the gate is open, wait it out" step of
+    the settled read above, of command_status's batch wait after its reopens
+    and of the site tools' wait after theirs. The predicate is the GATE and
+    nothing else: no position's verdict can end the wait early, because every
+    verdict the gate guards is ``unknown`` while it is up (``line_reached``
+    requires a fresh cache), so a wait keyed on one would only ever run to
+    its timeout. Health-checked each pass like every wait on the prover.
     """
-    deadline = time.monotonic() + DECORATION_GRACE + 0.1
+    deadline = time.monotonic() + _grace_remaining() + processing.DECORATION_GRACE
     while (grace := _grace_remaining()) > 0 and time.monotonic() < deadline:
-        tracker = client.get_processing_tracker(file_path)
-        if tracker is not None and line is not None:
-            await tracker.wait_until_line_reached_bounded(
-                line.to_lsp(),
-                timeout=grace + 0.1,
-                health_check=lambda: client._check_server_health(client.STALL_TIMEOUT),
-            )
-        else:
-            await asyncio.sleep(grace)
+        client._check_server_health(client.STALL_TIMEOUT)
+        await asyncio.sleep(grace)
 
 
 def _failed_count(client: IsabelleLSPClient, theories: list[TheoryStatus]) -> int:
@@ -2096,9 +2112,9 @@ async def check_evaluation_guard(
        reported. The wait adds a rider and nothing else: no target moves, no
        caret moves, no run is started or ended.
     3. The prover holds the theory but this client closed it — reopened (the
-       unified close's counterpart; about two seconds, no proof re-runs) and
-       judged again through the settled read, since the reopen's own didOpen
-       raises the grace gate.
+       unified close's counterpart; no proof re-runs, and about half a second
+       when the file was not touched meanwhile) and judged again through the
+       settled read, which waits the grace gate out if the reopen raised it.
     4. Still not evaluated while another file is under evaluation — the
        refusal naming that evaluation.
     5. Otherwise — the honest error: evaluate up to the line first.

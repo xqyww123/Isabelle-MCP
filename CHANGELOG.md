@@ -133,16 +133,20 @@
   Reporting now covers every theory the prover holds, and while a session that
   is not precompiled loads, that can be hundreds at once — during one
   `HOL-Analysis.Analysis` import, 150 in a single poll. Rather than a block
-  each, they are counted: `{N} theories are not yet processed.` (`1 theory is
-  not yet processed.`). Theories with an actual failure or a running command
-  still get their own block.
+  each, the imports of the open documents that still have unprocessed commands
+  are counted: `{N} imported theories are not yet processed.` (`1 imported
+  theory is not yet processed.`). A file you evaluated to a mid-file line, a
+  cancelled evaluation's target, or an open file nothing evaluated is not an
+  import and is not counted. Theories with an actual failure or a running
+  command still get their own block.
 - **Open files look after themselves.** Tool calls now close the files that are
   settled — no errors, no breakpoints registered in them, and not something you
   evaluated yourself (a file you evaluated stays open for the rest of the
   session) — so a long session no longer accumulates dependency documents
   nobody is working on, and the errors that are left open are the report. A
   file the prover still holds is silently reopened the first time a tool asks
-  about a position in it again: about two seconds, no proofs re-run, and the
+  about a position in it again: about half a second when the file was not
+  touched meanwhile, up to two seconds when it was; no proofs re-run, and the
   caret does not move. (One exception: a file that still contains Unicode
   symbols is normalised to ASCII on that first reopen, and that edit does cost
   one re-check, once per file.) `isabelle_command_status`,
@@ -152,6 +156,20 @@
   away: `command_status` answered `file not open`, `set_breakpoint` refused
   with "not open in the prover", and `list_breakable_sites` reported fully
   compiled ML code as not evaluated. All three reopen the file and answer.
+- **A closed file's cache can no longer answer for it.** Closing a file made
+  the prover publish an "erase" decoration push, from which this server
+  rebuilt an empty cache that read every line as processed. With the prover
+  busy on another file, a query on a just-reopened file could be served from
+  that empty cache. A cache is now built only from a full decoration push;
+  until one arrives the position is reported as not evaluated.
+- **The first edit to a newly loaded dependency is no longer missed.** An
+  import loaded by the last evaluation and edited before the next call used
+  to be trusted as unchanged, because there was no earlier record to compare
+  against. A dependency seen for the first time now counts as changed.
+- **Reopening an untouched file no longer costs the two-second grace
+  window.** A file the unified close tidied away and nobody touched since is
+  reopened without distrusting the decoration cache: the bytes pushed and the
+  file's stat are exactly what they were at the close.
 - **No tool starts an evaluation except `isabelle_evaluate_to`.** The six query
   tools — `isabelle_goal`, `isabelle_hover`, `isabelle_definition`,
   `isabelle_command_output`, `isabelle_find_theorems`,

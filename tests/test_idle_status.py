@@ -209,7 +209,8 @@ class TestIdleReport:
     ):
         # An open file nothing ever evaluated has unprocessed commands forever.
         # That must not put the session on the busy path (only running work
-        # does); it is counted in the summary line instead.
+        # does), and it is not an imported theory, so the summary line does
+        # not count it either: the report is the clean sentence alone.
         async def status():
             return [_theory_row(temp_theory_file, unprocessed=10, finished=0,
                                 consolidated=False, percentage=0)]
@@ -220,9 +221,30 @@ class TestIdleReport:
         assert view.status == "no_evaluation"
         assert view.message == IDLE_CLEAN_SENTENCE
         assert view.files == []
+        assert view.unprocessed_theories == 0
+        assert format_evaluation_result(view, None) == IDLE_CLEAN_SENTENCE
+
+    @pytest.mark.asyncio
+    async def test_a_loading_import_of_an_open_file_is_counted_when_idle(
+        self, temp_theory_file, mock_lsp_client,
+    ):
+        # The one kind of member the summary line admits: a theory in the
+        # import closure of an open document that still has unprocessed
+        # commands. Nothing is running yet (the load has not started), so the
+        # session is idle, and the count says what is still to come.
+        async def status():
+            return [_theory_row(temp_theory_file, imports=[{"theory_name": "Dep_loading"}]),
+                    _theory_row("/tmp/Dep_loading.thy", external=True,
+                                unprocessed=10, finished=0, consolidated=False)]
+
+        mock_lsp_client.request_theory_status = status
+        await _open_with(mock_lsp_client, temp_theory_file, all_processed=True)
+        view = await evaluation_status(mock_lsp_client)
+        assert view.status == "no_evaluation"
+        assert view.files == []
         assert view.unprocessed_theories == 1
         assert format_evaluation_result(view, None) == (
-            IDLE_CLEAN_SENTENCE + "\n\n1 theory is not yet processed."
+            IDLE_CLEAN_SENTENCE + "\n\n1 imported theory is not yet processed."
         )
 
     @pytest.mark.asyncio
@@ -234,7 +256,8 @@ class TestIdleReport:
         # from theory_status — never "0 commands are still running". No run
         # is outstanding, so the last run's target (temp_theory_file, half
         # evaluated) neither seeds a file snapshot nor clips a pending row —
-        # the picture is session-level, exactly as when idle.
+        # the picture is session-level, exactly as when idle — and its own
+        # unprocessed rest is not an imported theory, so no summary line.
         evaluation_state.start(temp_theory_file, MCPLine(5))
         evaluation_state.complete()
 
@@ -253,8 +276,7 @@ class TestIdleReport:
         assert [fs.file_path for fs in view.files] == ["/tmp/Dep_running.thy"]
         assert format_evaluation_result(view, None, call_to_action=False) == (
             "2 commands are still running.\n\n"
-            "/tmp/Dep_running.thy: in progress (2 running so far)\n\n"
-            "1 theory is not yet processed."
+            "/tmp/Dep_running.thy: in progress (2 running so far)"
         )
 
     @pytest.mark.asyncio

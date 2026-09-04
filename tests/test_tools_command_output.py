@@ -113,10 +113,10 @@ class TestFormatCommandOutput:
         r = CommandOutputResult(
             command=_span("apply auto", 10, 10),
             messages=[OutputMessage(kind="state", message="...")],
-            note="This line is still being executed (forked proof). Output may be incomplete.",
+            note="The command at T.thy:10 is still being executed; its output may be incomplete.",
         )
         assert format_command_output(r, 10) == (
-            '[note] This line is still being executed (forked proof). Output may be incomplete.\n'
+            '[note] The command at T.thy:10 is still being executed; its output may be incomplete.\n'
             '\n'
             '[line 10]\n'
             'apply auto\n'

@@ -482,17 +482,23 @@ def _per_test_evaluation_state_lock(monkeypatch):
 @pytest.fixture
 def trap_run_writes(monkeypatch):
     """Ruling 22's structural invariant, as a booby trap: every entry point
-    that writes the run — starting one, joining and advancing one — raises.
-    A tool path that walks its branches under this fixture never evaluates
-    (the fakes' ``set_caret`` asserts on its own)."""
+    that writes the run — starting one, joining and advancing one — and the
+    caret send raise. A tool path that walks its branches under this fixture
+    never evaluates. All four traps live here: the caret trap is installed on
+    the mock client's class, so it holds for every MockLSPClient of the test
+    (the FakeClients of the tool test modules assert on their own)."""
     from isabelle_mcp import evaluation as ev
 
     def trap(*a, **k):
         raise AssertionError("a tool path wrote the evaluation state")
 
+    async def async_trap(*a, **k):
+        raise AssertionError("a tool path moved the caret")
+
     monkeypatch.setattr(ev.EvaluationState, "join_or_start", trap)
     monkeypatch.setattr(ev.EvaluationState, "start", trap)
     monkeypatch.setattr(ev.EvaluationState, "advance", trap)
+    monkeypatch.setattr(MockLSPClient, "set_caret", async_trap)
 
 
 @pytest.fixture(autouse=True)
@@ -564,3 +570,15 @@ def _reset_component_cache():
     _resolve.cache_clear()
     yield
     _resolve.cache_clear()
+
+
+def full_decoration_entries(**content: list) -> list[dict]:
+    """The shape of a FULL ``PIDE/decoration`` push: every tracked type named,
+    empty unless *content* gives it ranges (LSP ``(l, c, l, c)`` tuples). The
+    server sends this list on every open and reopen; a differential push names
+    only what changed, and the client builds no tracker from one."""
+    from isabelle_mcp.processing import _TRACKED_TYPES
+    return [
+        {"type": typ, "content": [{"range": list(r)} for r in content.get(typ, [])]}
+        for typ in sorted(_TRACKED_TYPES)
+    ]

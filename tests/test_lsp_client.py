@@ -10,6 +10,7 @@ import pytest
 
 from isabelle_mcp.lsp_client import DocumentState, IsabelleLSPClient
 from isabelle_mcp.utils import IsabelleToolError, LSPLine, MCPLine
+from tests.conftest import full_decoration_entries
 
 
 @pytest.fixture(autouse=True)
@@ -302,8 +303,7 @@ class TestIsabelleLSPClient:
 
         await client._handle_notification("PIDE/decoration", {
             "uri": "file:///test.thy",
-            "entries": [{"type": "background_unprocessed1",
-                         "content": [{"range": [3, 0, 9, 0]}]}],
+            "entries": full_decoration_entries(background_unprocessed1=[(3, 0, 9, 0)]),
         })
 
         assert event.is_set()
@@ -501,10 +501,38 @@ class TestIsabelleLSPClient:
         await asyncio.sleep(0)
         await client._handle_notification("PIDE/decoration", {
             "uri": "file:///test.thy",
-            "entries": [{"type": "background_unprocessed1", "content": []}],
+            "entries": full_decoration_entries(),
         })
 
         assert await wait_task is True
+
+    @pytest.mark.asyncio
+    async def test_a_differential_push_builds_no_tracker_and_wakes_nobody(self):
+        # The server's erase push after a didClose names only the types that
+        # had content, now emptied. Folded into a blank tracker it would make
+        # an all-empty ghost that reads `processed` everywhere; the client
+        # builds a tracker from a FULL push only, and the wait is not woken.
+        # Mutation control for the full-push invariant in _handle_decoration.
+        client = IsabelleLSPClient()
+        event = asyncio.Event()
+        client._first_decoration_event["/test.thy"] = event
+        await client._handle_notification("PIDE/decoration", {
+            "uri": "file:///test.thy",
+            "entries": [{"type": "background_bad", "content": []},
+                        {"type": "background_sorry", "content": []}],
+        })
+        assert "/test.thy" not in client._processing_trackers
+        assert not event.is_set()
+        # Once a full push has built the tracker, a differential one updates it.
+        await client._handle_notification("PIDE/decoration", {
+            "uri": "file:///test.thy",
+            "entries": full_decoration_entries(background_sorry=[(4, 2, 4, 7)]),
+        })
+        await client._handle_notification("PIDE/decoration", {
+            "uri": "file:///test.thy",
+            "entries": [{"type": "background_sorry", "content": []}],
+        })
+        assert client._processing_trackers["/test.thy"].get_sorry_ranges() == []
 
     @pytest.mark.asyncio
     async def test_a_reopen_mints_a_fresh_event(self):
@@ -1088,3 +1116,167 @@ class TestDebuggerRequestWrappers:
         client.request = AsyncMock(return_value=None)
         reply = await client.debugger_eval("worker-1", "1")
         assert reply == {"status": "crashed"}
+
+
+class TestSameBytesReopen:
+    """A didOpen that pushes exactly what the prover already holds leaves the
+    decoration grace gate down. The judgement is a pair recorded at
+    close_document — sha256 of the text last pushed, and the file's stat — and
+    read back by the next open_document; both halves are computed by the
+    client, never asserted by a caller."""
+
+    @pytest.fixture
+    def client(self):
+        client = IsabelleLSPClient()
+
+        async def notify(method, params):
+            pass
+
+        client.notify = notify
+        return client
+
+    def _thy(self, tmp_path, text="theory T imports Main begin end\n") -> str:
+        path = tmp_path / "T.thy"
+        path.write_text(text)
+        return str(path)
+
+    async def _reopen(self, client, path, *, push=True) -> bool:
+        """Reopen *path*, feeding a full push during the wait when *push*;
+        returns whether the gate is up afterwards."""
+        from isabelle_mcp import processing
+        processing._last_edit_sent = float("-inf")
+
+        async def feed():
+            # open_document registers the document after an off-loop read.
+            while path not in client.open_documents:
+                await asyncio.sleep(0.001)
+            await client._handle_decoration({
+                "uri": client.open_documents[path].uri,
+                "entries": full_decoration_entries(),
+            })
+
+        feeder = asyncio.get_running_loop().create_task(feed()) if push else None
+        await client.open_document(path, decoration_timeout=0.05)
+        if feeder is not None:
+            await feeder
+        return processing._grace_remaining() > 0
+
+    @pytest.mark.asyncio
+    async def test_a_reopen_of_an_untouched_file_leaves_the_gate_down(
+        self, client, tmp_path,
+    ):
+        # Mutation control: record nothing at close, or compare only one
+        # half, and this reds (the gate goes up) or its siblings do.
+        from isabelle_mcp import processing
+        path = self._thy(tmp_path)
+        await client.open_document(path, wait_for_decoration=False)
+        assert processing._grace_remaining() > 0     # an ordinary open
+        await client.close_document(path)
+        assert await self._reopen(client, path) is False
+        assert client.open_documents[path].content == Path(path).read_text()
+
+    @pytest.mark.asyncio
+    async def test_a_reopen_of_an_edited_file_raises_the_gate(self, client, tmp_path):
+        path = self._thy(tmp_path)
+        await client.open_document(path, wait_for_decoration=False)
+        await client.close_document(path)
+        Path(path).write_text("theory T imports Main begin lemma x: True by simp end\n")
+        assert await self._reopen(client, path) is True
+
+    @pytest.mark.asyncio
+    async def test_a_reopen_of_a_rewritten_then_restored_file_raises_the_gate(
+        self, client, tmp_path,
+    ):
+        # Same bytes as at the close, but the file was written meanwhile (the
+        # prover's watcher may hold an intermediate version): the stat half of
+        # the pair differs, and the gate goes up. Mutation control for the
+        # stat half — compare content alone and this reds.
+        path = self._thy(tmp_path)
+        await client.open_document(path, wait_for_decoration=False)
+        await client.close_document(path)
+        original = Path(path).read_text()
+        Path(path).write_text(original + "(* edit *)\n")
+        Path(path).write_text(original)
+        assert await self._reopen(client, path) is True
+
+    @pytest.mark.asyncio
+    async def test_a_file_never_closed_by_us_is_opened_with_the_gate_up(
+        self, client, tmp_path,
+    ):
+        path = self._thy(tmp_path)
+        assert await self._reopen(client, path) is True
+
+    @pytest.mark.asyncio
+    async def test_no_full_push_in_time_puts_the_gate_back_up(self, client, tmp_path):
+        # Nothing certified the cache we left trusted: fall back to distrust.
+        path = self._thy(tmp_path)
+        await client.open_document(path, wait_for_decoration=False)
+        await client.close_document(path)
+        assert await self._reopen(client, path, push=False) is True
+
+    @pytest.mark.asyncio
+    async def test_the_record_does_not_survive_the_prover(self, client, tmp_path):
+        path = self._thy(tmp_path)
+        await client.open_document(path, wait_for_decoration=False)
+        await client.close_document(path)
+        assert path in client._closed_push_sigs
+        client._clear_session_state()
+        assert client._closed_push_sigs == {}
+
+    @pytest.mark.asyncio
+    async def test_a_close_seeds_the_dependency_record(self, client, tmp_path):
+        # From the next tool entry on, the closed file is a dependency the
+        # server syncs itself; a dependency first seen without a record counts
+        # as changed, so the close writes the record that spares an untouched
+        # file that charge. Mutation control for the seeding line.
+        from isabelle_mcp.lsp_client import _stat_sig
+        path = self._thy(tmp_path)
+        await client.open_document(path, wait_for_decoration=False)
+        assert path not in client._dep_stat_sigs
+        await client.close_document(path)
+        assert client._dep_stat_sigs[path] == _stat_sig(path)
+
+    @pytest.mark.asyncio
+    async def test_without_the_readiness_wait_the_gate_stays_up(self, client, tmp_path):
+        # Nothing would confirm the cache afterwards, so an untouched file
+        # reopened with wait_for_decoration=False is charged the window like
+        # any open. Mutation control for the `wait_for_decoration` conjunct.
+        from isabelle_mcp import processing
+        path = self._thy(tmp_path)
+        await client.open_document(path, wait_for_decoration=False)
+        await client.close_document(path)
+        processing._last_edit_sent = float("-inf")
+        await client.open_document(path, wait_for_decoration=False)
+        assert processing._grace_remaining() > 0
+
+    @pytest.mark.asyncio
+    async def test_a_write_racing_the_close_still_counts_as_a_change(self, client, tmp_path):
+        # The dependency seed is the stat of the text the prover was LAST
+        # GIVEN, not a stat taken at the close: a write landing after the
+        # entry's resync and before the close was charged no grace window, and
+        # the server absorbs it inside its own didClose handler. Seeding the
+        # fresh stat would record it as accounted for, and the next entry
+        # would trust the importers' stale decorations. Mutation control for
+        # the value seeded (`test_a_close_seeds_the_dependency_record` pins the
+        # line's existence, not its value: there the two stats coincide).
+        from isabelle_mcp.lsp_client import _stat_sig
+        path = self._thy(tmp_path)
+        await client.open_document(path, wait_for_decoration=False)
+        pushed = client.open_documents[path].stat_sig
+        Path(path).write_text("theory T imports Main begin lemma x: True by simp end\n")
+        await client.close_document(path)
+        assert _stat_sig(path) != pushed              # the race really happened
+        assert client._dep_stat_sigs[path] == pushed  # ... and the seed predates it
+
+    @pytest.mark.asyncio
+    async def test_the_reopen_record_keeps_the_fresh_stat(self, client, tmp_path):
+        # The same close writes a DIFFERENT stat into the same-bytes reopen
+        # record on purpose: that record anchors an interval that must contain
+        # the server's own didClose re-read, so it takes its stat as late as
+        # it can. Guards against "unifying" the two records onto one value.
+        from isabelle_mcp.lsp_client import _stat_sig
+        path = self._thy(tmp_path)
+        await client.open_document(path, wait_for_decoration=False)
+        Path(path).write_text("theory T imports Main begin lemma x: True by simp end\n")
+        await client.close_document(path)
+        assert client._closed_push_sigs[path][1] == _stat_sig(path)

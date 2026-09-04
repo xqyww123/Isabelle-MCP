@@ -414,8 +414,7 @@ Still open:
 > 2. **Completion stays on `line_reached`, not `diagnostics_settled`** (see the §5.2
 >    update). The snapshot is decoration-only — no diagnostics channel is read for it.
 > Also implemented: the fallback for a file with no decoration (e.g. an unopened
-> dependency) reports `theory_status` **counts** (failed→errors, warned→warnings, no
-> line numbers), using `unprocessed`/`consolidated` for "in progress" vs "clean".
+> dependency) reports `theory_status` **counts** (failed→errors, no line numbers), using `unprocessed`/`consolidated` for "in progress" vs "clean".
 > The internal structured result is the `EvaluationView`/`FileSnapshot` dataclass pair
 > rendered by `format_evaluation_result` (`evaluation.py`); the `isabelle_diagnostics`
 > tool and `tools/diagnostics.py` are deleted, while the diagnostic cache /

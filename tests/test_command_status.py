@@ -82,7 +82,9 @@ class FakeClient:
             raise OSError(f"cannot read {file_path}")
         self.open_documents[file_path] = _doc(evaluation_target)
         self._commands[file_path] = self._held.pop(file_path)
-        processing.note_edit_sent()              # didOpen raises the global grace gate
+        # The fake FORCES the gate up on every reopen (production skips it for
+        # a file untouched since its close): the tool must cope with it.
+        processing.note_edit_sent()
 
     # Files the prover holds but the disk cannot give us (a reopen fails).
     unreadable: frozenset[str] = frozenset()
@@ -187,16 +189,16 @@ async def test_a_theory_the_prover_holds_but_we_closed_is_reopened_and_answered(
 
 @pytest.fixture
 def _short_grace(monkeypatch):
-    """A reopen raises the grace gate (the fake's open_document mirrors the
-    didOpen); the batch wait honours it, so a test that reopens keeps the
-    window short."""
+    """The fake's reopen forces the grace gate up (production skips it for a
+    file untouched since its close); the batch wait honours it, so a test
+    that reopens keeps the window short."""
     monkeypatch.setattr(processing, "DECORATION_GRACE", 0.05)
 
 
 async def test_a_reopen_is_not_followed_by_an_unknown_answer(_short_grace):
-    # The reopen's didOpen raises the grace gate; without the one batch wait,
-    # the freshly reopened, fully processed position would be answered
-    # `unknown` for up to two seconds.
+    # With the gate up after the reopen and no batch wait, the freshly
+    # reopened, fully processed position would be answered `unknown` for the
+    # rest of the window.
     client = FakeClient(
         held={"/proj/Swept.thy": {41: [(_range(41), "by auto")]}},
     )

@@ -1,10 +1,11 @@
 import asyncio
 import os
+import time
 from pathlib import Path
 
 import pytest
 
-from isabelle_mcp import evaluation as ev
+from isabelle_mcp import evaluation as ev, processing
 from isabelle_mcp.evaluation import (
     cancel_evaluation,
     evaluate_to,
@@ -340,6 +341,29 @@ class TestLingeringFork:
         assert (await evaluation_status(mock_lsp_client)).status == "no_evaluation"
         assert (await cancel_evaluation(mock_lsp_client)).status == "no_evaluation"
 
+    @pytest.mark.asyncio
+    async def test_cancel_sees_a_dependency_running_in_a_closed_file(
+        self, mock_lsp_client, monkeypatch,
+    ):
+        # Under its lock cancel_evaluation may issue no request, so it reads
+        # the entry theory_status stashed on the client: a theory that is not
+        # open here but has running commands is work to cancel. Mutation
+        # control: hand it an empty list and it answers no_evaluation.
+        mock_lsp_client.entry_theories = [ev._parse_theory_status({
+            "node_name": "/lib/Dep_running.thy", "theory_name": "Dep_running",
+            "external": True, "running": 2, "unprocessed": 3, "finished": 5,
+            "consolidated": False,
+        })]
+
+        async def _spy():
+            return {"outcome": "retired", "retired": [], "excluded": [],
+                    "waived": [], "unloaded_from": []}
+
+        monkeypatch.setattr(mock_lsp_client, "force_interrupt", _spy)
+        assert (await cancel_evaluation(mock_lsp_client)).status == "cancelled"
+        mock_lsp_client.entry_theories = []
+        assert (await cancel_evaluation(mock_lsp_client)).status == "no_evaluation"
+
 
 class TestSnapshotCategorization:
     """_build_file_snapshot: decoration categorisation + theory_status fallback."""
@@ -508,7 +532,7 @@ class TestReportUnion:
         from isabelle_mcp.evaluation import _snapshot_files
         await mock_lsp_client.open_document(temp_theory_file)
         theories = [
-            self._ts(temp_theory_file),
+            self._ts(temp_theory_file, imports=["Broken", "Loading"]),
             self._ts("/lib/Broken.thy", ok=False, failed=2, external=True),
             self._ts("/lib/Loading.thy", unprocessed=7, finished=3,
                      consolidated=False, external=True),
@@ -519,7 +543,8 @@ class TestReportUnion:
         assert not broken.lined and broken.error_count == 2
         # The loading import has nothing failed or running: summary line only.
         from isabelle_mcp.evaluation import _unprocessed_theory_count
-        assert _unprocessed_theory_count(theories, {fs.file_path for fs in files}) == 1
+        assert _unprocessed_theory_count(
+            mock_lsp_client, theories, {fs.file_path for fs in files}) == 1
 
     @pytest.mark.asyncio
     async def test_a_rendered_file_is_not_counted_again_in_the_summary_line(
@@ -527,25 +552,58 @@ class TestReportUnion:
     ):
         # The caret perspective leaves everything past the target unprocessed,
         # so the target's own row has unprocessed > 0 on every mid-file
-        # evaluation. It is rendered above; it is not "1 theory is not yet
-        # processed." below. An import that is merely loading still counts.
+        # evaluation. It is rendered above; it is not "1 imported theory is
+        # not yet processed." below. An import that is merely loading counts.
         from isabelle_mcp.evaluation import _snapshot_files, _summary_count
         await mock_lsp_client.open_document(temp_theory_file)
         theories = [
-            self._ts(temp_theory_file, unprocessed=6, finished=4, consolidated=False),
+            self._ts(temp_theory_file, unprocessed=6, finished=4, consolidated=False,
+                     imports=["Loading"]),
             self._ts("/lib/Loading.thy", unprocessed=7, finished=3,
                      consolidated=False, external=True),
         ]
         files = _snapshot_files(mock_lsp_client, temp_theory_file, theories, MCPLine(5))
         assert [fs.file_path for fs in files] == [temp_theory_file]
-        assert _summary_count(theories, files) == 1
+        assert _summary_count(mock_lsp_client, theories, files) == 1
         # The same for a file the decoration scan brought in.
         mock_lsp_client._processing_trackers[temp_theory_file] = MockProcessingTracker(
             overview_error=[(2, 0, 2, 5)], bad=[(2, 0, 2, 5)],
         )
         files = _snapshot_files(mock_lsp_client, "", theories)
         assert [fs.file_path for fs in files] == [temp_theory_file]
-        assert _summary_count(theories, files) == 1
+        assert _summary_count(mock_lsp_client, theories, files) == 1
+
+    @pytest.mark.asyncio
+    async def test_only_the_imports_of_open_documents_are_counted(
+        self, temp_theory_file, mock_lsp_client,
+    ):
+        """The summary line's one kind of member, pinned from both sides:
+        a theory is counted iff it lies in the import closure of an open
+        document (transitively) and has unprocessed commands. A half-evaluated
+        or cancelled target and a never-evaluated open file are not imports and
+        are not counted — unless another open document imports them, in which
+        case the prover will process them in full and the count recedes.
+        Mutation control for the closure predicate: count every unprocessed
+        row and the retracted target is counted; count only direct imports
+        and the transitive one is not."""
+        from isabelle_mcp.evaluation import _snapshot_files, _summary_count
+        await mock_lsp_client.open_document(temp_theory_file)
+        retracted = "/proj/Retracted.thy"       # a cancelled target, not open now
+        theories = [
+            self._ts(temp_theory_file, imports=["Direct"]),
+            self._ts("/lib/Direct.thy", imports=["Deep"], external=True,
+                     unprocessed=3, finished=7, consolidated=False),
+            self._ts("/lib/Deep.thy", external=True,
+                     unprocessed=9, finished=1, consolidated=False),
+            self._ts(retracted, unprocessed=10, finished=0, consolidated=False),
+        ]
+        files = _snapshot_files(mock_lsp_client, "", theories)
+        assert files == []
+        assert _summary_count(mock_lsp_client, theories, files) == 2
+        # A cancelled target that another open document imports IS an imported
+        # theory: counted while its rest is still to be processed.
+        theories[0] = self._ts(temp_theory_file, imports=["Direct", "Retracted"])
+        assert _summary_count(mock_lsp_client, theories, files) == 3
 
     @pytest.mark.asyncio
     async def test_evaluating_to_mid_file_shows_no_summary_line_for_the_target(
@@ -610,6 +668,19 @@ class TestReportUnion:
         assert [fs.file_path for fs in files] == [real]
         assert files[0].error_count == 1
 
+    def test_an_empty_node_name_stays_empty_and_renders_nothing(self, mock_lsp_client):
+        """Negative control for the empty-node guard at _parse_theory_status:
+        canonicalize "" unconditionally and it becomes the current directory,
+        which is truthy, so a theory with no file would get a file snapshot
+        named after the working directory."""
+        from isabelle_mcp.evaluation import _parse_theory_status, _snapshot_files
+        row = _parse_theory_status({
+            "node_name": "", "theory_name": "Pure", "external": True,
+            "ok": False, "failed": 1, "running": 0, "unprocessed": 0,
+        })
+        assert row.node_name == ""
+        assert _snapshot_files(mock_lsp_client, "", [row]) == []
+
     @pytest.mark.asyncio
     async def test_a_decoration_only_file_that_renders_no_row_is_left_out(
         self, temp_theory_file, mock_lsp_client,
@@ -644,11 +715,11 @@ class TestReportUnion:
         assert format_evaluation_result(view, "/proj", call_to_action=False) == (
             "Evaluating towards Foo.thy:20.\n\n"
             "Foo.thy:\n  pending: lines 7-9\n\n"
-            "3 theories are not yet processed."
+            "3 imported theories are not yet processed."
         )
         view.unprocessed_theories = 1
         assert format_evaluation_result(view, "/proj", call_to_action=False).endswith(
-            "\n\n1 theory is not yet processed."
+            "\n\n1 imported theory is not yet processed."
         )
 
     @pytest.mark.asyncio
@@ -1054,7 +1125,14 @@ class TestDependencyEditStamp:
         mock_lsp_client.request_theory_status = theory_status
         monkeypatch.setattr(processing, "_last_edit_sent", float("-inf"))
 
-        await ev._dependency_freshness_wait(mock_lsp_client)  # baseline stat
+        # First sighting: no record to compare against, so it counts as
+        # changed (the edit that matters may be the one made just before the
+        # dep came into view). Mutation control: treat an unseen dep as
+        # unchanged and this reds.
+        await ev._dependency_freshness_wait(mock_lsp_client)
+        assert processing._grace_remaining() > 0.0
+        monkeypatch.setattr(processing, "_last_edit_sent", float("-inf"))
+        await ev._dependency_freshness_wait(mock_lsp_client)  # now on record
         assert processing._grace_remaining() == 0.0           # no change yet
 
         from isabelle_mcp import debugger
@@ -1066,6 +1144,28 @@ class TestDependencyEditStamp:
         # Phase D wiring: the changed blob is marked dirty for breakpoint
         # reconciliation.
         assert str(dep) in debugger.registry.pop_dirty()
+
+    @pytest.mark.asyncio
+    async def test_a_dep_with_a_record_written_ahead_is_not_charged_on_first_sight(
+        self, mock_lsp_client, tmp_path, monkeypatch,
+    ):
+        # close_document seeds the record for the file it closes; the next
+        # entry then compares rather than assumes, so an untouched file the
+        # unified close turned into a dependency costs no grace window.
+        from isabelle_mcp import processing
+        from isabelle_mcp.lsp_client import _stat_sig
+        dep = tmp_path / "Closed.thy"
+        dep.write_text("theory Closed imports Main begin end\n")
+        mock_lsp_client._dep_stat_sigs = {str(dep): _stat_sig(str(dep))}
+        mock_lsp_client.vscode_load_delay = 0.5
+
+        async def theory_status():
+            return [{"node_name": str(dep), "external": True}]
+
+        mock_lsp_client.request_theory_status = theory_status
+        monkeypatch.setattr(processing, "_last_edit_sent", float("-inf"))
+        assert await ev._dependency_freshness_wait(mock_lsp_client) == 0.0
+        assert processing._grace_remaining() == 0.0
 
 
 class TestEvaluationLifecycle:
@@ -1380,6 +1480,26 @@ class TestGuardPositionDecision:
         )
 
     @pytest.mark.asyncio
+    async def test_running_position_is_served_with_a_note(
+        self, mock_lsp_client, temp_theory_file,
+    ):
+        # The approved wording, pinned verbatim like the interrupted note.
+        await mock_lsp_client.open_document(temp_theory_file)
+        tracker = ProcessingTracker()
+        await tracker.update({
+            "background_unprocessed1": [], "background_running1": [(4, 0, 4, 20)],
+        })
+        mock_lsp_client._processing_trackers[temp_theory_file] = tracker
+
+        note = await ev.check_evaluation_guard(
+            mock_lsp_client, temp_theory_file, MCPLine(5),
+        )
+        assert note == (
+            f"The command at {temp_theory_file}:5 is still being executed; "
+            "its output may be incomplete."
+        )
+
+    @pytest.mark.asyncio
     async def test_still_unknown_after_the_wait_is_refused_not_evaluated(
         self, mock_lsp_client, temp_theory_file, monkeypatch,
     ):
@@ -1479,8 +1599,11 @@ class TestPluralWording:
         assert ev._still_running_sentence(2) == "2 commands are still running."
 
     def test_the_summary_line_agrees_with_its_verb(self):
-        assert ev.unprocessed_theories_sentence(1) == "1 theory is not yet processed."
-        assert ev.unprocessed_theories_sentence(2) == "2 theories are not yet processed."
+        # Approved verbatim (2026-09-03).
+        assert ev.unprocessed_theories_sentence(1) == (
+            "1 imported theory is not yet processed.")
+        assert ev.unprocessed_theories_sentence(2) == (
+            "2 imported theories are not yet processed.")
 
     def test_line_span_unit_word_pluralises(self):
         assert ev._fmt_spans([(5, 5)]) == "line 5"
@@ -2227,20 +2350,11 @@ class TestGuardDispatch:
 
     @pytest.mark.asyncio
     async def test_no_tool_path_but_evaluate_to_writes_the_run_or_the_caret(
-        self, mock_lsp_client, temp_theory_file, temp_theory_with_errors, monkeypatch,
+        self, mock_lsp_client, temp_theory_file, temp_theory_with_errors, trap_run_writes,
     ):
         """The structural invariant: with every run-writing entry point and
-        the caret send booby-trapped, the guard walks all five branches."""
-        def trap(*a, **k):
-            raise AssertionError("a query wrote the evaluation state")
-
-        async def async_trap(*a, **k):
-            trap()
-
-        monkeypatch.setattr(ev.EvaluationState, "join_or_start", trap)
-        monkeypatch.setattr(ev.EvaluationState, "start", trap)
-        monkeypatch.setattr(ev.EvaluationState, "advance", trap)
-        monkeypatch.setattr(mock_lsp_client, "set_caret", async_trap)
+        the caret send booby-trapped (the trap_run_writes fixture), the guard
+        walks all five branches."""
         guard = ev.check_evaluation_guard
 
         # 1. served
@@ -2300,3 +2414,88 @@ class TestSorryIsContent:
         fs = _build_file_snapshot(mock_lsp_client, path, {path: stale})
         assert fs.lined and fs.state == "clean" and fs.error_count == 0
         assert fs.sorry == [(4, 4)]
+
+
+class TestWaitOutGrace:
+    """wait_out_grace: the one wait behind the settled read, command_status's
+    batch wait and the site tools' wait. Its predicate is the gate alone; its
+    deadline is one whole window past the first expiry (every re-arm before it
+    is waited out in full, so the return can be one further window later); it
+    is health-checked like every wait on the prover."""
+
+    class _Client:
+        STALL_TIMEOUT = 60.0
+
+        def __init__(self, fail=False):
+            self.fail = fail
+            self.checks = 0
+
+        def _check_server_health(self, stall_timeout):
+            self.checks += 1
+            if self.fail:
+                raise IsabelleToolError("Isabelle process died (exit code 1)")
+
+    @pytest.mark.asyncio
+    async def test_returns_once_the_gate_has_closed(self, monkeypatch):
+        monkeypatch.setattr(processing, "DECORATION_GRACE", 0.05)
+        processing.note_edit_sent()
+        client = self._Client()
+        await ev.wait_out_grace(client)
+        assert processing._grace_remaining() == 0.0
+        assert client.checks >= 1
+
+    @pytest.mark.asyncio
+    async def test_outlasts_a_gate_rearmed_meanwhile(self, monkeypatch):
+        # The deadline is one whole window past the FIRST expiry: every
+        # re-arm that lands before then is waited out. Two re-arms, the second
+        # landing after the first expiry, pin the geometry — mutation control
+        # (the W1 defect): make the deadline `now + window + 0.1` and this
+        # reds, because the second re-arm lands past that deadline and the
+        # wait returns with the gate still up.
+        import asyncio
+        monkeypatch.setattr(processing, "DECORATION_GRACE", 0.3)
+        processing.note_edit_sent()
+
+        async def rearm():
+            await asyncio.sleep(0.2)
+            processing.note_edit_sent()          # gate now closes at 0.5
+            await asyncio.sleep(0.25)
+            processing.note_edit_sent()          # at 0.45: gate closes at 0.75
+
+        task = asyncio.create_task(rearm())
+        await ev.wait_out_grace(self._Client())
+        await task
+        assert processing._grace_remaining() == 0.0
+
+    @pytest.mark.asyncio
+    async def test_is_bounded_under_continuous_rearming(self, monkeypatch):
+        # Edits that never stop must not hold a tool forever: no re-arm past
+        # the deadline (one window past the first expiry) is honoured, so the
+        # wait returns at most one further window later and the caller reads
+        # what it can.
+        import asyncio
+        monkeypatch.setattr(processing, "DECORATION_GRACE", 0.1)
+        processing.note_edit_sent()
+        stop = False
+
+        async def keep_rearming():
+            while not stop:
+                processing.note_edit_sent()
+                await asyncio.sleep(0.02)
+
+        task = asyncio.create_task(keep_rearming())
+        started = time.monotonic()
+        await ev.wait_out_grace(self._Client())
+        elapsed = time.monotonic() - started
+        stop = True
+        await task
+        assert 0.15 <= elapsed < 0.6
+
+    @pytest.mark.asyncio
+    async def test_a_dead_prover_ends_the_wait_with_its_error(self, monkeypatch):
+        # Mutation control for the health check: drop it and this hangs for
+        # the window instead of raising.
+        monkeypatch.setattr(processing, "DECORATION_GRACE", 5.0)
+        processing.note_edit_sent()
+        with pytest.raises(IsabelleToolError, match="died"):
+            await ev.wait_out_grace(self._Client(fail=True))

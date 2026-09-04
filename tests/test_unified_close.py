@@ -23,7 +23,7 @@ from isabelle_mcp.evaluation import (
 )
 from isabelle_mcp.lsp_client import IsabelleLSPClient
 from isabelle_mcp.utils import acquire_within
-from tests.conftest import MockProcessingTracker
+from tests.conftest import MockProcessingTracker, full_decoration_entries
 
 
 def _row(path: str, **kw) -> dict:
@@ -318,8 +318,11 @@ class TestEvaluationTargetMark:
 
 class TestTrackerOpenCheck:
     async def test_a_closed_documents_tracker_is_unreadable(self, temp_theory_file):
-        # The erase push after didClose rebuilds an all-empty tracker — a ghost
-        # that would read as "fully processed". The getter hides it.
+        # The erase push after didClose is differential (it names only the
+        # types that had content), so it builds no tracker — the all-empty
+        # ghost that would read as "fully processed" is not representable —
+        # and the getter answers None for a closed document whatever the map
+        # holds.
         client = IsabelleLSPClient()
 
         async def notify(method, params):
@@ -329,15 +332,15 @@ class TestTrackerOpenCheck:
         await client.open_document(temp_theory_file, wait_for_decoration=False)
         await client._handle_decoration({
             "uri": client.open_documents[temp_theory_file].uri,
-            "entries": [{"type": "background_unprocessed1", "content": []}],
+            "entries": full_decoration_entries(),
         })
         assert client.get_processing_tracker(temp_theory_file) is not None
         await client.close_document(temp_theory_file)
         await client._handle_decoration({
             "uri": f"file://{temp_theory_file}",
-            "entries": [{"type": "background_unprocessed1", "content": []}],
+            "entries": [{"type": "background_bad", "content": []}],
         })
-        assert temp_theory_file in client._processing_trackers        # the ghost
+        assert temp_theory_file not in client._processing_trackers    # no ghost
         assert client.get_processing_tracker(temp_theory_file) is None  # unreadable
         assert client.file_all_processed(temp_theory_file) is False
 

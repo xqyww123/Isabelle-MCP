@@ -81,6 +81,11 @@ class FakeDebugClient:
     """Scripted wire: each debugger method pops its reply from a list (the
     last reply repeats), and records the calls it saw."""
 
+    STALL_TIMEOUT = 60.0
+
+    def _check_server_health(self, stall_timeout: float) -> None:
+        pass
+
     def __init__(self):
         self.debug = True
         self.project_root = None
@@ -123,7 +128,9 @@ class FakeDebugClient:
             content=CONTENT, is_evaluation_target=evaluation_target)
         if self.tracker_on_reopen is not None:
             self.trackers = {**getattr(self, "trackers", {}), file_path: self.tracker_on_reopen}
-        processing.note_edit_sent()              # didOpen raises the global grace gate
+        # The fake FORCES the gate up on every reopen (production skips it for
+        # a file untouched since its close): the tools must cope with it.
+        processing.note_edit_sent()
 
     async def set_caret(self, *a, **k):
         raise AssertionError("a breakpoint tool moved the caret")
@@ -1925,7 +1932,8 @@ class TestReopenOfSweptTheories:
 
     @pytest.fixture(autouse=True)
     def _short_grace(self, monkeypatch):
-        # A reopen raises the grace gate and waits it out; keep the window short.
+        # The fake's reopen forces the grace gate up and the tools wait it
+        # out; keep the window short.
         monkeypatch.setattr(processing, "DECORATION_GRACE", 0.05)
 
     def _swept(self, client, held: bool = True) -> None:
@@ -1946,8 +1954,9 @@ class TestReopenOfSweptTheories:
 
     @pytest.mark.asyncio
     async def test_a_ghost_tracker_does_not_answer_for_a_swept_theory(self, client):
-        # The erase push after didClose leaves a tracker that says everything
-        # is processed (the ghost); the reopened document gets its own, which
+        # A stale tracker for the closed path that says everything is
+        # processed (a ghost — installed by hand, since a differential push
+        # can no longer build one); the reopened document gets its own, which
         # says the line is not evaluated. The answer must come from the new
         # one: the not-evaluated refusal, never the ghost's "no site here".
         self._swept(client)
@@ -1964,8 +1973,9 @@ class TestReopenOfSweptTheories:
     async def test_a_reopened_theory_is_judged_after_the_grace_gate(
         self, client, monkeypatch,
     ):
-        # The reopen's own didOpen raises the grace gate; a long-evaluated
-        # line read under it says `unknown` and would be reported as "still
+        # The reopen's didOpen raises the grace gate (in production only when
+        # the file changed meanwhile; the fake always); a long-evaluated line
+        # read under it says `unknown` and would be reported as "still
         # evaluating" — about work that does not exist. The reopen waits the
         # gate out (outside the lock) before the sites are judged.
         monkeypatch.setattr(processing, "DECORATION_GRACE", 0.05)

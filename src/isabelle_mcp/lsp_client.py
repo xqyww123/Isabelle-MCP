@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -18,8 +19,10 @@ from isabelle_mcp.document_diff import ranged_content_changes
 from isabelle_mcp.models import RunningCommand, TheoryStatus
 from isabelle_mcp.query import QueryReply
 from isabelle_mcp.processing import (
+    _TRACKED_TYPES,
     ProcessingTracker,
     clip_line_range,
+    is_full_decoration_push,
     note_edit_sent,
     parse_decoration_ranges,
 )
@@ -135,6 +138,12 @@ def _stat_sig(file_path: str) -> StatSig | None:
 def _stat_sigs(paths: list[str]) -> dict[str, StatSig | None]:
     """Batch :func:`_stat_sig` — runnable off the event loop via ``to_thread``."""
     return {p: _stat_sig(p) for p in paths}
+
+
+def _content_sig(text: str) -> str:
+    """SHA-256 of a document text: the content half of the pair a closed
+    document leaves behind (see ``IsabelleLSPClient._closed_push_sigs``)."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 # D-C7: modifying a heap-precompiled file is refused outright, with the one
@@ -308,13 +317,27 @@ class IsabelleLSPClient:
         # nothing to say), so diagnostics cannot be the signal; every open
         # file gets a decoration push.
         self._first_decoration_event: dict[str, asyncio.Event] = {}
+        # Per closed document, written by close_document just before its
+        # didClose and read by the next open_document of the same canonical
+        # path: ``(sha256 of the text last pushed to the prover, _stat_sig)``.
+        # Reading the pair back unchanged says the file has not been written
+        # since we closed it — and since the server re-reads the file from disk
+        # inside its own close handler, that is exactly "the prover already
+        # holds what we are about to push": such a reopen leaves the decoration
+        # grace gate down. Only close_document and _clear_session_state remove
+        # an open_documents entry, and the latter clears this map too, so no
+        # record is ever consumed without the close that wrote it.
+        self._closed_push_sigs: dict[str, tuple[str, StatSig]] = {}
 
         # Optional FileWatcher (set by the server). open_document/close_document
         # register/deregister the file's parent directory for event-driven sync.
         self.file_watcher: Any = None
 
-        # Dependency-freshness (Layer 3): last-seen stat signatures of server-owned
-        # dependency files (external imports + .ML blobs), keyed by node_name.
+        # Dependency-freshness (Layer 3): per server-owned dependency file
+        # (external imports + .ML blobs), the disk signature a grace window has
+        # already been charged for — the stat Layer 3 itself last read, or, for
+        # a file the unified close just closed, the signature recorded by that
+        # document's last sync (see close_document). Keyed by node_name.
         self._dep_stat_sigs: dict[str, StatSig | None] = {}
         # The theory_status pulled at the last tool-call entry (Layer 3), parsed
         # and path-canonical. Read by the unified close and by the paths that must
@@ -725,6 +748,7 @@ class IsabelleLSPClient:
         self.diagnostic_cache.diagnostics.clear()
         self.diagnostic_cache.last_update.clear()
         self._first_decoration_event.clear()
+        self._closed_push_sigs.clear()
         self._preview_waiters.clear()
         self._processing_trackers.clear()
         # Debugger state must not survive its prover: thread names restart
@@ -1033,16 +1057,34 @@ class IsabelleLSPClient:
         # Canonical key, like open_documents: the getters compare the two.
         file_path = _canon(uri_to_file_path(uri))
         tracker = self._processing_trackers.get(file_path)
-        if tracker is None:
-            if not parsed:
+        if tracker is None or not tracker.initialized:
+            # A tracker is INITIALIZED only by a FULL push (is_full_decoration_push:
+            # every tracked type named). A differential push says nothing about
+            # the types it omits, so it may update a picture that exists but
+            # must never make one. The push that used to: the server's erase
+            # push after a didClose, which names exactly the types that had
+            # content, now emptied — folded into a blank tracker it made an
+            # all-empty, initialized GHOST that read `processed` at every line
+            # of a file the prover may not have evaluated, and that could be
+            # read the moment a reopen registered the document. (An empty,
+            # uninitialized tracker may pre-exist: the wait_for_processing
+            # helpers plant one — no live caller does today — hence the test on
+            # `initialized`, not on `is None`.)
+            if not is_full_decoration_push(parsed):
+                logger.debug(
+                    "dropped a differential decoration push for %s (no initialized "
+                    "tracker; missing %s)", file_path,
+                    sorted(_TRACKED_TYPES - parsed.keys()),
+                )
                 return
-            tracker = ProcessingTracker()
-            self._processing_trackers[file_path] = tracker
+            if tracker is None:
+                tracker = ProcessingTracker()
+                self._processing_trackers[file_path] = tracker
         await tracker.update(parsed)
         # The ONE set point, after the tracker is filled: whoever wakes from
-        # open_document's wait finds the tracker built. A push carrying no
-        # tracked type builds no tracker and wakes nobody (the wait falls to
-        # its timeout, as before).
+        # open_document's wait finds the tracker initialized — by the full
+        # push, since nothing else fills one (the wait falls to its timeout
+        # otherwise).
         event = self._first_decoration_event.get(file_path)
         if event is not None and not event.is_set():
             event.set()
@@ -1160,13 +1202,21 @@ class IsabelleLSPClient:
             doc.is_evaluation_target = doc.is_evaluation_target or evaluation_target
             return
 
+        # A reopen the prover cannot notice — the bytes about to be pushed and
+        # the file's stat are both what they were at close_document — leaves
+        # the decoration grace gate down (see _closed_push_sigs). Both halves
+        # are computed here, never asserted by a caller: caller-supplied
+        # content has no disk counterpart to compare, and without the
+        # first-decoration wait nothing would confirm the cache afterwards.
+        same_as_closed = False
         if content is None:
             # Unicode guard (off the event loop): may rewrite the file in
             # Isabelle ASCII; the returned text matches disk afterwards, so the
             # stat_sig taken below stays coherent. Caller-passed content (no
             # current callers) bypasses the guard — it has no disk counterpart
             # to keep in sync.
-            content, guard_warning = await asyncio.to_thread(sanitize_read, file_path)
+            text, guard_warning = await asyncio.to_thread(sanitize_read, file_path)
+            content = text
             if guard_warning is not None:
                 record_warning(file_path, guard_warning)
             doc = self.open_documents.get(file_path)
@@ -1174,6 +1224,15 @@ class IsabelleLSPClient:
                 # Another coroutine opened it while we were off-loop.
                 doc.is_evaluation_target = doc.is_evaluation_target or evaluation_target
                 return
+            # One stat, after the read (hence after any guard rewrite) and
+            # before the didOpen: it serves the DocumentState and this test.
+            stat_sig = _stat_sig(file_path)
+            same_as_closed = (
+                wait_for_decoration and stat_sig is not None
+                and self._closed_push_sigs.get(file_path) == (_content_sig(text), stat_sig)
+            )
+        else:
+            stat_sig = _stat_sig(file_path)
 
         uri = file_path_to_uri(file_path)
 
@@ -1189,7 +1248,7 @@ class IsabelleLSPClient:
         # an orphan. Registering first keeps the two in sync under cancellation.
         self.open_documents[file_path] = DocumentState(
             file_path=file_path, uri=uri, version=1, content=content,
-            stat_sig=_stat_sig(file_path), is_evaluation_target=evaluation_target,
+            stat_sig=stat_sig, is_evaluation_target=evaluation_target,
         )
         await self.notify("textDocument/didOpen", {
             "textDocument": {
@@ -1199,7 +1258,8 @@ class IsabelleLSPClient:
                 "text": content,
             }
         })
-        note_edit_sent()  # didOpen pushes content: an edit-send like any other
+        if not same_as_closed:
+            note_edit_sent()  # didOpen pushes content: an edit-send like any other
         self._add_file_watch(file_path)
 
         if wait_for_decoration:
@@ -1207,18 +1267,27 @@ class IsabelleLSPClient:
                 file_path, timeout=decoration_timeout,
             )
             if not received:
-                logger.debug(
-                    "No decoration received for %s within %.1fs",
+                if same_as_closed:
+                    # No full push certified the cache we left trusted: fall
+                    # back to distrusting it, as an ordinary open would.
+                    note_edit_sent()
+                # At WARNING: a full push that never comes is also what a
+                # renamed decoration type would look like (no tracker would
+                # ever be built again), and that must not fail silently.
+                logger.warning(
+                    "No full decoration push for %s within %.1fs",
                     file_path, decoration_timeout,
                 )
 
     async def wait_for_first_decoration(self, file_path: str, timeout: float = 2.0) -> bool:
         """Wait for the first decoration push after *file_path*'s didOpen.
 
-        True once the push has been folded into the file's tracker (so a caller
-        that wakes here can read it); False at the timeout — the 2.0 s backstop
-        for a push that carries no tracked type, or a file so large its first
-        push takes longer.
+        True once a FULL push has been folded into the file's tracker (so a
+        caller that wakes here can read it); False at the timeout — the 2.0 s
+        backstop for a first push that is missing a tracked type (it initializes
+        nothing, see _handle_decoration) or that is late: a file so large its
+        first push takes longer, or a prover busy publishing for another file,
+        which re-arms the server's output debounce (measured 3–15 s).
         """
         event = self._first_decoration_event.get(_canon(file_path))
         if event is None:
@@ -1253,6 +1322,28 @@ class IsabelleLSPClient:
         # argument rests on that. A second closer that reaches here with a
         # marked record is a bug, not a policy choice.
         assert not doc.is_evaluation_target, f"closing an evaluation target: {file_path}"
+        # Two records, two questions, two stats. The same-bytes reopen record
+        # asks "was anything written between now and the reopen?", so its stat
+        # is taken as LATE as possible, before the didClose: the server
+        # re-reads the file from disk inside its own close handler, and the
+        # interval this stat opens must contain that read for "same at both
+        # ends" to mean "unchanged throughout" (st_ctime_ns cannot be set
+        # back, so no write inside the interval restores the signature). The
+        # dependency-freshness record asks "which disk state has a grace
+        # window already been charged for?", and the only such state is the
+        # text the prover was last given — the signature recorded by this
+        # document's last sync (doc.stat_sig). A write landing between the
+        # tool entry's resync and this close was charged nothing, and the
+        # server absorbs it inside its didClose handler; seeding the fresh stat
+        # would record it as accounted for, and the next entry would trust the
+        # importers' stale decorations. From the next entry on the file is a
+        # dependency the server syncs itself, and a dependency first seen
+        # without a record counts as changed (see _dependency_freshness_wait).
+        stat_sig = _stat_sig(file_path)
+        self._closed_push_sigs.pop(file_path, None)
+        if stat_sig is not None:
+            self._closed_push_sigs[file_path] = (_content_sig(doc.content), stat_sig)
+        self._dep_stat_sigs[file_path] = doc.stat_sig
         del self.open_documents[file_path]
         await self.notify("textDocument/didClose", {"textDocument": {"uri": doc.uri}})
         self.diagnostic_cache.diagnostics.pop(file_path, None)
@@ -1407,11 +1498,11 @@ class IsabelleLSPClient:
         """Return the ProcessingTracker for *file_path*, or None.
 
         A tracker is readable only while its document is open (same key form
-        as ``open_documents``): closing a document drops its tracker, but the
-        server's erase push after didClose rebuilds an all-empty one, which
-        would read as "fully processed" — a ghost. Answering None for a closed
-        document here means every reader, present and future, says "nothing
-        known" instead.
+        as ``open_documents``): closing a document drops its tracker, and a
+        differential push for a closed file (the server's erase push after
+        didClose) builds none — see _handle_decoration. Answering None for a
+        closed document here means every reader, present and future, says
+        "nothing known" whatever the tracker map holds.
 
         ``open_documents`` never holds a false value (its one writer stores a
         DocumentState), so ``path in open_documents`` and

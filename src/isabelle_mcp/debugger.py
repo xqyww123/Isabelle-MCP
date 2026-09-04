@@ -920,8 +920,9 @@ def _position_state(client: IsabelleLSPClient, file_path: str, line: int) -> str
 async def _reopen_if_swept(client: IsabelleLSPClient, file_path: str) -> None:
     """The site tools' one piece of bookkeeping before they read the prover,
     outside every lock: a ``.thy`` the prover holds but the unified close
-    tidied away is reopened (about two seconds, no evaluation, no caret
-    move). The prover keeps the model of a closed file, so the listing itself
+    tidied away is reopened (no evaluation, no caret move; about half a
+    second when the file was not touched meanwhile). The prover keeps the
+    model of a closed file, so the listing itself
     never notices — but the decoration tracker these tools judge positions by
     goes with the document, and an armed breakpoint must live on a document we
     hold. A ``.ML``/``.sml`` is never a document of ours and is left alone;
@@ -933,9 +934,9 @@ async def _reopen_if_swept(client: IsabelleLSPClient, file_path: str) -> None:
     arming tag) judge positions from the decoration cache, and under the gate
     a long-evaluated line would read ``unknown`` and be reported as "still
     evaluating" — a sentence about work that does not exist."""
-    from isabelle_mcp.evaluation import _wait_out_grace, reopen_held_theory
+    from isabelle_mcp.evaluation import reopen_held_theory, wait_out_grace
     if await reopen_held_theory(client, file_path):
-        await _wait_out_grace(client, file_path)
+        await wait_out_grace(client)
 
 
 async def _no_site_on_line_error(
@@ -1300,9 +1301,10 @@ async def enable_all_breakpoints(
 
     Three stages. First, under the lock and writing nothing, the scoped
     entries are collected. Second, outside the lock, every file they name is
-    reopened if the unified close had tidied it away (a reopen costs about
-    two seconds and must not be paid under the registry lock: the cancel
-    sweep's bounded acquire would silently skip its demotion). Third, back
+    reopened if the unified close had tidied it away (a reopen waits on the
+    prover — up to a grace window when the file changed meanwhile — and must
+    not be paid under the registry lock: the cancel sweep's bounded acquire
+    would silently skip its demotion). Third, back
     under the lock, each entry still in the registry — by identity, since a
     concurrent delete may have removed it — is flipped enabled and armed. A
     concurrent disable_all lands in one of the states the serial order could

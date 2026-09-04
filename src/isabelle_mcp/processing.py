@@ -80,6 +80,29 @@ _TRACKED_TYPES = frozenset({
     "text_overview_warning",
 })
 
+
+def is_full_decoration_push(parsed: dict[str, list[tuple[int, int, int, int]]]) -> bool:
+    """Whether a parsed push names every tracked type — the mark of a FULL push.
+
+    CROSS-LANGUAGE INVARIANT, relied on by :meth:`IsabelleLSPClient._handle_decoration`
+    and mirrored in the Scala fork (``vscode_rendering.scala`` ``decorations`` —
+    "list of canonical length and order"; ``vscode_model.scala`` ``publish``;
+    ``vscode_resources.scala`` ``change_model``): the server publishes decorations
+    in two shapes. A **full** push carries the canonical list, every type present,
+    empty ones included; it is sent exactly when ``published_decorations`` is
+    empty, which every open and every reopen guarantees (``change_model`` clears
+    the baseline of a model coming back from ``external_file``). A **differential**
+    push carries only the entries that changed since the last publish. The "erase"
+    push the server emits ~0.5 s after a didClose is differential: it names only
+    the types that HAD content, now emptied, so for a file the unified close was
+    allowed to close (:func:`evaluation.theory_settled`) it can never name
+    ``background_unprocessed1`` or ``background_running1``.
+
+    So "names all of ``_TRACKED_TYPES``" separates a push computed for the
+    document we hold open from one computed while it was closed.
+    """
+    return _TRACKED_TYPES <= parsed.keys()
+
 # The state of the command(s) covering one position, judged from the decoration
 # cache alone. Fixed vocabulary — the agent-facing words of isabelle_command_status
 # are rendered from these and must not acquire a second meaning anywhere.
@@ -169,6 +192,14 @@ class ProcessingTracker:
         self._canceled: list[tuple[int, int, int, int]] = []
         self._initialized: bool = False
         self._condition: asyncio.Condition = asyncio.Condition()
+
+    @property
+    def initialized(self) -> bool:
+        """True once a push has been folded in. The client feeds an uninitialized
+        tracker nothing but a FULL push (:func:`is_full_decoration_push`), so
+        this also reads "the cache is a picture of the whole document, not one
+        differential slice of it"."""
+        return self._initialized
 
     async def update(self, parsed: dict[str, list[tuple[int, int, int, int]]]) -> None:
         """Merge decoration ranges from a (possibly incremental) push."""

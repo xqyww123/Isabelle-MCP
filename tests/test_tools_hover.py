@@ -174,7 +174,8 @@ class TestHoverTool:
         await mock_lsp_client.open_document(str(f))
         mock_lsp_client.hover_response = {"contents": "test"}
         with patch("isabelle_mcp.tools.hover.check_evaluation_guard", new_callable=AsyncMock) as mock_guard:
-            mock_guard.return_value = "This line is still being executed (forked proof). Output may be incomplete."
+            mock_guard.return_value = (
+                f"The command at {f}:1 is still being executed; its output may be incomplete.")
             result = await hover_info(mock_lsp_client, str(f), MCPLine(1), "hello")
         assert result.note is not None
-        assert "forked proof" in result.note
+        assert "still being executed" in result.note

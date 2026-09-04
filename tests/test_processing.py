@@ -264,3 +264,29 @@ async def test_range_state_reports_how_long_a_command_has_been_running():
     assert elapsed >= 0.0
     # Every other state carries no duration.
     assert t.range_state(9, 9) == (processing.PROCESSED, 0.0)
+
+
+# --------------------------------------------------------------------------
+# The full-push invariant: what the client builds a tracker from
+# --------------------------------------------------------------------------
+
+def test_a_full_push_names_every_tracked_type():
+    from isabelle_mcp.processing import _TRACKED_TYPES, is_full_decoration_push
+    full = {typ: [] for typ in _TRACKED_TYPES}
+    assert is_full_decoration_push(full)
+    assert is_full_decoration_push({**full, "text_keyword1": []})   # extras are fine
+    for typ in _TRACKED_TYPES:
+        partial = dict(full)
+        del partial[typ]
+        assert not is_full_decoration_push(partial), typ
+    assert not is_full_decoration_push({})
+
+
+@pytest.mark.asyncio
+async def test_initialized_reads_whether_a_push_was_folded_in():
+    tracker = ProcessingTracker()
+    assert not tracker.initialized
+    await tracker.update({"background_unprocessed1": []})
+    assert tracker.initialized
+    await tracker.reset()
+    assert not tracker.initialized
