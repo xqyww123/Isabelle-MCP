@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0
 
 - **Cancellation leaves no corpse.** `isabelle_cancel_evaluation` is now one
   server-side request that stops the prover, retracts every perspective and
