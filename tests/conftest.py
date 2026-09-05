@@ -8,9 +8,15 @@ import types
 
 import pytest
 
-from isabelle_mcp.lsp_client import DocumentState, IsabelleLSPClient, _canon
-from isabelle_mcp.models import TheoryStatus
-from isabelle_mcp.utils import LSPCharacter, LSPLine, set_symbols_text
+from isabelle_mcp.lsp_client import (
+    DocumentState,
+    IsabelleLSPClient,
+    _canon,
+    parse_theory_status,
+)
+from isabelle_mcp.models import TheoryStatusRecord
+from isabelle_mcp.processing import FreshnessState
+from isabelle_mcp.utils import LSPCharacter, LSPLine, OwnedLock, set_symbols_text
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -72,12 +78,16 @@ class MockProcessingTracker:
     the frontier edits ``unprocessed`` (the lists are live — a concurrent task
     can shrink them while an evaluation waits).
 
-    Not modelled: the post-edit grace window (the real ``_fresh`` gate, under
-    which every predicate answers "not yet" / ``unknown``) and cancelled
-    ranges. *all_processed=False* (without ranges) means "nothing evaluated at
-    all". *frontier* / *quiet* force ``line_reached`` / ``range_processed``
-    outright (for "frontier reached the target but a trailing fork in the
-    prefix is still in flight"); *state* forces ``position_state``.
+    Not modelled: the freshness rule (the real ``fresh`` gate, under which
+    every predicate answers "not yet" / ``unknown``) and cancelled ranges. The
+    picture is a FULL one (``initialized``) stamped *document_version* (0 by
+    default: Version.init, older than everything, so at least as new as the
+    mock client's default record and never newer than any real stamp); a test
+    about the stamp arbitration sets a stamp of its own. *all_processed=False*
+    (without ranges) means "nothing evaluated at all". *frontier* / *quiet*
+    force ``line_reached`` / ``range_processed`` outright (for "frontier
+    reached the target but a trailing fork in the prefix is still in flight");
+    *state* forces ``position_state``.
     """
 
     def __init__(
@@ -86,6 +96,7 @@ class MockProcessingTracker:
         state: str | None = None,
         bad=None, sorry=None, overview_error=None, overview_warning=None,
         running=None, unprocessed=None,
+        initialized: bool = True, document_version: int | None = 0,
     ):
         assert all_processed or not (running or unprocessed), \
             "all_processed=False means no ranges at all; pass ranges instead"
@@ -93,6 +104,8 @@ class MockProcessingTracker:
         self._frontier = frontier
         self._quiet = quiet
         self._state = state
+        self.initialized = initialized
+        self.document_version = document_version
         self._bad = bad or []
         self._sorry = sorry or []
         self._oerr = overview_error or []
@@ -145,6 +158,21 @@ class MockProcessingTracker:
     def all_processed(self) -> bool:
         return self._all_processed and not self.unprocessed and not self.running
 
+    @property
+    def fresh(self) -> bool:
+        # The stub models no freshness rule: an initialized picture is fresh.
+        return self.initialized
+
+    def stamp_at_least_as_new_as(self, version: int) -> bool:
+        # Mirrors ProcessingTracker: a full picture stamped at least as new as
+        # *version*. The stub's default stamp is 0 (Version.init), so it is at
+        # least as new as the mock client's default newest version (also 0).
+        return (
+            self.initialized
+            and self.document_version is not None
+            and self.document_version <= version
+        )
+
     def get_running_ranges(self) -> list[tuple[int, int, int, int]]:
         return list(self.running)
 
@@ -190,6 +218,7 @@ class MockLSPClient:
 
     # Real ProcessingTracker wait loops health-check through the client.
     STALL_TIMEOUT = 60.0
+    PROGRESS_CHECK_INTERVAL = 5.0
 
     def _check_server_health(self, stall_timeout: float) -> None:
         pass
@@ -208,9 +237,17 @@ class MockLSPClient:
         self.processing_status: dict[str, bool] = {}
         self._processing_trackers: dict[str, Any] = {}
         self.heap_sources: set[str] = set()
-        # The tool-call entry's parsed theory_status (see the real client);
-        # tests preset it for the paths that read it without a round trip.
-        self.entry_theories: list[TheoryStatus] = []
+        # The freshness state (see the real client): the newest version stays 0
+        # unless a test advances it, so every stub tracker's default stamp is
+        # at least as new as it and the mock's flush reconciles at once.
+        self.freshness = FreshnessState()
+        # The rows the mock's theory_status answers with, or None for "one
+        # settled row per open document"; ``theory_status_stamp`` is the reply's
+        # document_version (the mock's records carry the newest version unless
+        # a test says otherwise).
+        self.theory_rows: list[dict] | None = None
+        self.theory_status_stamp: int | None = None
+        self.flush_calls: list[bool] = []
 
         self.hover_response = None
         self.definition_response = None
@@ -240,8 +277,6 @@ class MockLSPClient:
         file_path: str,
         content: str | None = None,
         *,
-        wait_for_decoration: bool = True,
-        decoration_timeout: float = 2.0,
         evaluation_target: bool = False,
     ):
         # The real client's shape: canonical key, an already-open document is
@@ -300,28 +335,29 @@ class MockLSPClient:
     async def request_loaders(self, file_path: str) -> list[dict]:
         return list(self.loaders)
 
-    async def request_theory_status(self) -> list[dict]:
+    async def request_theory_status(self) -> TheoryStatusRecord:
         await asyncio.sleep(0)
-        theories = []
-        for path in self.open_documents:
-            name = Path(path).stem
-            theories.append({
-                "node_name": path,
-                "theory_name": name,
-                "external": False,
-                "imports": [],
-                "ok": True,
-                "total": 10,
-                "unprocessed": 0,
-                "running": 0,
-                "warned": 0,
-                "failed": 0,
-                "finished": 10,
-                "canceled": False,
-                "consolidated": True,
-                "percentage": 100,
-            })
-        return theories
+        rows = self.theory_rows
+        if rows is None:
+            rows = [settled_theory_row(path) for path in self.open_documents]
+        stamp = self.theory_status_stamp
+        if stamp is None:
+            stamp = self.freshness.newest_document_version
+        return theory_status_record(rows, stamp)
+
+    async def flush(self, *, resync_dependencies: bool) -> tuple[dict, int]:
+        """The mock's flush: yields once, names the newest version (nothing on
+        the mock ever creates one) and covers every content send."""
+        await asyncio.sleep(0)
+        self.flush_calls.append(resync_dependencies)
+        snapshot = self.freshness.content_sends
+        self.freshness.content_sends_flushed = max(
+            self.freshness.content_sends_flushed, snapshot)
+        await self.freshness.notify()
+        return (
+            {"document_version": self.freshness.newest_document_version, "changed_uris": []},
+            snapshot,
+        )
 
     async def cancel_execution(self) -> None:
         pass
@@ -464,7 +500,7 @@ def _per_test_evaluation_state_lock(monkeypatch):
     next test.
     """
     import importlib
-    new = asyncio.Lock()
+    new = OwnedLock("isabelle_mcp_evaluation_lock_held")
     for name in _LOCK_HOLDERS:
         monkeypatch.setattr(importlib.import_module(name), "_evaluation_state_lock", new)
     stale = [
@@ -511,17 +547,37 @@ def _per_test_registry_lock(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _reset_edit_clock(monkeypatch):
-    """Isolate the global edit clock per test.
+def _default_entry_record():
+    """Every test starts with an EMPTY entry record (as if the tool entry had
+    pulled a theory_status with no rows, stamped 0): the readers of the record
+    (the unified close, the cancel shortcut, the footer, the reopen) are
+    reachable from tests that never run an entry, and reading an unset record
+    is a programming error in production. A test about the record sets its
+    own with ``evaluation.set_entry_record``."""
+    from isabelle_mcp import evaluation as ev
+    token = ev._entry_record.set(TheoryStatusRecord(document_version=0, theories=()))
+    yield
+    ev._entry_record.reset(token)
 
-    Real-client tests bump processing._last_edit_sent (didOpen/didChange paths);
-    without this reset a leaked stamp would freshness-gate any real-tracker
-    assertion in the next ~2s of the suite. Pinning DECORATION_GRACE also
-    shields assertions from an ISABELLE_MCP_DECORATION_GRACE env override
-    (read at import time)."""
-    from isabelle_mcp import processing
-    monkeypatch.setattr(processing, "_last_edit_sent", float("-inf"))
-    monkeypatch.setattr(processing, "DECORATION_GRACE", 2.0)
+
+def settled_theory_row(path: str, **kw) -> dict:
+    """One raw theory_status row: settled unless *kw* says otherwise."""
+    row = {
+        "node_name": path, "theory_name": Path(path).stem, "external": False,
+        "imports": [], "ok": True, "total": 10, "unprocessed": 0, "running": 0,
+        "warned": 0, "failed": 0, "finished": 10, "canceled": False,
+        "consolidated": True, "percentage": 100,
+    }
+    row.update(kw)
+    return row
+
+
+def theory_status_record(rows: list[dict], document_version: int = 0) -> TheoryStatusRecord:
+    """The stamped record a PIDE/theory_status reply becomes, from raw rows."""
+    return TheoryStatusRecord(
+        document_version=document_version,
+        theories=tuple(parse_theory_status(r) for r in rows),
+    )
 
 
 @pytest.fixture

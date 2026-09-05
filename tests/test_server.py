@@ -695,9 +695,12 @@ class TestFooterScope:
 
         seen: dict[str, bool] = {}
 
+        cancel_entry: dict[str, bool] = {}
+
         def spy(name):
-            async def _ensure(*, footer: bool = False):
+            async def _ensure(*, footer: bool = False, cancel_tool: bool = False):
                 seen[name] = footer
+                cancel_entry[name] = cancel_tool
                 return mock_lsp_client
             return _ensure
 
@@ -732,6 +735,11 @@ class TestFooterScope:
         assert seen["isabelle_evaluation_status"] is False
         assert seen["isabelle_cancel_evaluation"] is False
         assert seen["isabelle_session_info"] is False
+        # The cancel tool alone asks for the exempted entry (no flush request,
+        # no unified close); every other tool takes the ordinary one.
+        assert cancel_entry["isabelle_cancel_evaluation"] is True
+        assert not any(v for name, v in cancel_entry.items()
+                       if name != "isabelle_cancel_evaluation")
 
     @pytest.mark.asyncio
     async def test_unicode_warning_comes_before_the_footer(self):

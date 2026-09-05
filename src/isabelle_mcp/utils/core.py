@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from urllib.parse import quote, unquote
@@ -32,6 +33,30 @@ async def acquire_within(lock: asyncio.Lock, timeout: float) -> AsyncGenerator[b
         yield True
     finally:
         lock.release()
+
+
+class OwnedLock(asyncio.Lock):
+    """An asyncio.Lock whose ownership is visible to the holding task's context.
+
+    ``held`` is a ContextVar set True between the ``async with`` entry and
+    exit, so code called under the lock can assert on it (I-8: no flush
+    request and no freshness wait may be awaited while the evaluation lock is
+    held — the wait's bound exceeds the cancel's whole budget and every escape
+    hatch takes this lock). ``asyncio.Lock.locked()`` cannot express
+    ownership; a ContextVar can, because a task's awaits share its context.
+    """
+
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self.held: contextvars.ContextVar[bool] = contextvars.ContextVar(name, default=False)
+
+    async def __aenter__(self) -> None:
+        await self.acquire()
+        self.held.set(True)
+
+    async def __aexit__(self, *exc: object) -> None:
+        self.held.set(False)
+        self.release()
 
 
 # MCP positions are 1-indexed; LSP positions are 0-indexed.

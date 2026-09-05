@@ -1,136 +1,218 @@
-"""Freshness semantics of ProcessingTracker (global post-edit grace window).
+"""Freshness semantics of ProcessingTracker: the picture stamp against the
+newest document version and the unflushed-content counters
+(ISABELLE_MCP_DECORATION_VERSION_STAMP_PLAN.md, section 3.2 (c)).
 
-Regression tests for the "Evaluation in progress" latch: completion used to
-require a decoration push strictly newer than the evaluation start, but the
-server never re-sends unchanged decorations, so an already-finished file
-latched "in progress" forever. Freshness now recovers by clock
-(DECORATION_GRACE after the last edit-send, recorded globally by
-note_edit_sent), never by waiting for a push that may legitimately never come.
+A picture is trusted iff it is a FULL picture stamped at least as new as the
+newest version the client has seen, read while no content the client wrote is
+still uncovered by a flush reply. No clock: freshness is regained by a push
+(an acknowledgement push included) or a flush reply, never by waiting.
 """
 
 import asyncio
-import time
 
 import pytest
 
 from isabelle_mcp import processing
-from isabelle_mcp.processing import ProcessingTracker, note_edit_sent
+from isabelle_mcp.processing import (
+    FreshnessState,
+    ProcessingTracker,
+    at_least_as_new,
+    is_full_decoration_push,
+    newer_of,
+)
 from isabelle_mcp.utils import LSPLine
+from tests.conftest import full_decoration_entries
 
-# 0.4s grace: wide enough that the "inside the window" asserts cannot be
-# outrun by a loaded CI runner, small enough to keep the suite fast.
-_GRACE = 0.4
-
-
-@pytest.fixture(autouse=True)
-def _short_grace(monkeypatch):
-    monkeypatch.setattr(processing, "DECORATION_GRACE", _GRACE)
-    monkeypatch.setattr(processing, "_last_edit_sent", float("-inf"))
+# Two real document versions: ids tick DOWNWARD, so -40 is newer than -19.
+OLDER = -19
+NEWER = -40
 
 
 def _noop_health_check() -> None:
     pass
 
 
+def _full(**content) -> dict:
+    return processing.parse_decoration_ranges(full_decoration_entries(**content))
+
+
+def _partial(**content) -> dict:
+    return processing.parse_decoration_ranges([
+        {"type": typ, "content": [{"range": list(r)} for r in ranges]}
+        for typ, ranges in content.items()
+    ])
+
+
+async def _tracker(state: FreshnessState | None = None, **ranges) -> ProcessingTracker:
+    """A tracker holding a full picture at the state's newest version."""
+    state = state or FreshnessState()
+    tracker = ProcessingTracker(state)
+    await tracker.update(_full(
+        background_unprocessed1=ranges.get("unprocessed", []),
+        background_running1=ranges.get("running", []),
+        background_canceled=ranges.get("canceled", []),
+    ), state.newest_document_version)
+    return tracker
+
+
+# --------------------------------------------------------------------------
+# The predicate pair (I-7): the only place the direction of "newer" is written
+# --------------------------------------------------------------------------
+
+def test_two_real_ids_compare_in_the_right_direction():
+    # Mutation control M-7: flip the comparison and both lines red.
+    assert at_least_as_new(NEWER, OLDER)
+    assert not at_least_as_new(OLDER, NEWER)
+    assert at_least_as_new(OLDER, OLDER)
+    assert newer_of(OLDER, NEWER) == NEWER
+    # 0 is Version.init: older than everything, at least as new as itself only.
+    assert at_least_as_new(OLDER, 0) and not at_least_as_new(0, OLDER)
+
+
+def test_the_freshness_state_folds_stamps_into_the_newest_version():
+    state = FreshnessState()
+    assert state.newest_document_version == 0
+    state.advance(OLDER)
+    state.advance(NEWER)
+    state.advance(OLDER)          # an older stamp never moves it back
+    assert state.newest_document_version == NEWER
+    state.reset()
+    assert state.newest_document_version == 0
+
+
+# --------------------------------------------------------------------------
+# The trust rule (I-4): fresh = full picture, stamp at least as new, no unflushed content
+# --------------------------------------------------------------------------
+
 async def test_not_initialized_blocks_line_reached():
-    tracker = ProcessingTracker()
+    tracker = ProcessingTracker(FreshnessState())
     assert not tracker.line_reached(5)
     assert not tracker.range_processed(LSPLine(0), LSPLine(10))
 
 
-async def test_first_push_makes_fresh_without_any_edit():
-    tracker = ProcessingTracker()
-    await tracker.update({"background_unprocessed1": [], "background_running1": []})
+async def test_first_full_push_makes_fresh():
+    tracker = await _tracker()
     assert tracker.line_reached(5)
     assert tracker.all_processed
+    assert tracker.fresh
 
 
 async def test_unprocessed_range_blocks_line_reached_when_fresh():
-    tracker = ProcessingTracker()
-    await tracker.update({"background_unprocessed1": [(3, 0, 7, 0)]})
+    tracker = await _tracker(unprocessed=[(3, 0, 7, 0)])
     assert not tracker.line_reached(5)
     assert tracker.line_reached(10)
 
 
-async def test_grace_recovers_without_a_push():
-    """The latch regression: an edit whose decorations do not change produces
-    no push; freshness must come back by clock alone."""
-    tracker = ProcessingTracker()
-    await tracker.update({"background_unprocessed1": [], "background_running1": []})
-
-    note_edit_sent()
-    assert not tracker.line_reached(5)  # inside the grace window: cache distrusted
-
-    await asyncio.sleep(_GRACE + 0.05)
-    assert tracker.line_reached(5)      # no push arrived — fresh again anyway
-
-
-async def test_edit_grace_is_global_across_trackers():
-    """One edit anywhere distrusts EVERY tracker: PIDE invalidation propagates
-    across imports, so editing A must also gate B's cached decorations."""
-    a, b = ProcessingTracker(), ProcessingTracker()
-    await a.update({"background_unprocessed1": []})
-    await b.update({"background_unprocessed1": []})
-
-    note_edit_sent()
-    assert not a.line_reached(5)
-    assert not b.line_reached(5)
-
-    await asyncio.sleep(_GRACE + 0.05)
-    assert a.line_reached(5)
-    assert b.line_reached(5)
-
-
-async def test_push_inside_grace_does_not_unlock_early_but_is_honored():
-    """A push landing right after an edit may still describe the pre-edit
-    document (in flight when we sent), so only the clock ends the grace window
-    — but its CONTENT must be merged and honored once the window elapses."""
-    tracker = ProcessingTracker()
-    await tracker.update({"background_unprocessed1": []})
-
-    note_edit_sent()
-    await tracker.update({"background_unprocessed1": [(3, 0, 7, 0)]})
+async def test_a_push_stamped_older_than_the_newest_version_never_makes_fresh():
+    # The client saw NEWER (a flush reply, say); a picture at OLDER describes
+    # an older document state and is not trusted, however complete it is.
+    state = FreshnessState()
+    state.advance(NEWER)
+    tracker = ProcessingTracker(state)
+    await tracker.update(_full(), OLDER)
+    assert tracker.initialized and not tracker.fresh
     assert not tracker.line_reached(5)
-    assert not tracker.line_reached(10)  # not because of ranges — window still open
+    assert tracker.position_state(5) == processing.UNKNOWN
+    # The push at the newest version (or newer) makes it fresh.
+    await tracker.update(_full(), NEWER)
+    assert tracker.fresh and tracker.line_reached(5)
 
-    await asyncio.sleep(_GRACE + 0.05)
-    assert not tracker.line_reached(5)   # in-grace push content survived
-    assert tracker.line_reached(10)
+
+async def test_a_newer_version_seen_elsewhere_unfreshens_every_tracker():
+    # The newest version is client-wide: a flush reply naming NEWER makes
+    # every picture stamped OLDER unfresh, whatever file it belongs to.
+    state = FreshnessState()
+    state.advance(OLDER)
+    a, b = await _tracker(state), await _tracker(state)
+    assert a.fresh and b.fresh
+    state.advance(NEWER)
+    assert not a.fresh and not b.fresh
 
 
-async def test_bounded_wait_wakes_when_grace_elapses():
-    """Without the grace-aware wait slice the condition loop would sleep a full
-    check_interval past the recovery point (no push ever notifies it)."""
+async def test_an_acknowledgement_push_freshens_without_content():
+    state = FreshnessState()
+    state.advance(OLDER)
+    tracker = await _tracker(state, unprocessed=[(3, 0, 7, 0)])
+    state.advance(NEWER)
+    assert not tracker.fresh
+    await tracker.update({}, NEWER)          # empty entries, a stamp
+    assert tracker.fresh
+    # The content survived: an ack says "nothing changed", not "nothing".
+    assert not tracker.line_reached(5) and tracker.line_reached(10)
+
+
+async def test_unflushed_content_blocks_freshness_until_the_reply():
+    state = FreshnessState()
+    tracker = await _tracker(state)
+    assert tracker.fresh
+    state.content_sends += 1                 # a didChange went out
+    assert state.unflushed_content and not tracker.fresh
+    assert tracker.position_state(5) == processing.UNKNOWN
+    state.content_sends_flushed = max(state.content_sends_flushed, 1)   # the reply
+    assert tracker.fresh
+
+
+async def test_a_tracker_without_freshness_state_is_never_fresh():
+    # The null-object sites (debugger.py, tools/command_status.py): a tracker
+    # that stands in for "no picture" cannot fold a push and answers
+    # not_evaluated everywhere.
     tracker = ProcessingTracker()
-    await tracker.update({"background_unprocessed1": [], "background_running1": []})
-    # start BEFORE the stamp: the wake cannot precede stamp+grace >= start+grace,
-    # so the lower-bound assert below is deterministic (no scheduling margin).
-    start = time.monotonic()
-    note_edit_sent()
+    assert not tracker.initialized and not tracker.fresh
+    assert tracker.position_state(5) == processing.NOT_EVALUATED
+    with pytest.raises(AssertionError):
+        await tracker.update(_full(), OLDER)
 
-    ok = await tracker.wait_until_processed_bounded(
-        LSPLine(0), LSPLine(10),
-        timeout=5.0, health_check=_noop_health_check, check_interval=5.0,
-    )
-    elapsed = time.monotonic() - start
 
-    assert ok
-    # Lower bound: it actually waited out the grace window (a no-op stamp
-    # would return instantly and silently void this test).
-    assert elapsed >= _GRACE
-    # Upper bound: it woke on grace expiry, not the 5s check_interval.
-    assert elapsed < _GRACE + 2.0
+# --------------------------------------------------------------------------
+# I-5: only a FULL push initializes, whatever the call site does
+# --------------------------------------------------------------------------
 
+async def test_a_differential_push_never_initializes():
+    # Mutation control M-8: drop the full-push rule from update and this reds.
+    state = FreshnessState()
+    tracker = ProcessingTracker(state)
+    await tracker.update(_partial(background_sorry=[(4, 2, 4, 7)]), OLDER)
+    assert not tracker.initialized and not tracker.fresh
+    assert tracker.get_sorry_ranges() == [(4, 2, 4, 7)]     # folded, not served
+    assert tracker.position_state(4) == processing.NOT_EVALUATED
+    await tracker.update({}, OLDER)                          # an ack initializes nothing
+    assert not tracker.initialized
+    await tracker.update(_full(), OLDER)                     # the full push does
+    assert tracker.initialized and tracker.fresh
+    assert tracker.get_sorry_ranges() == []                  # overwritten whole
+
+
+async def test_a_differential_push_updates_an_initialized_picture():
+    tracker = await _tracker()
+    await tracker.update(_partial(background_unprocessed1=[(3, 0, 7, 0)]), OLDER)
+    assert tracker.initialized
+    assert not tracker.line_reached(5)
+
+
+async def test_the_stamp_is_the_last_folded_push():
+    state = FreshnessState()
+    tracker = await _tracker(state)
+    assert tracker.document_version == 0
+    await tracker.update({}, NEWER)
+    assert tracker.document_version == NEWER
+
+
+async def test_reset_forgets_the_picture_and_its_stamp():
+    tracker = await _tracker()
+    await tracker.reset()
+    assert not tracker.initialized and tracker.document_version is None
+    assert not tracker.line_reached(5)
+
+
+# --------------------------------------------------------------------------
+# The waits on the tracker's own condition
+# --------------------------------------------------------------------------
 
 async def test_line_reached_wait_returns_despite_trailing_run():
     """wait_until_line_reached_bounded keys on the FRONTIER, not prefix-quiet: it
     returns as soon as the dest line leaves unprocessed, even with an earlier
     command still running (so the eval loop can decide complete vs in_progress)."""
-    tracker = ProcessingTracker()
-    await tracker.update({
-        "background_unprocessed1": [],
-        "background_running1": [(7, 0, 7, 0)],
-    })
+    tracker = await _tracker(running=[(7, 0, 7, 0)])
     ok = await tracker.wait_until_line_reached_bounded(
         LSPLine(9), timeout=5.0, health_check=_noop_health_check,
     )
@@ -140,56 +222,40 @@ async def test_line_reached_wait_returns_despite_trailing_run():
 
 
 async def test_line_reached_wait_times_out_when_unreached():
-    tracker = ProcessingTracker()
-    await tracker.update({"background_unprocessed1": [(3, 0, 9, 0)]})
+    tracker = await _tracker(unprocessed=[(3, 0, 9, 0)])
     ok = await tracker.wait_until_line_reached_bounded(
         LSPLine(5), timeout=0.1, health_check=_noop_health_check,
     )
     assert not ok
 
 
-async def test_reset_keeps_global_grace():
-    """reset() clears per-file decoration state; the global edit clock is not
-    per-file state and must survive (the edit still happened)."""
-    tracker = ProcessingTracker()
-    await tracker.update({"background_unprocessed1": []})
-    note_edit_sent()
-    await tracker.reset()
-    assert not tracker.line_reached(5)  # uninitialized again
-    await tracker.update({"background_unprocessed1": []})
-    assert not tracker.line_reached(5)  # still inside the global grace window
-    await asyncio.sleep(_GRACE + 0.05)
-    assert tracker.line_reached(5)
+async def test_a_wait_wakes_on_the_push_that_makes_the_picture_fresh():
+    state = FreshnessState()
+    state.advance(OLDER)
+    tracker = await _tracker(state)
+    state.advance(NEWER)                      # unfresh until the push at NEWER
 
+    async def push():
+        await asyncio.sleep(0.02)
+        await tracker.update({}, NEWER)
 
-def test_read_grace_env_parsing(monkeypatch):
-    """Invalid env falls back to the default with a warning (no import crash)."""
-    monkeypatch.setenv("ISABELLE_MCP_DECORATION_GRACE", "not-a-number")
-    assert processing._read_grace() == 2.0
-    monkeypatch.setenv("ISABELLE_MCP_DECORATION_GRACE", "0.7")
-    assert processing._read_grace() == 0.7
-    monkeypatch.delenv("ISABELLE_MCP_DECORATION_GRACE")
-    assert processing._read_grace() == 2.0
+    task = asyncio.ensure_future(push())
+    ok = await tracker.wait_until_processed_bounded(
+        LSPLine(0), LSPLine(10), timeout=5.0, health_check=_noop_health_check,
+        check_interval=5.0,
+    )
+    await task
+    assert ok
 
 
 # --------------------------------------------------------------------------
 # position_state — the definite answer line_reached cannot give
 # --------------------------------------------------------------------------
 
-async def _tracker(**ranges) -> ProcessingTracker:
-    tracker = ProcessingTracker()
-    await tracker.update({
-        "background_unprocessed1": ranges.get("unprocessed", []),
-        "background_running1": ranges.get("running", []),
-        "background_canceled": ranges.get("canceled", []),
-    })
-    return tracker
-
-
 async def test_position_state_never_evaluated_tracker():
     # No decoration has ever arrived: nothing is processed, which is what the
     # caller must act on — not "unknown".
-    assert ProcessingTracker().position_state(5) == processing.NOT_EVALUATED
+    assert ProcessingTracker(FreshnessState()).position_state(5) == processing.NOT_EVALUATED
 
 
 async def test_position_state_reports_each_decoration():
@@ -215,22 +281,25 @@ async def test_position_state_follows_isabelle_precedence():
     assert t.position_state(5) == processing.RUNNING
 
 
-async def test_position_state_is_unknown_inside_the_grace_window():
-    t = await _tracker()
+async def test_position_state_is_unknown_while_the_picture_is_not_fresh():
+    state = FreshnessState()
+    t = await _tracker(state)
     assert t.position_state(5) == processing.PROCESSED
-    note_edit_sent()
-    # The cache may still describe the pre-edit document, and nothing covers the
+    state.advance(NEWER)
+    # The picture describes an older document state, and nothing covers the
     # line to prove otherwise.
     assert t.position_state(5) == processing.UNKNOWN
-    await asyncio.sleep(_GRACE + 0.05)
+    await t.update({}, NEWER)
     assert t.position_state(5) == processing.PROCESSED
 
 
-async def test_position_state_stays_definite_inside_the_grace_window():
-    # A stale cache can only over-report work as unfinished, so a range covering
-    # the line is still trustworthy — only its ABSENCE is not.
-    t = await _tracker(unprocessed=[(5, 0, 5, 0)])
-    note_edit_sent()
+async def test_position_state_stays_definite_while_the_picture_is_not_fresh():
+    # The unprocessed scan comes first: not_evaluated is the least-finished
+    # verdict and the caller answers it by evaluating, so a range covering the
+    # line is still answered — only its ABSENCE is not.
+    state = FreshnessState()
+    t = await _tracker(state, unprocessed=[(5, 0, 5, 0)])
+    state.advance(NEWER)
     assert t.position_state(5) == processing.NOT_EVALUATED
 
 
@@ -267,11 +336,11 @@ async def test_range_state_reports_how_long_a_command_has_been_running():
 
 
 # --------------------------------------------------------------------------
-# The full-push invariant: what the client builds a tracker from
+# The full-push invariant: what makes a picture of the whole document
 # --------------------------------------------------------------------------
 
 def test_a_full_push_names_every_tracked_type():
-    from isabelle_mcp.processing import _TRACKED_TYPES, is_full_decoration_push
+    from isabelle_mcp.processing import _TRACKED_TYPES
     full = {typ: [] for typ in _TRACKED_TYPES}
     assert is_full_decoration_push(full)
     assert is_full_decoration_push({**full, "text_keyword1": []})   # extras are fine
@@ -283,10 +352,10 @@ def test_a_full_push_names_every_tracked_type():
 
 
 @pytest.mark.asyncio
-async def test_initialized_reads_whether_a_push_was_folded_in():
-    tracker = ProcessingTracker()
+async def test_initialized_reads_whether_a_full_push_was_folded_in():
+    tracker = ProcessingTracker(FreshnessState())
     assert not tracker.initialized
-    await tracker.update({"background_unprocessed1": []})
+    await tracker.update(_full(), OLDER)
     assert tracker.initialized
     await tracker.reset()
     assert not tracker.initialized

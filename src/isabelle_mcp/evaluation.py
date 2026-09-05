@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import anyio
 import asyncio
+import contextvars
 import logging
 import os
 import time
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -25,24 +27,23 @@ from isabelle_mcp.lsp_client import (
     PRECOMPILED_MODIFIED_ERROR,
     IsabelleLSPClient,
     _canon,
-    _stat_sigs,
+    parse_theory_status,
 )
 from isabelle_mcp.models import (
     EvaluationView,
     FileSnapshot,
     RunningCommand,
     TheoryStatus,
+    TheoryStatusRecord,
 )
-from isabelle_mcp import processing
 from isabelle_mcp.processing import (
     CANCELLED,
     NOT_EVALUATED,
     PROCESSED,
     RUNNING,
     UNKNOWN,
-    _grace_remaining,
+    at_least_as_new,
     clip_line_range,
-    note_edit_sent,
 )
 from isabelle_mcp.utils import (
     IsabelleCatastrophe,
@@ -50,6 +51,7 @@ from isabelle_mcp.utils import (
     LSPCharacter,
     LSPLine,
     MCPLine,
+    OwnedLock,
     acquire_within,
     plural,
     resolve_caret,
@@ -108,6 +110,17 @@ CANCEL_OUTCOME_NOTHING_RUNNING = "nothing_running"
 # held by a cancellation (R5); the teardown that follows a catastrophe runs
 # outside it and is bounded by its own segments.
 CANCEL_TOTAL_BUDGET: float = 150.0
+
+# The one bound of every freshness wait (wait_until_fresh): five minutes, then
+# the catastrophe. Normal waits end in well under a second (the prover assigns
+# the flushed version, the server publishes every visible file within
+# editor_output_delay + vscode_output_delay of that); what can hold one past
+# this bound is a server that stopped acknowledging or a writer rewriting
+# theory/ML files continuously for five minutes -- no answer can be served on
+# a picture that never became fresh, so no fallback branch exists. A WARNING
+# is logged once after FRESHNESS_WARNING_AFTER seconds. (User-approved: D-F/D-H.)
+FRESHNESS_TIMEOUT: float = 300.0
+FRESHNESS_WARNING_AFTER: float = 10.0
 
 # Approved copy (R-D4): the two success sentences.
 CANCEL_MESSAGES = {
@@ -213,8 +226,11 @@ INTERRUPTED_NOTE = (
     "its output may be incomplete."
 )
 
-# "a file", not "this file": the distrust comes from a GLOBAL edit clock, so the
-# change that armed it may have been to a different file.
+# Frozen text (agent-visible; user: the old wording stays). "a file", not "this
+# file": the newest document version is client-wide, so the version that made
+# the picture unfresh may have come from a change to a different file. Since
+# the guard waits until fresh before judging, this is served only in the race
+# between that wait's end and the read under the lock.
 UNKNOWN_POSITION_MESSAGE = (
     "Cannot tell whether {file}:{line} has been evaluated: a file changed a "
     "moment ago, so the processing state is not yet trustworthy. Retry in a few "
@@ -260,36 +276,14 @@ def _resolve_line(value: int, total_lines: int) -> MCPLine:
     return MCPLine(value)
 
 
-def _parse_theory_status(raw: dict) -> TheoryStatus:
-    """The one entry of prover paths into the Python side: ``node_name`` leaves
-    here canonical (:func:`_canon`), so every map keyed by it and every
-    comparison against an ``open_documents`` key agrees with the client's own
-    keying — a symlinked node_name never splits one file into two.
-
-    An empty node (a theory with no file) stays empty: ``os.path.realpath("")``
-    is the current directory, and the truth tests on ``node_name`` rely on the
-    empty string.
-    """
-    node = raw.get("node_name", "")
-    return TheoryStatus(
-        node_name=_canon(node) if node else "",
-        theory_name=raw.get("theory_name", ""),
-        external=raw.get("external", False),
-        imports=[imp["theory_name"] for imp in raw.get("imports", [])],
-        ok=raw.get("ok", True),
-        total=raw.get("total", 0),
-        unprocessed=raw.get("unprocessed", 0),
-        running=raw.get("running", 0),
-        warned=raw.get("warned", 0),
-        failed=raw.get("failed", 0),
-        finished=raw.get("finished", 0),
-        canceled=raw.get("canceled", False),
-        consolidated=raw.get("consolidated", False),
-        percentage=raw.get("percentage", 0),
-    )
+# The row parser lives with the wire (lsp_client.parse_theory_status). No
+# production code calls this alias any more (request_theory_status parses the
+# rows itself into a TheoryStatusRecord); it stays for the tests that build
+# rows by hand and for the docstring references below.
+_parse_theory_status = parse_theory_status
 
 
-def _find_theory_name(file_path: str, theories: list[TheoryStatus]) -> str | None:
+def _find_theory_name(file_path: str, theories: Iterable[TheoryStatus]) -> str | None:
     path = _canon(file_path)
     return next((t.theory_name for t in theories if t.node_name == path), None)
 
@@ -661,10 +655,49 @@ def last_evaluation_was_cancelled() -> bool:
 # cancel_evaluation (R-D8): it keeps the lock for the whole cancel request, so
 # every other tool call — evaluation_status and terminate included — queues
 # behind a cancellation; every await under the lock there has an explicit bound.
-_evaluation_state_lock = asyncio.Lock()
+# An OwnedLock: its ``held`` ContextVar makes I-8 checkable -- no flush request
+# and no wait_until_fresh may be awaited while this lock is held (the wait's
+# bound exceeds the cancel's whole budget, and every escape hatch takes this
+# lock).
+_evaluation_state_lock = OwnedLock("isabelle_mcp_evaluation_lock_held")
 
-# Sentinel for "dependency never stat'd before" (its recorded value may be None).
-_UNSEEN: object = object()
+# The entry record: the theory_status the tool entry pulled for THIS call
+# (resync_and_check_freshness step 3). A ContextVar, not a client attribute:
+# tool calls overlap by design, and each reads the record its own entry wrote.
+# Its contract is I-1b alone: its stamp is at least as new as the entry's flush
+# reply version; it is written unconditionally, never gated on freshness.
+_entry_record: contextvars.ContextVar[TheoryStatusRecord | None] = contextvars.ContextVar(
+    "isabelle_mcp_entry_record", default=None,
+)
+
+
+def set_entry_record(record: TheoryStatusRecord) -> None:
+    _entry_record.set(record)
+
+
+def entry_record() -> TheoryStatusRecord:
+    """The entry record of the call in flight. Reading it before the entry ran
+    is a programming error, not a state to degrade into."""
+    record = _entry_record.get()
+    if record is None:
+        raise RuntimeError("no entry record: the tool entry has not run in this call")
+    return record
+
+
+# A record that predates every picture: document_version 0 is Version.init's id,
+# older than everything, so any initialized picture is at least as new as it.
+# Used where a report must be rendered before any theory_status was pulled.
+_NO_RECORD = TheoryStatusRecord(document_version=0, theories=())
+
+
+def _record_fresh(client: IsabelleLSPClient, record: TheoryStatusRecord) -> bool:
+    """A record fresh in the full sense: its stamp is at least as new as the
+    newest version the client has seen, and no unflushed content stands. A
+    local comparison -- no request -- so it may be asked under the lock."""
+    return (
+        at_least_as_new(record.document_version, client.freshness.newest_document_version)
+        and not client.freshness.unflushed_content
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -673,7 +706,7 @@ _UNSEEN: object = object()
 
 async def _build_status_snapshot(
     client: IsabelleLSPClient,
-) -> tuple[list[TheoryStatus], list[RunningCommand]]:
+) -> tuple[TheoryStatusRecord, list[RunningCommand]]:
     """Pull theory_status, auto-open every failed theory, collect running commands.
 
     Auto-opening a not-ok theory (load-bearing side effect) gives it a decoration
@@ -684,21 +717,32 @@ async def _build_status_snapshot(
     the unified close is the one closer and closes such a file the moment it
     is settled. No diagnostics are read — the snapshot is built from
     decoration + theory_status (see :func:`_build_file_snapshot`).
-    """
-    raw_theories = await client.request_theory_status()
-    theories = [_parse_theory_status(t) for t in raw_theories]
 
-    for t in theories:
+    When the auto-open opened something, ONE wait until fresh over every open
+    document follows: the didOpen creates a version that un-freshens every
+    other file's picture, and their acknowledgements arrive in the same server
+    batch as the new file's first push, so waiting for all costs no more than
+    waiting for one. A call that opened nothing waits for nothing (its tracker
+    reads are in the under-reporting direction, and the report falls back to
+    counts under the stamp arbitration for at most one output delay).
+    """
+    record = await client.request_theory_status()
+
+    opened = False
+    for t in record.theories:
         if not t.ok and t.node_name and t.node_name not in client.open_documents:
             try:
                 await client.open_document(t.node_name)
+                opened = True
             except OSError:
                 # open failed before didOpen (e.g. unreadable path): nothing to
                 # report with line numbers, the count fallback still lists it.
                 logger.debug("auto-open of %s failed", t.node_name, exc_info=True)
+    if opened:
+        await wait_until_fresh(client, list(client.open_documents))
 
     running_commands = client.get_all_running_commands()
-    return theories, running_commands
+    return record, running_commands
 
 
 # ---------------------------------------------------------------------------
@@ -772,9 +816,19 @@ def _build_file_snapshot(
     client: IsabelleLSPClient,
     file_path: str,
     ts_map: dict[str, TheoryStatus],
+    document_version: int,
     dest_line: MCPLine | None = None,
 ) -> FileSnapshot:
-    """One file's problem snapshot. Decoration if current, else theory_status counts.
+    """One file's problem snapshot: from the decoration cache when it is a picture
+    at least as new as the theory_status it is paired with, else from that
+    theory_status's counts.
+
+    *document_version* is the stamp of the theory_status record the caller
+    judged on (its rows are *ts_map*). The arbitration is by stamp (D-E 乙): a
+    tracker that is initialized (a picture of the whole document, I-5) and whose
+    picture stamp is at least as new as the record's describes the same or a
+    newer document state, so its line numbers are trusted; an older picture, or
+    a slice of one, falls back to the counts.
 
     Built fully synchronously (no await between getter reads) so every getter reads
     one consistent tracker state. *dest_line* (set only for the evaluation target)
@@ -789,50 +843,34 @@ def _build_file_snapshot(
     # it. Do not unify with evaluate_to's count of real lines.
     n_lines = (doc.content.count("\n") + 1) if doc else None
 
-    if tracker is not None:
-        bad = tracker.get_bad_ranges()
+    if tracker is not None and tracker.stamp_at_least_as_new_as(document_version):
         sorry = tracker.get_sorry_ranges()
         oerr = tracker.get_overview_error_ranges()
-        owarn = tracker.get_overview_warning_ranges()
         running = tracker.get_running_ranges()
         unproc = tracker.get_unprocessed_ranges()
-        # bad and owarn stay in this test on purpose: neither is rendered, but
-        # either proves the decoration is fresh content. sorry is named here in
-        # its own right — the server also publishes a sorry as bad today (the
-        # distribution rendering is untouched), but nothing may rely on that.
-        deco_has_content = bool(bad or sorry or oerr or owarn or running or unproc)
-        # theory_status reports a problem/activity the decoration should reflect.
-        ts_active_or_problem = ts is not None and (
-            ts.unprocessed > 0 or ts.running > 0 or ts.failed
+        # errors = text_overview_error and nothing else: a sorry gets its own
+        # row and no count, and the prover's other "bad" commands (a benign
+        # `back`, say) render nothing.
+        errors = _merge_spans(_line_spans(oerr, n_lines))
+        sorry_spans = _merge_spans(_line_spans(sorry, n_lines))
+        running_spans = _line_spans(running, n_lines)
+        pending_spans = (
+            _pending_spans(unproc, int(dest_line.to_lsp()), n_lines)
+            if dest_line is not None else []
         )
-        # Trust decoration when it carries content, or when theory_status agrees
-        # there is nothing to show. Only fall back when theory_status reports a
-        # problem/activity that the (stale) decoration does NOT reflect — e.g. a
-        # dependency re-invalidated by an edit, whose decoration lags.
-        if deco_has_content or not ts_active_or_problem:
-            # errors = text_overview_error and nothing else: a sorry gets its own
-            # row and no count, and the prover's other "bad" commands (a benign
-            # `back`, say) render nothing.
-            errors = _merge_spans(_line_spans(oerr, n_lines))
-            sorry_spans = _merge_spans(_line_spans(sorry, n_lines))
-            running_spans = _line_spans(running, n_lines)
-            pending_spans = (
-                _pending_spans(unproc, int(dest_line.to_lsp()), n_lines)
-                if dest_line is not None else []
-            )
-            if errors:
-                state = "problems"
-            elif running_spans or pending_spans:
-                state = "in_progress"
-            else:
-                state = "clean"
-            return FileSnapshot(
-                file_path=file_path, lined=True, state=state,
-                errors=errors, sorry=sorry_spans, running=running_spans,
-                pending=pending_spans,
-                error_count=len(errors), running_count=len(running_spans),
-                pending_count=len(pending_spans),
-            )
+        if errors:
+            state = "problems"
+        elif running_spans or pending_spans:
+            state = "in_progress"
+        else:
+            state = "clean"
+        return FileSnapshot(
+            file_path=file_path, lined=True, state=state,
+            errors=errors, sorry=sorry_spans, running=running_spans,
+            pending=pending_spans,
+            error_count=len(errors), running_count=len(running_spans),
+            pending_count=len(pending_spans),
+        )
 
     # theory_status fallback (counts only, no line numbers)
     if ts is None:
@@ -858,7 +896,7 @@ def _listed_by_theory_status(t: TheoryStatus) -> bool:
 
 
 def _unprocessed_theory_count(
-    client: IsabelleLSPClient, theories: list[TheoryStatus], rendered: set[str],
+    client: IsabelleLSPClient, theories: Iterable[TheoryStatus], rendered: set[str],
 ) -> int:
     """The summary line's N: the imported theories with unprocessed commands
     that the report does not show per file.
@@ -879,6 +917,7 @@ def _unprocessed_theory_count(
     reason (this run's target, a decoration-scanned open document). A file with
     its own section is never also counted here.
     """
+    theories = list(theories)
     imported: set[str] = set()
     for path in client.open_documents:
         name = _find_theory_name(path, theories)
@@ -892,14 +931,14 @@ def _unprocessed_theory_count(
 
 
 def _summary_count(
-    client: IsabelleLSPClient, theories: list[TheoryStatus], files: list[FileSnapshot],
+    client: IsabelleLSPClient, theories: Iterable[TheoryStatus], files: list[FileSnapshot],
 ) -> int:
     """:func:`_unprocessed_theory_count` for the snapshots a report renders."""
     return _unprocessed_theory_count(client, theories, {fs.file_path for fs in files})
 
 
 def _relevant_files(
-    client: IsabelleLSPClient, target: str, theories: list[TheoryStatus],
+    client: IsabelleLSPClient, target: str, theories: Iterable[TheoryStatus],
 ) -> list[str]:
     """The files a report shows, in order — the explicit union of three parts:
 
@@ -912,10 +951,12 @@ def _relevant_files(
     2. every theory_status row with something failed or running, over the WHOLE
        document model, not just the target's import closure (a broken library
        import is reported until it is fixed) — node_names are canonical from
-       :func:`_parse_theory_status`, so a symlinked spelling cannot list one
+       :func:`parse_theory_status`, so a symlinked spelling cannot list one
        file twice or miss the ts_map;
     3. every open document whose decoration tracker holds a bad, sorry,
-       text_overview_error or running range.
+       text_overview_error or running range — read whatever the tracker's
+       freshness: selecting a file for a report is the under-reporting
+       direction (I-4), the snapshot itself is arbitrated by stamp.
 
     Part 3 is the only way a file that theory_status sees nothing wrong with
     gets into a report: theory_status is blind to ``sorry``, so a file whose
@@ -947,17 +988,19 @@ def _has_rows(fs: FileSnapshot) -> bool:
 def _snapshot_files(
     client: IsabelleLSPClient,
     target: str,
-    theories: list[TheoryStatus],
+    record: TheoryStatusRecord,
     dest_line: MCPLine | None = None,
 ) -> list[FileSnapshot]:
     """One snapshot per relevant file (:func:`_relevant_files`), synchronous so
-    every snapshot reads one tracker state.
+    every snapshot reads one tracker state; *record* is the theory_status the
+    snapshots are judged against, its stamp arbitrating decoration versus counts.
 
     A file that only part 3 of the union brought in and that renders no row —
     a benign ``background_bad`` range such as ``back`` — is left out: its
     snapshot would say nothing but ``clean``. The target and the theory_status
     rows keep their snapshots whatever they render.
     """
+    theories = record.theories
     ts_map = {t.node_name: t for t in theories}
     listed = {t.node_name for t in theories if _listed_by_theory_status(t)}
     out: list[FileSnapshot] = []
@@ -965,7 +1008,8 @@ def _snapshot_files(
         # Only the evaluation target gets dest_line — pending is the prefix
         # [0, dest] of the file actually being evaluated; other files have no
         # destination.
-        fs = _build_file_snapshot(client, f, ts_map, dest_line if f == target else None)
+        fs = _build_file_snapshot(
+            client, f, ts_map, record.document_version, dest_line if f == target else None)
         if f == target or f in listed or not fs.lined or _has_rows(fs):
             out.append(fs)
     return out
@@ -1058,12 +1102,11 @@ class _HitWatch:
             # Would-be "elsewhere": re-fetch once and recompute before the
             # verdict is final.
             try:
-                raw = await client.request_theory_status()
+                record = await client.request_theory_status()
             except IsabelleToolError:
                 pass   # keep the stale verdict; the notice still delivers
             else:
-                theories = [_parse_theory_status(t) for t in raw]
-                theory_set = evaluation_theory_set(self._target, theories)
+                theory_set = evaluation_theory_set(self._target, list(record.theories))
                 if real in theory_set:
                     return True
             self._classified.add(hit_id)   # elsewhere: the notice stands
@@ -1076,17 +1119,22 @@ async def _evaluation_wait_loop(
     state: EvaluationState,
     evaluation: Evaluation,
     timeout: float,
-) -> tuple[str, list[TheoryStatus], list[RunningCommand]]:
+) -> tuple[str, TheoryStatusRecord, list[RunningCommand]]:
     """Wait until the frontier reaches the run's target, or *timeout*.
 
     The target is ``state.destination_line``, read afresh each round right
     before the frontier decision: a second request on the same file advances
     it while this loop is waiting, and a copy taken at entry would judge the
     old target.
+
+    The per-poll reads are in the under-reporting direction and are woken by
+    the push itself, so no poll waits for freshness; the report falls back to
+    counts under the stamp arbitration for at most one output delay after a
+    version advance.
     """
     deadline = time.monotonic() + timeout
     last_restat = time.monotonic()
-    theories: list[TheoryStatus] = []
+    record = _NO_RECORD
     hit_watch = _HitWatch(client, file_path)
     while True:
         if evaluation.outcome or not state.active:
@@ -1096,7 +1144,7 @@ async def _evaluation_wait_loop(
             # get_all_running_commands is a synchronous read of local state.
             return (
                 evaluation.outcome or "cancelled",
-                theories,
+                record,
                 client.get_all_running_commands(),
             )
         now = time.monotonic()
@@ -1104,30 +1152,31 @@ async def _evaluation_wait_loop(
             last_restat = now
             # Push any edit that landed mid-evaluation; PIDE re-checks incrementally.
             await resync_changed_open_documents_locked(client)
-        theories, running_commands = await _build_status_snapshot(client)
+        record, running_commands = await _build_status_snapshot(client)
+        theories = list(record.theories)
         # The third exit condition, BEFORE the frontier decision: a parked
         # fork keeps the prefix busy, and returning a plain in_progress
         # there would bury the hit in a notice (section 6.1 wants the
         # result to lead with the hit report).
         if await hit_watch.hit_led_exit(theories):
-            return "hit", theories, client.get_all_running_commands()
+            return "hit", record, client.get_all_running_commands()
         # Decide the instant the frontier reaches dest: prefix quiet → complete;
-        # otherwise return in_progress NOW (no grace). Trailing forks are reported
+        # otherwise return in_progress NOW. Trailing forks are reported
         # (running/pending lines), not waited on — the caller polls to convergence.
         # No await between this read and the returns below, so the decision is
         # about one target.
         dest_line = state.destination_line
         if _frontier_reached(file_path, dest_line, client, theories):
             if _prefix_quiet(file_path, dest_line, client):
-                return "complete", theories, running_commands
-            return "in_progress", theories, running_commands
+                return "complete", record, running_commands
+            return "in_progress", record, running_commands
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return "in_progress", theories, running_commands
+            return "in_progress", record, running_commands
         tracker = client.get_processing_tracker(file_path)
         if tracker:
             # Wake when the frontier reaches dest (not when the whole prefix is
-            # quiet), so the decision above is prompt and never a pseudo-grace.
+            # quiet), so the decision above is prompt and adds no delay of its own.
             await tracker.wait_until_line_reached_bounded(
                 dest_line.to_lsp(),
                 timeout=min(remaining, 5.0),
@@ -1273,10 +1322,9 @@ async def evaluate_to(
         # notification is on the wire ahead of any cancel request by
         # construction -- not by there happening to be no checkpoint between
         # the release and the write. Bounded by SEND_TIMEOUT.
-        # No freshness invalidation here: every edit-send path calls
-        # note_edit_sent (didOpen/didChange/dep change), and a caret-only move
-        # cannot make stale decorations claim "processed" for work that isn't
-        # (see note_edit_sent's docstring).
+        # A caret move is not content: it creates no version the client must
+        # wait for; the pictures stay fresh until a stamped message carries the
+        # perspective version, after which every visible file is acknowledged.
         if is_target:
             try:
                 await client.set_caret(file_path, dest_line.to_lsp(), lsp_char)
@@ -1297,7 +1345,13 @@ async def evaluate_to(
                 raise
 
     try:
-        status, theories, running_commands = await _evaluation_wait_loop(
+        # The FIRST statement inside this try, not in the gap after the lock
+        # block: a flush answering an error (or a cancellation) during this wait
+        # must reach the handler below, which leaves the run; otherwise the run
+        # started by join_or_start would wedge busy_with_another_file for every
+        # later call. The wait owns its flush; the didOpen above is covered.
+        await wait_until_fresh(client, [file_path])
+        status, record, running_commands = await _evaluation_wait_loop(
             client, file_path, evaluation_state, evaluation,
             HEAP_POLL_INTERVAL if heap_warning else EVAL_POLL_INTERVAL,
         )
@@ -1306,15 +1360,15 @@ async def evaluate_to(
         # the only clearer of the flag and it always stamps.
         if (heap_warning and status not in ("complete", "hit")
                 and not evaluation.outcome and evaluation_state.owns(evaluation)):
-            # The miss may be only the post-edit grace gate (a concurrent edit
-            # re-armed it inside the short heap budget) — an unmodified precompiled
-            # file replays instantly once the gate opens. Re-check past the gate
-            # before declaring the file divergent and telling the agent not to retry.
-            grace = _grace_remaining()
-            if grace > 0:
-                status, theories, running_commands = await _evaluation_wait_loop(
-                    client, file_path, evaluation_state, evaluation,
-                    grace + 0.2,
+            # The miss may be only an unfresh picture (a concurrent edit landed
+            # inside the short heap budget) — an unmodified precompiled file
+            # replays instantly. One wait until fresh and one re-run before
+            # declaring the file divergent and telling the agent not to retry.
+            tracker = client.get_processing_tracker(file_path)
+            if tracker is None or not tracker.fresh:
+                await wait_until_fresh(client, [file_path])
+                status, record, running_commands = await _evaluation_wait_loop(
+                    client, file_path, evaluation_state, evaluation, HEAP_POLL_INTERVAL,
                 )
     except BaseException:
         # CancelledError is a BaseException (the old ``except Exception`` missed it)
@@ -1343,7 +1397,8 @@ async def evaluate_to(
     # an iteration's awaits (the loop samples ``active`` only at the top).
     if evaluation.outcome:
         status = evaluation.outcome
-    files = _snapshot_files(client, file_path, theories, dest_line)
+    theories = list(record.theories)
+    files = _snapshot_files(client, file_path, record, dest_line)
     if client.process is None:
         # The prover is gone from under this run: torn down by isabelle_terminate,
         # a relaunch, or the catastrophe handler. That fact, not
@@ -1436,7 +1491,7 @@ def _no_evaluation_view() -> EvaluationView:
 
 
 def _no_pending_work(
-    client: IsabelleLSPClient, theories: list[TheoryStatus],
+    client: IsabelleLSPClient, theories: Iterable[TheoryStatus],
 ) -> bool:
     """Whether there is genuinely nothing left to watch or cancel.
 
@@ -1458,18 +1513,18 @@ def _no_pending_work(
     )
 
 
-def _idle_view(client: IsabelleLSPClient, theories: list[TheoryStatus]) -> EvaluationView:
+def _idle_view(client: IsabelleLSPClient, record: TheoryStatusRecord) -> EvaluationView:
     """The status when no run is outstanding and nothing is running: every
     error that still stands, in every file, with line numbers where a
     decoration tracker has them.
 
     The same data path as the busy report (``_snapshot_files`` over the
-    post-debounce theory_status, after the auto-open of every failed theory),
-    with no target: a session-level picture, not the last run's. The first
-    line's count is taken from the very snapshots rendered below it, so the
-    two cannot disagree.
+    theory_status pulled after the entry wait, after the auto-open of every
+    failed theory), with no target: a session-level picture, not the last
+    run's. The first line's count is taken from the very snapshots rendered
+    below it, so the two cannot disagree.
     """
-    files = _snapshot_files(client, "", theories)
+    files = _snapshot_files(client, "", record)
     n_failed = sum(fs.error_count for fs in files)
     message = (
         IDLE_FAILED_SENTENCE.format(remain=failed_remain_sentence(n_failed))
@@ -1477,32 +1532,29 @@ def _idle_view(client: IsabelleLSPClient, theories: list[TheoryStatus]) -> Evalu
     )
     return EvaluationView(
         status="no_evaluation", message=message, files=files,
-        unprocessed_theories=_summary_count(client, theories, files),
+        unprocessed_theories=_summary_count(client, record.theories, files),
     )
 
 
 async def evaluation_status(
     client: IsabelleLSPClient,
 ) -> EvaluationView:
-    # Everything this tool answers is read from the decoration cache, which
-    # describes the pre-edit document for DECORATION_GRACE after an edit (the
-    # tool entry's own resync may have just sent one). Debounce: wait until the
-    # window has passed with no further edit -- under continuous editing the
-    # tool deliberately waits for the edits to stop rather than answer from a
-    # cache known to be stale. Polling during a run sends no edit, so it pays
-    # nothing here.
-    while (grace := _grace_remaining()) > 0:
-        await asyncio.sleep(grace)
+    # Everything this tool answers is read from the decoration cache: wait
+    # until every open document's picture is fresh (the tool entry's own
+    # resync may have just sent an edit). Bounded, health-checked; polling
+    # during a run sends no edit, so it pays one flush round trip here.
+    await wait_until_fresh(client, list(client.open_documents))
 
     # Capture the run handle BEFORE the await: the round trip below is the one
     # window in which another run can take over, and the stamp must go to the
     # run this call judged, never to a successor (D-B12).
     evaluation = evaluation_state.current
-    # One theory_status, pulled AFTER the debounce, decides idle-or-busy and
-    # feeds the report: the answer describes the post-edit document either way.
-    theories, running_commands = await _build_status_snapshot(client)
+    # One theory_status, pulled AFTER the wait, decides idle-or-busy and feeds
+    # the report: the answer describes the post-edit document either way.
+    record, running_commands = await _build_status_snapshot(client)
+    theories = list(record.theories)
     if _no_pending_work(client, theories):
-        return _idle_view(client, theories)
+        return _idle_view(client, record)
 
     # A target exists only while a run is outstanding. ``file_path`` and
     # ``destination_line`` are never reset (the footer still reads them), so
@@ -1517,7 +1569,7 @@ async def evaluation_status(
     complete = dest_line is not None and _is_evaluation_complete(
         target, dest_line, client, theories,
     )
-    files = _snapshot_files(client, target, theories, dest_line)
+    files = _snapshot_files(client, target, record, dest_line)
     n_unprocessed = _summary_count(client, theories, files)
     # Only the active evaluation owns the completion; once ``active`` is False
     # we are merely surfacing a lingering fork, which must stay visible (not
@@ -1580,10 +1632,11 @@ async def _progress_view(client: IsabelleLSPClient) -> EvaluationView:
     its bounded wait ran out: the same picture ``evaluation_status`` paints,
     minus that tool's terminal transition — a query reports, it never ends a
     run. The caller holds no lock; the run must be active."""
-    theories, running_commands = await _build_status_snapshot(client)
+    record, running_commands = await _build_status_snapshot(client)
+    theories = list(record.theories)
     target = evaluation_state.file_path
     dest_line = evaluation_state.destination_line
-    files = _snapshot_files(client, target, theories, dest_line)
+    files = _snapshot_files(client, target, record, dest_line)
     return EvaluationView(
         status="in_progress",
         target_file=target,
@@ -1614,62 +1667,6 @@ async def resync_changed_open_documents_locked(client: IsabelleLSPClient) -> Non
         await client.resync_changed_open_documents()
 
 
-async def _dependency_freshness_wait(client: IsabelleLSPClient) -> float:
-    """Layer 3 detection: how long to wait for the server to notice a fresh dep edit.
-
-    Dependency files (external imports + ``.ML`` blobs, identified by ``external`` in
-    ``theory_status`` and not themselves editor-opened) are synced by Isabelle's own
-    File_Watcher, which has a ``vscode_load_delay`` debounce. If such a dep changed
-    since our last check **and** its mtime is within that debounce window, return the
-    delay so the caller waits before querying; otherwise return ``0``. Stat'ing runs
-    off the event loop. The dep set is bounded to the document model's non-heap nodes.
-
-    A dep seen for the first time counts as changed: we have no record to compare
-    against, and the edit that matters may be the one made just before it came
-    into view (a theory loaded by the last evaluation and edited since; a file
-    the unified close turned into a dep). The only way a first sighting is not
-    charged the grace window is a record written ahead of it — ``close_document``
-    seeds one, so the common case, a closed file that was not touched, is not.
-
-    The parsed theory_status is stashed on the client (``entry_theories``) for
-    the unified close that follows and for the paths that must answer without
-    a fresh round trip.
-    """
-    theories = [_parse_theory_status(t) for t in await client.request_theory_status()]
-    client.entry_theories = theories
-    dep_nodes = [
-        t.node_name for t in theories
-        if t.external and t.node_name and t.node_name not in client.open_documents
-    ]
-    if not dep_nodes:
-        client._dep_stat_sigs.clear()
-        return 0.0
-
-    sigs = await asyncio.to_thread(_stat_sigs, dep_nodes)
-    delay = client.vscode_load_delay
-    now = time.time()
-    need_wait = False
-    for node, sig in sigs.items():
-        prev = client._dep_stat_sigs.get(node, _UNSEEN)
-        if prev is _UNSEEN or sig != prev:
-            # A dep changed — or was deleted (sig None), or is seen for the
-            # first time — on disk: the server's File_Watcher will didChange
-            # it internally; an edit like any other, so start the decoration
-            # grace.
-            note_edit_sent()
-            # Phase D bookkeeping: the blob's serials may be dead — mark it
-            # for the next reconciliation pass.
-            from isabelle_mcp import debugger
-            debugger.registry.mark_dirty(node)
-            # sig = (ino, size, mtime_ns, ctime_ns); recent edit ⇒ within the debounce.
-            if sig is not None and (now - sig[2] / 1e9) < delay:
-                need_wait = True
-        client._dep_stat_sigs[node] = sig
-    for gone in set(client._dep_stat_sigs) - set(sigs):
-        del client._dep_stat_sigs[gone]
-    return delay if need_wait else 0.0
-
-
 async def close_settled_documents(client: IsabelleLSPClient) -> None:
     """The unified close: the one mechanism that closes documents.
 
@@ -1679,11 +1676,11 @@ async def close_settled_documents(client: IsabelleLSPClient) -> None:
     demotes every breakpoint on it). What stays open is exactly the evaluation
     targets and the files that still have something wrong or in flight.
 
-    Runs after the tool entry's sync backstop, so theory_status describes the
-    text the prover has absorbed. Non-blocking under the post-edit grace gate:
-    with an edit still settling, nothing is closed this round — the invariant
-    is "eventually", not "on every call" (the auto-open's own didOpen raises
-    the gate, so this deferral is systematic and must not become a wait).
+    Runs after the tool entry's flush and theory_status, so the entry record
+    describes the text the prover has absorbed. A round that closed at least
+    one file ends, after the lock block, with a flush: a close of an edited
+    file is a text edit the server absorbs in its didClose handler, and the
+    next served read must not rest on a picture older than it (I-3).
 
     Locks: ``_evaluation_state_lock`` — closing changes the document model,
     like the Layer-2 sync at the same entry — and then, bounded by
@@ -1704,15 +1701,14 @@ async def close_settled_documents(client: IsabelleLSPClient) -> None:
     lossless.
     """
     from isabelle_mcp import debugger
+    closed = False
     async with _evaluation_state_lock:
-        if _grace_remaining() > 0:
-            return
         async with acquire_within(debugger.registry.lock, SWEEP_LOCK_WAIT) as held:
             if not held:
                 logger.debug("unified close: registry.lock busy; skipping this round")
                 return
             exempt = {entry.file_path for entry in debugger.registry.entries}
-            ts_map = {t.node_name: t for t in client.entry_theories}
+            ts_map = {t.node_name: t for t in entry_record().theories}
             for path, doc in list(client.open_documents.items()):
                 if doc.is_evaluation_target or path in exempt:
                     continue
@@ -1726,31 +1722,123 @@ async def close_settled_documents(client: IsabelleLSPClient) -> None:
                 try:
                     with anyio.move_on_after(_CLOSE_TIMEOUT, shield=True):
                         await client.close_document(path)
+                        closed = True
                 except Exception:
                     logger.warning("unified close: failed to close %s", path, exc_info=True)
+    if closed:
+        await client.flush(resync_dependencies=False)
 
 
-async def resync_and_check_freshness(client: IsabelleLSPClient) -> None:
-    """Tool-call entry backstop: Layer 2 (open docs) + Layer 3 (dependency)
-    freshness, then the unified close.
+async def resync_and_check_freshness(
+    client: IsabelleLSPClient, *, cancel_tool: bool = False,
+) -> None:
+    """The tool-call entry (see ``_ensure_lsp_started``), in order:
 
-    Runs at the start of every tool call (see ``_ensure_lsp_started``). Layer 2
-    holds ``_evaluation_state_lock`` — it mutates document content/version. Layer 3
-    runs **lock-free**: it only issues a read-only ``theory_status`` request and
-    maintains its own ``_dep_stat_sigs``, touching no lock-protected state, so it must
-    not block (or be blocked by) the event-driven push path. The unified close
-    comes last: it judges from Layer 3's theory_status, which describes the
-    text the two sync layers have just pushed.
+    1. the open-document sync (didChange for changed open files, under the
+       evaluation lock — it mutates document content/version);
+    2. one flush request with ``resync_dependencies``: the server re-reads
+       every dependency file from disk (an edit where the bytes differ),
+       resolves imports, hands everything to the prover and names an assigned
+       version containing it all — the reply advances the newest version and
+       reconciles the unflushed content, and its ``changed_uris`` are marked
+       dirty for the breakpoint registry inside ``client.flush``;
+    3. one theory_status, stored as this call's entry record (unconditionally:
+       its contract is I-1b, its stamp is at least as new as step 2's reply
+       version);
+    4. the unified close, which flushes once more if it closed anything.
+
+    *cancel_tool* (passed by ``isabelle_cancel_evaluation`` alone) runs steps
+    1 and 3 only: the flush request is a precondition of trusting a picture,
+    not of acting, and a tool that serves no picture does not wait for a
+    document version — its local quiescence shortcut then answers only from
+    a record fresh in the full sense (see ``cancel_evaluation``).
     """
-    await resync_changed_open_documents_locked(client)   # Layer 2 (locked)
-    wait = await _dependency_freshness_wait(client)        # Layer 3 (lock-free)
-    if wait > 0:
-        logger.info(
-            "Dependency changed <%.2fs ago; waiting %.2fs for the server to notice it",
-            wait, wait,
-        )
-        await asyncio.sleep(wait)
-    await close_settled_documents(client)
+    await resync_changed_open_documents_locked(client)
+    if not cancel_tool:
+        await client.flush(resync_dependencies=True)
+    set_entry_record(await client.request_theory_status())
+    if not cancel_tool:
+        await close_settled_documents(client)
+
+
+async def wait_until_fresh(
+    client: IsabelleLSPClient, files: Iterable[str], *, deadline: float | None = None,
+) -> None:
+    """Wait until every open file among *files* has a fresh picture (§0 of the
+    plan: initialized, stamped at least as new as the newest version, read
+    while no unflushed content stands). The one helper behind every freshness
+    wait; one bound (FRESHNESS_TIMEOUT, or the caller's *deadline*), one
+    failure (the catastrophe).
+
+    The wait OWNS its flush: unflushed content can be discharged only by a
+    flush request, and a content send landing after the wait began (the file
+    watcher's sink runs between tool steps) would otherwise strand it. Each
+    round flushes, then parks on the client-level freshness condition until
+    EITHER every file in the wait set has an initialized tracker stamped at
+    least as new as the newest version, OR a content send landed past the
+    flush's snapshot (``content_sends != snapshot``, a pure state test on the
+    monotone counter) — in which case the round re-arms from the top. What is
+    returned is fresh in the full sense: the wait's own flush raised
+    ``content_sends_flushed`` to the snapshot and the final check saw no later
+    send.
+
+    The wait set and the per-file test are re-evaluated on EVERY pass: a file
+    no longer open leaves the set (the unified close runs at every other tool
+    entry; a closed file's readers answer the frozen not-open / not-evaluated
+    words, the under-reporting direction); an open file with no tracker, or an
+    uninitialized one, fails the test. Health-checked each pass, the 5 s
+    check interval as the backstop; a WARNING once after 10 s. Never awaited
+    under the evaluation lock (I-8).
+    """
+    if _evaluation_state_lock.held.get():
+        raise RuntimeError("I-8: wait_until_fresh awaited under _evaluation_state_lock")
+    started = time.monotonic()
+    if deadline is None:
+        deadline = started + FRESHNESS_TIMEOUT
+    wanted = [_canon(f) for f in files]
+    freshness = client.freshness
+    warned = False
+
+    def pictures_fresh() -> bool:
+        for path in wanted:
+            if path not in client.open_documents:
+                continue
+            tracker = client.get_processing_tracker(path)
+            if tracker is None or not tracker.stamp_at_least_as_new_as(
+                    freshness.newest_document_version):
+                return False
+        return True
+
+    def out_of_budget() -> IsabelleCatastrophe:
+        return IsabelleCatastrophe(
+            f"no fresh picture within {FRESHNESS_TIMEOUT:g}s for "
+            f"{[p for p in wanted if p in client.open_documents]}")
+
+    while True:
+        # checked at every round's head too: a caller looping wait-then-read
+        # under one budget must end at the bound even if every round is short
+        if time.monotonic() >= deadline:
+            raise out_of_budget()
+        _, snapshot = await client.flush(resync_dependencies=False)
+        async with freshness.condition:
+            while not (pictures_fresh() or freshness.content_sends != snapshot):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise out_of_budget()
+                if not warned and time.monotonic() - started >= FRESHNESS_WARNING_AFTER:
+                    warned = True
+                    logger.warning(
+                        "still waiting for a fresh picture after %.0fs (newest version %d): %s",
+                        FRESHNESS_WARNING_AFTER, freshness.newest_document_version, wanted)
+                try:
+                    await asyncio.wait_for(
+                        freshness.condition.wait(),
+                        timeout=min(remaining, client.PROGRESS_CHECK_INTERVAL))
+                except asyncio.TimeoutError:
+                    client._check_server_health(client.STALL_TIMEOUT)
+        if freshness.content_sends != snapshot:
+            continue   # a content send landed past the snapshot: re-arm from the top
+        return
 
 
 async def cancel_evaluation(
@@ -1767,8 +1855,16 @@ async def cancel_evaluation(
     passes through untouched: state reset, attribution withdrawn, no teardown.
     """
     async with _evaluation_state_lock:
-        # The entry theory_status: no request may be issued under this lock.
-        if _no_pending_work(client, client.entry_theories):
+        # The local quiescence shortcut answers only from an entry record that
+        # is fresh in the full sense (user ruling 乙): the cancel tool's entry
+        # issued no flush, so this round's own didChange may stand unflushed,
+        # or the newest version may have advanced past the record while this
+        # call waited for the lock. Otherwise the request body runs and the
+        # prover's own outcome answers ("Evaluation cancelled. Nothing was
+        # running." when nothing was). No request may be issued under this
+        # lock; the freshness test is a local comparison.
+        record = entry_record()
+        if _record_fresh(client, record) and _no_pending_work(client, record.theories):
             return _no_evaluation_view()
 
         from isabelle_mcp import debugger
@@ -1866,51 +1962,31 @@ async def _settled_position_state(
 ) -> str:
     """:func:`position_state`, but ``unknown`` is waited out rather than returned.
 
-    ``unknown`` means only that an edit landed within the last
-    ``DECORATION_GRACE`` seconds, so the cache cannot be trusted yet. Refusing on
-    it would be unhelpful (the agent can do nothing but retry) and re-evaluating
+    ``unknown`` means only that the file's picture is not fresh. Refusing on it
+    would be unhelpful (the agent can do nothing but retry) and re-evaluating
     on it would be wasteful (the line may have finished minutes ago), so the
-    guard simply waits the window out and asks again.
+    guard waits until fresh and asks again, under the one budget: a content
+    send landing between a wait's end and the read (the watcher's sink) makes
+    the read ``unknown`` once more and the loop waits again.
     """
-    async with _evaluation_state_lock:
-        state = position_state(client, file_path, line)
-    if state != UNKNOWN:
-        return state
-    await wait_out_grace(client)
-    async with _evaluation_state_lock:
-        return position_state(client, file_path, line)
+    deadline = time.monotonic() + FRESHNESS_TIMEOUT
+    while True:
+        async with _evaluation_state_lock:
+            state = position_state(client, file_path, line)
+        if state != UNKNOWN:
+            return state
+        await wait_until_fresh(client, [file_path], deadline=deadline)
 
 
-async def wait_out_grace(client: IsabelleLSPClient) -> None:
-    """Sleep until the post-edit grace window has closed — bounded: an edit
-    landing during the wait re-arms the gate and is waited for too. The
-    deadline is one whole window past the FIRST expiry, and every re-arm
-    landing before it is waited out in full, so the call can return up to one
-    further window later; past the deadline the caller reads what it can.
-    Not for ``evaluation_status``, whose entry debounce deliberately waits for
-    the edits to STOP, with no bound.
-
-    The one implementation behind the "the gate is open, wait it out" step of
-    the settled read above, of command_status's batch wait after its reopens
-    and of the site tools' wait after theirs. The predicate is the GATE and
-    nothing else: no position's verdict can end the wait early, because every
-    verdict the gate guards is ``unknown`` while it is up (``line_reached``
-    requires a fresh cache), so a wait keyed on one would only ever run to
-    its timeout. Health-checked each pass like every wait on the prover.
-    """
-    deadline = time.monotonic() + _grace_remaining() + processing.DECORATION_GRACE
-    while (grace := _grace_remaining()) > 0 and time.monotonic() < deadline:
-        client._check_server_health(client.STALL_TIMEOUT)
-        await asyncio.sleep(grace)
-
-
-def _failed_count(client: IsabelleLSPClient, theories: list[TheoryStatus]) -> int:
+def _failed_count(client: IsabelleLSPClient, record: TheoryStatusRecord) -> int:
     """The failures that still stand, session-wide: the sum of ``error_count``
-    over the very file snapshots a report would render from *theories* — one
+    over the very file snapshots a report would render from *record* — one
     computation behind every ``N failed commands remain.`` (open files and bad
-    dependencies alike; a dependency whose decoration has not arrived counts
-    by its theory_status ``failed``, exactly as its snapshot renders)."""
-    return sum(fs.error_count for fs in _snapshot_files(client, "", theories))
+    dependencies alike; a dependency whose picture is older than the record
+    counts by its theory_status ``failed``, exactly as its snapshot renders).
+    Its number can lag by one tool call in either direction; its call sites
+    are branches that make no completion claim."""
+    return sum(fs.error_count for fs in _snapshot_files(client, "", record))
 
 
 FOOTER_HIT_DETAILS_CALL = "Call isabelle_debug_state for the hit details."
@@ -1961,9 +2037,9 @@ async def _footer_status_line(
         # "2 commands have been running…" argues with itself. The call to action
         # stays: the agent is being told work is running, so it needs somewhere
         # to look. The failure count is the session-wide one, from the entry
-        # theory_status (no fresh data in hand, and no round trip here).
+        # record (no fresh data in hand, and no round trip here).
         return " ".join(
-            _footer_activity(running, _failed_count(client, client.entry_theories)),
+            _footer_activity(running, _failed_count(client, entry_record())),
         )
 
     # Capture the handle HERE, with the target it belongs to and before any
@@ -1978,25 +2054,25 @@ async def _footer_status_line(
     towards = _target_sentence(TOWARDS_SENTENCE, target, int(dest), root)
 
     if position_state(client, target, dest) == UNKNOWN:
-        # A file changed a moment ago. Say the target and nothing else: the counts
-        # would come from the same cache that is not trusted for the position.
+        # The target's picture is not fresh. Say the target and nothing else:
+        # the counts would come from the same cache that is not trusted for
+        # the position.
         return towards
 
     tracker = client.get_processing_tracker(target)
     if tracker is None or not tracker.line_reached(dest.to_lsp()):
-        # No fresh data in hand: the entry theory_status.
+        # No fresh data in hand: the entry record.
         return " ".join([
             towards,
-            *_footer_activity(running, _failed_count(client, client.entry_theories)),
+            *_footer_activity(running, _failed_count(client, entry_record())),
         ])
 
-    theories = [
-        _parse_theory_status(t) for t in await client.request_theory_status()
-    ]
+    record = await client.request_theory_status()
+    theories = list(record.theories)
     if _is_evaluation_complete(target, dest, client, theories):
         # The same theory_status the completion verdict was judged on: the
         # suffix's N and the verdict describe one instant.
-        n_failed = _failed_count(client, theories)
+        n_failed = _failed_count(client, record)
         # Under the lock, like the other terminal transitions: the stamp and
         # the flag travel together. Two gates on the sentence.
         # The outcome test: the run already ended for another reason during
@@ -2020,9 +2096,9 @@ async def _footer_status_line(
     if _frontier_reached(target, dest, client, theories):
         return " ".join([
             _target_sentence(ARRIVED_SENTENCE, target, int(dest), root),
-            *_footer_activity(running, _failed_count(client, theories)),
+            *_footer_activity(running, _failed_count(client, record)),
         ])
-    return " ".join([towards, *_footer_activity(running, _failed_count(client, theories))])
+    return " ".join([towards, *_footer_activity(running, _failed_count(client, record))])
 
 
 def _footer_activity(
@@ -2047,17 +2123,18 @@ async def reopen_held_theory(client: IsabelleLSPClient, file_path: str) -> bool:
     """Reopen a ``.thy`` the prover holds but this client has closed (the
     unified close tidied it away); True when a didOpen was sent.
 
-    The prover's holding is read from the entry theory_status — no request.
-    The reopen carries the evaluation-target mark, so the file stays open for
-    the rest of the session; it evaluates nothing and moves no caret. A theory
-    the prover does not hold, a file that is open already, and any non-``.thy``
+    The prover's holding is read from the entry record — no request. The
+    reopen carries the evaluation-target mark, so the file stays open for the
+    rest of the session; it evaluates nothing and moves no caret. A theory the
+    prover does not hold, a file that is open already, and any non-``.thy``
     path (a ``.ML`` blob shows up in theory_status too, and is never a
-    document of ours) are left alone.
+    document of ours) are left alone. The caller that reopened a batch does
+    ONE ``wait_until_fresh`` over it before reading pictures.
     """
     path = _canon(file_path)
     if not path.endswith(".thy") or path in client.open_documents:
         return False
-    if all(t.node_name != path for t in client.entry_theories):
+    if all(t.node_name != path for t in entry_record().theories):
         return False
     await client.open_document(path, evaluation_target=True)
     return True
@@ -2066,8 +2143,10 @@ async def reopen_held_theory(client: IsabelleLSPClient, file_path: str) -> bool:
 def _served_state(state: str, rel: str, line: MCPLine) -> "str | None":
     """The guard's answer for a judged position, or ``""`` when the position
     is not served: None (processed), a note (running / interrupted), or a
-    raised refusal (unknown — still inside the grace window after waiting it
-    out; the line may have finished long ago, so say only what is true)."""
+    raised refusal (unknown — the settled read waits until fresh before
+    judging, so this branch is reachable only in the race between that wait's
+    end and the read; the line may have finished long ago, so say only what
+    is true)."""
     if state == PROCESSED:
         return None
     if state == RUNNING:
@@ -2104,17 +2183,16 @@ async def check_evaluation_guard(
     Queries never evaluate. The dispatch, in order of priority:
 
     1. The position has been evaluated — served (a still-running or
-       interrupted command is served with a note; an untrustworthy cache is
-       refused with the retry sentence).
+       interrupted command is served with a note), judged through the settled
+       read, which waits until the file's picture is fresh.
     2. An evaluation is running towards this file and its target covers the
        line — a pure wait of at most EVAL_POLL_INTERVAL for the frontier to
        reach it, then judged again; on timeout the evaluation's progress is
        reported. The wait adds a rider and nothing else: no target moves, no
        caret moves, no run is started or ended.
     3. The prover holds the theory but this client closed it — reopened (the
-       unified close's counterpart; no proof re-runs, and about half a second
-       when the file was not touched meanwhile) and judged again through the
-       settled read, which waits the grace gate out if the reopen raised it.
+       unified close's counterpart; no proof re-runs) and judged again through
+       the settled read, which waits for the reopened file's first picture.
     4. Still not evaluated while another file is under evaluation — the
        refusal naming that evaluation.
     5. Otherwise — the honest error: evaluate up to the line first.

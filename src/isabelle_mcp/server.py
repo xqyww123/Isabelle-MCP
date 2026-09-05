@@ -241,7 +241,9 @@ def _yaml_result(model: BaseModel) -> ToolResult:
     )
 
 
-async def _ensure_lsp_started(*, footer: bool = False) -> IsabelleLSPClient:
+async def _ensure_lsp_started(
+    *, footer: bool = False, cancel_tool: bool = False,
+) -> IsabelleLSPClient:
     if _lsp_client is None:
         raise IsabelleToolError("LSP client not initialized")
     if _lsp_client.process is None:
@@ -249,10 +251,11 @@ async def _ensure_lsp_started(*, footer: bool = False) -> IsabelleLSPClient:
             "No Isabelle session is running. Call isabelle_launch(session=...) "
             "first to start one (ask the user if the session is unclear).",
         )
-    # Backstop sync at every tool-call start: Layer 2 (re-stat open docs and push the
-    # changed ones) + Layer 3 (wait out the server's debounce if a dependency just
-    # changed). Catches anything the event-driven watcher missed.
-    await resync_and_check_freshness(_lsp_client)
+    # The tool entry: the open-document sync, one flush request (the server
+    # re-reads every dependency file and names an assigned version), this
+    # call's entry record, the unified close. The cancel tool skips the flush
+    # and the close (see resync_and_check_freshness).
+    await resync_and_check_freshness(_lsp_client, cancel_tool=cancel_tool)
     if footer:
         # Only the tools that DISPLAY the footer compute it. The computation can
         # end an evaluation (see evaluation_footer), and a tool that does not show
@@ -568,7 +571,7 @@ async def isabelle_cancel_evaluation() -> ToolResult:
     unfinished command remain valid for querying.  Other tool calls wait
     while a cancellation is in progress.
     """
-    client = await _ensure_lsp_started()
+    client = await _ensure_lsp_started(cancel_tool=True)
     view = await cancel_evaluation(client)
     return ToolResult(content=[TextContent(
         type="text", text=format_evaluation_result(view, client.project_root),

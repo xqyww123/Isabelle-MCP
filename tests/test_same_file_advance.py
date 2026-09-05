@@ -137,7 +137,7 @@ class TestAdvance:
         async def fake_loop(client, file_path, state, evaluation, timeout):
             state.cancel()
             state.start("/tmp/Other.thy", MCPLine(3))
-            return "in_progress", [], []
+            return "in_progress", ev._NO_RECORD, []
         monkeypatch.setattr(ev, "_evaluation_wait_loop", fake_loop)
         view = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
         assert view.destination_line == 5

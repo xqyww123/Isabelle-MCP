@@ -15,7 +15,7 @@ import os
 from collections import OrderedDict
 
 from isabelle_mcp import processing
-from isabelle_mcp.evaluation import relativize, reopen_held_theory, wait_out_grace
+from isabelle_mcp.evaluation import relativize, reopen_held_theory, wait_until_fresh
 from isabelle_mcp.lsp_client import IsabelleLSPClient
 from isabelle_mcp.models import CommandStatusLine, CommandStatusPosition, LinePosition
 from isabelle_mcp.processing import ProcessingTracker
@@ -74,9 +74,10 @@ async def command_status(
     "Not evaluated" is one of this tool's ANSWERS, so nothing here refuses,
     waits for an evaluation, or starts one. The one thing done before asking
     is bookkeeping: a ``.thy`` the prover still holds but the unified close
-    tidied away is reopened (no proof re-runs; about half a second when the
-    file was not touched meanwhile), so its positions are answered from a
-    live decoration tracker rather than from nothing.
+    tidied away is reopened (no proof re-runs), so its positions are answered
+    from a live decoration tracker rather than from nothing; the reopened
+    batch is waited for once, until its pictures are fresh. A file open all
+    along is never waited for: an unfresh picture answers ``unknown``.
     """
     if not positions:
         raise IsabelleToolError("positions must not be empty")
@@ -90,10 +91,11 @@ async def command_status(
     for pos in positions:
         by_file.setdefault(os.path.realpath(pos.file_path), []).append(pos)
 
-    reopened = False
+    reopened: list[str] = []
     for file_path in by_file:
         try:
-            reopened = await reopen_held_theory(client, file_path) or reopened
+            if await reopen_held_theory(client, file_path):
+                reopened.append(file_path)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -106,12 +108,12 @@ async def command_status(
             # batch is answered as usual.
             logger.warning("reopen of %s failed", file_path, exc_info=True)
     if reopened:
-        # A reopen's didOpen may have raised the global grace gate (it does
-        # not for a file untouched since its close), under which every state
-        # word would read `unknown` — the opposite of what this tool is for.
-        # One wait for the whole batch: the gate is global, so one wait covers
-        # every file, and it costs nothing when the gate is down.
-        await wait_out_grace(client)
+        # A reopened file has no picture until its first push arrives (and
+        # its didOpen un-freshens every other picture), under which every
+        # state word would read `unknown` — the opposite of what this tool is
+        # for. One wait for the whole batch: the acknowledgements arrive in
+        # the same server batch as the new pictures.
+        await wait_until_fresh(client, reopened)
 
     answers: dict[int, CommandStatusLine] = {}
     for file_path, group in by_file.items():

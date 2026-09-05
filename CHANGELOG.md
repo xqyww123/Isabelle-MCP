@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.6.0
+
+- **The two-second guess is gone: every picture now says which document
+  version it describes.** Every `PIDE/decoration` push and every
+  `PIDE/theory_status` reply carries the PIDE document version it was rendered
+  from, and every exchange that changes the document — the new `PIDE/flush`
+  request at every tool call's entry, `PIDE/cancel_evaluation` — replies with
+  an assigned version that contains everything this server had sent. A cached
+  picture is trusted exactly when its version is at least as new as the newest
+  one seen and no edit of ours is still uncovered by a flush reply; the server
+  acknowledges every open file at every version it renders, with an empty push
+  when nothing changed. So a tool never answers from a picture of the pre-edit
+  document, and never waits a fixed two seconds to be sure: it waits for the
+  picture at the new version, normally a fraction of a second (a busy prover
+  no longer delays the pushes indefinitely — the output timer fires at most
+  `vscode_output_delay` after the first change instead of being re-armed by
+  every one). The wait is bounded at five minutes; expiry terminates the
+  session like any internal failure.
+- **Dependency edits are found by the server, exactly.** At every tool call's
+  entry the server re-reads every dependency file (`.ML` blobs, imported
+  `.thy`) from disk and pushes an edit only where the bytes differ — no stat
+  signatures, no half-second debounce wait, no first-sighting rule. Files the
+  unified close tidied away are reopened in the same fraction of a second
+  whether or not they were written meanwhile.
+- **`isabelle_cancel_evaluation` skips the entry's flush and close**, so a
+  cancel is never held up by a document version; when its record of the
+  prover's state is not current — an edit of this very call still unflushed,
+  or another call's newer picture received while it waited for the lock — the
+  prover answers instead of the local "No evaluation in progress." shortcut,
+  with "Evaluation cancelled. Nothing was running." when nothing was.
+- **The Scala component and the Python package check each other at launch**
+  (protocol version 1). A mismatch refuses the launch with: *"Isabelle-MCP's
+  Scala component does not match this isabelle-mcp package. Run `isabelle-mcp
+  install` to update it."* The prebuilt jar is rebuilt.
+- Superseded 0.5.0 notes, left standing below: the half-second / two-second
+  reopen timings ("Open files look after themselves"), the same-bytes reopen
+  record ("Reopening an untouched file no longer costs the two-second grace
+  window") and the first-sighting rule ("The first edit to a newly loaded
+  dependency is no longer missed") — each replaced by the version stamps above.
+  The operator variable `ISABELLE_MCP_DECORATION_GRACE` no longer exists.
+
 ## 0.5.0
 
 - **Cancellation leaves no corpse.** `isabelle_cancel_evaluation` is now one

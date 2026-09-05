@@ -16,10 +16,28 @@ from isabelle_mcp.evaluation import (
     sync_file_locked,
 )
 from isabelle_mcp.lsp_client import DocumentState
-from isabelle_mcp.models import EvaluationView, FileSnapshot, RunningCommand
-from isabelle_mcp.processing import ProcessingTracker, parse_decoration_ranges
+from isabelle_mcp.models import (
+    EvaluationView,
+    FileSnapshot,
+    RunningCommand,
+    TheoryStatusRecord,
+)
+from isabelle_mcp.processing import (
+    FreshnessState,
+    ProcessingTracker,
+    parse_decoration_ranges,
+)
 from isabelle_mcp.utils import IsabelleToolError, MCPLine
-from tests.conftest import MockProcessingTracker
+from tests.conftest import (
+    MockProcessingTracker,
+    full_decoration_entries,
+    settled_theory_row,
+    theory_status_record,
+)
+
+# Two real document versions (ids tick downward: NEWER is newer than OLDER).
+OLDER = -19
+NEWER = -40
 
 
 @pytest.fixture(autouse=True)
@@ -30,6 +48,19 @@ def _fast_poll(monkeypatch):
 
 def _file(view: EvaluationView, path: str) -> FileSnapshot | None:
     return next((f for f in view.files if f.file_path == path), None)
+
+
+def _record(theories, document_version: int = 0) -> TheoryStatusRecord:
+    """A theory_status record from parsed rows, stamped 0 unless said otherwise."""
+    return TheoryStatusRecord(document_version=document_version, theories=tuple(theories))
+
+
+async def _real_tracker(client, **ranges) -> ProcessingTracker:
+    """A real tracker holding a full picture at the client's newest version."""
+    tracker = ProcessingTracker(client.freshness)
+    await tracker.update(parse_decoration_ranges(full_decoration_entries(**ranges)),
+                         client.freshness.newest_document_version)
+    return tracker
 
 
 class TestEvaluateTo:
@@ -141,7 +172,7 @@ class TestEvaluateTo:
     ):
         # Frontier reached dest, but a trailing command in the prefix is still
         # unprocessed (a queued/in-flight fork). Must NOT report complete/clean;
-        # returns in_progress immediately (grace=0) and lists the pending line.
+        # returns in_progress immediately and lists the pending line.
         mock_lsp_client._processing_trackers[temp_theory_file] = MockProcessingTracker(
             frontier=True, quiet=False, unprocessed=[(7, 0, 7, 5)],  # 0-idx 7 -> line 8
         )
@@ -241,11 +272,11 @@ class TestEvaluationStatus:
         real_status = mock_lsp_client.request_theory_status
 
         async def cancel_and_restart():
-            result = await real_status()
+            record = await real_status()
             if evaluation_state.active and evaluation_state.current.outcome == "":
                 evaluation_state.cancel()
                 evaluation_state.start(temp_theory_file, MCPLine(5))
-            return result
+            return record
 
         mock_lsp_client.request_theory_status = cancel_and_restart
         view = await evaluation_status(mock_lsp_client)
@@ -346,14 +377,14 @@ class TestLingeringFork:
         self, mock_lsp_client, monkeypatch,
     ):
         # Under its lock cancel_evaluation may issue no request, so it reads
-        # the entry theory_status stashed on the client: a theory that is not
-        # open here but has running commands is work to cancel. Mutation
-        # control: hand it an empty list and it answers no_evaluation.
-        mock_lsp_client.entry_theories = [ev._parse_theory_status({
+        # this call's entry record: a theory that is not open here but has
+        # running commands is work to cancel. Mutation control: hand it an
+        # empty record and it answers no_evaluation.
+        ev.set_entry_record(theory_status_record([{
             "node_name": "/lib/Dep_running.thy", "theory_name": "Dep_running",
             "external": True, "running": 2, "unprocessed": 3, "finished": 5,
             "consolidated": False,
-        })]
+        }]))
 
         async def _spy():
             return {"outcome": "retired", "retired": [], "excluded": [],
@@ -361,8 +392,41 @@ class TestLingeringFork:
 
         monkeypatch.setattr(mock_lsp_client, "force_interrupt", _spy)
         assert (await cancel_evaluation(mock_lsp_client)).status == "cancelled"
-        mock_lsp_client.entry_theories = []
+        ev.set_entry_record(theory_status_record([]))
         assert (await cancel_evaluation(mock_lsp_client)).status == "no_evaluation"
+
+    @pytest.mark.asyncio
+    async def test_the_local_shortcut_answers_only_from_a_fresh_record(
+        self, mock_lsp_client, monkeypatch,
+    ):
+        """User ruling 乙 (mutation control M-22, both legs): the cancel tool's
+        entry issued no flush, so its record may be unfresh in two ways —
+        unflushed content stands (this round's own didChange), or the newest
+        version advanced past the record while the call waited for the lock.
+        Either way the prover answers, never the local shortcut."""
+        asked: list[bool] = []
+
+        async def _spy():
+            asked.append(True)
+            return {"outcome": "nothing_running", "retired": [], "excluded": [],
+                    "waived": [], "unloaded_from": []}
+
+        monkeypatch.setattr(mock_lsp_client, "force_interrupt", _spy)
+        # Fresh in the full sense: the shortcut answers, no request.
+        ev.set_entry_record(theory_status_record([], OLDER))
+        mock_lsp_client.freshness.advance(OLDER)
+        assert (await cancel_evaluation(mock_lsp_client)).status == "no_evaluation"
+        assert asked == []
+        # Leg 1: unflushed content stands.
+        mock_lsp_client.freshness.content_sends += 1
+        view = await cancel_evaluation(mock_lsp_client)
+        assert view.status == "cancelled" and asked == [True]
+        assert view.message == ev.CANCEL_MESSAGES["nothing_running"]
+        mock_lsp_client.freshness.content_sends_flushed = mock_lsp_client.freshness.content_sends
+        # Leg 2: the newest version advanced past the record's stamp.
+        mock_lsp_client.freshness.advance(NEWER)
+        assert (await cancel_evaluation(mock_lsp_client)).status == "cancelled"
+        assert asked == [True, True]
 
 
 class TestSnapshotCategorization:
@@ -398,7 +462,7 @@ class TestSnapshotCategorization:
             sorry=[(6, 0, 6, 5)],
             overview_warning=[(8, 0, 8, 5)],
         )
-        fs = _build_file_snapshot(mock_lsp_client, path, {path: self._ts(path)})
+        fs = _build_file_snapshot(mock_lsp_client, path, {path: self._ts(path)}, 0)
         assert fs.lined and fs.state == "problems"
         assert fs.errors == [(5, 5)] and fs.error_count == 1
         assert fs.sorry == [(7, 7)]
@@ -412,7 +476,7 @@ class TestSnapshotCategorization:
         mock_lsp_client._processing_trackers[path] = MockProcessingTracker(
             bad=[(4, 0, 4, 5)], sorry=[(4, 0, 4, 5)],
         )
-        fs = _build_file_snapshot(mock_lsp_client, path, {path: self._ts(path)})
+        fs = _build_file_snapshot(mock_lsp_client, path, {path: self._ts(path)}, 0)
         assert fs.state == "clean" and fs.error_count == 0
         assert fs.sorry == [(5, 5)]
         # The sorry is what brings the file into a report, by its own name —
@@ -435,22 +499,22 @@ class TestSnapshotCategorization:
         mock_lsp_client._processing_trackers[path] = MockProcessingTracker(
             overview_error=[(3, 0, 3, 0)], bad=[(3, 0, 3, 0)],
         )
-        fs = _build_file_snapshot(mock_lsp_client, path, {path: theories[0]})
+        fs = _build_file_snapshot(mock_lsp_client, path, {path: theories[0]}, 0)
         assert fs.errors == [(4, 4)]
-        assert _failed_count(mock_lsp_client, theories) == 1
+        assert _failed_count(mock_lsp_client, _record(theories)) == 1
         # ...while a range starting further past EOF is still clipped away.
         mock_lsp_client._processing_trackers[path] = MockProcessingTracker(
             overview_error=[(4, 0, 4, 0)], bad=[(4, 0, 4, 0)],
         )
-        fs = _build_file_snapshot(mock_lsp_client, path, {path: theories[0]})
+        fs = _build_file_snapshot(mock_lsp_client, path, {path: theories[0]}, 0)
         assert fs.errors == []
-        assert _failed_count(mock_lsp_client, theories) == 0
+        assert _failed_count(mock_lsp_client, _record(theories)) == 0
 
     def test_fallback_counts_when_no_tracker(self, mock_lsp_client):
         from isabelle_mcp.evaluation import _build_file_snapshot
         path = "/tmp/Dep.thy"
         ts = self._ts(path, ok=False, failed=2, warned=1)
-        fs = _build_file_snapshot(mock_lsp_client, path, {path: ts})
+        fs = _build_file_snapshot(mock_lsp_client, path, {path: ts}, 0)
         assert not fs.lined
         assert fs.state == "problems"
         assert fs.error_count == 2
@@ -458,26 +522,60 @@ class TestSnapshotCategorization:
     def test_a_warning_alone_is_no_problem_in_either_flavour(self, mock_lsp_client):
         from isabelle_mcp.evaluation import _build_file_snapshot
         path = "/tmp/Warned.thy"
-        # theory_status flavour: warned is not a problem, and not a reason to
-        # distrust a decoration that shows nothing.
+        # theory_status flavour: warned is not a problem.
         ts = self._ts(path, warned=1)
-        assert _build_file_snapshot(mock_lsp_client, path, {path: ts}).state == "clean"
-        # decoration flavour: a warning range renders no row, yet it still
-        # proves the decoration is fresh content (the deco_has_content test).
+        assert _build_file_snapshot(mock_lsp_client, path, {path: ts}, 0).state == "clean"
+        # decoration flavour: a warning range renders no row; a picture at
+        # least as new as the record is trusted over the record's counts.
         self._open(mock_lsp_client, path)
         mock_lsp_client._processing_trackers[path] = MockProcessingTracker(
             overview_warning=[(4, 0, 4, 5)],
         )
         fs = _build_file_snapshot(
-            mock_lsp_client, path, {path: self._ts(path, ok=False, failed=1)},
+            mock_lsp_client, path, {path: self._ts(path, ok=False, failed=1)}, 0,
         )
         assert fs.lined and fs.state == "clean" and fs.error_count == 0
+
+    def test_the_arbitration_is_by_stamp_on_real_ids(self, mock_lsp_client):
+        """D-E 乙 (mutation control M-7's second site): the decoration is
+        rendered iff its picture stamp is at least as new as the record's;
+        an older picture falls back to the record's counts, whatever content
+        it holds. Ids tick downward: OLDER is -19, NEWER is -40."""
+        from isabelle_mcp.evaluation import _build_file_snapshot
+        path = "/tmp/Stamped.thy"
+        self._open(mock_lsp_client, path)
+        mock_lsp_client._processing_trackers[path] = MockProcessingTracker(
+            overview_error=[(4, 0, 4, 5)], bad=[(4, 0, 4, 5)], document_version=OLDER,
+        )
+        ts = self._ts(path, ok=False, failed=3)
+        # picture OLDER, record OLDER: at least as new, rendered with lines
+        fs = _build_file_snapshot(mock_lsp_client, path, {path: ts}, OLDER)
+        assert fs.lined and fs.errors == [(5, 5)] and fs.error_count == 1
+        # picture OLDER, record NEWER: the picture is older, counts
+        fs = _build_file_snapshot(mock_lsp_client, path, {path: ts}, NEWER)
+        assert not fs.lined and fs.error_count == 3
+        # picture NEWER, record OLDER: newer than the record, rendered
+        mock_lsp_client._processing_trackers[path].document_version = NEWER
+        fs = _build_file_snapshot(mock_lsp_client, path, {path: ts}, OLDER)
+        assert fs.lined and fs.error_count == 1
+
+    def test_an_uninitialized_picture_renders_counts(self, mock_lsp_client):
+        # A file just opened, its tracker folded from a differential push
+        # only (no full picture yet): the counts, not a slice of a picture.
+        from isabelle_mcp.evaluation import _build_file_snapshot
+        path = "/tmp/Slice.thy"
+        self._open(mock_lsp_client, path)
+        mock_lsp_client._processing_trackers[path] = MockProcessingTracker(
+            overview_error=[(4, 0, 4, 5)], initialized=False,
+        )
+        fs = _build_file_snapshot(mock_lsp_client, path, {path: self._ts(path, ok=False, failed=2)}, 0)
+        assert not fs.lined and fs.error_count == 2
 
     def test_fallback_in_progress_not_clean(self, mock_lsp_client):
         from isabelle_mcp.evaluation import _build_file_snapshot
         path = "/tmp/Dep.thy"
         ts = self._ts(path, consolidated=False, unprocessed=3)
-        fs = _build_file_snapshot(mock_lsp_client, path, {path: ts})
+        fs = _build_file_snapshot(mock_lsp_client, path, {path: ts}, 0)
         assert not fs.lined
         assert fs.state == "in_progress"
 
@@ -490,7 +588,7 @@ class TestSnapshotCategorization:
             unprocessed=[(2, 0, 4, 5)],  # 0-idx 2..4 -> 1-idx 3..5
         )
         fs = _build_file_snapshot(
-            mock_lsp_client, path, {path: self._ts(path)}, dest_line=MCPLine(8),
+            mock_lsp_client, path, {path: self._ts(path)}, 0, dest_line=MCPLine(8),
         )
         assert fs.lined
         assert fs.pending == [(3, 5)] and fs.pending_count == 1
@@ -504,7 +602,7 @@ class TestSnapshotCategorization:
         mock_lsp_client._processing_trackers[path] = MockProcessingTracker(
             unprocessed=[(2, 0, 4, 5)],
         )
-        fs = _build_file_snapshot(mock_lsp_client, path, {path: self._ts(path)})
+        fs = _build_file_snapshot(mock_lsp_client, path, {path: self._ts(path)}, 0)
         assert fs.lined and fs.pending == [] and fs.state == "clean"
 
 
@@ -537,7 +635,7 @@ class TestReportUnion:
             self._ts("/lib/Loading.thy", unprocessed=7, finished=3,
                      consolidated=False, external=True),
         ]
-        files = _snapshot_files(mock_lsp_client, temp_theory_file, theories, MCPLine(5))
+        files = _snapshot_files(mock_lsp_client, temp_theory_file, _record(theories), MCPLine(5))
         assert [fs.file_path for fs in files] == [temp_theory_file, "/lib/Broken.thy"]
         broken = files[1]
         assert not broken.lined and broken.error_count == 2
@@ -562,14 +660,14 @@ class TestReportUnion:
             self._ts("/lib/Loading.thy", unprocessed=7, finished=3,
                      consolidated=False, external=True),
         ]
-        files = _snapshot_files(mock_lsp_client, temp_theory_file, theories, MCPLine(5))
+        files = _snapshot_files(mock_lsp_client, temp_theory_file, _record(theories), MCPLine(5))
         assert [fs.file_path for fs in files] == [temp_theory_file]
         assert _summary_count(mock_lsp_client, theories, files) == 1
         # The same for a file the decoration scan brought in.
         mock_lsp_client._processing_trackers[temp_theory_file] = MockProcessingTracker(
             overview_error=[(2, 0, 2, 5)], bad=[(2, 0, 2, 5)],
         )
-        files = _snapshot_files(mock_lsp_client, "", theories)
+        files = _snapshot_files(mock_lsp_client, "", _record(theories))
         assert [fs.file_path for fs in files] == [temp_theory_file]
         assert _summary_count(mock_lsp_client, theories, files) == 1
 
@@ -597,7 +695,7 @@ class TestReportUnion:
                      unprocessed=9, finished=1, consolidated=False),
             self._ts(retracted, unprocessed=10, finished=0, consolidated=False),
         ]
-        files = _snapshot_files(mock_lsp_client, "", theories)
+        files = _snapshot_files(mock_lsp_client, "", _record(theories))
         assert files == []
         assert _summary_count(mock_lsp_client, theories, files) == 2
         # A cancelled target that another open document imports IS an imported
@@ -609,14 +707,8 @@ class TestReportUnion:
     async def test_evaluating_to_mid_file_shows_no_summary_line_for_the_target(
         self, temp_theory_file, mock_lsp_client,
     ):
-        real_status = mock_lsp_client.request_theory_status
-
-        async def mid_file():
-            theories = await real_status()
-            theories[0].update(unprocessed=6, finished=4, consolidated=False)
-            return theories
-
-        mock_lsp_client.request_theory_status = mid_file
+        mock_lsp_client.theory_rows = [settled_theory_row(
+            temp_theory_file, unprocessed=6, finished=4, consolidated=False)]
         view = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
         assert view.status == "complete" and view.unprocessed_theories == 0
         assert "not yet processed" not in format_evaluation_result(view, None)
@@ -635,7 +727,7 @@ class TestReportUnion:
             unprocessed=[(6, 0, 9, 0)],
         )
         theories = [self._ts(temp_theory_file, ok=False, failed=1, finished=9)]
-        files = _snapshot_files(mock_lsp_client, "", theories)
+        files = _snapshot_files(mock_lsp_client, "", _record(theories))
         assert [fs.file_path for fs in files] == [temp_theory_file]
 
     @pytest.mark.asyncio
@@ -652,8 +744,9 @@ class TestReportUnion:
         link_dir.symlink_to(Path(real).parent, target_is_directory=True)
         alias = str(link_dir / Path(real).name)
         assert alias != real and os.path.realpath(alias) == real
-        # The file is open under its real path with an error decoration; the
-        # prover names it by the symlink spelling.
+        # The file is open under its real path with a picture OLDER than the
+        # record (so its snapshot renders from the row's counts); the prover
+        # names it by the symlink spelling.
         await mock_lsp_client.open_document(real)
         mock_lsp_client._processing_trackers[real] = MockProcessingTracker(
             all_processed=True,
@@ -664,9 +757,9 @@ class TestReportUnion:
             "running": 0, "warned": 0, "failed": 1, "finished": 9,
             "canceled": False, "consolidated": True, "percentage": 100,
         })]
-        files = _snapshot_files(mock_lsp_client, "", theories)
+        files = _snapshot_files(mock_lsp_client, "", _record(theories, NEWER))
         assert [fs.file_path for fs in files] == [real]
-        assert files[0].error_count == 1
+        assert not files[0].lined and files[0].error_count == 1
 
     def test_an_empty_node_name_stays_empty_and_renders_nothing(self, mock_lsp_client):
         """Negative control for the empty-node guard at _parse_theory_status:
@@ -679,7 +772,7 @@ class TestReportUnion:
             "ok": False, "failed": 1, "running": 0, "unprocessed": 0,
         })
         assert row.node_name == ""
-        assert _snapshot_files(mock_lsp_client, "", [row]) == []
+        assert _snapshot_files(mock_lsp_client, "", _record([row])) == []
 
     @pytest.mark.asyncio
     async def test_a_decoration_only_file_that_renders_no_row_is_left_out(
@@ -692,15 +785,15 @@ class TestReportUnion:
         mock_lsp_client._processing_trackers[temp_theory_file] = MockProcessingTracker(
             bad=[(4, 0, 4, 4)],
         )
-        assert _snapshot_files(mock_lsp_client, "", [self._ts(temp_theory_file)]) == []
+        assert _snapshot_files(mock_lsp_client, "", _record([self._ts(temp_theory_file)])) == []
         # Likewise a running range past EOF, which clipping leaves nothing of.
         mock_lsp_client._processing_trackers[temp_theory_file] = MockProcessingTracker(
             running=[(40, 0, 40, 5)],
         )
-        assert _snapshot_files(mock_lsp_client, "", [self._ts(temp_theory_file)]) == []
+        assert _snapshot_files(mock_lsp_client, "", _record([self._ts(temp_theory_file)])) == []
         # The target keeps its snapshot whatever it renders.
         files = _snapshot_files(
-            mock_lsp_client, temp_theory_file, [self._ts(temp_theory_file)], MCPLine(5),
+            mock_lsp_client, temp_theory_file, _record([self._ts(temp_theory_file)]), MCPLine(5),
         )
         assert [fs.file_path for fs in files] == [temp_theory_file]
 
@@ -731,20 +824,15 @@ class TestReportUnion:
         # with commands left unprocessed behind the failure (the prover stops
         # there), which is the branch nothing else covers.
         broken = str(tmp_path / "Broken.thy")       # not on disk: the auto-open fails, the count row stays
-        real_status = mock_lsp_client.request_theory_status
-
-        async def with_failed_import():
-            theories = await real_status()
-            theories[0]["imports"] = [{"theory_name": "Broken"}]
-            theories.append({
+        mock_lsp_client.theory_rows = [
+            settled_theory_row(temp_theory_file, imports=[{"theory_name": "Broken"}]),
+            {
                 "node_name": broken, "theory_name": "Broken",
                 "external": True, "imports": [], "ok": False, "total": 3,
                 "unprocessed": 1, "running": 0, "warned": 0, "failed": 1,
                 "finished": 1, "canceled": False, "consolidated": False,
-            })
-            return theories
-
-        mock_lsp_client.request_theory_status = with_failed_import
+            },
+        ]
         view = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
         assert view.status == "complete" and not evaluation_state.active
         assert [fs.file_path for fs in view.files] == [temp_theory_file, broken]
@@ -795,7 +883,7 @@ class TestCompletionSentence:
         async def loop_then_successor(client, file_path, state, evaluation, timeout):
             state.complete()
             state.start("/tmp/Other_successor.thy", MCPLine(3))
-            return "complete", [], []
+            return "complete", ev._NO_RECORD, []
 
         monkeypatch.setattr(ev, "_evaluation_wait_loop", loop_then_successor)
         view = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
@@ -929,14 +1017,14 @@ class TestDecorationClear:
 
     @pytest.mark.asyncio
     async def test_empty_push_clears_all_four_types(self):
-        tr = ProcessingTracker()
+        tr = ProcessingTracker(FreshnessState())
         present = parse_decoration_ranges([
             {"type": "background_bad", "content": [{"range": [4, 0, 4, 5]}]},
             {"type": "background_sorry", "content": [{"range": [7, 2, 7, 7]}]},
             {"type": "text_overview_error", "content": [{"range": [4, 0, 4, 5]}]},
             {"type": "text_overview_warning", "content": [{"range": [6, 0, 6, 5]}]},
         ])
-        await tr.update(present)
+        await tr.update(present, 0)
         assert tr.get_bad_ranges() and tr.get_overview_error_ranges() and tr.get_overview_warning_ranges()
         assert tr.get_sorry_ranges() == [(7, 2, 7, 7)]
 
@@ -946,7 +1034,7 @@ class TestDecorationClear:
             {"type": "text_overview_error", "content": []},
             {"type": "text_overview_warning", "content": []},
         ])
-        await tr.update(emptied)
+        await tr.update(emptied, 0)
         assert tr.get_bad_ranges() == []
         assert tr.get_sorry_ranges() == []
         assert tr.get_overview_error_ranges() == []
@@ -954,38 +1042,48 @@ class TestDecorationClear:
 
     @pytest.mark.asyncio
     async def test_reset_forgets_the_sorry_ranges_too(self):
-        tr = ProcessingTracker()
+        tr = ProcessingTracker(FreshnessState())
         await tr.update(parse_decoration_ranges([
             {"type": "background_sorry", "content": [{"range": [7, 2, 7, 7]}]},
-        ]))
+        ]), 0)
         await tr.reset()
         assert tr.get_sorry_ranges() == []
 
 
-class TestLatchRegression:
-    """The 0.1.1 latch, pinned at the level it occurred: evaluate_to with a REAL
-    tracker must complete when no decoration push follows the edit (the server
-    re-sends nothing when decorations are unchanged). Pre-fix code waited for a
-    strictly-newer push and reported in_progress forever."""
+class TestEvaluateToWaitsUntilFresh:
+    """evaluate_to's one wait: the first statement inside the try after the
+    lock block, over the target alone, owning its flush."""
 
     @pytest.mark.asyncio
-    async def test_evaluate_completes_without_new_push_after_edit(
+    async def test_evaluate_completes_on_a_real_tracker_after_a_flush(
         self, mock_lsp_client, temp_theory_file, monkeypatch,
     ):
-        from isabelle_mcp import processing
-
-        monkeypatch.setattr(processing, "DECORATION_GRACE", 0.1)
-        monkeypatch.setattr(processing, "_last_edit_sent", float("-inf"))
+        # The picture is at the newest version and nothing is unflushed: the
+        # wait's flush replies at once and the run completes with no push.
         monkeypatch.setattr(ev, "EVAL_POLL_INTERVAL", 5.0)
-
-        tracker = ProcessingTracker()
-        await tracker.update(
-            {"background_unprocessed1": [], "background_running1": []},
-        )
-        processing.note_edit_sent()  # an edit went out; no push will ever follow
-        mock_lsp_client._processing_trackers[temp_theory_file] = tracker
-
+        mock_lsp_client._processing_trackers[temp_theory_file] = (
+            await _real_tracker(mock_lsp_client))
         view = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
+        assert view.status == "complete"
+        assert mock_lsp_client.flush_calls == [False]      # the wait's own flush
+
+    @pytest.mark.asyncio
+    async def test_a_flush_error_during_the_wait_leaves_the_run_and_the_next_call_free(
+        self, mock_lsp_client, temp_theory_file, temp_theory_with_errors, monkeypatch,
+    ):
+        """The wait is INSIDE the try: a flush answering an error must reach
+        the handler that leaves the run, or busy_with_another_file would
+        refuse every later evaluate_to (mutation control: hoist the wait into
+        the gap between the lock block and the try)."""
+        async def failing_flush(*, resync_dependencies):
+            raise IsabelleToolError("LSP error: prover already terminated")
+
+        monkeypatch.setattr(mock_lsp_client, "flush", failing_flush)
+        with pytest.raises(IsabelleToolError, match="already terminated"):
+            await evaluate_to(mock_lsp_client, temp_theory_file, 5)
+        assert evaluation_state.active is False
+        monkeypatch.undo()
+        view = await evaluate_to(mock_lsp_client, temp_theory_with_errors, 3)
         assert view.status == "complete"
 
 
@@ -1011,31 +1109,37 @@ class TestCancelSafety:
         assert evaluation_state.active is False
 
     @pytest.mark.asyncio
-    async def test_cancel_in_grace_recheck_resets_state(
+    async def test_cancel_in_the_heap_recheck_resets_state(
         self, temp_theory_file, mock_lsp_client, monkeypatch,
     ):
         import asyncio
         import os
 
-        from isabelle_mcp import processing
-
         mock_lsp_client.heap_sources = {os.path.realpath(temp_theory_file)}
-        monkeypatch.setattr(processing, "DECORATION_GRACE", 100.0)
-        processing.note_edit_sent()  # open the grace window → _grace_remaining() > 0
+        # The heap budget expired on an unfresh picture: one wait until fresh
+        # and one re-run follow. The wait is stubbed (an uninitialized stub
+        # tracker never becomes fresh on the mock).
+        mock_lsp_client._processing_trackers[temp_theory_file] = MockProcessingTracker(
+            initialized=False,
+        )
 
+        async def no_wait(client, files, **kw):
+            pass
+
+        monkeypatch.setattr(ev, "wait_until_fresh", no_wait)
         calls = []
 
         async def fake_loop(client, file_path, state, evaluation, timeout):
             calls.append(1)
             if len(calls) == 1:
-                return "in_progress", [], []
+                return "in_progress", ev._NO_RECORD, []
             raise asyncio.CancelledError()
 
         monkeypatch.setattr(ev, "_evaluation_wait_loop", fake_loop)
         with pytest.raises(asyncio.CancelledError):
             await evaluate_to(mock_lsp_client, temp_theory_file, 5)
-        # The cancel landed on the SECOND (grace re-check) wait loop, now inside the
-        # try; 改动 C/F1 resets state instead of leaking active=True.
+        # The cancel landed on the SECOND (re-check) wait loop, inside the try:
+        # the state is reset instead of leaking active=True.
         assert calls == [1, 1]
         assert evaluation_state.active is False
 
@@ -1101,71 +1205,6 @@ class TestLockedSync:
         mock_lsp_client.resync_changed_open_documents = fake_resync
         await resync_changed_open_documents_locked(mock_lsp_client)
         assert called["n"] == 1
-
-
-class TestDependencyEditStamp:
-    """Layer-3: an external import/.ML file changing on disk is an edit too
-    (the server's own File_Watcher will didChange it internally) — detection
-    must bump the global edit clock."""
-
-    @pytest.mark.asyncio
-    async def test_external_dep_change_bumps_edit_clock(
-        self, mock_lsp_client, tmp_path, monkeypatch,
-    ):
-        from isabelle_mcp import processing
-
-        dep = tmp_path / "Helper.ML"
-        dep.write_text("val x = 1;")
-        mock_lsp_client._dep_stat_sigs = {}
-        mock_lsp_client.vscode_load_delay = 0.5
-
-        async def theory_status():
-            return [{"node_name": str(dep), "external": True}]
-
-        mock_lsp_client.request_theory_status = theory_status
-        monkeypatch.setattr(processing, "_last_edit_sent", float("-inf"))
-
-        # First sighting: no record to compare against, so it counts as
-        # changed (the edit that matters may be the one made just before the
-        # dep came into view). Mutation control: treat an unseen dep as
-        # unchanged and this reds.
-        await ev._dependency_freshness_wait(mock_lsp_client)
-        assert processing._grace_remaining() > 0.0
-        monkeypatch.setattr(processing, "_last_edit_sent", float("-inf"))
-        await ev._dependency_freshness_wait(mock_lsp_client)  # now on record
-        assert processing._grace_remaining() == 0.0           # no change yet
-
-        from isabelle_mcp import debugger
-        debugger.registry.pop_dirty()   # isolate from earlier tests
-        dep.write_text("val x = 2; (* edited externally *)")
-        wait = await ev._dependency_freshness_wait(mock_lsp_client)
-        assert processing._grace_remaining() > 0.0            # clock bumped
-        assert wait > 0.0                                     # debounce wait requested
-        # Phase D wiring: the changed blob is marked dirty for breakpoint
-        # reconciliation.
-        assert str(dep) in debugger.registry.pop_dirty()
-
-    @pytest.mark.asyncio
-    async def test_a_dep_with_a_record_written_ahead_is_not_charged_on_first_sight(
-        self, mock_lsp_client, tmp_path, monkeypatch,
-    ):
-        # close_document seeds the record for the file it closes; the next
-        # entry then compares rather than assumes, so an untouched file the
-        # unified close turned into a dependency costs no grace window.
-        from isabelle_mcp import processing
-        from isabelle_mcp.lsp_client import _stat_sig
-        dep = tmp_path / "Closed.thy"
-        dep.write_text("theory Closed imports Main begin end\n")
-        mock_lsp_client._dep_stat_sigs = {str(dep): _stat_sig(str(dep))}
-        mock_lsp_client.vscode_load_delay = 0.5
-
-        async def theory_status():
-            return [{"node_name": str(dep), "external": True}]
-
-        mock_lsp_client.request_theory_status = theory_status
-        monkeypatch.setattr(processing, "_last_edit_sent", float("-inf"))
-        assert await ev._dependency_freshness_wait(mock_lsp_client) == 0.0
-        assert processing._grace_remaining() == 0.0
 
 
 class TestEvaluationLifecycle:
@@ -1267,7 +1306,7 @@ class TestEvaluationLifecycle:
 
         async def fake_loop(client, file_path, state, evaluation, timeout):
             state.complete()                       # what evaluation_status does
-            return "cancelled", [], []             # what the old loop guessed
+            return "cancelled", ev._NO_RECORD, []  # what the old loop guessed
 
         monkeypatch.setattr(ev, "_evaluation_wait_loop", fake_loop)
         view = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
@@ -1281,7 +1320,7 @@ class TestEvaluationLifecycle:
     ):
         async def fake_loop(client, file_path, state, evaluation, timeout):
             state.cancel()
-            return "in_progress", [], []
+            return "in_progress", ev._NO_RECORD, []
 
         monkeypatch.setattr(ev, "_evaluation_wait_loop", fake_loop)
         view = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
@@ -1301,7 +1340,7 @@ class TestEvaluationLifecycle:
 
         async def fake_loop(client, file_path, state, evaluation, timeout):
             state.cancel()
-            return "in_progress", [], []
+            return "in_progress", ev._NO_RECORD, []
 
         monkeypatch.setattr(ev, "_evaluation_wait_loop", fake_loop)
         view = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
@@ -1342,7 +1381,7 @@ class TestEvaluationLifecycle:
 
         async def fake_loop(client, file_path, state, evaluation, timeout):
             state._finish("abandoned")   # a peer abandons while we wait
-            return "in_progress", [], []
+            return "in_progress", ev._NO_RECORD, []
 
         monkeypatch.setattr(ev, "_evaluation_wait_loop", fake_loop)
         view = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
@@ -1362,7 +1401,7 @@ class TestEvaluationLifecycle:
         async def fake_loop(client, file_path, state, evaluation, timeout):
             # A second evaluation starts while we were waiting.
             runs.append(state.start(file_path, state.destination_line))
-            return "complete", [], []
+            return "complete", ev._NO_RECORD, []
 
         monkeypatch.setattr(ev, "_evaluation_wait_loop", fake_loop)
         view = await evaluate_to(mock_lsp_client, temp_theory_file, 5)
@@ -1374,8 +1413,8 @@ class TestEvaluationLifecycle:
 
 
 class TestGuardPositionDecision:
-    """§4.3: the guard judges the requested position, and waits out an
-    untrustworthy cache instead of guessing in either direction."""
+    """§4.3: the guard judges the requested position, and waits for a fresh
+    picture instead of guessing in either direction."""
 
     @pytest.mark.asyncio
     async def test_unknown_is_waited_out_then_served(
@@ -1383,32 +1422,36 @@ class TestGuardPositionDecision:
     ):
         from isabelle_mcp import processing
 
-        monkeypatch.setattr(processing, "DECORATION_GRACE", 0.3)
         await mock_lsp_client.open_document(temp_theory_file)
-        tracker = ProcessingTracker()
-        await tracker.update(
-            {"background_unprocessed1": [], "background_running1": []},
-        )
+        tracker = await _real_tracker(mock_lsp_client)
         mock_lsp_client._processing_trackers[temp_theory_file] = tracker
-        processing.note_edit_sent()          # cache is untrustworthy right now
+        mock_lsp_client.freshness.advance(NEWER)   # a newer version was seen
 
         assert tracker.position_state(4) == processing.UNKNOWN
         carets = []
         mock_lsp_client.set_caret = (
             lambda *a, **k: carets.append(a) or asyncio.sleep(0)
         )
-        # Neither a refusal nor a re-evaluation: wait the window out and answer.
+
+        async def the_push_arrives():
+            await asyncio.sleep(0.02)
+            await tracker.update({}, NEWER)             # the acknowledgement push
+            await mock_lsp_client.freshness.notify()
+
+        push = asyncio.create_task(the_push_arrives())
+        # Neither a refusal nor a re-evaluation: wait until fresh and answer.
         assert await ev.check_evaluation_guard(
             mock_lsp_client, temp_theory_file, MCPLine(5),
         ) is None
+        await push
         # The old guard also ended at None — but by running a whole evaluate_to,
         # which moves the caret. That is the behaviour this clause removes.
         assert carets == []
         assert evaluation_state.active is False
 
     @pytest.mark.asyncio
-    async def test_stale_running_range_in_the_grace_window_is_not_served(
-        self, mock_lsp_client, temp_theory_file, monkeypatch,
+    async def test_stale_running_range_of_an_unfresh_picture_is_not_served(
+        self, mock_lsp_client, temp_theory_file,
     ):
         """The agent edits a line the prover is executing, then queries it.
 
@@ -1417,46 +1460,34 @@ class TestGuardPositionDecision:
         is still executing; the freshness test has to come first."""
         from isabelle_mcp import processing
 
-        monkeypatch.setattr(processing, "DECORATION_GRACE", 100.0)
         await mock_lsp_client.open_document(temp_theory_file)
-        tracker = ProcessingTracker()
-        await tracker.update({
-            "background_unprocessed1": [], "background_running1": [(4, 0, 4, 20)],
-            "background_canceled": [],
-        })
+        tracker = await _real_tracker(mock_lsp_client, background_running1=[(4, 0, 4, 20)])
         mock_lsp_client._processing_trackers[temp_theory_file] = tracker
-        processing.note_edit_sent()          # the edit the agent just made
+        mock_lsp_client.freshness.content_sends += 1   # the edit the agent just made
 
         assert tracker.position_state(4) == processing.UNKNOWN
         assert tracker.position_state(4) != processing.RUNNING
 
     @pytest.mark.asyncio
-    async def test_stale_canceled_range_in_the_grace_window_is_not_served(
-        self, mock_lsp_client, temp_theory_file, monkeypatch,
+    async def test_stale_canceled_range_of_an_unfresh_picture_is_not_served(
+        self, mock_lsp_client, temp_theory_file,
     ):
         from isabelle_mcp import processing
 
-        monkeypatch.setattr(processing, "DECORATION_GRACE", 100.0)
-        tracker = ProcessingTracker()
-        await tracker.update({
-            "background_unprocessed1": [], "background_running1": [],
-            "background_canceled": [(4, 0, 4, 20)],
-        })
-        processing.note_edit_sent()
+        tracker = await _real_tracker(mock_lsp_client, background_canceled=[(4, 0, 4, 20)])
+        mock_lsp_client.freshness.advance(NEWER)
         assert tracker.position_state(4) == processing.UNKNOWN
 
     @pytest.mark.asyncio
-    async def test_unprocessed_stays_definite_in_the_grace_window(
-        self, mock_lsp_client, temp_theory_file, monkeypatch,
+    async def test_unprocessed_stays_definite_on_an_unfresh_picture(
+        self, mock_lsp_client, temp_theory_file,
     ):
-        """The one scan that may stay in front: an edit can only un-process a
-        line, and the caller's response to NOT_EVALUATED is to evaluate it."""
+        """The one scan that may stay in front: not_evaluated is the
+        least-finished verdict, and the caller's response to it is to evaluate."""
         from isabelle_mcp import processing
 
-        monkeypatch.setattr(processing, "DECORATION_GRACE", 100.0)
-        tracker = ProcessingTracker()
-        await tracker.update({"background_unprocessed1": [(4, 0, 4, 20)]})
-        processing.note_edit_sent()
+        tracker = await _real_tracker(mock_lsp_client, background_unprocessed1=[(4, 0, 4, 20)])
+        mock_lsp_client.freshness.advance(NEWER)
         assert tracker.position_state(4) == processing.NOT_EVALUATED
 
     @pytest.mark.asyncio
@@ -1464,12 +1495,8 @@ class TestGuardPositionDecision:
         self, mock_lsp_client, temp_theory_file,
     ):
         await mock_lsp_client.open_document(temp_theory_file)
-        tracker = ProcessingTracker()
-        await tracker.update({
-            "background_unprocessed1": [], "background_running1": [],
-            "background_canceled": [(4, 0, 4, 20)],
-        })
-        mock_lsp_client._processing_trackers[temp_theory_file] = tracker
+        mock_lsp_client._processing_trackers[temp_theory_file] = await _real_tracker(
+            mock_lsp_client, background_canceled=[(4, 0, 4, 20)])
 
         note = await ev.check_evaluation_guard(
             mock_lsp_client, temp_theory_file, MCPLine(5),
@@ -1485,11 +1512,8 @@ class TestGuardPositionDecision:
     ):
         # The approved wording, pinned verbatim like the interrupted note.
         await mock_lsp_client.open_document(temp_theory_file)
-        tracker = ProcessingTracker()
-        await tracker.update({
-            "background_unprocessed1": [], "background_running1": [(4, 0, 4, 20)],
-        })
-        mock_lsp_client._processing_trackers[temp_theory_file] = tracker
+        mock_lsp_client._processing_trackers[temp_theory_file] = await _real_tracker(
+            mock_lsp_client, background_running1=[(4, 0, 4, 20)])
 
         note = await ev.check_evaluation_guard(
             mock_lsp_client, temp_theory_file, MCPLine(5),
@@ -1503,9 +1527,19 @@ class TestGuardPositionDecision:
     async def test_still_unknown_after_the_wait_is_refused_not_evaluated(
         self, mock_lsp_client, temp_theory_file, monkeypatch,
     ):
+        # The race the frozen sentence survives for: a picture that reads
+        # unknown after the wait returned (a content send between the wait's
+        # end and the read). The wait is stubbed; the settled read loops
+        # under its budget, so the budget is shortened to reach the refusal.
         from isabelle_mcp import processing
 
         class AlwaysUnknown:
+            initialized = True
+            document_version = 0
+
+            def stamp_at_least_as_new_as(self, version):
+                return True
+
             def position_state(self, line):
                 return processing.UNKNOWN
 
@@ -1514,15 +1548,23 @@ class TestGuardPositionDecision:
 
         await mock_lsp_client.open_document(temp_theory_file)
         mock_lsp_client._processing_trackers[temp_theory_file] = AlwaysUnknown()
-        monkeypatch.setattr(ev, "_grace_remaining", lambda: 0.05)
-
-        with pytest.raises(IsabelleToolError, match="Cannot tell whether") as exc:
+        monkeypatch.setattr(ev, "FRESHNESS_TIMEOUT", 0.05)
+        from isabelle_mcp.utils import IsabelleCatastrophe
+        with pytest.raises(IsabelleCatastrophe):
             await ev.check_evaluation_guard(
                 mock_lsp_client, temp_theory_file, MCPLine(5),
             )
-        # Must not claim the line was not reached, and must not auto-start.
-        assert "not been evaluated" not in str(exc.value)
         assert evaluation_state.active is False
+
+    def test_the_unknown_refusal_keeps_its_frozen_text(self, temp_theory_file):
+        # UNKNOWN_POSITION_MESSAGE stays verbatim (user: the old wording is
+        # kept), served only in the race between a returned wait and the read.
+        from isabelle_mcp import processing
+        with pytest.raises(IsabelleToolError) as exc:
+            ev._served_state(processing.UNKNOWN, temp_theory_file, MCPLine(5))
+        assert str(exc.value) == ev.UNKNOWN_POSITION_MESSAGE.format(
+            file=temp_theory_file, line=5)
+
 
     @pytest.mark.asyncio
     async def test_every_query_tool_is_now_judged_by_position_alone(
@@ -1616,15 +1658,23 @@ class TestEvaluationFooter:
 
     async def _client(self, mock_lsp_client, temp_theory_file, **ranges):
         await mock_lsp_client.open_document(temp_theory_file)
-        tracker = ProcessingTracker()
-        await tracker.update({
-            "background_unprocessed1": ranges.get("unprocessed", []),
-            "background_running1": ranges.get("running", []),
-            "background_bad": ranges.get("bad", []),
-            "text_overview_error": ranges.get("overview_error", []),
-        })
-        mock_lsp_client._processing_trackers[temp_theory_file] = tracker
+        mock_lsp_client._processing_trackers[temp_theory_file] = await _real_tracker(
+            mock_lsp_client,
+            background_unprocessed1=ranges.get("unprocessed", []),
+            background_running1=ranges.get("running", []),
+            background_bad=ranges.get("bad", []),
+            text_overview_error=ranges.get("overview_error", []),
+        )
         return mock_lsp_client
+
+    @staticmethod
+    def _with_rows(client, *extra_rows: dict, imports: list[str] = ()) -> None:
+        """The mock's theory_status: one settled row per open document (the
+        first importing *imports*), then *extra_rows*."""
+        rows = [settled_theory_row(p) for p in client.open_documents]
+        if imports:
+            rows[0]["imports"] = [{"theory_name": name} for name in imports]
+        client.theory_rows = rows + list(extra_rows)
 
     def _slow(self, path):
         return RunningCommand(
@@ -1663,19 +1713,11 @@ class TestEvaluationFooter:
         client = await self._client(mock_lsp_client, temp_theory_file, **ranges)
         client.get_all_running_commands = lambda: [self._slow(temp_theory_file)]
         if outlet == "import_not_done":
-            real_status = client.request_theory_status
-
-            async def with_unfinished_import():
-                theories = await real_status()
-                theories[0]["imports"] = [{"theory_name": "Dep_import"}]
-                theories.append({
-                    "node_name": "/tmp/Dep_import.thy",
-                    "theory_name": "Dep_import", "imports": [], "ok": True,
-                    "consolidated": False, "running": 1, "unprocessed": 5,
-                })
-                return theories
-
-            client.request_theory_status = with_unfinished_import
+            self._with_rows(client, {
+                "node_name": "/tmp/Dep_import.thy",
+                "theory_name": "Dep_import", "imports": [], "ok": True,
+                "consolidated": False, "running": 1, "unprocessed": 5,
+            }, imports=["Dep_import"])
         if outlet != "no_target":
             target = 20 if outlet == "towards" else 5
             evaluation_state.start(temp_theory_file, MCPLine(target))
@@ -1719,42 +1761,35 @@ class TestEvaluationFooter:
         self, mock_lsp_client, temp_theory_file, tmp_path, outlet,
     ):
         """Item 14 (a): with a run outstanding, the failure count comes from
-        the SAME freshly parsed theory_status the verdict is judged on — a
-        dependency whose failure is known only to theory_status (no
-        decoration yet) counts — never from the entry stash, which is set
-        here to a clean list so the two sources diverge. The idle status line
-        agrees with the footer. (Mutation control: read client.entry_theories
-        at any of the three fresh-read sites and its case reds.)"""
-        from isabelle_mcp.evaluation import _parse_theory_status
+        the SAME freshly pulled theory_status record the verdict is judged on
+        — a dependency whose failure is known only to theory_status (no
+        decoration yet) counts — never from the entry record, which is set
+        here to a clean one so the two sources diverge. The idle status line
+        agrees with the footer. (Mutation control: read the entry record at
+        any of the three fresh-read sites and its case reds.)"""
         # "towards" here is the branch AFTER the theory_status round trip: the
         # target line is reached but an import is still running, so the
         # frontier is not (the not-reached branch before the round trip reads
-        # the entry stash by design).
+        # the entry record by design).
         ranges = {"completed": {}, "arrived": {"running": [(2, 0, 2, 9)]},
                   "towards": {}}[outlet]
         client = await self._client(mock_lsp_client, temp_theory_file, **ranges)
         dep = str(tmp_path / "Dep_status_only.thy")        # not on disk, no tracker
-        real_status = client.request_theory_status
-
-        async def with_failed_dep():
-            theories = await real_status()
-            theories.append({
-                "node_name": dep, "theory_name": "Dep_status_only", "external": True,
-                "imports": [], "ok": False, "total": 3, "unprocessed": 0, "running": 0,
-                "warned": 0, "failed": 1, "finished": 2, "canceled": False,
-                "consolidated": True,
-            })
-            if outlet == "towards":
-                theories[0]["imports"] = [{"theory_name": "Dep_import"}]
-                theories.append({
-                    "node_name": "/tmp/Dep_import.thy", "theory_name": "Dep_import",
-                    "imports": [], "ok": True, "consolidated": False,
-                    "running": 1, "unprocessed": 5,
-                })
-            return theories
-
-        client.request_theory_status = with_failed_dep
-        client.entry_theories = [_parse_theory_status(t) for t in await real_status()]
+        ev.set_entry_record(await client.request_theory_status())   # the clean one
+        failed_dep = {
+            "node_name": dep, "theory_name": "Dep_status_only", "external": True,
+            "imports": [], "ok": False, "total": 3, "unprocessed": 0, "running": 0,
+            "warned": 0, "failed": 1, "finished": 2, "canceled": False,
+            "consolidated": True,
+        }
+        if outlet == "towards":
+            self._with_rows(client, failed_dep, {
+                "node_name": "/tmp/Dep_import.thy", "theory_name": "Dep_import",
+                "imports": [], "ok": True, "consolidated": False,
+                "running": 1, "unprocessed": 5,
+            }, imports=["Dep_import"])
+        else:
+            self._with_rows(client, failed_dep)
         evaluation_state.start(temp_theory_file, MCPLine(5))
         footer = await ev.evaluation_footer(client)
         lead = {
@@ -1778,17 +1813,16 @@ class TestEvaluationFooter:
     async def test_the_ambient_count_comes_from_the_entry_theory_status(
         self, mock_lsp_client, temp_theory_file,
     ):
-        # No run, nothing open with an error — but the entry theory_status
-        # knows of a failed dependency: the footer counts it, without a round
-        # trip (a request here would surface in the mock's theory listing).
-        from isabelle_mcp.evaluation import _parse_theory_status
+        # No run, nothing open with an error — but the entry record knows of
+        # a failed dependency: the footer counts it, without a round trip (a
+        # request here would surface in the mock's theory listing).
         client = await self._client(mock_lsp_client, temp_theory_file)
         client.get_all_running_commands = lambda: [self._slow(temp_theory_file)]
-        client.entry_theories = [_parse_theory_status({
+        ev.set_entry_record(theory_status_record([{
             "node_name": "/lib/Broken.thy", "theory_name": "Broken",
             "external": True, "ok": False, "total": 2, "unprocessed": 0,
             "running": 0, "failed": 1, "finished": 1, "consolidated": True,
-        })]
+        }]))
         assert await ev.evaluation_footer(client) == (
             "1 command has been running for over 10s. 1 failed command remains. "
             "Call isabelle_evaluation_status for details."
@@ -1810,16 +1844,13 @@ class TestEvaluationFooter:
         )
 
     @pytest.mark.asyncio
-    async def test_stale_cache_reports_the_target_and_no_counts(
-        self, mock_lsp_client, temp_theory_file, monkeypatch,
+    async def test_an_unfresh_picture_reports_the_target_and_no_counts(
+        self, mock_lsp_client, temp_theory_file,
     ):
-        from isabelle_mcp import processing
-
         client = await self._client(mock_lsp_client, temp_theory_file)
         client.get_all_running_commands = lambda: [self._slow(temp_theory_file)]
         evaluation_state.start(temp_theory_file, MCPLine(20))
-        monkeypatch.setattr(processing, "DECORATION_GRACE", 100.0)
-        processing.note_edit_sent()
+        client.freshness.advance(NEWER)      # the picture is older than the newest version
         # The counts would come from the same cache that is not trusted here.
         assert await ev.evaluation_footer(client) == (
             f"Evaluating towards {temp_theory_file}:20."
@@ -1867,19 +1898,11 @@ class TestEvaluationFooter:
         # import is still checking, so the frontier is not. The old footer said
         # a hollow "arrived"; the truth is "towards", and the run is unstamped.
         client = await self._client(mock_lsp_client, temp_theory_file)
-        real_status = client.request_theory_status
-
-        async def with_unfinished_import():
-            theories = await real_status()
-            theories[0]["imports"] = [{"theory_name": "Dep_import"}]
-            theories.append({
-                "node_name": "/tmp/Dep_import.thy", "theory_name": "Dep_import",
-                "imports": [], "ok": True, "consolidated": False,
-                "running": 1, "unprocessed": 5,
-            })
-            return theories
-
-        client.request_theory_status = with_unfinished_import
+        self._with_rows(client, {
+            "node_name": "/tmp/Dep_import.thy", "theory_name": "Dep_import",
+            "imports": [], "ok": True, "consolidated": False,
+            "running": 1, "unprocessed": 5,
+        }, imports=["Dep_import"])
         run = evaluation_state.start(temp_theory_file, MCPLine(5))
         assert await ev.evaluation_footer(client) == (
             f"Evaluating towards {temp_theory_file}:5."
@@ -1930,17 +1953,13 @@ class TestEvaluationFooter:
         failed theories as a side effect."""
         client = await self._client(mock_lsp_client, temp_theory_file)
         evaluation_state.start(temp_theory_file, MCPLine(5))
-
-        async def fail_theory_status():
-            return [{
-                "node_name": "/tmp/Broken_footer.thy", "theory_name": "Broken",
-                "external": False, "imports": [], "ok": False, "total": 1,
-                "unprocessed": 0, "running": 0, "warned": 0, "failed": 1,
-                "finished": 0, "canceled": False, "consolidated": True,
-                "percentage": 100,
-            }]
-
-        client.request_theory_status = fail_theory_status
+        client.theory_rows = [{
+            "node_name": "/tmp/Broken_footer.thy", "theory_name": "Broken",
+            "external": False, "imports": [], "ok": False, "total": 1,
+            "unprocessed": 0, "running": 0, "warned": 0, "failed": 1,
+            "finished": 0, "canceled": False, "consolidated": True,
+            "percentage": 100,
+        }]
         await ev.evaluation_footer(client)
         assert "/tmp/Broken_footer.thy" not in client.open_documents
 
@@ -1954,8 +1973,22 @@ class TestForceInterruptContract:
         from isabelle_mcp.lsp_client import IsabelleLSPClient
         client = IsabelleLSPClient.__new__(IsabelleLSPClient)
         client.request = AsyncMock(**reply)
-        monkeypatch.setattr("isabelle_mcp.lsp_client.note_edit_sent", lambda: None)
+        client.freshness = FreshnessState()
         return client
+
+    @pytest.mark.asyncio
+    async def test_a_success_reply_advances_the_newest_version(self, monkeypatch):
+        client = self._client(monkeypatch, {"return_value": {
+            "outcome": "nothing_running", "document_version": NEWER}})
+        await client.force_interrupt()
+        assert client.freshness.newest_document_version == NEWER
+
+    @pytest.mark.asyncio
+    async def test_a_stampless_success_reply_is_a_catastrophe(self, monkeypatch):
+        from isabelle_mcp.utils import IsabelleCatastrophe
+        client = self._client(monkeypatch, {"return_value": {"outcome": "nothing_running"}})
+        with pytest.raises(IsabelleCatastrophe, match="document_version"):
+            await client.force_interrupt()
 
     @pytest.mark.asyncio
     async def test_unknown_outcome_is_a_catastrophe(self, monkeypatch):
@@ -2215,9 +2248,7 @@ class TestGuardDispatch:
     ):
         # Mutation control: drop the reopen step and this reds — the sentence
         # comes back instead of the answer.
-        mock_lsp_client.entry_theories = [
-            ev._parse_theory_status({"node_name": temp_theory_file, "ok": True}),
-        ]
+        ev.set_entry_record(theory_status_record([{"node_name": temp_theory_file, "ok": True}]))
         opened = []
         real_open = mock_lsp_client.open_document
 
@@ -2238,9 +2269,7 @@ class TestGuardDispatch:
     ):
         # The reopen comes before the busy test: a reopen executes nothing and
         # has no quarrel with the running evaluation.
-        mock_lsp_client.entry_theories = [
-            ev._parse_theory_status({"node_name": temp_theory_file, "ok": True}),
-        ]
+        ev.set_entry_record(theory_status_record([{"node_name": temp_theory_file, "ok": True}]))
         evaluation_state.start("/tmp/Other.thy", MCPLine(100))
         assert await ev.check_evaluation_guard(
             mock_lsp_client, temp_theory_file, MCPLine(5)) is None
@@ -2252,9 +2281,7 @@ class TestGuardDispatch:
     ):
         # Reopened because the prover holds it, yet the position was never
         # processed (an in-model node nothing evaluated): the honest error.
-        mock_lsp_client.entry_theories = [
-            ev._parse_theory_status({"node_name": temp_theory_file, "unprocessed": 10}),
-        ]
+        ev.set_entry_record(theory_status_record([{"node_name": temp_theory_file, "unprocessed": 10}]))
         real_open = mock_lsp_client.open_document
 
         async def open_unevaluated(path, **kw):
@@ -2368,9 +2395,7 @@ class TestGuardDispatch:
             await guard(mock_lsp_client, temp_theory_file, MCPLine(5))
         # 3. reopened (the prover holds it)
         await mock_lsp_client.close_document(temp_theory_file)
-        mock_lsp_client.entry_theories = [
-            ev._parse_theory_status({"node_name": temp_theory_file, "ok": True}),
-        ]
+        ev.set_entry_record(theory_status_record([{"node_name": temp_theory_file, "ok": True}]))
         assert await guard(mock_lsp_client, temp_theory_file, MCPLine(5)) is None
         # 2. the pure wait, run active on this file (start() is trapped, so
         #    the run is minted through the dataclass directly)
@@ -2392,10 +2417,11 @@ class TestGuardDispatch:
 
 
 class TestSorryIsContent:
-    def test_a_sorry_alone_proves_the_decoration_is_fresh(self, mock_lsp_client):
-        """deco_has_content names sorry in its own right: with theory_status
-        lagging (it still says a command failed) and the decoration showing
-        only the sorry, the decoration is trusted — not the stale count."""
+    def test_a_sorry_alone_is_rendered_from_a_picture_at_least_as_new(self, mock_lsp_client):
+        """With theory_status lagging (its rows still say a command failed)
+        and a picture at least as new showing only the sorry, the picture is
+        trusted — not the stale count. (The arbitration is by stamp alone; a
+        sorry needs no special standing.)"""
         from isabelle_mcp.evaluation import _build_file_snapshot
         from isabelle_mcp.models import TheoryStatus
         path = "/tmp/Fresh.thy"
@@ -2411,91 +2437,163 @@ class TestSorryIsContent:
             ok=False, total=2, unprocessed=0, running=0, failed=1, finished=1,
             consolidated=True,
         )
-        fs = _build_file_snapshot(mock_lsp_client, path, {path: stale})
+        fs = _build_file_snapshot(mock_lsp_client, path, {path: stale}, 0)
         assert fs.lined and fs.state == "clean" and fs.error_count == 0
         assert fs.sorry == [(4, 4)]
 
 
-class TestWaitOutGrace:
-    """wait_out_grace: the one wait behind the settled read, command_status's
-    batch wait and the site tools' wait. Its predicate is the gate alone; its
-    deadline is one whole window past the first expiry (every re-arm before it
-    is waited out in full, so the return can be one further window later); it
-    is health-checked like every wait on the prover."""
+class _WaitClient:
+    """Enough of the client for wait_until_fresh: the freshness state, the
+    open documents, one real tracker per file, and a flush whose reply names
+    ``reply_version`` and covers every content send counted before it. Pushes
+    are fed by the test; ``send_content`` is what _send does for a didChange."""
 
-    class _Client:
-        STALL_TIMEOUT = 60.0
+    STALL_TIMEOUT = 60.0
+    PROGRESS_CHECK_INTERVAL = 5.0
 
-        def __init__(self, fail=False):
-            self.fail = fail
-            self.checks = 0
+    def __init__(self, *paths: str, reply_version: int = 0, fail=False):
+        self.freshness = FreshnessState()
+        self.open_documents = {p: DocumentState(p, f"file://{p}", 1, "") for p in paths}
+        self._trackers: dict[str, ProcessingTracker] = {}
+        self.reply_version = reply_version
+        self.fail = fail
+        self.flushes = 0
+        self.checks = 0
 
-        def _check_server_health(self, stall_timeout):
-            self.checks += 1
-            if self.fail:
-                raise IsabelleToolError("Isabelle process died (exit code 1)")
+    def _check_server_health(self, stall_timeout):
+        self.checks += 1
+        if self.fail:
+            raise IsabelleToolError("Isabelle process died (exit code 1)")
+
+    def get_processing_tracker(self, path):
+        return self._trackers.get(path) if path in self.open_documents else None
+
+    async def flush(self, *, resync_dependencies):
+        self.flushes += 1
+        snapshot = self.freshness.content_sends
+        await asyncio.sleep(0)
+        self.freshness.advance(self.reply_version)
+        self.freshness.content_sends_flushed = max(self.freshness.content_sends_flushed, snapshot)
+        await self.freshness.notify()
+        return {"document_version": self.reply_version, "changed_uris": []}, snapshot
+
+    async def push(self, path: str, document_version: int, full: bool = True) -> None:
+        """A decoration push for *path*, folded as _handle_decoration folds it."""
+        self.freshness.advance(document_version)
+        tracker = self._trackers.get(path)
+        if tracker is None:
+            tracker = self._trackers[path] = ProcessingTracker(self.freshness)
+        entries = full_decoration_entries() if full else []
+        await tracker.update(parse_decoration_ranges(entries), document_version)
+        await self.freshness.notify()
+
+    async def send_content(self) -> None:
+        self.freshness.content_sends += 1
+        await self.freshness.notify()
+
+    async def close(self, path: str) -> None:
+        del self.open_documents[path]
+        self._trackers.pop(path, None)
+        await self.freshness.notify()
+
+
+class TestWaitUntilFresh:
+    """wait_until_fresh: the one helper behind every freshness wait. It owns
+    its flush, exits on the pictures OR a content send past its snapshot (then
+    re-arms), re-evaluates the wait set every pass, wakes on the client-level
+    condition, and ends at its bound in the catastrophe."""
 
     @pytest.mark.asyncio
-    async def test_returns_once_the_gate_has_closed(self, monkeypatch):
-        monkeypatch.setattr(processing, "DECORATION_GRACE", 0.05)
-        processing.note_edit_sent()
-        client = self._Client()
-        await ev.wait_out_grace(client)
-        assert processing._grace_remaining() == 0.0
-        assert client.checks >= 1
+    async def test_returns_at_once_when_every_picture_is_fresh(self):
+        client = _WaitClient("/a.thy", reply_version=OLDER)
+        await client.push("/a.thy", OLDER)
+        await ev.wait_until_fresh(client, ["/a.thy"])
+        assert client.flushes == 1
 
     @pytest.mark.asyncio
-    async def test_outlasts_a_gate_rearmed_meanwhile(self, monkeypatch):
-        # The deadline is one whole window past the FIRST expiry: every
-        # re-arm that lands before then is waited out. Two re-arms, the second
-        # landing after the first expiry, pin the geometry — mutation control
-        # (the W1 defect): make the deadline `now + window + 0.1` and this
-        # reds, because the second re-arm lands past that deadline and the
-        # wait returns with the gate still up.
-        import asyncio
-        monkeypatch.setattr(processing, "DECORATION_GRACE", 0.3)
-        processing.note_edit_sent()
+    async def test_wakes_within_the_push_not_at_the_backstop(self):
+        # Mutation control M-24: drop the notify after a folded push and this
+        # waits for the 5 s check interval (the test's bound is far below it).
+        client = _WaitClient("/a.thy", reply_version=NEWER)
+        await client.push("/a.thy", OLDER)            # older than the reply version
 
-        async def rearm():
-            await asyncio.sleep(0.2)
-            processing.note_edit_sent()          # gate now closes at 0.5
-            await asyncio.sleep(0.25)
-            processing.note_edit_sent()          # at 0.45: gate closes at 0.75
+        async def push():
+            await asyncio.sleep(0.02)
+            await client.push("/a.thy", NEWER, full=False)     # the acknowledgement
 
-        task = asyncio.create_task(rearm())
-        await ev.wait_out_grace(self._Client())
-        await task
-        assert processing._grace_remaining() == 0.0
-
-    @pytest.mark.asyncio
-    async def test_is_bounded_under_continuous_rearming(self, monkeypatch):
-        # Edits that never stop must not hold a tool forever: no re-arm past
-        # the deadline (one window past the first expiry) is honoured, so the
-        # wait returns at most one further window later and the caller reads
-        # what it can.
-        import asyncio
-        monkeypatch.setattr(processing, "DECORATION_GRACE", 0.1)
-        processing.note_edit_sent()
-        stop = False
-
-        async def keep_rearming():
-            while not stop:
-                processing.note_edit_sent()
-                await asyncio.sleep(0.02)
-
-        task = asyncio.create_task(keep_rearming())
+        task = asyncio.create_task(push())
         started = time.monotonic()
-        await ev.wait_out_grace(self._Client())
-        elapsed = time.monotonic() - started
-        stop = True
+        await asyncio.wait_for(ev.wait_until_fresh(client, ["/a.thy"]), 2.0)
         await task
-        assert 0.15 <= elapsed < 0.6
+        assert time.monotonic() - started < 1.0
+
+    @pytest.mark.asyncio
+    async def test_a_content_send_during_a_parked_wait_re_arms_the_flush(self):
+        # Mutation controls M-13 / M-13b: with no in-wait flush, or with the
+        # inner exit reduced to freshness alone, the send strands the wait
+        # (unflushed content can be discharged only by a flush).
+        client = _WaitClient("/a.thy", reply_version=OLDER)
+        await client.push("/a.thy", OLDER)
+        # the picture is at the reply version, but a send lands after the flush
+        original_flush = client.flush
+
+        async def flush_then_send(*, resync_dependencies):
+            reply = await original_flush(resync_dependencies=resync_dependencies)
+            if client.flushes == 1:
+                # after the first flush's snapshot: counted past it
+                client.freshness.content_sends += 1
+            return reply
+
+        client.flush = flush_then_send
+        await asyncio.wait_for(ev.wait_until_fresh(client, ["/a.thy"]), 2.0)
+        assert client.flushes == 2                       # re-armed once
+        assert not client.freshness.unflushed_content    # fresh in the full sense
+
+    @pytest.mark.asyncio
+    async def test_a_closed_file_leaves_the_wait_set(self):
+        # Mutation control M-23: keep a closed file in the set and the wait
+        # runs to the catastrophe.
+        client = _WaitClient("/a.thy", "/b.thy", reply_version=OLDER)
+        await client.push("/a.thy", OLDER)                # /b.thy never gets a picture
+
+        async def close_b():
+            await asyncio.sleep(0.02)
+            await client.close("/b.thy")
+
+        task = asyncio.create_task(close_b())
+        await asyncio.wait_for(ev.wait_until_fresh(client, ["/a.thy", "/b.thy"]), 2.0)
+        await task
+
+    @pytest.mark.asyncio
+    async def test_a_file_that_never_gets_a_full_push_ends_in_the_catastrophe(
+        self, monkeypatch,
+    ):
+        # Mutation controls M-3 / M-9 / M-18 from the client's side: no ack,
+        # or a stampless push dropped, or the bound removed (then this hangs).
+        from isabelle_mcp.utils import IsabelleCatastrophe
+        monkeypatch.setattr(ev, "FRESHNESS_TIMEOUT", 0.1)
+        client = _WaitClient("/a.thy", reply_version=OLDER)
+        await client.push("/a.thy", OLDER, full=False)   # a slice, never a picture
+        with pytest.raises(IsabelleCatastrophe, match="no fresh picture"):
+            await asyncio.wait_for(ev.wait_until_fresh(client, ["/a.thy"]), 2.0)
 
     @pytest.mark.asyncio
     async def test_a_dead_prover_ends_the_wait_with_its_error(self, monkeypatch):
-        # Mutation control for the health check: drop it and this hangs for
-        # the window instead of raising.
-        monkeypatch.setattr(processing, "DECORATION_GRACE", 5.0)
-        processing.note_edit_sent()
+        # The health check on the backstop pass, like every wait on the prover.
+        monkeypatch.setattr(_WaitClient, "PROGRESS_CHECK_INTERVAL", 0.02)
+        client = _WaitClient("/a.thy", reply_version=OLDER, fail=True)
         with pytest.raises(IsabelleToolError, match="died"):
-            await ev.wait_out_grace(self._Client(fail=True))
+            await asyncio.wait_for(ev.wait_until_fresh(client, ["/a.thy"]), 2.0)
+
+    @pytest.mark.asyncio
+    async def test_never_under_the_evaluation_lock(self, mock_lsp_client):
+        # I-8 (mutation control M-19): the ContextVar the OwnedLock sets is
+        # what both the wait and the flush assert on.
+        async with ev._evaluation_state_lock:
+            with pytest.raises(RuntimeError, match="I-8"):
+                await ev.wait_until_fresh(mock_lsp_client, [])
+            from isabelle_mcp.lsp_client import IsabelleLSPClient
+            client = IsabelleLSPClient()
+            with pytest.raises(RuntimeError, match="I-8"):
+                await client.flush(resync_dependencies=False)
+        await ev.wait_until_fresh(mock_lsp_client, [])       # released: fine

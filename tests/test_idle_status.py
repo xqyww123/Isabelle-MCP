@@ -3,10 +3,10 @@ calls to ask for status must not hide the failures that remain once the run
 has ended — in the files it evaluated and in their dependencies alike.
 
 The idle answer walks the same data path as the busy one: one theory_status
-pulled after the debounce, every failed theory auto-opened, every file with
+pulled after the entry wait, every failed theory auto-opened, every file with
 something wrong listed with line numbers, under a first line that says whether
-any errors remain. A recent edit makes the tool wait until the edits have
-stopped (debounce; a further edit re-arms the window). Warnings are never
+any errors remain. The entry waits until every open document's picture is
+fresh (a content send during the wait re-arms it). Warnings are never
 reported. isabelle_cancel_evaluation's idle reply is untouched.
 """
 
@@ -16,7 +16,6 @@ import time
 
 import pytest
 
-from isabelle_mcp import processing
 from isabelle_mcp.evaluation import (
     IDLE_CLEAN_SENTENCE,
     cancel_evaluation,
@@ -24,10 +23,14 @@ from isabelle_mcp.evaluation import (
     evaluation_status,
     format_evaluation_result,
 )
+from isabelle_mcp.processing import ProcessingTracker, parse_decoration_ranges
 from isabelle_mcp.server import isabelle_evaluation_status, mcp
 from isabelle_mcp.utils import MCPLine
-from tests.conftest import MockProcessingTracker
+from tests.conftest import MockProcessingTracker, full_decoration_entries
 from tests.test_server import _patch_ensure
+
+OLDER = -19
+NEWER = -40
 
 
 async def _open_with(client, path: str, **tracker_kw) -> None:
@@ -35,6 +38,21 @@ async def _open_with(client, path: str, **tracker_kw) -> None:
     (LSP 0-indexed ``(line, char, line, char)``)."""
     await client.open_document(path)
     client._processing_trackers[path] = MockProcessingTracker(**tracker_kw)
+
+
+async def _open_with_real(client, path: str, document_version: int, **ranges) -> ProcessingTracker:
+    """Open *path* with a REAL tracker holding a full picture stamped
+    *document_version* (``overview_error=[...]`` and kin as in _open_with)."""
+    await client.open_document(path)
+    entries = full_decoration_entries(
+        text_overview_error=ranges.get("overview_error", []),
+        background_bad=ranges.get("bad", []),
+        background_running1=ranges.get("running", []),
+    )
+    tracker = ProcessingTracker(client.freshness)
+    await tracker.update(parse_decoration_ranges(entries), document_version)
+    client._processing_trackers[path] = tracker
+    return tracker
 
 
 def _second_file(tmp_path, name: str) -> str:
@@ -183,14 +201,20 @@ class TestIdleReport:
         # just because no run is outstanding.
         dep = _second_file(tmp_path, "Dep.thy")
         calls = []
+        real_status = mock_lsp_client.request_theory_status
 
         async def status():
             calls.append(True)
-            return [_theory_row(temp_theory_file),
-                    _theory_row(dep, ok=False, failed=1, finished=9)]
+            return await real_status()
 
         mock_lsp_client.request_theory_status = status
-        await _open_with(mock_lsp_client, temp_theory_file)
+        mock_lsp_client.theory_rows = [_theory_row(temp_theory_file),
+                                       _theory_row(dep, ok=False, failed=1, finished=9)]
+        # The auto-opened file has no picture at least as new as the record:
+        # the mock plants a tracker on open, so give the record a NEWER stamp
+        # than the planted picture's (0) — counts until its decoration arrives.
+        mock_lsp_client.theory_status_stamp = NEWER
+        await _open_with(mock_lsp_client, temp_theory_file, document_version=NEWER)
         view = await evaluation_status(mock_lsp_client)
         assert calls == [True]
         assert dep in mock_lsp_client.open_documents
@@ -211,11 +235,9 @@ class TestIdleReport:
         # That must not put the session on the busy path (only running work
         # does), and it is not an imported theory, so the summary line does
         # not count it either: the report is the clean sentence alone.
-        async def status():
-            return [_theory_row(temp_theory_file, unprocessed=10, finished=0,
-                                consolidated=False, percentage=0)]
-
-        mock_lsp_client.request_theory_status = status
+        mock_lsp_client.theory_rows = [
+            _theory_row(temp_theory_file, unprocessed=10, finished=0,
+                        consolidated=False, percentage=0)]
         await _open_with(mock_lsp_client, temp_theory_file, all_processed=False)
         view = await evaluation_status(mock_lsp_client)
         assert view.status == "no_evaluation"
@@ -232,12 +254,10 @@ class TestIdleReport:
         # import closure of an open document that still has unprocessed
         # commands. Nothing is running yet (the load has not started), so the
         # session is idle, and the count says what is still to come.
-        async def status():
-            return [_theory_row(temp_theory_file, imports=[{"theory_name": "Dep_loading"}]),
-                    _theory_row("/tmp/Dep_loading.thy", external=True,
-                                unprocessed=10, finished=0, consolidated=False)]
-
-        mock_lsp_client.request_theory_status = status
+        mock_lsp_client.theory_rows = [
+            _theory_row(temp_theory_file, imports=[{"theory_name": "Dep_loading"}]),
+            _theory_row("/tmp/Dep_loading.thy", external=True,
+                        unprocessed=10, finished=0, consolidated=False)]
         await _open_with(mock_lsp_client, temp_theory_file, all_processed=True)
         view = await evaluation_status(mock_lsp_client)
         assert view.status == "no_evaluation"
@@ -260,14 +280,10 @@ class TestIdleReport:
         # unprocessed rest is not an imported theory, so no summary line.
         evaluation_state.start(temp_theory_file, MCPLine(5))
         evaluation_state.complete()
-
-        async def status():
-            return [_theory_row(temp_theory_file, unprocessed=4, finished=6,
-                                consolidated=False),
-                    _theory_row("/tmp/Dep_running.thy", running=2, unprocessed=3,
-                                finished=5, consolidated=False)]
-
-        mock_lsp_client.request_theory_status = status
+        mock_lsp_client.theory_rows = [
+            _theory_row(temp_theory_file, unprocessed=4, finished=6, consolidated=False),
+            _theory_row("/tmp/Dep_running.thy", running=2, unprocessed=3,
+                        finished=5, consolidated=False)]
         await _open_with(mock_lsp_client, temp_theory_file, unprocessed=[(6, 0, 9, 0)])
         view = await evaluation_status(mock_lsp_client)
         assert view.status == "in_progress"
@@ -288,13 +304,10 @@ class TestIdleReport:
         # not approved output.
         evaluation_state.start(temp_theory_file, MCPLine(5))
         evaluation_state.complete()
-
-        async def status():
-            return [_theory_row(temp_theory_file),
-                    _theory_row("/tmp/Dep_running.thy", running=1, unprocessed=0,
-                                finished=9, consolidated=False)]
-
-        mock_lsp_client.request_theory_status = status
+        mock_lsp_client.theory_rows = [
+            _theory_row(temp_theory_file),
+            _theory_row("/tmp/Dep_running.thy", running=1, unprocessed=0,
+                        finished=9, consolidated=False)]
         await _open_with(mock_lsp_client, temp_theory_file)
         view = await evaluation_status(mock_lsp_client)
         assert [fs.file_path for fs in view.files] == ["/tmp/Dep_running.thy"]
@@ -307,74 +320,65 @@ class TestIdleReport:
         # A failed dependency whose decoration has not arrived: the first line
         # and the file snapshot below it are computed from one source, so the
         # count above can never disagree with the rows below.
-        from isabelle_mcp.evaluation import _failed_count, _parse_theory_status
+        from isabelle_mcp.evaluation import _failed_count
+        from tests.conftest import theory_status_record
         dep = _second_file(tmp_path, "Dep_count.thy")
         rows = [_theory_row(temp_theory_file),
                 _theory_row(dep, ok=False, failed=1, finished=9)]
-
-        async def status():
-            return rows
-
-        mock_lsp_client.request_theory_status = status
-        await _open_with(mock_lsp_client, temp_theory_file)
+        mock_lsp_client.theory_rows = rows
+        mock_lsp_client.theory_status_stamp = NEWER      # the auto-opened dep: counts
+        await _open_with(mock_lsp_client, temp_theory_file, document_version=NEWER)
         view = await evaluation_status(mock_lsp_client)
-        theories = [_parse_theory_status(r) for r in rows]
-        assert _failed_count(mock_lsp_client, theories) == 1
+        assert _failed_count(mock_lsp_client, theory_status_record(rows, NEWER)) == 1
         assert "1 failed command remains." in view.message
         assert sum(fs.error_count for fs in view.files) == 1
 
 
-class TestIdleGraceWindow:
-    """An edit within DECORATION_GRACE makes the decoration cache describe the
-    pre-edit document. The idle branch waits the remaining window out and judges
-    afresh, instead of answering from the stale cache or hiding the answer."""
-
-    @pytest.fixture(autouse=True)
-    def _short_grace(self, monkeypatch):
-        monkeypatch.setattr(processing, "DECORATION_GRACE", 0.05)
+class TestIdleEntryWait:
+    """The tool's entry waits until every open document's picture is fresh —
+    stamped at least as new as the newest version, no unflushed content —
+    instead of answering from a picture of an older document state."""
 
     @pytest.mark.asyncio
     async def test_reports_the_post_edit_picture(
         self, temp_theory_file, mock_lsp_client,
     ):
-        # Before the edit, the tracker shows an error; the edit fixed it, and the
-        # server's fresh decoration lands inside the window.
-        await _open_with(
-            mock_lsp_client, temp_theory_file,
+        # Before the edit, the picture (at OLDER) shows an error; the edit
+        # fixed it, the client saw NEWER, and the server's push at NEWER
+        # lands while the entry waits.
+        tracker = await _open_with_real(
+            mock_lsp_client, temp_theory_file, OLDER,
             overview_error=[(2, 0, 2, 5)], bad=[(2, 0, 2, 5)],
         )
-        processing.note_edit_sent()
+        mock_lsp_client.freshness.advance(NEWER)
 
         async def fresh_decoration_arrives():
-            await asyncio.sleep(0.01)
-            mock_lsp_client._processing_trackers[temp_theory_file] = (
-                MockProcessingTracker()
-            )
+            await asyncio.sleep(0.02)
+            await tracker.update(parse_decoration_ranges(full_decoration_entries()), NEWER)
+            await mock_lsp_client.freshness.notify()
 
         push = asyncio.ensure_future(fresh_decoration_arrives())
         started = time.monotonic()
         view = await evaluation_status(mock_lsp_client)
         await push
-        assert time.monotonic() - started >= 0.04
+        assert time.monotonic() - started >= 0.015
         assert view.message == IDLE_CLEAN_SENTENCE
         assert view.files == []
 
     @pytest.mark.asyncio
-    async def test_work_that_starts_inside_the_window_takes_the_busy_path(
+    async def test_work_that_starts_inside_the_wait_takes_the_busy_path(
         self, temp_theory_file, mock_lsp_client,
     ):
-        # The edit made the prover re-run a command; by the time the window has
-        # passed, something is running, and that is the answer.
-        await _open_with(mock_lsp_client, temp_theory_file)
-        processing.note_edit_sent()
+        # The edit made the prover re-run a command; the push that makes the
+        # picture fresh shows it running, and that is the answer.
+        tracker = await _open_with_real(mock_lsp_client, temp_theory_file, OLDER)
+        mock_lsp_client.freshness.advance(NEWER)
 
         async def command_starts():
-            await asyncio.sleep(0.01)
-            # Through the tracker, as production would: the running-command
-            # list is derived from the same ranges the sections render.
-            mock_lsp_client._processing_trackers[temp_theory_file].running.append(
-                (7, 0, 8, 5),
-            )
+            await asyncio.sleep(0.02)
+            await tracker.update(parse_decoration_ranges(full_decoration_entries(
+                background_running1=[(7, 0, 8, 5)])), NEWER)
+            await mock_lsp_client.freshness.notify()
 
         push = asyncio.ensure_future(command_starts())
         view = await evaluation_status(mock_lsp_client)
@@ -383,35 +387,35 @@ class TestIdleGraceWindow:
         assert view.message == "1 command is still running."
 
     @pytest.mark.asyncio
-    async def test_an_edit_during_the_wait_re_arms_it(
+    async def test_a_content_send_during_the_wait_re_arms_it(
         self, temp_theory_file, mock_lsp_client,
     ):
-        # Debounce: a further edit during the wait re-arms the window, so the
-        # tool answers only once the edits have stopped — and from the picture
-        # after the LAST edit.
-        await _open_with(
-            mock_lsp_client, temp_theory_file,
+        # A didChange landing while the entry waits (the watcher's sink) is
+        # unflushed content: the wait re-arms its flush and answers from the
+        # picture after the LAST edit.
+        tracker = await _open_with_real(
+            mock_lsp_client, temp_theory_file, OLDER,
             overview_error=[(2, 0, 2, 5)], bad=[(2, 0, 2, 5)],
         )
-        processing.note_edit_sent()
+        mock_lsp_client.freshness.advance(NEWER)
 
         async def second_edit_then_fix():
-            await asyncio.sleep(0.03)
-            processing.note_edit_sent()
-            mock_lsp_client._processing_trackers[temp_theory_file] = (
-                MockProcessingTracker()
-            )
+            await asyncio.sleep(0.02)
+            mock_lsp_client.freshness.content_sends += 1      # the second edit
+            await mock_lsp_client.freshness.notify()
+            await asyncio.sleep(0.02)
+            await tracker.update(parse_decoration_ranges(full_decoration_entries()), NEWER)
+            await mock_lsp_client.freshness.notify()
 
         push = asyncio.ensure_future(second_edit_then_fix())
-        started = time.monotonic()
         view = await evaluation_status(mock_lsp_client)
         await push
-        # 0.03 s until the second edit, then a full re-armed 0.05 s window.
-        assert time.monotonic() - started >= 0.07
         assert view.message == IDLE_CLEAN_SENTENCE
+        assert mock_lsp_client.flush_calls == [False, False]   # re-armed once
+        assert not mock_lsp_client.freshness.unflushed_content
 
     @pytest.mark.asyncio
-    async def test_without_a_recent_edit_it_answers_at_once(
+    async def test_with_a_fresh_picture_it_answers_at_once(
         self, temp_theory_file, mock_lsp_client,
     ):
         await _open_with(
@@ -422,6 +426,7 @@ class TestIdleGraceWindow:
         view = await evaluation_status(mock_lsp_client)
         assert time.monotonic() - started < 0.04
         assert "but 1 failed command remains." in view.message
+        assert mock_lsp_client.flush_calls == [False]         # the entry wait's flush
 
 
 class TestIdleReport2:

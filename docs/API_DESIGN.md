@@ -44,6 +44,9 @@ ARCHITECTURE.md.
 | `isabelle_find_theorems` | `PIDE/find_theorems_at_position` (ours, position-explicit) | As above, in the command's context |
 | `isabelle_command_output` | `PIDE/output_at_position` (ours, position-explicit) | Request-response; returns the enclosing command's source+range and rendered output in one shot |
 | `isabelle_command_status` | `PIDE/commands_at_lines` (ours) | Request-response; the commands overlapping each requested line, for however many lines are asked about |
+| every tool's entry | `PIDE/flush` (ours) | Request-response; `{resync_dependencies}` → the server re-reads the dependency files when asked, flushes everything pending to the prover and replies `{document_version, changed_uris}` once the prover has assigned that version |
+| every tool's entry, the status report | `PIDE/theory_status` (ours) | Request-response; every row rendered from one document state, the reply stamped with its `document_version` |
+| (pushed) | `PIDE/decoration` (stock, extended) | Notification; every push carries `document_version`, the version it was rendered from; an empty push with a stamp acknowledges "nothing changed at this version" |
 
 ### 2.3 Session Management
 

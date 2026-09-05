@@ -12,7 +12,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from isabelle_mcp import debugger, processing
+from isabelle_mcp import debugger, evaluation as ev, processing
+from isabelle_mcp.processing import FreshnessState
+from tests.conftest import theory_status_record
 from isabelle_mcp.debugger import (
     ARMED,
     PENDING,
@@ -64,11 +66,24 @@ def _listing(*bps: dict, status: str = "ok", open_: bool = True) -> dict:
 DEFAULT_SITES = (_bp(11, VAL_XS, 4), _bp(12, VAL_SHIFT, 0), _bp(13, VAL_TOTAL, 4))
 
 
+def _entry(*paths: str) -> None:
+    """This call's entry record: the theories the prover holds."""
+    ev.set_entry_record(theory_status_record([{"node_name": p} for p in paths]))
+
+
 class FakeTracker:
+    # A full picture stamped 0 (Version.init): fresh against the fake client's
+    # newest version, which stays 0.
+    initialized = True
+    document_version = 0
+
     def __init__(self, state: str = processing.PROCESSED,
                  unprocessed: list[tuple[int, int, int, int]] | None = None):
         self.state = state
         self.unprocessed = unprocessed or []
+
+    def stamp_at_least_as_new_as(self, version: int) -> bool:
+        return self.initialized and self.document_version <= version
 
     def position_state(self, line0: int) -> str:
         return self.state
@@ -82,6 +97,7 @@ class FakeDebugClient:
     last reply repeats), and records the calls it saw."""
 
     STALL_TIMEOUT = 60.0
+    PROGRESS_CHECK_INTERVAL = 5.0
 
     def _check_server_health(self, stall_timeout: float) -> None:
         pass
@@ -91,8 +107,12 @@ class FakeDebugClient:
         self.project_root = None
         self.open_documents = {
             THY: SimpleNamespace(content=CONTENT, is_evaluation_target=False)}
-        # The entry theory_status: what the prover holds (the reopen reads it).
-        self.entry_theories = [_parse_theory_status({"node_name": THY})]
+        # The entry record: what the prover holds (the reopen reads it).
+        _entry(THY)
+        # The freshness state: the newest version stays 0, as every fake
+        # tracker's stamp does, so a reopened file's picture is fresh at once.
+        self.freshness = FreshnessState()
+        self.flushes = 0
         self.opened: list[tuple[str, bool]] = []
         self.debugger_state_history: list[dict] = []
         self.debugger_threads: dict[str, list[dict]] = {}
@@ -128,9 +148,13 @@ class FakeDebugClient:
             content=CONTENT, is_evaluation_target=evaluation_target)
         if self.tracker_on_reopen is not None:
             self.trackers = {**getattr(self, "trackers", {}), file_path: self.tracker_on_reopen}
-        # The fake FORCES the gate up on every reopen (production skips it for
-        # a file untouched since its close): the tools must cope with it.
-        processing.note_edit_sent()
+
+    async def flush(self, *, resync_dependencies):
+        self.flushes += 1
+        snapshot = self.freshness.content_sends
+        self.freshness.content_sends_flushed = max(self.freshness.content_sends_flushed, snapshot)
+        await self.freshness.notify()
+        return {"document_version": 0, "changed_uris": []}, snapshot
 
     async def set_caret(self, *a, **k):
         raise AssertionError("a breakpoint tool moved the caret")
@@ -147,8 +171,9 @@ class FakeDebugClient:
 
     async def request_theory_status(self):
         self.calls.append(("theory_status",))
-        return self.theory_replies.pop(0) if len(self.theory_replies) > 1 \
+        rows = self.theory_replies.pop(0) if len(self.theory_replies) > 1 \
             else self.theory_replies[0]
+        return theory_status_record(rows)
 
     async def debugger_breakpoints(self, file_path, *, timeout, request_timeout):
         self.calls.append(("breakpoints", file_path, timeout, request_timeout))
@@ -1756,6 +1781,19 @@ class TestForgottenArmingFence:
         assert await debugger.forgotten_arming_fence(client, THY) is None
 
     @pytest.mark.asyncio
+    async def test_a_healthy_reopen_emits_no_fence_warning(self, client):
+        # Mutation control M-21: at fence time a reopened file has a brand-new
+        # tracker with no picture yet (the fence runs under the lock, after the
+        # open and before the freshness wait). An uninitialized tracker counts
+        # nothing as reburied — otherwise the fence would fire on every healthy
+        # reopen in a debug session and stop being read.
+        debugger.registry.entries.append(_armed_entry(serial=11))
+        client.trackers = {THY: processing.ProcessingTracker(client.freshness)}
+        client.theory_replies = self._theories()
+        assert await debugger.forgotten_arming_fence(client, THY) is None
+        assert not any(c[0] == "theory_status" for c in client.calls)
+
+    @pytest.mark.asyncio
     async def test_armed_ml_entry_with_changed_sig_warns(
             self, client, tmp_path):
         blob = tmp_path / "tools.ML"
@@ -1930,16 +1968,10 @@ class TestReopenOfSweptTheories:
     sites are read; a theory the prover does not hold gets the listing's own
     sentence; a .ML is never reopened. The reopen happens outside every lock."""
 
-    @pytest.fixture(autouse=True)
-    def _short_grace(self, monkeypatch):
-        # The fake's reopen forces the grace gate up and the tools wait it
-        # out; keep the window short.
-        monkeypatch.setattr(processing, "DECORATION_GRACE", 0.05)
-
     def _swept(self, client, held: bool = True) -> None:
         del client.open_documents[THY]
         if not held:
-            client.entry_theories = []
+            _entry()
             client.listing_replies = [_listing(open_=False)]
 
     @pytest.mark.asyncio
@@ -1970,17 +2002,16 @@ class TestReopenOfSweptTheories:
             where=f"{THY}:{VAL_XS}")
 
     @pytest.mark.asyncio
-    async def test_a_reopened_theory_is_judged_after_the_grace_gate(
-        self, client, monkeypatch,
-    ):
-        # The reopen's didOpen raises the grace gate (in production only when
-        # the file changed meanwhile; the fake always); a long-evaluated line
-        # read under it says `unknown` and would be reported as "still
-        # evaluating" — about work that does not exist. The reopen waits the
-        # gate out (outside the lock) before the sites are judged.
-        monkeypatch.setattr(processing, "DECORATION_GRACE", 0.05)
-        tracker = processing.ProcessingTracker()
-        await tracker.update({"background_unprocessed1": [], "background_running1": []})
+    async def test_a_reopened_theory_is_judged_after_its_first_picture(self, client):
+        # A reopened file has no picture until its first push; a long-evaluated
+        # line read before it says `unknown` and would be reported as "still
+        # evaluating" — about work that does not exist. The reopen waits for
+        # the file's picture (outside the lock; the wait's own flush is the
+        # witness) before the sites are judged.
+        from isabelle_mcp.processing import parse_decoration_ranges
+        from tests.conftest import full_decoration_entries
+        tracker = processing.ProcessingTracker(client.freshness)
+        await tracker.update(parse_decoration_ranges(full_decoration_entries()), 0)
         self._swept(client)
         client.tracker_on_reopen = tracker
         client.listing_replies = [_listing()]        # evaluated, but no site
@@ -1989,32 +2020,7 @@ class TestReopenOfSweptTheories:
         assert str(exc.value).startswith(debugger.NO_SITE_ON_LINE.format(
             where=f"{THY}:{VAL_XS}"))
         assert "still evaluating" not in str(exc.value)
-
-    @pytest.mark.asyncio
-    async def test_the_reopen_wait_outlasts_a_gate_rearmed_meanwhile(
-        self, client, monkeypatch,
-    ):
-        # The gate is global: an edit landing while the reopen waits re-arms
-        # it. The wait keeps going until the gate has really closed (bounded),
-        # so the site verdict is still judged after it — not "still
-        # evaluating" about work that does not exist.
-        monkeypatch.setattr(processing, "DECORATION_GRACE", 0.3)
-        tracker = processing.ProcessingTracker()
-        await tracker.update({"background_unprocessed1": [], "background_running1": []})
-        self._swept(client)
-        client.tracker_on_reopen = tracker
-        client.listing_replies = [_listing()]
-
-        async def rearm_mid_wait():
-            await asyncio.sleep(0.2)
-            processing.note_edit_sent()
-
-        rearm = asyncio.create_task(rearm_mid_wait())
-        with pytest.raises(IsabelleToolError) as exc:
-            await debugger.set_breakpoint(client, THY, VAL_XS, None)
-        await rearm
-        assert str(exc.value).startswith(debugger.NO_SITE_ON_LINE.format(
-            where=f"{THY}:{VAL_XS}"))
+        assert client.flushes == 1
 
     @pytest.mark.asyncio
     async def test_no_site_tool_writes_the_run_or_the_caret(self, client, trap_run_writes):
@@ -2054,7 +2060,7 @@ class TestReopenOfSweptTheories:
 
     @pytest.mark.asyncio
     async def test_an_ml_file_is_never_reopened(self, client):
-        client.entry_theories.append(_parse_theory_status({"node_name": ML}))
+        _entry(THY, ML)
         client.listing_replies = [_listing(open_=False)]
         client.loaders = []
         with pytest.raises(IsabelleToolError) as exc:
@@ -2138,7 +2144,7 @@ class TestReopenOfSweptTheories:
             file_path=other, line=3, anchor="val y", state=PENDING,
             serial=None, reason=debugger.TAG_NOT_EVALUATED))
         self._swept(client)
-        client.entry_theories.append(_parse_theory_status({"node_name": other}))
+        _entry(THY, other)
         real_open = client.open_document
 
         async def open_or_fail(file_path, **kw):

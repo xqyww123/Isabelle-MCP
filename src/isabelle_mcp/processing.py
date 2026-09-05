@@ -1,10 +1,10 @@
-"""Tracks PIDE processing status per file based on PIDE/decoration notifications."""
+"""Tracks PIDE processing status per file based on PIDE/decoration notifications,
+and the freshness rule that decides when that cache may be trusted."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import time as _time
 from collections.abc import Callable
 
@@ -12,67 +12,72 @@ from isabelle_mcp.utils.core import LSPLine
 
 logger = logging.getLogger(__name__)
 
-# How long after any edit reaches the server the cached decoration state is
-# treated as stale. The 2.0s default covers both publish chains with margin:
-# our own didChange (input batch 0.1s + decoration output throttle 0.5s ≈ 0.6s)
-# and an external dependency edit (the server's File_Watcher debounce
-# vscode_load_delay 0.5s + the same 0.6s ≈ 1.1s, anchored at our detection
-# time which may lag the disk change by up to the debounce). The server stays
-# silent forever when the recomputed decorations equal the published ones, so
-# freshness must recover by clock — waiting for a push would latch
-# "in progress" permanently on a no-op re-evaluation.
-def _read_grace() -> float:
-    """Parse ISABELLE_MCP_DECORATION_GRACE (default 2.0; invalid → warn + 2.0).
 
-    A non-positive value disables the gate entirely — cached decorations are
-    then always trusted, reintroducing the post-edit stale-read races.
+# ── Document versions and freshness ─────────────────────────────────────────
+#
+# Every picture the server sends (a PIDE/decoration push, a PIDE/theory_status
+# reply) carries `document_version`: the id of the PIDE Document.Version it was
+# rendered from. Every exchange that changes the document (PIDE/flush,
+# PIDE/cancel_evaluation) replies with an assigned version that contains every
+# edit the client had sent before the request. The client trusts a picture iff
+# its stamp is at least as new as the newest version it has seen and no content
+# it wrote is still uncovered by a flush reply — no clock, no grace window.
+#
+# Ids tick DOWNWARD: the JVM counter starts at 0 and decrements
+# (Pure/Concurrent/counter.scala: "unique identifiers < 0 ... JVM ticks
+# backwards"); Document_ID.none = 0 is Version.init's id, the oldest version
+# there is. So NEWER MEANS NUMERICALLY SMALLER. The direction lives in the two
+# functions below and nowhere else (I-7): no other module writes a relational
+# operator, max, min or sorted on a document version.
+
+def at_least_as_new(stamp: int, reference: int) -> bool:
+    """True iff document version *stamp* is at least as new as *reference*."""
+    return stamp <= reference
+
+
+def newer_of(a: int, b: int) -> int:
+    """The newer of two document versions."""
+    return min(a, b)
+
+
+class FreshnessState:
+    """The client's freshness state, shared by reference with every tracker.
+
+    ``newest_document_version`` is the client's high-water mark: the newest
+    version seen in any picture stamp or reply version since the prover
+    started (0 = Version.init until the first stamp). ``content_sends`` counts
+    the didOpen/didChange messages written to the wire, ``content_sends_flushed``
+    how many of them a flush reply has covered; the two counters are plain
+    integers compared with ``!=``, never document versions. ``condition`` is the
+    ONE client-level condition every freshness wait parks on; it is notified by
+    a folded decoration push, a close, a flush reply and a content send.
     """
-    raw = os.environ.get("ISABELLE_MCP_DECORATION_GRACE", "2.0")
-    try:
-        return float(raw)
-    except ValueError:
-        logger.warning(
-            "Invalid ISABELLE_MCP_DECORATION_GRACE=%r; using 2.0", raw,
-        )
-        return 2.0
 
+    def __init__(self) -> None:
+        self.newest_document_version: int = 0
+        self.content_sends: int = 0
+        self.content_sends_flushed: int = 0
+        self.condition: asyncio.Condition = asyncio.Condition()
 
-DECORATION_GRACE: float = _read_grace()
+    @property
+    def unflushed_content(self) -> bool:
+        return self.content_sends != self.content_sends_flushed
 
-# Monotonic time of the last edit known to have reached the server's document
-# model — GLOBAL, not per file: PIDE invalidation propagates across imports, so
-# any edit makes every file's cached decorations untrustworthy for the grace
-# period. -inf until the first edit (a freshly started server is fresh).
-_last_edit_sent: float = float("-inf")
+    def advance(self, document_version: int) -> None:
+        """Fold a stamp or reply version into the newest version."""
+        self.newest_document_version = newer_of(
+            self.newest_document_version, document_version)
 
+    async def notify(self) -> None:
+        async with self.condition:
+            self.condition.notify_all()
 
-def note_edit_sent() -> None:
-    """Record that the server's document model just changed.
+    def reset(self) -> None:
+        """A new server process restarts everything."""
+        self.newest_document_version = 0
+        self.content_sends = 0
+        self.content_sends_flushed = 0
 
-    Call this when WE send content — didOpen, didChange — or when the server
-    changes the document on our behalf (cancel_evaluation's retirement edits and
-    perspective retraction), and when Layer-3 dependency tracking
-    observes that an external import/.ML file changed on disk (those are synced
-    by the server's own File_Watcher, not by our didChange).
-
-    For :data:`DECORATION_GRACE` seconds afterwards every tracker's cached
-    decoration state is distrusted: it may still describe the pre-edit
-    document, and trusting it would let an empty unprocessed list pass for
-    "evaluation complete" before the server even assimilated the edit.
-
-    Caret-only moves are deliberately NOT edits: decorations always cover the
-    whole document, independent of the caret perspective (empirically
-    verified — see docs/TECH_NOTE.md, "decoration covers the whole document"),
-    so after a caret move the stale cache can only OVER-report unprocessed
-    regions — it waits longer, it never claims unchecked work done.
-    """
-    global _last_edit_sent
-    _last_edit_sent = _time.monotonic()
-
-
-def _grace_remaining() -> float:
-    """Seconds left until the post-edit grace window elapses (0 if elapsed)."""
-    return max(0.0, DECORATION_GRACE - (_time.monotonic() - _last_edit_sent))
 
 _TRACKED_TYPES = frozenset({
     "background_unprocessed1", "background_running1", "background_canceled",
@@ -84,22 +89,19 @@ _TRACKED_TYPES = frozenset({
 def is_full_decoration_push(parsed: dict[str, list[tuple[int, int, int, int]]]) -> bool:
     """Whether a parsed push names every tracked type — the mark of a FULL push.
 
-    CROSS-LANGUAGE INVARIANT, relied on by :meth:`IsabelleLSPClient._handle_decoration`
+    CROSS-LANGUAGE INVARIANT, enforced by :meth:`ProcessingTracker.update` (I-5)
     and mirrored in the Scala fork (``vscode_rendering.scala`` ``decorations`` —
     "list of canonical length and order"; ``vscode_model.scala`` ``publish``;
-    ``vscode_resources.scala`` ``change_model``): the server publishes decorations
-    in two shapes. A **full** push carries the canonical list, every type present,
+    ``vscode_resources.scala`` ``close_model``): the server publishes decorations
+    in three shapes. A **full** push carries the canonical list, every type present,
     empty ones included; it is sent exactly when ``published_decorations`` is
-    empty, which every open and every reopen guarantees (``change_model`` clears
-    the baseline of a model coming back from ``external_file``). A **differential**
-    push carries only the entries that changed since the last publish. The "erase"
-    push the server emits ~0.5 s after a didClose is differential: it names only
-    the types that HAD content, now emptied, so for a file the unified close was
-    allowed to close (:func:`evaluation.theory_settled`) it can never name
-    ``background_unprocessed1`` or ``background_running1``.
+    empty, which every open and every reopen guarantees (``close_model`` clears
+    the baseline). A **differential** push carries only the entries that changed
+    since the last publish. An **acknowledgement** push carries no entries at all:
+    "re-rendered at this version, nothing changed".
 
-    So "names all of ``_TRACKED_TYPES``" separates a push computed for the
-    document we hold open from one computed while it was closed.
+    So "names all of ``_TRACKED_TYPES``" separates a picture of the whole
+    document from a slice of one.
     """
     return _TRACKED_TYPES <= parsed.keys()
 
@@ -166,7 +168,12 @@ class ProcessingTracker:
     All line numbers are 0-indexed (LSP convention).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, freshness: FreshnessState | None = None) -> None:
+        # The client's freshness state, by reference. A tracker built without it
+        # (the null-object sites in debugger.py and tools/command_status.py) is
+        # never initialized and never fresh.
+        self._freshness = freshness
+        self._document_version: int | None = None
         self._unprocessed: list[tuple[int, int, int, int]] = []
         self._running: list[tuple[int, int, int, int]] = []
         self._running_onset: dict[tuple[int, int, int, int], float] = {}
@@ -195,15 +202,30 @@ class ProcessingTracker:
 
     @property
     def initialized(self) -> bool:
-        """True once a push has been folded in. The client feeds an uninitialized
-        tracker nothing but a FULL push (:func:`is_full_decoration_push`), so
-        this also reads "the cache is a picture of the whole document, not one
-        differential slice of it"."""
+        """True once a FULL push has been folded in (I-5): the cache is a picture
+        of the whole document, not one differential slice of it."""
         return self._initialized
 
-    async def update(self, parsed: dict[str, list[tuple[int, int, int, int]]]) -> None:
-        """Merge decoration ranges from a (possibly incremental) push."""
+    @property
+    def document_version(self) -> int | None:
+        """The picture stamp of the last folded push; None before the first."""
+        return self._document_version
+
+    async def update(
+        self, parsed: dict[str, list[tuple[int, int, int, int]]], document_version: int,
+    ) -> None:
+        """Merge decoration ranges from a push stamped *document_version*.
+
+        Every push for an open document is folded, whatever its shape. Only a
+        FULL push initializes the tracker (I-5, enforced HERE so no call site can
+        make a picture out of a slice): content folded into an uninitialized
+        tracker is never served (`fresh` requires initialization; `range_state`
+        answers `not_evaluated`) and is overwritten whole by the full push, which
+        names every tracked type.
+        """
         async with self._condition:
+            if self._freshness is None:
+                raise AssertionError("a tracker without freshness state cannot fold pushes")
             if "background_unprocessed1" in parsed:
                 self._unprocessed = parsed["background_unprocessed1"]
             if "background_running1" in parsed:
@@ -228,16 +250,40 @@ class ProcessingTracker:
                 self._overview_error = parsed["text_overview_error"]
             if "text_overview_warning" in parsed:
                 self._overview_warning = parsed["text_overview_warning"]
-            self._initialized = True
+            self._document_version = document_version
+            self._initialized = self._initialized or is_full_decoration_push(parsed)
             self._condition.notify_all()
 
+    def stamp_at_least_as_new_as(self, version: int) -> bool:
+        """This is a FULL picture (I-5) stamped at least as new as *version*.
+
+        The one place the picture-versus-a-reference-version half of the trust
+        rule (I-4) lives: ``fresh`` asks it about the newest version the client
+        has seen, and the report's stamp arbitration (``_build_file_snapshot``)
+        and the freshness wait (``wait_until_fresh``) ask it about the version
+        each is judging against. Answers False for a tracker that never folded a
+        full push. Does NOT read the content counters — those are the whole
+        client's state, weighed by ``fresh`` alone."""
+        return (
+            self._initialized
+            and self._document_version is not None
+            and at_least_as_new(self._document_version, version)
+        )
+
     @property
-    def _fresh(self) -> bool:
-        return self._initialized and _grace_remaining() == 0.0
+    def fresh(self) -> bool:
+        """The trust rule (I-4): a picture of the whole document, rendered at a
+        version at least as new as the newest one the client has seen, read while
+        no content the client wrote is still uncovered by a flush reply."""
+        return (
+            self._freshness is not None
+            and self.stamp_at_least_as_new_as(self._freshness.newest_document_version)
+            and not self._freshness.unflushed_content
+        )
 
     def range_processed(self, start_line: LSPLine, end_line: LSPLine) -> bool:
         """True if no unprocessed/running range overlaps [start_line, end_line]."""
-        if not self._fresh:
+        if not self.fresh:
             return False
         for sl, _, el, _ in self._unprocessed:
             if _ranges_overlap(sl, el, start_line, end_line):
@@ -249,7 +295,7 @@ class ProcessingTracker:
 
     @property
     def all_processed(self) -> bool:
-        return self._fresh and not self._unprocessed and not self._running
+        return self.fresh and not self._unprocessed and not self._running
 
     async def wait_until_processed(
         self,
@@ -263,8 +309,7 @@ class ProcessingTracker:
             while not self.range_processed(start_line, end_line):
                 try:
                     await asyncio.wait_for(
-                        self._condition.wait(),
-                        timeout=self._wait_timeout(check_interval),
+                        self._condition.wait(), timeout=check_interval,
                     )
                 except asyncio.TimeoutError:
                     health_check()
@@ -287,8 +332,7 @@ class ProcessingTracker:
                     return False
                 try:
                     await asyncio.wait_for(
-                        self._condition.wait(),
-                        timeout=min(remaining, self._wait_timeout(check_interval)),
+                        self._condition.wait(), timeout=min(remaining, check_interval),
                     )
                 except asyncio.TimeoutError:
                     if _time.monotonic() >= deadline:
@@ -321,8 +365,7 @@ class ProcessingTracker:
                     return False
                 try:
                     await asyncio.wait_for(
-                        self._condition.wait(),
-                        timeout=min(remaining, self._wait_timeout(check_interval)),
+                        self._condition.wait(), timeout=min(remaining, check_interval),
                     )
                 except asyncio.TimeoutError:
                     if _time.monotonic() >= deadline:
@@ -330,28 +373,14 @@ class ProcessingTracker:
                     health_check()
         return True
 
-    def _wait_timeout(self, check_interval: float) -> float:
-        """Wait-slice for the condition loops: wake when the grace window elapses.
-
-        No push arrives when decorations did not change, so a wait gated only on
-        the condition variable would sleep the full *check_interval* past the
-        moment the cache became trustworthy again. The +0.05 keeps a float-tick
-        wake from landing just BEFORE expiry (and then re-sleeping a whole
-        check_interval); it is pure latency slack.
-        """
-        grace = _grace_remaining()
-        if grace > 0.0:
-            return min(check_interval, grace + 0.05)
-        return check_interval
-
     def line_reached(self, line: int) -> bool:
         """True if *line* (0-indexed) is NOT inside any unprocessed range.
 
         Ignores running ranges — a forked proof means the eval chain has
-        already passed this line.  Returns False inside the post-edit grace
-        window (see :func:`note_edit_sent`).
+        already passed this line.  Returns False while the picture is not
+        fresh (see :attr:`fresh`).
         """
-        if not self._fresh:
+        if not self.fresh:
             return False
         for sl, _, el, _ in self._unprocessed:
             if sl <= line <= el:
@@ -382,18 +411,17 @@ class ProcessingTracker:
         command is the honest answer.
 
         Freshness is checked before the running and canceled scans, and that
-        placement is load-bearing. Inside the post-edit grace window the cache may
-        still describe the PRE-edit document; the familiar "a stale cache can only
-        over-report work as unfinished" argument makes that safe only for a caller
-        whose response is *do more work*. ``RUNNING`` and ``CANCELLED`` are
-        SERVED — a caller acts on them by answering the query — and relative to
-        the edited document the honest answer is that the line has not run yet.
-        (The server would answer such a query from the last assigned version:
-        ``output_at_position`` carries no ``is_outdated`` guard.)
+        placement is load-bearing. An unfresh picture may still describe an OLDER
+        document version; the familiar "a stale cache can only over-report work as
+        unfinished" argument makes that safe only for a caller whose response is
+        *do more work*. ``RUNNING`` and ``CANCELLED`` are SERVED — a caller acts
+        on them by answering the query — and relative to the newest version the
+        honest answer is ``UNKNOWN``: the picture is not fresh.
 
-        ``NOT_EVALUATED`` keeps the old conservative meaning, so the unprocessed
-        scan may stay in front: an edit can only un-process a line, and the caller
-        responds by evaluating it.
+        ``NOT_EVALUATED`` keeps the conservative meaning, so the unprocessed scan
+        may stay in front: the newest version is client-wide, so "not fresh" does
+        not say this file was edited; what survives is that ``NOT_EVALUATED`` is
+        the least-finished verdict and the caller answers it by evaluating.
 
         A tracker that has never received a decoration reports ``NOT_EVALUATED``:
         nothing has been processed, which is exactly what the caller must act on.
@@ -416,7 +444,7 @@ class ProcessingTracker:
                 return (NOT_EVALUATED, 0.0)
         if not self._initialized:
             return (NOT_EVALUATED, 0.0)
-        if _grace_remaining() > 0.0:
+        if not self.fresh:
             return (UNKNOWN, 0.0)
         now = _time.monotonic()
         for r in self._running:
@@ -478,5 +506,6 @@ class ProcessingTracker:
             self._canceled.clear()
             self._overview_error.clear()
             self._overview_warning.clear()
+            self._document_version = None
             self._initialized = False
             self._condition.notify_all()

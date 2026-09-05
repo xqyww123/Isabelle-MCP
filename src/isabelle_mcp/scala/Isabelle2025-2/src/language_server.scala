@@ -31,6 +31,13 @@ object Language_Server {
 
   val prelude_version = "6"
 
+  /* The client<->server wire version, a plain integer starting at 1, independent of the
+     package version; emitted as a top-level field of the initialize reply and compared by
+     the Python client before it reports a successful launch.  Bump it whenever the wire
+     between the two changes (a message, a field, a reply shape). */
+
+  val protocol_version = 1
+
   /* bounded wait on a promise, against a deadline; the polling idiom of await_pong, shared */
 
   def await_promise[A](promise: Promise[A], deadline: Time): Option[A] = {
@@ -358,25 +365,20 @@ class Language_Server(
 
   /* output to client */
 
+  /* delay_output.invoke() is the one "something may have changed" signal.  Delay.first: a
+     busy prover posts Commands_Changed every editor_output_delay, and Delay.last would
+     re-arm on each of them and never fire (measured: pushes withheld for seconds, no bound
+     in principle).  So from the first signal to flush_output is at most
+     vscode_output_delay, and every visible model is rendered on each run (I-2). */
+
   private val delay_output: Delay =
-    Delay.last(options.seconds("vscode_output_delay"), channel.Error_Logger) {
-      if (resources.flush_output(channel)) delay_output.invoke()
+    Delay.first(options.seconds("vscode_output_delay"), channel.Error_Logger) {
+      if (resources.flush_output(session, channel)) delay_output.invoke()
     }
-
-  def update_output(changed_nodes: Iterable[JFile]): Unit = {
-    resources.update_output(changed_nodes)
-    delay_output.invoke()
-  }
-
-  def update_output_visible(): Unit = {
-    resources.update_output_visible()
-    delay_output.invoke()
-  }
 
   private val prover_output =
     Session.Consumer[Session.Commands_Changed](getClass.getName) {
-      case changed =>
-        update_output(changed.nodes.toList.map(resources.node_file(_)))
+      case _ => delay_output.invoke()
     }
 
   private val syslog_messages =
@@ -567,14 +569,14 @@ class Language_Server(
       Text.Info(_, word) <- Spell_Checker.current_word(rendering, range)
     } {
       spell_checker.update(word, include, permanent)
-      update_output_visible()
+      delay_output.invoke()
     }
   }
 
   def reset_dictionary(): Unit = {
     for (spell_checker <- resources.spell_checker.get) {
       spell_checker.reset()
-      update_output_visible()
+      delay_output.invoke()
     }
   }
 
@@ -670,13 +672,17 @@ class Language_Server(
     channel.write(LSP.Documentation_Response(ml_settings))
 
 
-  /* theory status */
+  /* theory status: every row from ONE document state, stamped with its version (I-1a) */
 
   def theory_status(id: LSP.Id): Unit = {
     val now = Date.now()
+    val models = resources.get_models()
+    val doc_state = session.get_state()
+    val pending_edits = Document.Pending_Edits.make(models)
+    val document_version = doc_state.snapshot(pending_edits = pending_edits).version.id
     val theories =
-      (for (model <- resources.get_models().iterator) yield {
-        val snapshot = resources.snapshot(model)
+      (for (model <- models.iterator) yield {
+        val snapshot = doc_state.snapshot(node_name = model.node_name, pending_edits = pending_edits)
         val status = Document_Status.Node_Status.make(
           now = now,
           state = snapshot.state,
@@ -688,7 +694,130 @@ class Language_Server(
             "imports" -> snapshot.node.header.imports.map(_.json)) ++
           status.json
       }).toList
-    channel.write(LSP.Theory_Status.reply(id, theories))
+    channel.write(LSP.Theory_Status.reply(id, document_version, theories))
+  }
+
+
+  /* budget-bounded requests: what the cancel and flush requests share
+
+     Each runs on its own bare thread (not the fixed-size Future pool: an abandoned wait
+     would occupy a pool thread) against ONE deadline, and replies at most once, from its
+     finally.  Manager round trips are made on a further bare thread and awaited against
+     the deadline; a wait given up leaks its daemon thread until the JVM goes. */
+
+  private val request_poll_step = Time.seconds(0.05)
+
+  private def check_ready(session: VSCode_Session): Unit =
+    session.phase match {
+      case Session.Ready =>
+      case Session.Inactive => VSCode_Resources.request_fail("prover never started")
+      case Session.Startup => VSCode_Resources.request_fail("prover still starting")
+      case Session.Shutdown => VSCode_Resources.request_fail("prover shutting down")
+      case Session.Terminated(_) => VSCode_Resources.request_fail("prover already terminated")
+    }
+
+  /* Poll the document state until `ready` holds.  check_ready runs FIRST on every pass,
+     before the state is read: it is the whole guard against a prover that exits while a
+     request waits for an assignment.  A Raw_Edits the manager drops because the prover is
+     gone has phase = Terminated set before it, on the manager thread, so the first pass
+     after session.update returns already fails; a prover that dies after accepting the
+     edits never assigns, the tip never becomes stable, and the poll ends at the phase
+     flip or at the deadline -- never a false success. */
+
+  private def await_state(
+    session: VSCode_Session,
+    deadline: Time,
+    reason: String
+  )(ready: Document.State => Boolean): Document.State = {
+    val promise = Future.promise[Document.State]
+    val stop = new java.util.concurrent.atomic.AtomicBoolean(false)
+    Isabelle_Thread.fork(name = "await_state", daemon = true) {
+      try {
+        while (!stop.get && !promise.is_finished) {
+          check_ready(session)
+          val st = session.get_state()
+          if (ready(st)) promise.fulfill(st) else request_poll_step.sleep()
+        }
+      }
+      catch { case exn: Throwable => promise.fulfill_result(Exn.Exn(exn)) }
+    }
+    val st =
+      Language_Server.await_promise(promise, deadline) getOrElse {
+        stop.set(true)
+        VSCode_Resources.request_fail(reason)
+      }
+    // A manager that has shut down answers with Document.State.init (session.scala); so
+    // does a live session that has not seen a single update yet.  The phase tells them
+    // apart, up to the moment it flips; past that the budget does.  Kept beside the
+    // per-pass check above because session.stop() writes phase Shutdown BEFORE the
+    // manager's Stop resets the state, so a pass that read Ready before the flip and the
+    // init singleton after it must still fail: this re-reads the phase AFTER the state.
+    if (st eq Document.State.init) check_ready(session)
+    st
+  }
+
+
+  /* the flush request: PIDE/flush (ISABELLE_MCP_DECORATION_VERSION_STAMP_PLAN.md section 3.1 (d))
+
+     Absorb everything the client has sent, hand it to the prover, and name an assigned
+     version that contains it all.  Steps: (1) when asked, re-read every dependency file;
+     (2) resolve imports; (3) flush_input -- one session.update, NOT forked and NOT bounded
+     separately: the reply's soundness is "send_wait returned => our change is history.tip
+     => any stable tip the poll then sees is that change or a descendant"; (4) poll until
+     the tip is stable; (5) reply.  Steps 1-3 hold the monitor (timed entry); step 3's
+     session.update and the round trips inside flush_edits are untimed by construction, so
+     the client bounds the whole request with its own hard timeout.  Two overlapping
+     flushes serialise on the monitor.  document_version 0 (Version.init) is the legitimate
+     answer of a session that has handed the prover nothing yet. */
+
+  private val flush_budget = Time.seconds(120)
+
+  def flush(id: LSP.Id, resync_dependencies: Boolean): Unit = {
+    Isabelle_Thread.fork(name = "flush", daemon = true) {
+      val deadline = Time.now() + flush_budget
+      var reply: JSON.T = LSP.Flush.error(id, "no result")
+      try {
+        val (document_version, changed_files) = flush_body(deadline, resync_dependencies)
+        reply = LSP.Flush.reply(id, document_version, changed_files)
+      }
+      catch {
+        case exn: VSCode_Resources.Request_Failure =>
+          log("flush failed: " + exn.reason)
+          reply = LSP.Flush.error(id, exn.reason)
+        case exn: Throwable =>
+          log("flush failed: " + Exn.message(exn))
+          reply = LSP.Flush.error(id, "internal failure: " + Exn.message(exn))
+      }
+      finally { channel.write(reply) }
+    }
+  }
+
+  private def flush_body(deadline: Time, resync_dependencies: Boolean): (Long, List[JFile]) = {
+    val session =
+      try { this.session }
+      catch { case ERROR(_) => VSCode_Resources.request_fail("server inactive") }
+    check_ready(session)
+
+    val changed_files =
+      if (resync_dependencies) {
+        val (changed, vanished) = resources.resync_external_models(Some(deadline))
+        changed ::: vanished
+      }
+      else Nil
+
+    val (_, invoke_load) =
+      resources.resolve_dependencies(session, editor, file_watcher, Some(deadline))
+    if (invoke_load) delay_load.invoke()
+    // the resolved models are in pending_input: step 3 flushes them along with the rest
+
+    resources.flush_input(session, channel, Some(deadline))
+
+    val st =
+      await_state(session, deadline, "no assigned version within the budget")(
+        _.stable_tip_version.isDefined)
+    val version =
+      st.stable_tip_version getOrElse VSCode_Resources.request_fail("stable tip vanished")
+    (version.id, changed_files)
   }
 
   /* cancellation: PIDE/cancel_evaluation (ISABELLE_MCP_CANCELLATION_REDESIGN_PLAN.md section 3)
@@ -711,10 +840,13 @@ class Language_Server(
 
      Everything waits against ONE deadline, 120 s from the moment the body starts; the
      budget running out, the prover vanishing, a lost report, or any exception is the
-     aborted outcome, and the Python side then terminates the prover.  The body runs on its
-     own bare thread (not the fixed-size Future pool: an abandoned wait would occupy a pool
-     thread), and the reply is written at most once, from the finally -- a client that has
-     stopped reading gets none, and is covered by the Python side's 135 s gate. */
+     aborted outcome, and the Python side then terminates the prover.  Thread and reply
+     discipline as for every budget-bounded request above; a client that has stopped
+     reading gets no reply, and is covered by the Python side's 135 s gate.
+
+     The reply carries document_version, the reply version: an assigned version that
+     contains every edit the request made -- the stable tip after the last awaited
+     assignment, v0 when the request sent nothing. */
 
   private val cancel_handler = new Language_Server.Cancel_Handler
   private val prelude_handler = new Language_Server.Prelude_Handler
@@ -722,7 +854,6 @@ class Language_Server(
 
   private val cancel_budget = Time.seconds(120)
   private val cancel_update_bound = Time.seconds(5)   // session.update under the monitor; Z14(b)
-  private val cancel_poll_step = Time.seconds(0.05)
 
   private def cancel_aborted(reason: String): JSON.T =
     JSON.Object("outcome" -> "aborted", "reason" -> reason)
@@ -733,7 +864,7 @@ class Language_Server(
       var reply: JSON.T = cancel_aborted("no result")
       try { reply = cancel_evaluation_body(deadline) }
       catch {
-        case exn: VSCode_Resources.Cancel_Failure =>
+        case exn: VSCode_Resources.Request_Failure =>
           log("cancel_evaluation aborted: " + exn.reason)
           reply = cancel_aborted(exn.reason)
         case exn: Throwable =>
@@ -765,18 +896,11 @@ class Language_Server(
   }
 
   private def cancel_evaluation_body(deadline: Time): JSON.T = {
-    def fail(reason: String): Nothing = VSCode_Resources.cancel_fail(reason)
+    def fail(reason: String): Nothing = VSCode_Resources.request_fail(reason)
 
     val session = try { this.session } catch { case ERROR(_) => fail("server inactive") }
 
-    def check_ready(): Unit =
-      session.phase match {
-        case Session.Ready =>
-        case Session.Inactive => fail("prover never started")
-        case Session.Startup => fail("prover still starting")
-        case Session.Shutdown => fail("prover shutting down")
-        case Session.Terminated(_) => fail("prover already terminated")
-      }
+    def check_ready(): Unit = server.check_ready(session)
     check_ready()
     // a precondition of retraction: with 0 the caret branch is skipped and every visible
     // model's perspective is its full text, never empty (vscode_model.scala)
@@ -784,33 +908,11 @@ class Language_Server(
       fail("vscode_caret_perspective is 0: no perspective can be retracted")
     }
 
-    /* manager round trips, each on its own bare thread and awaited against the deadline;
-       a wait given up leaks its daemon thread until the JVM goes, and giving up a
+    /* manager round trips, awaited against the deadline (await_state above); giving up a
        session.update does not withdraw it */
 
-    def await_state(reason: String)(ready: Document.State => Boolean): Document.State = {
-      val promise = Future.promise[Document.State]
-      val stop = new java.util.concurrent.atomic.AtomicBoolean(false)
-      Isabelle_Thread.fork(name = "cancel_await_state", daemon = true) {
-        try {
-          while (!stop.get && !promise.is_finished) {
-            val st = session.get_state()
-            if (ready(st)) promise.fulfill(st) else cancel_poll_step.sleep()
-          }
-        }
-        catch { case exn: Throwable => promise.fulfill_result(Exn.Exn(exn)) }
-      }
-      val st =
-        Language_Server.await_promise(promise, deadline) getOrElse {
-          stop.set(true)
-          fail(reason)
-        }
-      // A manager that has shut down answers with Document.State.init (session.scala); so
-      // does a live session that has not seen a single update yet.  The phase tells them
-      // apart, up to the moment it flips; past that the budget does.
-      if (st eq Document.State.init) check_ready()
-      st
-    }
+    def await_state(reason: String)(ready: Document.State => Boolean): Document.State =
+      server.await_state(session, deadline, reason)(ready)
 
     def get_state(): Document.State =
       await_state("document state not readable within the budget")(_ => true)
@@ -844,6 +946,8 @@ class Language_Server(
         case Exn.Exn(_) => fail("probe not performed: no stable version to read the eval execs from")
       }
     val assignment0 = st0.the_assignment(v0).check_finished
+    // the reply version: advanced at each point where an assignment of ours was awaited
+    var reply_version = v0.id
     // eval exec ids only (execs also holds print entries); ids, never Command objects
     val probe: Map[Document_ID.Exec, (Document.Node.Name, Document_ID.Command)] =
       (for {
@@ -875,7 +979,7 @@ class Language_Server(
           fail("prover did not acknowledge the stop within the budget" +
             " (backlog or dead: indistinguishable)")
         }
-        else cancel_poll_step.sleep()
+        else request_poll_step.sleep()
       }
       for (err <- report.get.error) fail("the prover failed while stopping: " + err)
 
@@ -889,7 +993,8 @@ class Language_Server(
       val retraction = resources.cancel_retract(session, st0, deadline, cancel_update_bound)
       for (VSCode_Resources.Commit(tip_before) <- retraction.commit) {
         after_update()
-        await_state("retraction not assigned within the budget")(assigned_after(tip_before))
+        val st1 = await_state("retraction not assigned within the budget")(assigned_after(tip_before))
+        for (v <- st1.stable_tip_version) reply_version = v.id
       }
 
       /* the retire loop */
@@ -928,8 +1033,10 @@ class Language_Server(
           case VSCode_Resources.Flushed(VSCode_Resources.Commit(tip_before)) =>
             flush_rounds += 1
             after_update()
-            await_state("unflushed edits kept arriving" + counters + state_bits(st))(
-              assigned_after(tip_before))
+            val st1 =
+              await_state("unflushed edits kept arriving" + counters + state_bits(st))(
+                assigned_after(tip_before))
+            for (v <- st1.stable_tip_version) reply_version = v.id
           case VSCode_Resources.Retire(version, retired, excluded, commit) =>
             for (x <- excluded) {
               excluded_all += ((x, version))
@@ -943,6 +1050,7 @@ class Language_Server(
                 await_state("assignment never arrived" + counters + state_bits(st))(
                   assigned_after(tip_before))
               val version1 = st1.stable_tip_version.get
+              reply_version = version1.id
               for (r <- retired) {
                 val still_there = version1.nodes(r.name).commands.exists(_.id == r.command.id)
                 if (!still_there) {
@@ -1004,6 +1112,7 @@ class Language_Server(
 
       JSON.Object(
         "outcome" -> outcome,
+        "document_version" -> reply_version,
         "retired" -> retired_json,
         "excluded" -> excluded_json,
         "waived" -> waived_json,
@@ -1300,6 +1409,7 @@ class Language_Server(
           case LSP.Sledgehammer_Sendback(text) => sledgehammer.sendback(text)
           case LSP.Theory_Status(id) => theory_status(id)
           case LSP.Cancel_Evaluation(id) => cancel_evaluation(id)
+          case LSP.Flush(id, resync_dependencies) => flush(id, resync_dependencies)
           case LSP.Loaders(id, file) => loaders(id, file)
           case LSP.Command_At_Position(id, node_pos) => command_at_position(id, node_pos)
           case LSP.Output_At_Position(id, node_pos) => output_at_position(id, node_pos)

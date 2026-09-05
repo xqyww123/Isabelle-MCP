@@ -30,10 +30,12 @@ import asyncio
 import logging
 import os
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
 from isabelle_mcp.lsp_client import IsabelleLSPClient, _stat_sig
+from isabelle_mcp.models import TheoryStatus
 from isabelle_mcp.utils.core import IsabelleToolError, acquire_within, plural
 from isabelle_mcp.utils.formatters import (
     cartouche,
@@ -929,14 +931,14 @@ async def _reopen_if_swept(client: IsabelleLSPClient, file_path: str) -> None:
     a theory the prover does not hold is left alone too, and the listing then
     says so in its own words.
 
-    After a reopen the grace gate its didOpen raised is waited out here, still
-    outside the lock: the reads under the lock (the no-site verdict, the
-    arming tag) judge positions from the decoration cache, and under the gate
-    a long-evaluated line would read ``unknown`` and be reported as "still
+    After a reopen the file's first picture is waited for here, still outside
+    the lock: the reads under the lock (the no-site verdict, the arming tag)
+    judge positions from the decoration cache, and before that picture a
+    long-evaluated line would read ``unknown`` and be reported as "still
     evaluating" — a sentence about work that does not exist."""
-    from isabelle_mcp.evaluation import reopen_held_theory, wait_out_grace
+    from isabelle_mcp.evaluation import reopen_held_theory, wait_until_fresh
     if await reopen_held_theory(client, file_path):
-        await wait_out_grace(client)
+        await wait_until_fresh(client, [file_path])
 
 
 async def _no_site_on_line_error(
@@ -1302,9 +1304,9 @@ async def enable_all_breakpoints(
     Three stages. First, under the lock and writing nothing, the scoped
     entries are collected. Second, outside the lock, every file they name is
     reopened if the unified close had tidied it away (a reopen waits on the
-    prover — up to a grace window when the file changed meanwhile — and must
-    not be paid under the registry lock: the cancel sweep's bounded acquire
-    would silently skip its demotion). Third, back
+    prover for the file's first picture and must not be paid under the
+    registry lock: the cancel sweep's bounded acquire would silently skip
+    its demotion). Third, back
     under the lock, each entry still in the registry — by identity, since a
     concurrent delete may have removed it — is flipped enabled and armed. A
     concurrent disable_all lands in one of the states the serial order could
@@ -1912,21 +1914,18 @@ def paused_section(client: IsabelleLSPClient) -> str | None:
 
 
 def _transitive_importers(
-    marked_nodes: set[str], raw_theories: list[dict[str, Any]],
+    marked_nodes: set[str], theories: Iterable[TheoryStatus],
 ) -> set[str]:
     """realpaths of every theory that transitively imports one of the
     marked files, per theory_status's header-import graph (theory names on
     the edges, node_names on the nodes)."""
     by_name: dict[str, str] = {}
     imports: dict[str, list[str]] = {}
-    for t in raw_theories:
-        name = t.get("theory_name") or ""
-        node = t.get("node_name") or ""
-        if not name or not node:
+    for t in theories:
+        if not t.theory_name or not t.node_name:
             continue
-        by_name[name] = os.path.realpath(node)
-        imports[name] = [
-            i.get("theory_name", "") for i in t.get("imports", [])]
+        by_name[t.theory_name] = os.path.realpath(t.node_name)
+        imports[t.theory_name] = list(t.imports)
     tainted = {n for n, node in by_name.items() if node in marked_nodes}
     changed = True
     while changed:
@@ -1975,14 +1974,14 @@ async def reconcile_dirty(client: IsabelleLSPClient) -> None:
             # over-approximation).
             targets |= {f for f in armed_files if f.endswith(".ML")}
             try:
-                raw = await client.request_theory_status()
+                record = await client.request_theory_status()
             except IsabelleToolError:
                 # No graph to propagate over: over-approximate to every
                 # armed-entry file — the listing verification below is
                 # what protects against false demotion either way.
                 targets = set(armed_files)
             else:
-                targets |= _transitive_importers(thy_marks, raw) \
+                targets |= _transitive_importers(thy_marks, record.theories) \
                     & armed_files
         unverified |= targets
         for path in sorted(targets):
@@ -2019,14 +2018,21 @@ def _position_reburied(client: IsabelleLSPClient, entry: Breakpoint) -> bool:
     """Fence bullet 2: the armed entry's recorded position is no longer
     processed — the site this very run is about to rebury. `.thy` asks the
     decoration tracker; `.ML` compares the blob's stat signature against
-    the arming-time one. UNKNOWN and RUNNING do not count: the edit clock
-    is global, and a warning that fires on every healthy run stops being
-    read (section 5's rationale for excluding `code not found`)."""
+    the arming-time one. A missing or uninitialized tracker counts nothing
+    as reburied: a reopen leaves a brand-new tracker at fence time (the fence
+    runs under the lock, after the open and before the freshness wait), and
+    a fence firing on every healthy reopen would stop being read. UNKNOWN
+    and RUNNING do not count either: the newest version is client-wide, and
+    a warning that fires on every healthy run stops being read (section 5's
+    rationale for excluding `code not found`)."""
     from isabelle_mcp import processing
     if entry.file_path.endswith(".ML"):
         return entry.ml_sig is not None \
             and _stat_sig(entry.file_path) != entry.ml_sig
-    state = _position_state(client, entry.file_path, entry.line)
+    tracker = client.get_processing_tracker(entry.file_path)
+    if tracker is None or not tracker.initialized:
+        return False
+    state = tracker.position_state(entry.line - 1)
     return state in (processing.NOT_EVALUATED, processing.CANCELLED)
 
 
@@ -2050,17 +2056,13 @@ async def forgotten_arming_fence(
     ]
     if not candidates:
         return None
-    from isabelle_mcp.evaluation import (
-        _parse_theory_status,
-        evaluation_theory_set,
-    )
+    from isabelle_mcp.evaluation import evaluation_theory_set
     try:
-        raw = await client.request_theory_status()
+        record = await client.request_theory_status()
     except IsabelleToolError:
         logger.warning("fence skipped: theory_status failed")
         return None
-    theories = [_parse_theory_status(t) for t in raw]
-    theory_set = evaluation_theory_set(target_file, theories)
+    theory_set = evaluation_theory_set(target_file, list(record.theories))
     n = sum(1 for e in candidates if e.file_path in theory_set)
     if not n:
         return None

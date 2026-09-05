@@ -149,9 +149,16 @@ object LSP {
   /* init and exit */
 
   object Initialize extends Request0("initialize") {
+    /* protocol_version is the client<->server wire version (Language_Server.protocol_version),
+       a top-level field of the result: serverInfo.version would feed the agent-visible
+       isabelle_version.  A jar without the field is protocol version 0. */
     def reply(id: Id, error: String): JSON.T =
       ResponseMessage.strict(
-        id, Some(JSON.Object("capabilities" -> ServerCapabilities.json)), error)
+        id,
+        Some(JSON.Object(
+          "capabilities" -> ServerCapabilities.json,
+          "protocol_version" -> Language_Server.protocol_version)),
+        error)
   }
 
   object ServerCapabilities {
@@ -551,10 +558,16 @@ object LSP {
     def json: JSON.T = JSON.Object("type" -> typ, "content" -> content.map(_.json))
   }
 
+  /* document_version: the picture stamp -- the id of the Document.Version the entries were
+     rendered from (VSCode_Rendering.decoration_output).  A required key: the client drops a
+     push without it.  Empty entries with a stamp is an acknowledgement push. */
   sealed case class Decoration(entries: List[Decoration_Entry]) {
-    def json(file: JFile): JSON.T =
+    def json(file: JFile, document_version: Long): JSON.T =
       Notification("PIDE/decoration",
-        JSON.Object("uri" -> Url.print_file(file), "entries" -> entries.map(_.json)))
+        JSON.Object(
+          "uri" -> Url.print_file(file),
+          "entries" -> entries.map(_.json),
+          "document_version" -> document_version))
   }
 
   object Decoration_Request {
@@ -667,9 +680,31 @@ object LSP {
       }
   }
 
+  /* every row rendered from ONE document state; document_version is its picture stamp */
   object Theory_Status extends Request0("PIDE/theory_status") {
-    def reply(id: Id, theories: List[JSON.T]): JSON.T =
-      ResponseMessage(id, Some(JSON.Object("theories" -> theories)))
+    def reply(id: Id, document_version: Long, theories: List[JSON.T]): JSON.T =
+      ResponseMessage(id,
+        Some(JSON.Object("document_version" -> document_version, "theories" -> theories)))
+  }
+
+  /* PIDE/flush: absorb everything the client has sent (and re-read every dependency file
+     from disk when resync_dependencies), hand it to the prover, and reply once the prover
+     has assigned a version containing it all -- the reply version.  changed_uris names the
+     dependency files whose bytes differed or that no longer read.  Any failure is an LSP
+     error naming the reason; never a stampless success.  Language_Server.flush. */
+  object Flush {
+    def unapply(json: JSON.T): Option[(Id, Boolean)] =
+      json match {
+        case RequestMessage(id, "PIDE/flush", Some(params)) =>
+          for (resync <- JSON.bool(params, "resync_dependencies")) yield (id, resync)
+        case _ => None
+      }
+    def reply(id: Id, document_version: Long, changed_files: List[JFile]): JSON.T =
+      ResponseMessage(id,
+        Some(JSON.Object(
+          "document_version" -> document_version,
+          "changed_uris" -> changed_files.map(Url.print_file))))
+    def error(id: Id, reason: String): JSON.T = ResponseMessage.strict(id, None, reason)
   }
 
   /* one request, one reply, eight outcomes; the payload is documented at

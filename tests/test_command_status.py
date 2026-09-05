@@ -6,10 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from isabelle_mcp import processing
-from isabelle_mcp.evaluation import _parse_theory_status
+from isabelle_mcp import evaluation as ev, processing
 from isabelle_mcp.models import LinePosition
-from isabelle_mcp.processing import ProcessingTracker
+from isabelle_mcp.processing import FreshnessState, ProcessingTracker
 from isabelle_mcp.tools.command_status import (
     CANCELLED,
     FILE_NOT_OPEN,
@@ -21,6 +20,9 @@ from isabelle_mcp.tools.command_status import (
     format_command_status,
 )
 from isabelle_mcp.utils import IsabelleToolError
+from tests.conftest import full_decoration_entries, theory_status_record
+
+NEWER = -40
 
 
 def _range(start_line: int, end_line: int | None = None) -> dict:
@@ -47,6 +49,7 @@ class FakeClient:
 
     project_root = "/proj"
     STALL_TIMEOUT = 60.0
+    PROGRESS_CHECK_INTERVAL = 5.0
 
     def __init__(self, *, commands: dict[str, dict[int, list]] | None = None,
                  trackers: dict[str, ProcessingTracker] | None = None,
@@ -58,14 +61,25 @@ class FakeClient:
         self.open_documents = {p: _doc() for p in self._commands}
         for path in unheld_open:
             self.open_documents[path] = _doc()
-        self.entry_theories = [
-            _parse_theory_status({"node_name": p}) for p in [*self._commands, *self._held]
-        ]
+        # The entry record: what the prover holds (the reopen reads it).
+        ev.set_entry_record(theory_status_record(
+            [{"node_name": p} for p in [*self._commands, *self._held]]))
+        # The freshness state: the newest version stays 0, as every tracker's
+        # stamp does, so a reopened file's picture is fresh once it exists.
+        self.freshness = FreshnessState()
+        self.flushes = 0
         self.requests: list[tuple[str, list[int]]] = []
         self.opened: list[tuple[str, bool]] = []
 
     def _check_server_health(self, stall_timeout: float) -> None:
         pass
+
+    async def flush(self, *, resync_dependencies):
+        self.flushes += 1
+        snapshot = self.freshness.content_sends
+        self.freshness.content_sends_flushed = max(self.freshness.content_sends_flushed, snapshot)
+        await self.freshness.notify()
+        return {"document_version": 0, "changed_uris": []}, snapshot
 
     def get_processing_tracker(self, file_path):
         if file_path not in self.open_documents:
@@ -82,9 +96,6 @@ class FakeClient:
             raise OSError(f"cannot read {file_path}")
         self.open_documents[file_path] = _doc(evaluation_target)
         self._commands[file_path] = self._held.pop(file_path)
-        # The fake FORCES the gate up on every reopen (production skips it for
-        # a file untouched since its close): the tool must cope with it.
-        processing.note_edit_sent()
 
     # Files the prover holds but the disk cannot give us (a reopen fails).
     unreadable: frozenset[str] = frozenset()
@@ -100,13 +111,15 @@ class FakeClient:
         return {int(line): per_file.get(int(line), []) for line in lines}
 
 
-async def _tracker(**ranges) -> ProcessingTracker:
-    tracker = ProcessingTracker()
-    await tracker.update({
-        "background_unprocessed1": ranges.get("unprocessed", []),
-        "background_running1": ranges.get("running", []),
-        "background_canceled": ranges.get("canceled", []),
-    })
+async def _tracker(state: FreshnessState | None = None, **ranges) -> ProcessingTracker:
+    """A real tracker with a full picture stamped 0 on its own freshness state
+    (newest 0, nothing unflushed: fresh) unless *state* says otherwise."""
+    tracker = ProcessingTracker(state or FreshnessState())
+    await tracker.update(processing.parse_decoration_ranges(full_decoration_entries(
+        background_unprocessed1=ranges.get("unprocessed", []),
+        background_running1=ranges.get("running", []),
+        background_canceled=ranges.get("canceled", []),
+    )), 0)
     return tracker
 
 
@@ -172,7 +185,7 @@ async def test_a_theory_the_prover_does_not_hold_is_not_evaluated():
     assert client.opened == [] and client.requests == []
 
 
-async def test_a_theory_the_prover_holds_but_we_closed_is_reopened_and_answered(_short_grace):
+async def test_a_theory_the_prover_holds_but_we_closed_is_reopened_and_answered():
     # The unified close tidied the file away; the prover still holds it. The
     # tool reopens it (marked, so it stays open) and answers from the live
     # tracker — never from nothing, never "not evaluated". Mutation control:
@@ -187,18 +200,11 @@ async def test_a_theory_the_prover_holds_but_we_closed_is_reopened_and_answered(
     assert answer.state == PROCESSED
 
 
-@pytest.fixture
-def _short_grace(monkeypatch):
-    """The fake's reopen forces the grace gate up (production skips it for a
-    file untouched since its close); the batch wait honours it, so a test
-    that reopens keeps the window short."""
-    monkeypatch.setattr(processing, "DECORATION_GRACE", 0.05)
-
-
-async def test_a_reopen_is_not_followed_by_an_unknown_answer(_short_grace):
-    # With the gate up after the reopen and no batch wait, the freshly
-    # reopened, fully processed position would be answered `unknown` for the
-    # rest of the window.
+async def test_a_reopen_is_followed_by_one_wait_for_the_batch():
+    # A reopened file has no picture until its first push: the tool waits
+    # ONCE for the reopened batch (the wait's own flush is the witness) and
+    # then answers from the picture — never `unknown` for a processed line.
+    # A call that reopens nothing waits for nothing.
     client = FakeClient(
         held={"/proj/Swept.thy": {41: [(_range(41), "by auto")]}},
     )
@@ -206,14 +212,18 @@ async def test_a_reopen_is_not_followed_by_an_unknown_answer(_short_grace):
     [answer] = await command_status(
         client, [LinePosition(file_path="/proj/Swept.thy", line=42)])
     assert answer.state == PROCESSED
+    assert client.flushes == 1
+    [answer] = await command_status(
+        client, [LinePosition(file_path="/proj/Swept.thy", line=42)])
+    assert answer.state == PROCESSED and client.flushes == 1
 
 
-async def test_the_batch_wait_is_keyed_on_the_gate_not_on_a_position(_short_grace):
+async def test_the_batch_wait_is_keyed_on_freshness_not_on_a_position():
     # One reopened file, two positions: one evaluated, one past the frontier.
     # A wait keyed on the farthest position's verdict would return at once
-    # (`not evaluated` needs no gate) and leave the evaluated line answered
-    # `unknown`; the wait is keyed on the gate, so both answer truthfully,
-    # whatever order the positions are asked in.
+    # (`not evaluated` needs no fresh picture) and leave the evaluated line
+    # answered `unknown`; the wait is keyed on the pictures being fresh, so
+    # both answer truthfully, whatever order the positions are asked in.
     for lines in ([42, 200], [200, 42]):
         client = FakeClient(
             held={"/proj/Half.thy": {
@@ -225,9 +235,9 @@ async def test_the_batch_wait_is_keyed_on_the_gate_not_on_a_position(_short_grac
         assert {a.line: a.state for a in answers} == {42: PROCESSED, 200: NOT_EVALUATED}
 
 
-async def test_the_batch_wait_covers_a_second_reopened_file(_short_grace):
+async def test_the_batch_wait_covers_a_second_reopened_file():
     # Two reopened files: the first entirely unevaluated, the second fully
-    # processed. One wait, keyed on the gate, serves both.
+    # processed. One wait, over the reopened batch, serves both.
     client = FakeClient(held={
         "/proj/A.thy": {0: [(_range(0), "theory A")]},
         "/proj/B.thy": {41: [(_range(41), "by auto")]},
@@ -239,31 +249,10 @@ async def test_the_batch_wait_covers_a_second_reopened_file(_short_grace):
         LinePosition(file_path="/proj/B.thy", line=42),
     ])
     assert [a.state for a in answers] == [NOT_EVALUATED, PROCESSED]
+    assert client.flushes == 1
 
 
-async def test_the_batch_wait_outlasts_a_gate_rearmed_meanwhile(monkeypatch):
-    # An edit landing during the batch wait re-arms the global gate; the
-    # wait keeps going until the gate has really closed, so no evaluated
-    # position is answered `unknown`.
-    import asyncio
-    monkeypatch.setattr(processing, "DECORATION_GRACE", 0.3)
-    client = FakeClient(
-        held={"/proj/Swept.thy": {41: [(_range(41), "by auto")]}},
-    )
-    client._trackers["/proj/Swept.thy"] = await _tracker()
-
-    async def rearm_mid_wait():
-        await asyncio.sleep(0.2)
-        processing.note_edit_sent()
-
-    rearm = asyncio.create_task(rearm_mid_wait())
-    [answer] = await command_status(
-        client, [LinePosition(file_path="/proj/Swept.thy", line=42)])
-    await rearm
-    assert answer.state == PROCESSED
-
-
-async def test_no_position_query_writes_the_run_or_the_caret(_short_grace, trap_run_writes):
+async def test_no_position_query_writes_the_run_or_the_caret(trap_run_writes):
     # Ruling 22's structural invariant for isabelle_command_status: the
     # reopen branch and the not-open branch both complete with every
     # run-writing entry point booby-trapped (set_caret asserts on the fake).
@@ -320,7 +309,7 @@ async def test_an_ml_position_keeps_its_answer_of_old():
     # A .ML blob is never a document of ours and is never reopened; its
     # answer is byte for byte what it was.
     client = FakeClient(commands={})
-    client.entry_theories = [_parse_theory_status({"node_name": "/proj/Blob.ML"})]
+    ev.set_entry_record(theory_status_record([{"node_name": "/proj/Blob.ML"}]))
     [answer] = await command_status(
         client, [LinePosition(file_path="/proj/Blob.ML", line=3)])
     assert answer.state == FILE_NOT_OPEN
@@ -346,17 +335,18 @@ async def test_cancelled_and_unknown_carry_their_hints():
     [answer] = await command_status(client, [LinePosition(file_path="/proj/My.thy", line=42)])
     assert answer.state == CANCELLED == "cancelled, re-evaluate to get a result"
 
+    # A file open all along whose picture is not fresh (a newer version was
+    # seen): `unknown`, and the tool never waits for it (ruling 26).
+    state = FreshnessState()
     client = FakeClient(
         commands={"/proj/My.thy": {41: [(_range(41), "by auto")]}},
-        trackers={"/proj/My.thy": await _tracker()},
+        trackers={"/proj/My.thy": await _tracker(state)},
     )
-    processing.note_edit_sent()
-    try:
-        [answer] = await command_status(
-            client, [LinePosition(file_path="/proj/My.thy", line=42)])
-        assert answer.state == UNKNOWN == "unknown, retry in a few seconds"
-    finally:
-        processing._last_edit_sent = float("-inf")
+    state.advance(NEWER)
+    [answer] = await command_status(
+        client, [LinePosition(file_path="/proj/My.thy", line=42)])
+    assert answer.state == UNKNOWN == "unknown, retry in a few seconds"
+    assert client.flushes == 0
 
 
 async def test_a_command_spanning_lines_answers_every_line_it_covers():

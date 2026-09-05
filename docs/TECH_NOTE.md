@@ -72,13 +72,16 @@ that file; the handler stores it with whole-list replacement
 
 ### 1.2 Decoration channel — granularity and coverage
 
-`publish` decides what to re-send (`vscode_model.scala:197-209`):
+`publish` decides what to re-send (`vscode_model.scala`, our fork):
 
 ```scala
+val version_id = rendering.snapshot.version.id                      // the picture stamp
 val changed_diagnostics =
   if (diagnostics == published_diagnostics) None else Some(diagnostics)   // whole list
 val changed_decorations =
-  if (decorations == published_decorations) None
+  if (decorations == published_decorations) {
+    if (published_version.contains(version_id)) None else Some(Nil)      // acknowledgement
+  }
   else if (published_decorations.isEmpty) Some(decorations)               // first time: all types
   else Some(for { (a,b) <- decorations zip published_decorations if a != b } yield a)  // only CHANGED types
 ```
@@ -88,9 +91,20 @@ val changed_decorations =
   **only the decoration types whose content changed**. Within an included type the
   range list is the full set for that type. → A client must **accumulate per type**
   across pushes; this is exactly what `ProcessingTracker.update` does
-  (`processing.py:64-79`, replaces a type's ranges only when that type is present).
-  Empirically confirmed: push 0 carried ~43 types; push 1 carried only the changed
-  subset (`background_running1`, `background_bad`, …).
+  (replaces a type's ranges only when that type is present, and initializes the
+  picture only from a full push). Empirically confirmed: push 0 carried ~43 types;
+  push 1 carried only the changed subset (`background_running1`, `background_bad`, …).
+- **Every push carries `document_version`**, the id of the PIDE document version
+  the entries were rendered from (`VSCode_Rendering.decoration_output` reads it off
+  the very snapshot it rendered). `flush_output` renders **every visible model** on
+  each run, and a model whose rendering did not change since the last push still
+  gets an **acknowledgement push** — empty `entries`, a stamp — whenever the
+  version it was rendered at is new for it. So the client learns, for every open
+  file and every version the prover assigns, that the file was re-rendered there;
+  the old "silence means unchanged" ambiguity is gone, and with it the timed
+  grace window the client used to guess with. Ids tick downward (a newer version
+  has a numerically smaller id); the client compares them only through
+  `processing.at_least_as_new`.
 
 **Crucial — decoration covers the whole document, not the caret window.**
 `decorations` iterates `model.content.text_range` (the entire file),

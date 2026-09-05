@@ -72,7 +72,10 @@ sealed case class VSCode_Model(
   last_perspective: Document.Node.Perspective_Text.T = Document.Node.Perspective_Text.empty,
   pending_edits: List[Text.Edit] = Nil,
   published_diagnostics: List[Text.Info[Command.Results]] = Nil,
-  published_decorations: List[VSCode_Model.Decoration] = Nil
+  published_decorations: List[VSCode_Model.Decoration] = Nil,
+  /* the picture stamp of the last decoration push (real or acknowledgement) for this
+     model; cleared with the rest of the published baseline when the model is closed */
+  published_version: Option[Long] = None
 ) extends Document.Model {
   model =>
 
@@ -209,34 +212,47 @@ sealed case class VSCode_Model(
   }
 
 
-  /* publish annotations */
+  /* publish annotations
+
+     The decoration list to send: the full list on an empty baseline, the changed entries
+     otherwise, and Some(Nil) -- an acknowledgement push -- when nothing changed but this
+     version has not been pushed for this model yet (I-2: every visible model is
+     acknowledged at every version it was rendered at).  None only when the version was
+     already pushed.  The returned model records the version whenever there is something
+     to send. */
 
   def publish(
     rendering: VSCode_Rendering
   ): (Option[List[Text.Info[Command.Results]]], Option[List[VSCode_Model.Decoration]], VSCode_Model) = {
+    val version_id = rendering.snapshot.version.id
     val (diagnostics, decorations, model) = publish_full(rendering)
 
     val changed_diagnostics =
       if (diagnostics == published_diagnostics) None else Some(diagnostics)
     val changed_decorations =
-      if (decorations == published_decorations) None
+      if (decorations == published_decorations) {
+        if (published_version.contains(version_id)) None else Some(Nil)
+      }
       else if (published_decorations.isEmpty) Some(decorations)
       else Some(for { (a, b) <- decorations zip published_decorations if a != b } yield a)
 
-    (changed_diagnostics, changed_decorations, model)
+    (changed_diagnostics, changed_decorations, model.copy(published_version = Some(version_id)))
   }
 
   def publish_full(
     rendering: VSCode_Rendering
   ): (List[Text.Info[Command.Results]],List[VSCode_Model.Decoration], VSCode_Model) = {
     val diagnostics = rendering.diagnostics
-    val decorations =
-      if (node_visible) rendering.decorations
-      else { for (deco <- published_decorations) yield VSCode_Model.Decoration.empty(deco.typ) }
+    val decorations = rendering.decorations
 
     (diagnostics, decorations,
       copy(published_diagnostics = diagnostics, published_decorations = decorations))
   }
+
+  /* a closed model has no published baseline: the next open starts with a full push */
+
+  def clear_published: VSCode_Model =
+    copy(published_diagnostics = Nil, published_decorations = Nil, published_version = None)
 
 
   /* prover session */

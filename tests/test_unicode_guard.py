@@ -219,7 +219,7 @@ class TestPushPathsConvert:
         client = _mock_process_client()
         f = tmp_path / "Foo.thy"
         f.write_text('theory Foo begin lemma "α = α" oops end', encoding="utf-8")
-        await client.open_document(str(f), wait_for_decoration=False)
+        await client.open_document(str(f))
         doc = client.open_documents[str(f)]
         assert "\\<alpha>" in doc.content and "α" not in doc.content
         assert doc.content == f.read_text(encoding="utf-8")
@@ -231,7 +231,7 @@ class TestPushPathsConvert:
         client = _mock_process_client()
         f = tmp_path / "Foo.thy"
         f.write_text("theory Foo begin end")
-        await client.open_document(str(f), wait_for_decoration=False)
+        await client.open_document(str(f))
         f.write_text('theory Foo begin lemma "α = α" oops end', encoding="utf-8")
         client.notify = AsyncMock()
         await client.resync_changed_open_documents()
@@ -252,7 +252,7 @@ class TestPushPathsConvert:
         client = _mock_process_client()
         f = tmp_path / "Foo.thy"
         f.write_text("theory Foo begin end")
-        await client.open_document(str(f), wait_for_decoration=False)
+        await client.open_document(str(f))
         text = 'theory Foo (* 注 *) begin lemma "α" oops end'
         f.write_text(text, encoding="utf-8")
         client.notify = AsyncMock()

@@ -267,7 +267,9 @@ extends Rendering(snapshot, model.session.resources.options, model.session) {
     // and the "sorry removed" clearing push would never be sent.
     List(VSCode_Model.Decoration.ranges(VSCode_Rendering.sorry_decoration_type, sorry_ranges))
 
-  def decoration_output(decos: List[VSCode_Model.Decoration]): LSP.Decoration =
+  /* the PIDE/decoration notification, stamped with the version of the very snapshot the
+     entries were rendered from (I-1a): no caller passes a stamp */
+  def decoration_output(decos: List[VSCode_Model.Decoration], file: JFile): JSON.T =
     LSP.Decoration(decos.map(deco =>
       LSP.Decoration_Entry(deco.typ,
         for (Text.Info(text_range, msgs) <- deco.content)
@@ -276,7 +278,7 @@ extends Rendering(snapshot, model.session.resources.options, model.session) {
             val hover_message =
               msgs.map(msg => LSP.MarkedString(resources.output_pretty_tooltip(msg)))
             LSP.Decoration_Range(range, hover_message = hover_message)
-          })))
+          }))).json(file, snapshot.version.id)
 
 
   /* hyperlinks */

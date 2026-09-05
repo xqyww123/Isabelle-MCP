@@ -14,7 +14,7 @@
 
 Isabelle-MCP is a Python-based MCP (Model Context Protocol) server that acts as a bridge between AI agents and Isabelle's Language Server Protocol (LSP) implementation.
 
-> **`isabelle mcp_server`** is *our* LSP server: an Isabelle Scala component that Isabelle-MCP ships (a fork of Isabelle2025-2's `vscode_server` sources, package `isabelle.mcp`). The stock `vscode_server` does not expose the PIDE requests this design needs — `PIDE/theory_status`, `PIDE/cancel_evaluation`, `PIDE/command_at_position`, `PIDE/output_at_position`, `PIDE/symbols`, `PIDE/find_theorems_*` — so they used to be patched into the Isabelle distribution. They are now our own code, and **no Isabelle patch is required**. See `docs/COMPONENT_INSTALL_PLAN.md` and `src/isabelle_mcp/scala/Isabelle2025-2/docs/CANCELLATION.md`. The architecture follows the proven patterns from `lean-lsp-mcp` while adapting to Isabelle's PIDE (Prover IDE) specific features.
+> **`isabelle mcp_server`** is *our* LSP server: an Isabelle Scala component that Isabelle-MCP ships (a fork of Isabelle2025-2's `vscode_server` sources, package `isabelle.mcp`). The stock `vscode_server` does not expose the PIDE requests this design needs — `PIDE/theory_status`, `PIDE/flush`, `PIDE/cancel_evaluation`, `PIDE/command_at_position`, `PIDE/output_at_position`, `PIDE/symbols`, `PIDE/find_theorems_*` — nor the document-version stamp every `PIDE/decoration` push and `PIDE/theory_status` reply carries, so they used to be patched into the Isabelle distribution. They are now our own code, and **no Isabelle patch is required**. See `docs/COMPONENT_INSTALL_PLAN.md` and `src/isabelle_mcp/scala/Isabelle2025-2/docs/CANCELLATION.md`. The architecture follows the proven patterns from `lean-lsp-mcp` while adapting to Isabelle's PIDE (Prover IDE) specific features.
 
 ### 1.1 High-Level Architecture
 
@@ -441,10 +441,13 @@ via the `ProcessingTracker`.)
   watcher missed (inotify overflow, NFS, a disabled watcher). Stat'ing runs off the
   event loop via `asyncio.to_thread`.
 - **Dependency files (Layer 3):** `.ML` blobs and imported `.thy` are synced by
-  Isabelle's *own* mcp_server File_Watcher, not the MCP. Because that watcher has a
-  `vscode_load_delay` debounce (default 0.5 s, read at startup), the tool-call backstop
-  also stats the `theory_status` dependency set; if a dep changed within that window it
-  waits the delay so the server has certainly noticed it before querying.
+  Isabelle's *own* mcp_server File_Watcher between tool calls, not by the MCP. At the
+  tool-call entry the backstop sends one `PIDE/flush {resync_dependencies: true}`: the
+  server re-reads every dependency file from disk (an edit only where the bytes
+  differ), resolves imports, hands everything pending to the prover and replies with
+  the assigned document version that contains it all, plus the files that changed
+  (`changed_uris`, marked dirty for the breakpoint registry). The entry then pulls one
+  `PIDE/theory_status` (this call's *entry record*) and runs the unified close.
 - **Mid-evaluation edits are intentional:** the locked sync paths take
   `_evaluation_state_lock` but do not skip while an evaluation is active; PIDE re-checks
   incrementally and the `ProcessingTracker` adopts the new version. A long evaluation
@@ -495,9 +498,19 @@ class DiagnosticCache:
 > it comes from the per-file `ProcessingTracker`, which consumes `PIDE/decoration`
 > `background_running1`/`background_unprocessed1` ranges directly.
 >
-> Tracker freshness is clock-based: every edit-send (didOpen/didChange/external-dep
-> change) bumps a global timestamp, and cached decorations are distrusted for
-> `DECORATION_GRACE` (default 2 s) afterwards — see `processing.note_edit_sent`.
+> Tracker freshness is version-based, never clock-based. Every `PIDE/decoration`
+> push carries `document_version`, the id of the PIDE document version it was
+> rendered from (ids tick downward: newer means numerically smaller; the
+> direction lives in `processing.at_least_as_new` alone). The client keeps the
+> newest version it has seen in any stamp or reply (`FreshnessState`), counts
+> every didOpen/didChange it writes as unflushed content until a `PIDE/flush`
+> reply covers it, and trusts a picture iff it is a FULL picture stamped at
+> least as new as the newest version with no unflushed content — the tracker's
+> `fresh`. An empty push with a stamp is an acknowledgement: "re-rendered at this
+> version, nothing changed". The server acknowledges every visible file within
+> `editor_output_delay` + `vscode_output_delay` of each assigned version, so a
+> wait for a fresh picture (`evaluation.wait_until_fresh`, one bound of five
+> minutes, expiry the catastrophe) normally ends in a fraction of a second.
 
 ---
 
@@ -591,7 +604,7 @@ never evaluate; the guard dispatches on the requested position, in this order:
    to the run and nothing else: no target moves, no caret moves, no run is
    started or ended.
 3. The prover holds the theory but this client closed it (the unified close) →
-   reopened with the evaluation-target mark, the grace gate waited out, judged
+   reopened with the evaluation-target mark, its first picture waited for, judged
    again. No proof re-runs.
 4. Still not evaluated while another file is under evaluation →
    ``NOT_EVALUATED_REFUSAL``, naming that evaluation.
@@ -1099,9 +1112,10 @@ Agent edits file.thy on disk (ordinary file tools)
    │   ProcessingTracker.update()  (adopts new version's ranges; wakes waiters)
    │
    └─ Dependency files (.ML blobs, imported .thy) — the SERVER's job:
-       Isabelle's own mcp_server File_Watcher disk-watches them (0.5 s debounce).
-       Layer 3: the tool-call backstop stats the theory_status dep set and, if a dep
-       changed within the debounce window, waits vscode_load_delay before querying.
+       Isabelle's own mcp_server File_Watcher disk-watches them between tool calls
+       (0.5 s debounce). Layer 3: the tool-call entry sends PIDE/flush with
+       resync_dependencies — the server re-reads every dependency file, flushes
+       everything to the prover and replies with the assigned document version.
 ```
 
 (Pushing mid-evaluation is intentional — PIDE re-checks incrementally.)

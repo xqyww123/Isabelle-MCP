@@ -639,12 +639,13 @@ whether the sections below hold errors: `No evaluation in progress. Nothing is
 running and no errors remain.` or `No evaluation in progress. Nothing is
 running, but {N} failed commands remain.` (`1 failed command remains.` in the
 singular). A dependency error reappears in every idle report until it is fixed.
-An edit
-within the last `ISABELLE_MCP_DECORATION_GRACE` seconds (default 2 s) makes the
-tool wait until that window has passed with no further edit — a further edit
-re-arms it — before judging, so the answer (idle or busy) never describes the
-pre-edit document; while a file is being edited continuously, the tool
-deliberately waits for the edits to stop.
+Before judging, the tool waits until every open file's decoration picture is
+fresh — rendered by the server at a document version at least as new as the
+newest one this server has seen, with no edit of ours still uncovered by a
+flush reply (§7.1) — so the answer (idle or busy) never describes the
+pre-edit document. Normally that is a fraction of a second; a further edit
+landing during the wait re-arms it. The wait is bounded (five minutes) and
+its expiry is the catastrophe of §4.4.3.
 
 #### 4.4.3 `isabelle_cancel_evaluation`
 
@@ -715,9 +716,12 @@ those edits to Isabelle automatically:
   the start of each MCP call and pushes any the watcher missed (content comparison is
   the final gate).
 - **Dependency files (the server's job).** `.ML` blobs and imported `.thy` are synced
-  by Isabelle's own mcp_server File_Watcher. Because that watcher debounces by
-  `vscode_load_delay` (default `0.5` s), the backstop also stats the `theory_status`
-  dependency set and waits out the debounce when a dependency was just edited.
+  by Isabelle's own mcp_server File_Watcher between tool calls. At every tool call's
+  entry the backstop sends one `PIDE/flush` request with `resync_dependencies`, on
+  which the server itself re-reads every dependency file from disk (an edit only where
+  the bytes differ), hands everything pending to the prover, and replies with the
+  document version that contains it all — so no tool ever judges from a picture older
+  than a dependency edit, and nothing is guessed from stat signatures or timers.
 - Pushing an edit *during* an in-progress evaluation is intentional and supported:
   PIDE re-checks incrementally and the processing tracker adopts the new version —
   exactly as editing in jEdit/VS Code while checking runs. The locked sync paths do not

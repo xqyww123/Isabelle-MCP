@@ -187,10 +187,9 @@ object VSCode_Resources {
     caret: Option[(JFile, Line.Position)] = None,
     overlays: Document.Overlays = Document.Overlays.empty,
     pending_input: Set[JFile] = Set.empty,
-    pending_output: Set[JFile] = Set.empty,
     /* counts the session.update calls made under the monitor with a non-empty edit list:
-       the cancel request reads the document state outside the monitor and uses this to
-       tell whether that reading is still current once it is back inside */
+       the cancel request and flush_output read the document state outside the monitor and
+       use this to tell whether that reading is still current once they are back inside */
     update_serial: Long = 0,
     /* counts the changes to the overlay table.  Two writers: change_overlay bumps this
        when the table really changed; the cancel request's step 0 empties the table and
@@ -200,8 +199,7 @@ object VSCode_Resources {
     def update_models(changed: Iterable[(JFile, VSCode_Model)]): State =
       copy(
         models = models ++ changed,
-        pending_input = changed.foldLeft(pending_input) { case (set, (file, _)) => set + file },
-        pending_output = changed.foldLeft(pending_output) { case (set, (file, _)) => set + file })
+        pending_input = changed.foldLeft(pending_input) { case (set, (file, _)) => set + file })
 
     def update_caret(new_caret: Option[(JFile, Line.Position)]): State =
       if (caret == new_caret) this
@@ -241,13 +239,13 @@ object VSCode_Resources {
   }
 
 
-  /* cancellation (ISABELLE_MCP_CANCELLATION_REDESIGN_PLAN.md section 3.1.2)
+  /* budget-bounded requests (the cancel request, the flush request)
 
-     Every failure of the cancel request is a Cancel_Failure with the reason for the log;
-     Language_Server turns any of them into the one catastrophic reply. */
+     Every failure of such a request is a Request_Failure with the reason for the log;
+     Language_Server turns any of them into the request's one failure reply. */
 
-  final class Cancel_Failure(val reason: String) extends RuntimeException(reason)
-  def cancel_fail(reason: String): Nothing = throw new Cancel_Failure(reason)
+  final class Request_Failure(val reason: String) extends RuntimeException(reason)
+  def request_fail(reason: String): Nothing = throw new Request_Failure(reason)
 
   /* a command retired this round: the zero-length edit (or the net-zero pair) is in the
      batch; "waived" marks a first-of-file single-character command, whose net-zero pair
@@ -298,8 +296,8 @@ object VSCode_Resources {
 
   /* the monitor: a re-entrant lock whose acquisition can be bounded by a deadline
 
-     Synchronized would do for everyone but the cancel request, which may not wait
-     unboundedly on anything (R-D9).  Re-entrant because node_perspective reads
+     Synchronized would do for everyone but the cancel and flush requests, which may not
+     wait unboundedly on anything (R-D9).  Re-entrant because node_perspective reads
      visible_node -> get_model -> value while the cancel request holds the lock.  No
      condition waiting: nobody uses timed_access/guarded_access on this state. */
 
@@ -319,14 +317,21 @@ object VSCode_Resources {
         try { lock.tryLock((deadline - Time.now()).ms max 0L, TimeUnit.MILLISECONDS) }
         catch {
           case _: InterruptedException =>
-            cancel_fail("interrupted while waiting for the document model monitor")
+            request_fail("interrupted while waiting for the document model monitor")
         }
       if (!acquired) {
-        cancel_fail("document model monitor held by another party for the rest of the budget")
+        request_fail("document model monitor held by another party for the rest of the budget")
       }
       try { val (result, state1) = f(state); state = state1; result }
       finally { lock.unlock() }
     }
+
+    /* the entry the shared operations use: timed when a request's deadline is given */
+    def change_result_entry[B](deadline: Option[Time])(f: A => (B, A)): B =
+      deadline match {
+        case Some(d) => change_result_timed(d)(f)
+        case None => change_result(f)
+      }
   }
 
   /* session.update from inside the monitor: a short fixed bound, not the remaining budget,
@@ -346,7 +351,7 @@ object VSCode_Resources {
       catch { case exn: Throwable => sent.fulfill_result(Exn.Exn(exn)) }
     }
     if (Language_Server.await_promise(sent, Time.now() + bound).isEmpty) {
-      cancel_fail("session.update not acknowledged within " + bound)
+      request_fail("session.update not acknowledged within " + bound)
     }
   }
 
@@ -484,28 +489,23 @@ extends Resources(session_background, log = log) {
   ): Unit = {
     state.change { st =>
       val model = st.models.getOrElse(file, VSCode_Model.init(session, editor, node_name(file)))
-      // A model coming back from external_file (a reopen) must forget its published baseline:
-      // the decoration publish is differential (vscode_model.scala:214-227), so for a clean
-      // file whose content did not change it would send nothing at all and the client would
-      // never see any decoration for the reopened file.  The clearing has to happen here, on
-      // the reopen side -- on the close side it would suppress the erase push instead.
-      val model0 =
-        if (model.external_file) {
-          model.copy(published_decorations = Nil, published_diagnostics = Nil)
-        }
-        else model
       val model1 =
-        (model0.change_text(text, range) getOrElse model0).set_version(version).external(false)
+        (model.change_text(text, range) getOrElse model).set_version(version).external(false)
       st.update_models(Some(file -> model1))
     }
   }
 
+  // the published baseline goes with the close, so a reopened model always starts with a
+  // full push and "a non-visible model has no published baseline" holds by construction
   def close_model(file: JFile): Boolean =
     state.change_result(st =>
       st.models.get(file) match {
         case None => (false, st)
-        case Some(model) => (true, st.update_models(Some(file -> model.external(true))))
+        case Some(model) =>
+          (true, st.update_models(Some(file -> model.external(true).clear_published)))
       })
+
+  /* the file watcher's entry: the external models among the files it saw change */
 
   def sync_models(changed_files: Set[JFile]): Unit =
     state.change { st =>
@@ -517,6 +517,23 @@ extends Resources(session_background, log = log) {
           model1 <- model.change_text(text)
         } yield (file, model1)).toList
       st.update_models(changed_models)
+    }
+
+  /* the flush request's entry: EVERY external model re-read from disk; an edit only where
+     the bytes differ (change_text).  Returns the files whose bytes differed and, separately,
+     those that no longer read; a vanished file keeps its model with the last text. */
+
+  def resync_external_models(deadline: Option[Time] = None): (List[JFile], List[JFile]) =
+    state.change_result_entry(deadline) { st =>
+      val changed = new mutable.ListBuffer[(JFile, VSCode_Model)]
+      val vanished = new mutable.ListBuffer[JFile]
+      for ((file, model) <- st.models if model.external_file) {
+        read_file_content(model.node_name) match {
+          case None => vanished += file
+          case Some(text) => for (model1 <- model.change_text(text)) changed += (file -> model1)
+        }
+      }
+      ((changed.toList.map(_._1), vanished.toList), st.update_models(changed.toList))
     }
 
 
@@ -537,9 +554,10 @@ extends Resources(session_background, log = log) {
   def resolve_dependencies(
     session: VSCode_Session,
     editor: Language_Server.Editor,
-    file_watcher: MCP_File_Watcher
+    file_watcher: MCP_File_Watcher,
+    deadline: Option[Time] = None
   ): (Boolean, Boolean) = {
-    state.change_result { st =>
+    state.change_result_entry(deadline) { st =>
       val stable_tip_version = session.stable_tip_version(st.models.values)
 
       val thy_files =
@@ -570,8 +588,12 @@ extends Resources(session_background, log = log) {
 
   /* pending input */
 
-  def flush_input(session: VSCode_Session, channel: Channel): Unit = {
-    state.change { st =>
+  def flush_input(
+    session: VSCode_Session,
+    channel: Channel,
+    deadline: Option[Time] = None
+  ): Unit = {
+    state.change_result_entry(deadline) { st =>
       val changed_models =
         (for {
           file <- st.pending_input.iterator
@@ -583,10 +605,11 @@ extends Resources(session_background, log = log) {
       val edits = changed_models.flatMap(_._1)
       session.update(st.document_blobs, edits)
 
-      st.copy(
-        models = st.models ++ changed_models.iterator.map(_._2),
-        pending_input = Set.empty,
-        update_serial = if (edits.nonEmpty) st.update_serial + 1 else st.update_serial)
+      ((),
+        st.copy(
+          models = st.models ++ changed_models.iterator.map(_._2),
+          pending_input = Set.empty,
+          update_serial = if (edits.nonEmpty) st.update_serial + 1 else st.update_serial))
     }
   }
 
@@ -628,10 +651,10 @@ extends Resources(session_background, log = log) {
         doc_state.snapshot(node_name = model.node_name, pending_edits = pending_edits),
         st.document_blobs, None, overlays(model.node_name), cancel_required(model))
     if (perspective.required) {
-      VSCode_Resources.cancel_fail("theory " + model.node_name + " is marked required")
+      VSCode_Resources.request_fail("theory " + model.node_name + " is marked required")
     }
     if (perspective.visible == Text.Perspective.full) {
-      VSCode_Resources.cancel_fail("load-command escape: a file loaded from " +
+      VSCode_Resources.request_fail("load-command escape: a file loaded from " +
         model.node_name + " is an open visible model")
     }
     perspective
@@ -719,7 +742,7 @@ extends Resources(session_background, log = log) {
       else if (st.models.values.exists(_.pending_edits.nonEmpty)) {
         /* step b */
         for ((file, model) <- st.models if model.pending_edits.nonEmpty && !st.pending_input(file)) {
-          VSCode_Resources.cancel_fail("model with unflushed edits outside pending_input: " + file)
+          VSCode_Resources.request_fail("model with unflushed edits outside pending_input: " + file)
         }
         val pending_edits = Document.Pending_Edits.make(st.models.values)
         val changed =
@@ -733,7 +756,7 @@ extends Resources(session_background, log = log) {
             (edits, (file, model.copy(pending_edits = Nil, last_perspective = perspective)))
           }).toList
         val edits = changed.flatMap(_._1)
-        if (edits.isEmpty) VSCode_Resources.cancel_fail("unflushed edits produced no edit")
+        if (edits.isEmpty) VSCode_Resources.request_fail("unflushed edits produced no edit")
         val tip_before = doc_state.stable_tip_version.map(_.id)
         val st1 =
           st.copy(
@@ -775,7 +798,7 @@ extends Resources(session_background, log = log) {
                       excluded += VSCode_Resources.Excluded(name, command_id, None, "reassigned")
                     case Some((command, start)) =>
                       if (command.length == 0) {
-                        VSCode_Resources.cancel_fail("offset invalid: empty command " +
+                        VSCode_Resources.request_fail("offset invalid: empty command " +
                           command_id + " in " + name)
                       }
                       retired += VSCode_Resources.Retired(exec_id, name, command, start,
@@ -798,7 +821,7 @@ extends Resources(session_background, log = log) {
             for ((name, edits) <- retire_edits) {
               Exn.capture { Thy_Syntax.edit_text(edits, version.nodes(name).commands) } match {
                 case Exn.Exn(exn) =>
-                  VSCode_Resources.cancel_fail(
+                  VSCode_Resources.request_fail(
                     "offset invalid in " + name + ": " + Exn.message(exn))
                 case Exn.Res(_) =>
               }
@@ -841,18 +864,18 @@ extends Resources(session_background, log = log) {
     deadline: Time
   ): Unit = {
     state.change_result_timed(deadline) { st =>
-      if (st.caret.isDefined) VSCode_Resources.cancel_fail("caret still set after retraction")
+      if (st.caret.isDefined) VSCode_Resources.request_fail("caret still set after retraction")
       // step 0 emptied the table and recorded the serial; a change since is someone
       // else's overlay, which can hand the prover work after the retraction
       if (st.overlay_serial != overlay_serial0) {
-        VSCode_Resources.cancel_fail("overlay table changed after retraction")
+        VSCode_Resources.request_fail("overlay table changed after retraction")
       }
       for ((file, model) <- st.models if model.pending_edits.nonEmpty && !st.pending_input(file)) {
-        VSCode_Resources.cancel_fail("model with unflushed edits outside pending_input: " + file)
+        VSCode_Resources.request_fail("model with unflushed edits outside pending_input: " + file)
       }
       val (retracted, _) = retraction(st, doc_state, st.overlays)
       if (retracted.nonEmpty) {
-        VSCode_Resources.cancel_fail("perspective not empty after retraction: " +
+        VSCode_Resources.request_fail("perspective not empty after retraction: " +
           retracted.map(_._2.node_name).mkString(", "))
       }
       ((), st)
@@ -860,43 +883,48 @@ extends Resources(session_background, log = log) {
   }
 
 
-  /* pending output */
+  /* output: one rendering of EVERY visible model per cycle
 
-  def update_output(changed_nodes: Iterable[JFile]): Unit =
-    state.change(st => st.copy(pending_output = st.pending_output ++ changed_nodes))
+     No set of "changed" files gates the run: a version the prover creates on its own
+     (consolidation) names no node, and every visible model must still be acknowledged at
+     it (I-2).  The document state is read OUTSIDE the monitor (a manager round trip) after
+     update_serial, and the serial is re-validated first thing inside: a flush_input that
+     completed between the two reads cleared the models' pending edits while the state
+     read here lacks its change, so is_outdated would read false and every range would be
+     converted against the models' NEW text -- a picture describing no version.  A changed
+     serial postpones the whole batch, exactly like an outdated snapshot (true: re-arm). */
 
-  def update_output_visible(): Unit =
-    state.change(st => st.copy(pending_output = st.pending_output ++
-      (for ((file, model) <- st.models.iterator if model.node_visible) yield file)))
-
-  def flush_output(channel: Channel): Boolean = {
+  def flush_output(session: VSCode_Session, channel: Channel): Boolean = {
+    val serial0 = state.value.update_serial
+    val doc_state = session.get_state()
     state.change_result { st =>
-      val (postponed, flushed) =
-        (for {
-          file <- st.pending_output.iterator
-          model <- st.models.get(file)
-        } yield (file, model, rendering(model))).toList.partition(_._3.snapshot.is_outdated)
+      if (st.update_serial != serial0) (true, st)
+      else {
+        val pending_edits = Document.Pending_Edits.make(st.models.values)
+        val (postponed, flushed) =
+          (for ((file, model) <- st.models.iterator if model.node_visible) yield {
+            val snapshot =
+              doc_state.snapshot(node_name = model.node_name, pending_edits = pending_edits)
+            (file, model, rendering(snapshot, model))
+          }).toList.partition(_._3.snapshot.is_outdated)
 
-      val changed_iterator =
-        for {
-          (file, model, rendering) <- flushed.iterator
-          (changed_diags, changed_decos, model1) = model.publish(rendering)
-          if changed_diags.isDefined || changed_decos.isDefined
-        }
-        yield {
-          for (diags <- changed_diags)
-            channel.write(LSP.PublishDiagnostics(file, rendering.diagnostics_output(diags)))
-          if (pide_extensions) {
-            for (decos <- changed_decos)
-              channel.write(rendering.decoration_output(decos).json(file))
+        val changed_iterator =
+          for {
+            (file, model, rendering) <- flushed.iterator
+            (changed_diags, changed_decos, model1) = model.publish(rendering)
+            if changed_diags.isDefined || changed_decos.isDefined
           }
-          (file, model1)
-        }
+          yield {
+            for (diags <- changed_diags)
+              channel.write(LSP.PublishDiagnostics(file, rendering.diagnostics_output(diags)))
+            if (pide_extensions) {
+              for (decos <- changed_decos) channel.write(rendering.decoration_output(decos, file))
+            }
+            (file, model1)
+          }
 
-      (postponed.nonEmpty,
-        st.copy(
-          models = st.models ++ changed_iterator,
-          pending_output = postponed.map(_._1).toSet))
+        (postponed.nonEmpty, st.copy(models = st.models ++ changed_iterator))
+      }
     }
   }
 
@@ -939,9 +967,9 @@ extends Resources(session_background, log = log) {
   def force_decorations(channel: Channel, file: JFile): Unit = {
     val model = state.value.models(file)
     val rendering1 = rendering(model)
-    val (_, decos, model1) = model.publish_full(rendering1)
+    val (_, decos, _) = model.publish_full(rendering1)
     if (pide_extensions) {
-      channel.write(rendering1.decoration_output(decos).json(file))
+      channel.write(rendering1.decoration_output(decos, file))
     }
   }
 

@@ -5,7 +5,7 @@ All positions are 1-indexed (MCP convention).
 
 from dataclasses import dataclass, field
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class HoverEntry(BaseModel):
@@ -176,6 +176,18 @@ class TheoryStatus(BaseModel):
     canceled: bool = Field(default=False, description="True if execution was canceled")
     consolidated: bool = Field(default=False, description="True if fully processed")
     percentage: int = Field(default=0, description="Processing progress (0-100)")
+
+
+class TheoryStatusRecord(BaseModel):
+    """One PIDE/theory_status reply: every row rendered from ONE document state,
+    stamped with that state's version (the picture stamp, ``document_version``).
+    Frozen: the tool entry stores one per call and readers compare its stamp
+    against the newest version the client has seen."""
+
+    model_config = ConfigDict(frozen=True)
+
+    document_version: int = Field(description="The document version the rows were rendered from")
+    theories: tuple[TheoryStatus, ...] = Field(default=(), description="One row per theory the server holds")
 
 
 class RunningCommand(BaseModel):

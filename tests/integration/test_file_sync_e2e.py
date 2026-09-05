@@ -21,6 +21,7 @@ import time
 
 import pytest
 
+from isabelle_mcp.evaluation import wait_until_fresh
 from isabelle_mcp.file_watcher import FileWatcher
 from isabelle_mcp.lsp_client import IsabelleLSPClient
 from isabelle_mcp.utils import LSPCharacter, LSPLine
@@ -121,9 +122,9 @@ async def test_file_sync_end_to_end(tmp_path):
 
     try:
         await client.start()
-        assert client.vscode_load_delay > 0  # read from `isabelle options`
 
-        await client.open_document(host, wait_for_decoration=True, decoration_timeout=10.0)
+        await client.open_document(host)
+        await wait_until_fresh(client, [host])   # the first picture, at the flushed version
         await client.set_caret(host, LSPLine(7), LSPCharacter(0))
         # open_document registered the parent dir with the watcher.
         assert d in fw._watched_dirs
@@ -161,13 +162,15 @@ async def test_file_sync_end_to_end(tmp_path):
         assert await _wait_until(lambda: not _ml_stale(client, host), timeout=30.0), \
             "server File_Watcher did not pick up the .ML fix"
 
-        # S4 — Layer 3 detection: a fresh dep edit yields a wait == vscode_load_delay.
-        from isabelle_mcp.evaluation import _dependency_freshness_wait
-        await _dependency_freshness_wait(client)   # prime sigs (no 'prev' → no wait)
+        # S4 — the flush request's resync: a dependency edited on disk is named
+        # in changed_uris (by path here, converted by the client) and the reply
+        # version covers it.
         _write(helper, _helper_src(2))
-        wait = await _dependency_freshness_wait(client)
-        assert wait == pytest.approx(client.vscode_load_delay), \
-            f"Layer 3 should wait vscode_load_delay on a fresh dep edit, got {wait}"
+        reply, _ = await client.flush(resync_dependencies=True)
+        assert os.path.realpath(helper) in {
+            os.path.realpath(u.removeprefix("file://")) for u in reply["changed_uris"]}, \
+            f"the resync did not name the edited .ML blob: {reply}"
+        assert await _wait_until(lambda: _ml_stale(client, host), timeout=30.0)
         _write(helper, _helper_src(1))
     finally:
         try:
