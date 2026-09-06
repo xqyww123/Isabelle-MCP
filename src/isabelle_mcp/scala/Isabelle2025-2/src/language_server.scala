@@ -46,6 +46,17 @@ object Language_Server {
     if (promise.is_finished) Some(promise.join) else None
   }
 
+  /* The two protocol args that identify a command to ML/mcp_prelude.ML's mcp_resolve: the
+     node that OWNS the command, and its id.  Both are taken FROM the Command, never from a
+     file model's own node -- load-bearing for `.ML` blobs: a blob's breakable / queried
+     command belongs to the LOADER theory's node (the ML_file command), not the blob file's
+     node, so command_exec against the blob node would raise -> "undefined".  Every site that
+     sends a (node, command_id) pair to mcp_resolve routes through here, so the wrong-node
+     pairing cannot recur (it was the same bug at all three send sites). */
+
+  def command_ref(command: Command): (String, String) =
+    (command.node_name.node, command.id.toString)
+
 
   /* the prelude's cancel report: one protocol message per Isabelle_MCP.cancel_evaluation,
      matched to its request by serial (see ML/mcp_prelude.ML).  "error" is set when any
@@ -1266,7 +1277,7 @@ class Language_Server(
     for {
       (rendering, offset) <- rendering_offset(node_pos)
       command <- rendering.snapshot.current_command(rendering.model.node_name, offset)
-    } yield (rendering.model.node_name.node, command.id.toString)
+    } yield Language_Server.command_ref(command)
 
   private def query_messages(result: Query.Result): XML.Body =
     for (case XML.Elem(markup, body) <- Symbol.decode_yxml_failsafe(result.text))

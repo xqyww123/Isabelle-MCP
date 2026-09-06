@@ -138,7 +138,15 @@ async def test_blob_breakpoint_arms_and_stops_inside_the_blob(prover):
 
     # REGRESSION CORE: every blob site carries a real boolean state, never `undefined`.
     # The wrong-node bug makes each state the literal string "undefined" instead.
-    blob_sites = await _breakpoints(client, blob)
+    # Poll until the breakable markup has surfaced -- an ok-but-empty listing is a benign
+    # transient just after the model opens, not a failure (_breakpoints only retries on
+    # `outdated`, so absorb the up-to-date-but-not-yet-surfaced window here).
+    blob_sites: list = []
+    for _ in range(30):
+        blob_sites = await _breakpoints(client, blob)
+        if blob_sites:
+            break
+        await asyncio.sleep(1.0)
     assert blob_sites, "no breakable sites found in the blob"
     assert all(isinstance(bp["state"], bool) for bp in blob_sites), (
         "a blob site read a non-boolean state -- the wrong-node bug is back: "

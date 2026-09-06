@@ -353,9 +353,8 @@ class Debugger_Adapter(server: Language_Server) {
             session.protocol_command_args("Isabelle_MCP.breakpoint_states",
               (token ::
                 sites.flatMap({ case (_, serial, command) =>
-                  // a blob's breakable command lives in the LOADER theory's node, not the
-                  // blob file's own node -- send the command's node so command_exec resolves
-                  List(command.node_name.node, command.id.toString, serial.toString)
+                  val (node, command_id) = Language_Server.command_ref(command)
+                  List(node, command_id, serial.toString)
                 })).map(XML.string))
           }
         }
@@ -401,11 +400,9 @@ class Debugger_Adapter(server: Language_Server) {
                     respond_timeout(Query.Result(Query.TIMEOUT))
                 }
               server.query_handler.register(token, result => { timer.cancel(); respond(result) })
+              val (node, command_id) = Language_Server.command_ref(command)
               session.protocol_command_args("Isabelle_MCP.toggle_breakpoint",
-                // command's own node, not the blob file's: a blob site's command belongs to
-                // the loader theory (see breakpoint_states) so command_exec can resolve it
-                List(token, command.node_name.node, command.id.toString,
-                  serial.toString, state.toString).map(XML.string))
+                List(token, node, command_id, serial.toString, state.toString).map(XML.string))
           }
         }
     }
