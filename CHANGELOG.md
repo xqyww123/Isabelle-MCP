@@ -1,27 +1,5 @@
 # Changelog
 
-## Unreleased
-
-- **A rule's position in command output reads `file:line`, not `⌂`.** A
-  position from a theory in the live document reaches the prover with only a
-  command id and an offset (that is how PIDE sends commands), so `Position.here`
-  prints the `⌂` placeholder that jEdit turns into a hyperlink — and this
-  text-only client used to drop it, leaving e.g. `φreasoning(2000):` with no
-  location at all. `isabelle_command_output` now resolves it, through the same
-  snapshot lookup the hyperlinks use, into the file and 1-based line, shown
-  relative to the project root like every other path. Positions that already
-  print a line (heap theories: `(line N of "…")`) and placeholders whose command
-  is no longer in the document are unchanged.
-- **The project root comes from the client's declared MCP roots when it has
-  any.** Paths were relative to the server process's working directory, which
-  is the agent's project directory only by the host's convention. A client with
-  the roots capability (Claude Code) names its project directory explicitly;
-  the first tool call asks for it (`roots/list`) and adopts the first `file://`
-  root. Clients without it (Codex) keep the working directory. The default
-  session dir of `isabelle_launch` follows the same root, and a `file_path`
-  given relative to it resolves against it, so a path copied out of a tool's
-  output can be handed back in.
-
 ## 0.6.0
 
 - **The two-second guess is gone: every picture now says which document
@@ -56,6 +34,45 @@
   (protocol version 1). A mismatch refuses the launch with: *"Isabelle-MCP's
   Scala component does not match this isabelle-mcp package. Run `isabelle-mcp
   install` to update it."* The prebuilt jar is rebuilt.
+- **A rule's position in command output reads `file:line`, not `⌂`.** A
+  position from a theory in the live document reaches the prover with only a
+  command id and an offset (that is how PIDE sends commands), so `Position.here`
+  prints the `⌂` placeholder that jEdit turns into a hyperlink — and this
+  text-only client used to drop it, leaving e.g. `φreasoning(2000):` with no
+  location at all. `isabelle_command_output` now resolves it, through the same
+  snapshot lookup the hyperlinks use, into the file and 1-based line, shown
+  relative to the project root like every other path. Positions that already
+  print a line (heap theories: `(line N of "…")`) and placeholders whose command
+  is no longer in the document are unchanged.
+- **The project root comes from the client's declared MCP roots when it has
+  any.** Paths were relative to the server process's working directory, which
+  is the agent's project directory only by the host's convention. A client with
+  the roots capability (Claude Code) names its project directory explicitly;
+  the first tool call asks for it (`roots/list`) and adopts the first `file://`
+  root. Clients without it (Codex) keep the working directory. The default
+  session dir of `isabelle_launch` follows the same root, and a `file_path`
+  given relative to it resolves against it, so a path copied out of a tool's
+  output can be handed back in.
+- **Breakpoints and queries inside a `.ML` blob work.** A breakpoint whose
+  site sits in an auxiliary file loaded by `ML_file` could never be armed —
+  its state read `undefined` and the toggle answered `undefined` — and
+  `isabelle_goal` and `isabelle_find_theorems` at any position inside such a
+  file answered `undefined` too, while everything in a `.thy` worked. All
+  three paired the blob file's own document node with a command that belongs
+  to the loader theory's node (a blob's commands are the loader's `ML_file`
+  command), and the prover's lookup raised. The (node, command) pair is now
+  derived once from the command itself, so the mispairing cannot recur. A
+  blob breakpoint arms, reads a real boolean and stops execution inside the
+  blob; `.thy` breakpoints and queries are unchanged. The prebuilt jar is
+  rebuilt.
+- **The unified close no longer disarms a breakpoint inside a `.ML` blob.**
+  The sweep exempted the `.ML` file holding a breakpoint but not the `.thy`
+  that loads it — and the breakpoint lives in the loader's execution, so
+  closing the loader recompiled it on reopen and the site silently stopped
+  firing. The loader of every breakpointed `.ML` is now exempt too, resolved
+  from the prover at each sweep (one bounded query per blob, only while such
+  a breakpoint exists; a loader that cannot be resolved skips that round
+  rather than close against an incomplete list).
 - Superseded 0.5.0 notes, left standing below: the half-second / two-second
   reopen timings ("Open files look after themselves"), the same-bytes reopen
   record ("Reopening an untouched file no longer costs the two-second grace
