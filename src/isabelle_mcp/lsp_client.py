@@ -359,8 +359,6 @@ class IsabelleLSPClient:
         # PIDE/query_cancel names.
         self._query_seq: int = 0
 
-        # PIDE dynamic output
-
         # PIDE preview
         self._preview_lock = asyncio.Lock()
         self._preview_waiters: dict[tuple[str, int], asyncio.Future[JsonDict]] = {}

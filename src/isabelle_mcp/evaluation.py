@@ -1,11 +1,11 @@
-"""Async evaluation lifecycle for Isabelle theories (v0.3.0).
+"""Async evaluation lifecycle for Isabelle theories.
 
 Separates *evaluation* (telling Isabelle what to process) from *querying*
 (reading hover/goal/diagnostic results).  Three MCP tools manage
 evaluation; query tools call :func:`check_evaluation_guard` to ensure
 the target region has been processed.
 
-v0.3.0 leverages PIDE/theory_status for dependency-aware completion and
+It leverages PIDE/theory_status for dependency-aware completion and
 PIDE/cancel_evaluation for cancellation (stanch, retire, retract -- see
 ISABELLE_MCP_CANCELLATION_REDESIGN_PLAN.md section 3).
 """
