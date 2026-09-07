@@ -134,6 +134,102 @@ class TestSweepCriterion:
         assert set(mock_lsp_client.open_documents) == {target, broken}
 
 
+class TestLoaderExemption:
+    """R-B widening (Q3): a blob's breakpoint entry is keyed by the .ML path, but
+    the breakpoint lives in the LOADER theory's execution -- closing the loader
+    recompiles it on reopen and orphans the armed site. So the loader .thy of any
+    .ML that has an entry is exempt too, read live via request_loaders."""
+
+    async def test_the_loader_of_a_blob_entry_stays_open(
+        self, mock_lsp_client, tmp_path,
+    ):
+        loader = _theory_file(tmp_path, "Loader.thy")  # settled, NOT a target, no own entry
+        blob = str(tmp_path / "Aux.ML")
+        await mock_lsp_client.open_document(loader)
+        _settled(mock_lsp_client, loader)
+        entry = Breakpoint(file_path=blob, line=1, anchor="end", state=debugger.ARMED)
+        debugger.registry.entries.append(entry)
+        mock_lsp_client.loaders = [{"file": loader, "theory": "Loader", "state": "evaluated"}]
+        try:
+            await close_settled_documents(mock_lsp_client)
+            assert loader in mock_lsp_client.open_documents, (
+                "the loader of a .ML breakpoint entry must not be closed"
+            )
+        finally:
+            debugger.registry.entries.remove(entry)
+
+    async def test_without_the_loader_link_the_loader_is_closed(
+        self, mock_lsp_client, tmp_path,
+    ):
+        # Mutation control: name no loader and the settled non-target loader is
+        # closed -- exactly the Q3 orphaning the exemption exists to prevent.
+        loader = _theory_file(tmp_path, "Loader.thy")
+        blob = str(tmp_path / "Aux.ML")
+        await mock_lsp_client.open_document(loader)
+        _settled(mock_lsp_client, loader)
+        entry = Breakpoint(file_path=blob, line=1, anchor="end", state=debugger.ARMED)
+        debugger.registry.entries.append(entry)
+        mock_lsp_client.loaders = []
+        try:
+            await close_settled_documents(mock_lsp_client)
+            assert loader not in mock_lsp_client.open_documents
+        finally:
+            debugger.registry.entries.remove(entry)
+
+    async def test_a_failed_loader_query_skips_the_round(
+        self, mock_lsp_client, temp_theory_file, tmp_path, monkeypatch,
+    ):
+        # If a loader cannot be resolved, close nothing this round (safe: one
+        # round more open) rather than risk closing a loader on a partial set.
+        blob = str(tmp_path / "Aux.ML")
+        await mock_lsp_client.open_document(temp_theory_file)  # settled, non-target, no entry
+        _settled(mock_lsp_client, temp_theory_file)
+        entry = Breakpoint(file_path=blob, line=1, anchor="end", state=debugger.ARMED)
+        debugger.registry.entries.append(entry)
+
+        async def boom(_path):
+            raise RuntimeError("prover down")
+
+        monkeypatch.setattr(mock_lsp_client, "request_loaders", boom)
+        try:
+            await close_settled_documents(mock_lsp_client)
+            assert temp_theory_file in mock_lsp_client.open_documents, (
+                "a failed loader query must skip the whole round, closing nothing"
+            )
+        finally:
+            debugger.registry.entries.remove(entry)
+
+    async def test_a_slow_loader_query_times_out_and_skips_the_round(
+        self, mock_lsp_client, temp_theory_file, tmp_path, monkeypatch,
+    ):
+        # The _LOADER_QUERY_TIMEOUT fuse: a hung loader query trips the timeout
+        # and skips the round (nothing closed) instead of hanging the sweep with
+        # both locks held. Deleting the anyio.fail_after wrapper reddens this.
+        blob = str(tmp_path / "Aux.ML")
+        await mock_lsp_client.open_document(temp_theory_file)  # settled, non-target, no entry
+        _settled(mock_lsp_client, temp_theory_file)
+        entry = Breakpoint(file_path=blob, line=1, anchor="end", state=debugger.ARMED)
+        debugger.registry.entries.append(entry)
+
+        async def slow(_path):
+            await asyncio.sleep(1.0)     # never returns before the fuse
+            return []
+
+        monkeypatch.setattr(mock_lsp_client, "request_loaders", slow)
+        monkeypatch.setattr(ev, "_LOADER_QUERY_TIMEOUT", 0.02)
+        started = asyncio.get_running_loop().time()
+        try:
+            await close_settled_documents(mock_lsp_client)
+            assert asyncio.get_running_loop().time() - started < 0.5, (
+                "the loader-query fuse did not fire promptly"
+            )
+            assert temp_theory_file in mock_lsp_client.open_documents, (
+                "a timed-out loader query must skip the whole round"
+            )
+        finally:
+            debugger.registry.entries.remove(entry)
+
+
 class TestSweepDeferral:
     async def test_a_round_that_closed_something_ends_with_one_flush(
         self, mock_lsp_client, temp_theory_file, tmp_path,

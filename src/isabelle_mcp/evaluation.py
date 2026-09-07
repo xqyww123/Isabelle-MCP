@@ -85,6 +85,12 @@ _CLOSE_TIMEOUT: float = 5.0
 # taken and the sweep would silently spin forever without closing anything.
 SWEEP_LOCK_WAIT: float = 0.05
 
+# How long the unified close waits for one PIDE/loaders answer when it extends the
+# exempt set to a .ML breakpoint's loader theory (see close_settled_documents).
+# Bounded so a slow prover cannot stall the sweep while it holds the evaluation and
+# registry locks; on any failure the round is skipped and nothing is closed.
+_LOADER_QUERY_TIMEOUT: float = 5.0
+
 # One sentence for every way a run is stopped by someone else — the agent's own
 # cancel and a session teardown alike — as seen from the evaluate_to side.
 CANCELLED_MESSAGE = "Evaluation cancelled."
@@ -1674,8 +1680,11 @@ async def close_settled_documents(client: IsabelleLSPClient) -> None:
     Closes every open document that is settled (:func:`theory_settled` on the
     entry theory_status), carries no evaluation-target mark, and has no entry
     in the breakpoint registry (armed or pending — closing a file silently
-    demotes every breakpoint on it). What stays open is exactly the evaluation
-    targets and the files that still have something wrong or in flight.
+    demotes every breakpoint on it), and is not the loader theory of a `.ML`
+    that has such an entry (a blob breakpoint lives in its loader's execution;
+    closing the loader recompiles it on reopen and orphans the site). What
+    stays open is exactly the evaluation targets and the files that still have
+    something wrong or in flight.
 
     Runs after the tool entry's flush and theory_status, so the entry record
     describes the text the prover has absorbed. A round that closed at least
@@ -1689,12 +1698,14 @@ async def close_settled_documents(client: IsabelleLSPClient) -> None:
     order (cancel_evaluation → finish_cancel_sweep takes them the same way).
     Holding the registry lock makes a breakpoint tool's arming transaction —
     several awaits between "entry exists" and "site armed" — invisible to the
-    sweep; the exemption read itself is atomic anyway. When the registry lock
-    is busy the whole round is skipped (a file stays open one round longer),
-    and the bound doubles as a fuse: a lock-order violation elsewhere degrades
-    to a skipped round instead of a deadlock. It is a fuse, not permission to
-    relax the rule that no evaluation runs while the registry lock is held —
-    the boundary is evaluation, not any prover round trip (fetch_sites stays
+    sweep, and holds the registry stable across the bounded PIDE/loaders round
+    trips the exemption build now issues, one per breakpointed .ML, to add each
+    blob's loader theory to the exempt set. When the registry lock is busy the
+    whole round is skipped (a file stays open one round longer), and the bound
+    doubles as a fuse: a lock-order violation elsewhere degrades to a skipped
+    round instead of a deadlock. It is a fuse, not permission to relax the rule
+    that no evaluation runs while the registry lock is held — the boundary is
+    evaluation, not any prover round trip (fetch_sites and the loader query stay
     inside that lock; the reopen of a swept theory stays outside it). One
     structural consequence: the cancel sweep and this entry sweep both take
     the evaluation-state lock first, so the two can never contend for the
@@ -1709,6 +1720,32 @@ async def close_settled_documents(client: IsabelleLSPClient) -> None:
                 logger.debug("unified close: registry.lock busy; skipping this round")
                 return
             exempt = {entry.file_path for entry in debugger.registry.entries}
+            # A blob's entry is keyed by its .ML path (exempt above), but the
+            # breakpoint lives in the LOADER theory's execution: closing the
+            # loader recompiles it on reopen and orphans the armed site (Q3). So
+            # exempt each breakpointed .ML's loader .thy too, read live from the
+            # prover -- one query per distinct blob (rare; usually none).
+            # A loader that cannot be resolved skips the WHOLE round (return),
+            # not just that file: closing against a partial exempt set could
+            # close a loader. Unlike a busy registry lock (transient), a
+            # persistent request_loaders failure keeps every settled file open
+            # until it clears -- still lossless (the sweep only closes), and the
+            # safe direction.
+            blob_paths = {entry.file_path for entry in debugger.registry.entries
+                          if entry.file_path.endswith(".ML")}
+            for blob_path in blob_paths:
+                try:
+                    with anyio.fail_after(_LOADER_QUERY_TIMEOUT):
+                        loaders = await client.request_loaders(blob_path)
+                except Exception:
+                    logger.debug(
+                        "unified close: loader query failed for %s; skipping round",
+                        blob_path)
+                    return
+                for loader in loaders:
+                    loader_file = loader.get("file")
+                    if loader_file:
+                        exempt.add(os.path.realpath(loader_file))
             ts_map = {t.node_name: t for t in entry_record().theories}
             for path, doc in list(client.open_documents.items()):
                 if doc.is_evaluation_target or path in exempt:
