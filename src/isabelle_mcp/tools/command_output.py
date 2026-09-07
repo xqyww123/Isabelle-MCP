@@ -57,7 +57,7 @@ async def command_output(
     command = CommandSpan.from_lsp((source, rng))
     messages = [
         OutputMessage(kind=m.get("kind", "normal"), message=m.get("text", ""))
-        for m in parse_command_output_html(content)
+        for m in parse_command_output_html(content, client.project_root)
     ]
     return CommandOutputResult(command=command, messages=messages, note=note)
 

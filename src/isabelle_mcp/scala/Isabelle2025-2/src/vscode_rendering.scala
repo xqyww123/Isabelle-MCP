@@ -16,6 +16,11 @@ import scala.annotation.tailrec
 
 
 object VSCode_Rendering {
+  /* what Position.here (Pure/General/position.ML) prints for an id+offset-only position;
+     compared decoded, since prover text may reach us either way */
+  def is_here_placeholder(body: XML.Body): Boolean =
+    Symbol.decode(XML.content(body)) == Symbol.decode("\\<^here>")
+
   /* decorations */
 
   private def color_decorations(
@@ -331,6 +336,33 @@ extends Rendering(snapshot, model.session.resources.options, model.session) {
       case Position.Item_Def_Id(id, range) => hyperlink_command(id, range)
       case _ => None
     }
+
+  /* "\<^here>" resolved to "<file>:<line1>"
+
+     Position.here prints that placeholder when a position carries only a command id and
+     an offset -- which is every position from a theory in the live document, since the
+     prover receives commands without their line or file (Document.define_command).  jEdit
+     turns it into a hyperlink; this client is text-only, so resolve it here, with the same
+     snapshot lookup the hyperlinks use.  Positions that already print a line/file (heap
+     theories) and placeholders whose command is no longer in the document are left as
+     they are.  Resolved against THIS snapshot's version, which is the version the
+     surrounding output describes, so an outdated snapshot is not a reason to refuse. */
+
+  def resolve_here_positions(body: XML.Body): XML.Body = {
+    def resolve(tree: XML.Tree): XML.Tree =
+      tree match {
+        case XML.Elem(markup @ Markup(Markup.POSITION, Position.Item_Id(id, range)), body)
+        if VSCode_Rendering.is_here_placeholder(body) =>
+          snapshot.find_command_position(id, range.start) match {
+            case Some(node_pos) =>
+              XML.Elem(markup, List(XML.Text(" " + node_pos.name + ":" + node_pos.line1)))
+            case None => tree
+          }
+        case XML.Elem(markup, body) => XML.Elem(markup, body.map(resolve))
+        case _ => tree
+      }
+    body.map(resolve)
+  }
 
   /* ML breakpoints (mirrors jedit_rendering.scala's breakpoint lookup, over a range):
      every breakable site's markup in the range, as found -- single-symbol ranges, no

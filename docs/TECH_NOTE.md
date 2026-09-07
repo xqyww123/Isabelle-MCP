@@ -478,8 +478,10 @@ Still open:
 
 - Accept + display **relative** paths; normalize to absolute internally for
   `file://` URIs and all path-keyed state. **Resolved:** the project root is the
-  per-agent stdio server's CWD (`os.path.realpath(os.getcwd())`), set in the
-  lifespan; a path that escapes the root falls back to absolute.
+  first `file://` root the client declares through MCP `roots/list` (asked once,
+  at the first tool call — Claude Code declares one, Codex none), falling back
+  to the per-agent stdio server's CWD (`os.path.realpath(os.getcwd())`) set in
+  the lifespan; a path that escapes the root falls back to absolute.
 
 ### 7.6 Adjacent / out-of-scope work
 

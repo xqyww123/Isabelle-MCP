@@ -9,7 +9,14 @@ import yaml
 from bs4 import BeautifulSoup, NavigableString
 from pydantic import BaseModel
 
-from isabelle_mcp.utils.core import IsabelleToolError, LSPCharacter, LSPLine, MCPColumn, MCPLine
+from isabelle_mcp.utils.core import (
+    IsabelleToolError,
+    LSPCharacter,
+    LSPLine,
+    MCPColumn,
+    MCPLine,
+    relativize,
+)
 
 
 def model_to_yaml(model: BaseModel) -> str:
@@ -116,21 +123,41 @@ def _normalize_command_output_text(text: str) -> str:
     return text.strip()
 
 
+def _display_position(text: str, project_root: str | None) -> str:
+    """The text of a ``<span class="position">``: the server resolves a live-document
+    position to ``<absolute file>:<line>``, which the agent sees relative to the
+    project root like every other path. Anything else (the bare ⌂ of an unresolvable
+    position, a heap theory's ``(line N of "…")``) passes through."""
+    m = re.fullmatch(r"(\s*)(.+):(\d+)", text)
+    if m is None:
+        return text
+    return f"{m.group(1)}{relativize(m.group(2), project_root)}:{m.group(3)}"
+
+
 class _CommandOutputHTMLParser(HTMLParser):
-    def __init__(self) -> None:
+    def __init__(self, project_root: str | None = None) -> None:
         super().__init__(convert_charrefs=True)
         self.messages: list[dict[str, str]] = []
+        self._project_root = project_root
         self._current_kind: str | None = None
         self._current_text: list[str] = []
         self._current_depth = 0
+        # > 0 while inside a <span class="position"> (nested depth within it)
+        self._position_depth = 0
+        self._position_text: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if self._current_kind is not None:
-            self._current_depth += 1
-            return
-
         attr_map = dict(attrs)
         css_classes = (attr_map.get("class") or "").split()
+        if self._current_kind is not None:
+            self._current_depth += 1
+            if self._position_depth:
+                self._position_depth += 1
+            elif "position" in css_classes:
+                self._position_depth = 1
+                self._position_text = []
+            return
+
         kind = next(
             (
                 _COMMAND_OUTPUT_KIND_BY_CSS_CLASS[css_class]
@@ -150,6 +177,11 @@ class _CommandOutputHTMLParser(HTMLParser):
         if self._current_kind is None:
             return
 
+        if self._position_depth:
+            self._position_depth -= 1
+            if self._position_depth == 0:
+                self._current_text.append(
+                    _display_position("".join(self._position_text), self._project_root))
         self._current_depth -= 1
         if self._current_depth > 0:
             return
@@ -162,12 +194,13 @@ class _CommandOutputHTMLParser(HTMLParser):
         self._current_depth = 0
 
     def handle_data(self, data: str) -> None:
-        if self._current_kind is not None:
-            self._current_text.append(data)
+        if self._current_kind is None:
+            return
+        (self._position_text if self._position_depth else self._current_text).append(data)
 
 
-def parse_command_output_html(html: str) -> list[dict[str, str]]:
-    parser = _CommandOutputHTMLParser()
+def parse_command_output_html(html: str, project_root: str | None = None) -> list[dict[str, str]]:
+    parser = _CommandOutputHTMLParser(project_root)
     parser.feed(html)
     parser.close()
     return parser.messages

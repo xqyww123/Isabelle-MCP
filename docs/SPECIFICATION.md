@@ -515,7 +515,8 @@ ToolAnnotations(
 session: Annotated[str, Field(description="Session/logic name, e.g. HOL, HOL-Analysis, Minilang")]
 session_dirs: Annotated[Optional[list[str]], Field(
     description="Extra -d session search dirs for non-builtin sessions; "
-                "defaults to the server's working directory."
+                "defaults to the project root (the client's declared root, "
+                "else the server's working directory)."
 )] = None
 debug: Annotated[bool, Field(
     description="Launch with ML debugger instrumentation (-o ML_debugger=true): "

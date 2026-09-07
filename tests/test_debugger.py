@@ -8,6 +8,7 @@ change must be a conscious edit here, never an accident.
 from __future__ import annotations
 
 import asyncio
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -742,6 +743,15 @@ class TestDelBreakpoints:
         assert out == "deleted 1 breakpoint"
         assert debugger.registry.entries == []
         assert ("toggle", THY, 11, False) in client.calls
+
+    @pytest.mark.asyncio
+    async def test_relative_ref_resolves_against_the_project_root(self, client):
+        client.project_root = os.path.dirname(THY)
+        await debugger.set_breakpoint(client, THY, VAL_XS, None)
+        out = await debugger.del_breakpoints(
+            client, [(os.path.basename(THY), VAL_XS, None)])
+        assert out == "deleted 1 breakpoint"
+        assert debugger.registry.entries == []
 
     @pytest.mark.asyncio
     async def test_no_match_is_reported(self, client):

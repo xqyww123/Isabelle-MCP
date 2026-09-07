@@ -1,5 +1,6 @@
 """Tests for utility modules."""
 
+import os
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,9 @@ from isabelle_mcp.utils.core import (
     file_path_to_uri,
     lsp_to_mcp_position,
     mcp_to_lsp_position,
+    project_root_from_roots,
+    relativize,
+    resolve_path,
     uri_to_file_path,
 )
 from isabelle_mcp.utils.formatters import (
@@ -331,3 +335,75 @@ class TestModelToYaml:
         from isabelle_mcp.utils.formatters import model_to_yaml
         text = model_to_yaml(SessionInfo(current_session="HOL", version="Isabelle2025-2"))
         assert text.index("current_session") < text.index("version")
+
+
+class TestPositionSpans:
+    """A live-document position arrives resolved by the server as
+    "<absolute file>:<line>" inside <span class="position">; the parser shows it
+    relative to the project root, like every other path the agent sees."""
+
+    HTML = (
+        '<pre class="source"><span class="tracing_message">φreasoning(2000):'
+        '<span class="position"> /proj/Phi_System/Phi_Types.thy:1967</span>\n'
+        'A ⟹ B</span></pre>'
+    )
+
+    def test_position_under_the_root_is_relativized(self):
+        assert parse_command_output_html(self.HTML, "/proj") == [
+            {'kind': 'tracing', 'text': 'φreasoning(2000): Phi_System/Phi_Types.thy:1967 A ⟹ B'}
+        ]
+
+    def test_position_outside_the_root_stays_absolute(self):
+        assert parse_command_output_html(self.HTML, "/elsewhere")[0]['text'] == (
+            'φreasoning(2000): /proj/Phi_System/Phi_Types.thy:1967 A ⟹ B'
+        )
+
+    def test_without_a_root_stays_absolute(self):
+        assert parse_command_output_html(self.HTML)[0]['text'] == (
+            'φreasoning(2000): /proj/Phi_System/Phi_Types.thy:1967 A ⟹ B'
+        )
+
+    def test_unresolved_placeholder_is_still_dropped(self):
+        html = ('<pre class="source"><span class="error_message">Undefined fact: "x"'
+                '<span class="position">⌂</span></span></pre>')
+        assert parse_command_output_html(html, "/proj") == [
+            {'kind': 'error', 'text': 'Undefined fact: "x"'}
+        ]
+
+    def test_heap_theory_position_text_passes_through(self):
+        html = ('<pre class="source"><span class="writeln_message">rule'
+                '<span class="position"> (line 12 of "~~/src/HOL/HOL.thy")</span></span></pre>')
+        assert parse_command_output_html(html, "/proj")[0]['text'] == (
+            'rule (line 12 of "~~/src/HOL/HOL.thy")'
+        )
+
+
+class TestProjectRootFromRoots:
+    def test_first_file_root(self):
+        assert project_root_from_roots(["file:///a/b", "file:///c"]) == "/a/b"
+
+    def test_skips_non_file_roots(self):
+        assert project_root_from_roots(["https://example.org/x", "file:///a"]) == "/a"
+
+    def test_percent_decoding(self):
+        assert project_root_from_roots(["file:///a%20b"]) == "/a b"
+
+    def test_none_without_file_roots(self):
+        assert project_root_from_roots([]) is None
+        assert project_root_from_roots(["https://example.org/x"]) is None
+
+
+class TestResolvePath:
+    def test_relative_is_taken_against_the_root(self):
+        assert resolve_path("A/B.thy", "/proj") == "/proj/A/B.thy"
+
+    def test_absolute_ignores_the_root(self):
+        assert resolve_path("/elsewhere/B.thy", "/proj") == "/elsewhere/B.thy"
+
+    def test_without_a_root_relative_is_against_the_cwd(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        assert resolve_path("B.thy", None) == os.path.realpath(str(tmp_path / "B.thy"))
+
+    def test_round_trip_with_relativize(self):
+        for path in ("/proj/A/B.thy", "/elsewhere/C.thy"):
+            assert resolve_path(relativize(path, "/proj"), "/proj") == path

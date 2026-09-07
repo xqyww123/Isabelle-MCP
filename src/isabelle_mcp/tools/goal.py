@@ -3,7 +3,6 @@ from isabelle_mcp.evaluation import (
     check_evaluation_guard,
     format_evaluation_result,
     last_evaluation_was_cancelled,
-    relativize,
 )
 from isabelle_mcp.lsp_client import IsabelleLSPClient
 from isabelle_mcp.models import CommandSpan, EvaluationView, GoalState
@@ -13,6 +12,7 @@ from isabelle_mcp.utils import (
     LSPLine,
     MCPLine,
     parse_goals_from_html,
+    relativize,
     resolve_caret,
 )
 

@@ -36,7 +36,13 @@ from typing import Any
 
 from isabelle_mcp.lsp_client import IsabelleLSPClient, _stat_sig
 from isabelle_mcp.models import TheoryStatus
-from isabelle_mcp.utils.core import IsabelleToolError, acquire_within, plural
+from isabelle_mcp.utils.core import (
+    IsabelleToolError,
+    acquire_within,
+    plural,
+    relativize,
+    resolve_path,
+)
 from isabelle_mcp.utils.formatters import (
     cartouche,
     format_call_stack,
@@ -899,7 +905,6 @@ registry = DebuggerRegistry()
 
 
 def _display_path(client: IsabelleLSPClient, file_path: str) -> str:
-    from isabelle_mcp.evaluation import relativize
     return relativize(file_path, client.project_root)
 
 
@@ -1121,14 +1126,6 @@ async def _record_armed(
     return keep
 
 
-def _normalize_ref_path(client: IsabelleLSPClient, path: str) -> str:
-    """Accept both the project-root-relative form listings print and
-    absolute paths (section 4.3)."""
-    if not os.path.isabs(path) and client.project_root:
-        path = os.path.join(client.project_root, path)
-    return os.path.realpath(path)
-
-
 async def del_breakpoints(
     client: IsabelleLSPClient, refs: list[tuple[str, int, str | None]],
 ) -> str:
@@ -1144,7 +1141,7 @@ async def del_breakpoints(
     ambiguous: list[str] = []
     async with registry.lock:
         for path, line, at_text in refs:
-            real = _normalize_ref_path(client, path)
+            real = resolve_path(path, client.project_root)  # section 4.3
             display = f"{_display_path(client, real)}:{line}"
             if at_text is not None:
                 display += f" before {cartouche(at_text)}"

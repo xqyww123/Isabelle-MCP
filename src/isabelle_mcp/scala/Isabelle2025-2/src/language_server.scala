@@ -1227,7 +1227,9 @@ class Language_Server(
                     } yield HTML.link(uri.toString + "#" + def_line, body)
                 }
               val elements = Browser_Info.extra_elements.copy(entity = Markup.Elements.full)
-              val html = node_context.make_html(elements, Pretty.separate(output))
+              val html =
+                node_context.make_html(elements,
+                  rendering.resolve_here_positions(Pretty.separate(output)))
               Some((Symbol.decode(command.source), range, HTML.source(html).toString))
             }
           }

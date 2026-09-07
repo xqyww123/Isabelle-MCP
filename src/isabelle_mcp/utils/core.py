@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import os
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from urllib.parse import quote, unquote
@@ -183,3 +184,37 @@ def uri_to_file_path(uri: str) -> str:
     if not uri.startswith("file://"):
         raise ValueError(f"Invalid file URI: {uri}")
     return unquote(uri[7:])
+
+
+def relativize(path: str, root: str | None) -> str:
+    """The agent-facing form of a path: relative to the project root when it lives
+    under it, absolute otherwise."""
+    real = os.path.realpath(path)
+    if root is None:
+        return real
+    try:
+        rel = os.path.relpath(real, root)
+    except ValueError:
+        return real
+    # Only relativize when the file actually lives under root; otherwise relpath
+    # produces ugly ../../.. traversals (e.g. project_root=cwd but the .thy is
+    # elsewhere) — fall back to the absolute path in that case.
+    return real if rel.startswith("..") else rel
+
+
+def resolve_path(path: str, root: str | None) -> str:
+    """The inverse of relativize: a path the agent hands in, as a real path. A
+    relative path is taken against the project root (the form relativize prints),
+    so a path copied out of a tool's output resolves back to the same file."""
+    if root is not None and not os.path.isabs(path):
+        path = os.path.join(root, path)
+    return os.path.realpath(path)
+
+
+def project_root_from_roots(root_uris: list[str]) -> str | None:
+    """The project root an MCP client declares through ``roots/list``: its first
+    ``file://`` root, as a real path. None when it declares no such root."""
+    for uri in root_uris:
+        if uri.startswith("file://"):
+            return os.path.realpath(uri_to_file_path(uri))
+    return None

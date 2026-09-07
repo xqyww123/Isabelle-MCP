@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- **A rule's position in command output reads `file:line`, not `⌂`.** A
+  position from a theory in the live document reaches the prover with only a
+  command id and an offset (that is how PIDE sends commands), so `Position.here`
+  prints the `⌂` placeholder that jEdit turns into a hyperlink — and this
+  text-only client used to drop it, leaving e.g. `φreasoning(2000):` with no
+  location at all. `isabelle_command_output` now resolves it, through the same
+  snapshot lookup the hyperlinks use, into the file and 1-based line, shown
+  relative to the project root like every other path. Positions that already
+  print a line (heap theories: `(line N of "…")`) and placeholders whose command
+  is no longer in the document are unchanged.
+- **The project root comes from the client's declared MCP roots when it has
+  any.** Paths were relative to the server process's working directory, which
+  is the agent's project directory only by the host's convention. A client with
+  the roots capability (Claude Code) names its project directory explicitly;
+  the first tool call asks for it (`roots/list`) and adopts the first `file://`
+  root. Clients without it (Codex) keep the working directory. The default
+  session dir of `isabelle_launch` follows the same root, and a `file_path`
+  given relative to it resolves against it, so a path copied out of a tool's
+  output can be handed back in.
+
 ## 0.6.0
 
 - **The two-second guess is gone: every picture now says which document

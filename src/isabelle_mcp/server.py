@@ -10,10 +10,10 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools.tool import ToolResult
-from mcp.types import TextContent
+from mcp.types import ClientCapabilities, RootsCapability, TextContent
 from pydantic import BaseModel
 
 from isabelle_mcp import debugger
@@ -49,6 +49,8 @@ from isabelle_mcp.utils import (
     IsabelleCatastrophe,
     IsabelleToolError,
     MCPLine,
+    project_root_from_roots,
+    resolve_path,
 )
 from isabelle_mcp.utils.formatters import model_to_yaml
 
@@ -98,10 +100,11 @@ async def _file_change_sink(path: str) -> None:
 @asynccontextmanager
 async def server_lifespan(_app: Any) -> AsyncGenerator[None]:
     global _lsp_client, _file_watcher
-    # Per-agent stdio server: project_root is this process's cwd (each agent launches
-    # the server from its project dir), so evaluation snapshots render paths relative
-    # to it. The session/logic is chosen at run time via isabelle_launch — the prover
-    # is NOT started here.
+    # Per-agent stdio server: project_root starts as this process's cwd (each agent
+    # launches the server from its project dir), so evaluation snapshots render paths
+    # relative to it. A client that declares MCP roots replaces it with its declared
+    # root at the first tool call (ProjectRootMiddleware). The session/logic is chosen
+    # at run time via isabelle_launch — the prover is NOT started here.
     _lsp_client = IsabelleLSPClient(
         extra_args=_server_extra_args, project_root=os.path.realpath(os.getcwd()),
     )
@@ -223,10 +226,69 @@ class CatastropheMiddleware(Middleware):
             return ToolResult(content=[TextContent(type="text", text=CATASTROPHE_MESSAGE)])
 
 
+async def _adopt_client_roots(ctx: Context | None) -> None:
+    """Replace the cwd-derived project root with the client's declared one.
+
+    A client with the MCP roots capability names its project directory explicitly
+    (roots/list) — Claude Code does, Codex does not. The cwd stays in place when
+    the client declares no such capability, lists no file:// root, or the request
+    fails: the root is a display convenience, never worth failing a tool call.
+    """
+    client = _lsp_client
+    if client is None or ctx is None:
+        return
+    try:
+        if not ctx.session.check_client_capability(
+            ClientCapabilities(roots=RootsCapability()),
+        ):
+            return
+        roots = await asyncio.wait_for(ctx.list_roots(), timeout=10)
+    except Exception:
+        logger.exception("roots/list failed; keeping the cwd as the project root")
+        return
+    root = project_root_from_roots([str(r.uri) for r in roots])
+    if root is not None:
+        client.project_root = root
+
+
+class ProjectRootMiddleware(Middleware):
+    """Ask the client for its roots once, at the first tool call.
+
+    Roots can only be requested inside a session, which the lifespan predates,
+    and the first tool call is normally isabelle_launch, whose default session
+    dirs are derived from the project root — so this must run before it: every
+    call waits for the one request, so none can run with the un-adopted root.
+    The root then stays fixed for the session, and roots/list_changed is
+    deliberately not tracked: agent-facing references are printed relative to
+    the root and parsed back against it (relativize / resolve_path), so moving
+    it would break that round trip.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._adopted = False
+
+    async def on_call_tool(
+        self, context: MiddlewareContext, call_next: CallNext,
+    ) -> ToolResult:
+        if not self._adopted:
+            async with self._lock:
+                if not self._adopted:
+                    await _adopt_client_roots(context.fastmcp_context)
+                    self._adopted = True
+        return await call_next(context)
+
+
 # Order: the catastrophe handler is outermost, so a catastrophe skips the
 # footer/notice decoration of a successful call.
 mcp.add_middleware(CatastropheMiddleware())
 mcp.add_middleware(UnicodeWarningMiddleware())
+mcp.add_middleware(ProjectRootMiddleware())
+
+
+def _optional_path(client: IsabelleLSPClient, file_path: str | None) -> str | None:
+    """resolve_path for the tools whose file_path may be omitted."""
+    return None if file_path is None else resolve_path(file_path, client.project_root)
 
 
 def _yaml_result(model: BaseModel) -> ToolResult:
@@ -271,16 +333,17 @@ async def _ensure_lsp_started(
     return _lsp_client
 
 
-def _default_session_dirs() -> list[str]:
-    """Default ``-d`` dirs when the agent doesn't pass any: the server's cwd, but
+def _default_session_dirs(project_root: str | None) -> list[str]:
+    """Default ``-d`` dirs when the agent doesn't pass any: the project root, but
     ONLY if it is a session-root dir (has ROOT/ROOTS). ``isabelle vscode_server``
     rejects a ``-d`` dir lacking ROOT/ROOTS ("Bad session root directory"), so a
-    blind ``-d $cwd`` would break for scratch/non-project cwds. Built-in sessions
+    blind ``-d $root`` would break for scratch/non-project roots. Built-in sessions
     (HOL, …) need no ``-d`` at all.
     """
-    cwd = os.path.realpath(os.getcwd())
-    if os.path.exists(os.path.join(cwd, "ROOT")) or os.path.exists(os.path.join(cwd, "ROOTS")):
-        return [cwd]
+    if project_root is None:
+        return []
+    if any(os.path.exists(os.path.join(project_root, f)) for f in ("ROOT", "ROOTS")):
+        return [project_root]
     return []
 
 
@@ -390,7 +453,8 @@ async def isabelle_launch(
             errors with the exact build command if it is not.
         session_dirs: Extra ``-d`` session search directories for non-builtin
             sessions (Isabelle reads their ROOT/ROOTS to discover the session).
-            Defaults to the server's working directory when that directory is itself
+            Defaults to the project root (the client's declared root directory,
+            else the server's working directory) when that directory is itself
             a session root (contains ROOT/ROOTS), otherwise none. Built-in sessions
             (HOL, HOL-Analysis, …) need no session dirs.
         debug: Launch with ML debugger instrumentation (`-o ML_debugger=true`):
@@ -425,7 +489,8 @@ async def isabelle_launch(
             # isabelle_terminate and the catastrophe handler run.
             await _lsp_client.teardown()
         _lsp_client.session_dirs = (
-            session_dirs if session_dirs is not None else _default_session_dirs()
+            session_dirs if session_dirs is not None
+            else _default_session_dirs(_lsp_client.project_root)
         )
         _lsp_client.logic = session
         _lsp_client.debug = debug
@@ -538,8 +603,8 @@ async def isabelle_evaluate_to(
             used. Without it (default), evaluation proceeds through the command on
             ``line``.
     """
-    file_path = os.path.realpath(file_path)
     client = await _ensure_lsp_started()
+    file_path = resolve_path(file_path, client.project_root)
     view = await evaluate_to(client, file_path, line, after_text)
     return ToolResult(content=[TextContent(
         type="text", text=format_evaluation_result(view, client.project_root),
@@ -596,9 +661,9 @@ async def isabelle_hover(file_path: str, line: int, symbol: str) -> ToolResult:
         line: Line number (1-indexed)
         symbol: Symbol text to look up (e.g. "Suc", "my_const", "⟹")
     """
+    client = await _ensure_lsp_started(footer=True)
     return _yaml_result(await hover_info(
-        await _ensure_lsp_started(footer=True), os.path.realpath(file_path),
-        MCPLine(line), symbol,
+        client, resolve_path(file_path, client.project_root), MCPLine(line), symbol,
     ))
 
 
@@ -617,9 +682,9 @@ async def isabelle_definition(file_path: str, line: int, symbol: str) -> ToolRes
         line: Line number (1-indexed)
         symbol: Symbol text to look up (e.g. "my_const", "List.map")
     """
+    client = await _ensure_lsp_started(footer=True)
     return _yaml_result(await declaration_location(
-        await _ensure_lsp_started(footer=True), os.path.realpath(file_path),
-        MCPLine(line), symbol,
+        client, resolve_path(file_path, client.project_root), MCPLine(line), symbol,
     ))
 
 
@@ -643,9 +708,9 @@ async def isabelle_local_occurrences(file_path: str, line: int, symbol: str) -> 
         line: Line number (1-indexed)
         symbol: Symbol text to look up (e.g. "my_const", "add_one"), ASCII or Unicode.
     """
+    client = await _ensure_lsp_started(footer=True)
     return _yaml_result(await local_occurrences(
-        await _ensure_lsp_started(footer=True), os.path.realpath(file_path),
-        MCPLine(line), symbol,
+        client, resolve_path(file_path, client.project_root), MCPLine(line), symbol,
     ))
 
 
@@ -666,8 +731,8 @@ async def isabelle_goal(
         after_text: Optional text on the line; the command right after it is used.
             Without it, the command at the end of the line is used.
     """
-    file_path = os.path.realpath(file_path)
     lsp = await _ensure_lsp_started(footer=True)
+    file_path = resolve_path(file_path, lsp.project_root)
     return _yaml_result(await goal(lsp, file_path, MCPLine(line), after_text))
 
 
@@ -724,8 +789,8 @@ async def isabelle_find_theorems(
         limit: Max theorems to return (default ~40, Isabelle's find_theorems_limit).
         allow_duplicates: Keep alpha-equivalent duplicates (default removes them).
     """
-    file_path = os.path.realpath(file_path)
     lsp = await _ensure_lsp_started(footer=True)
+    file_path = resolve_path(file_path, lsp.project_root)
     return _yaml_result(await find_theorems(
         lsp, file_path, MCPLine(line), after_text,
         names=names, exclude_names=exclude_names,
@@ -754,9 +819,9 @@ async def isabelle_command_output(
         after_text: Optional text on the line; the command right after it is used.
             Without it, the command at the end of the line is used.
     """
+    client = await _ensure_lsp_started(footer=True)
     result = await command_output(
-        await _ensure_lsp_started(footer=True), os.path.realpath(file_path),
-        MCPLine(line), after_text,
+        client, resolve_path(file_path, client.project_root), MCPLine(line), after_text,
     )
     return ToolResult(
         content=[TextContent(type="text", text=format_command_output(result, line))],
@@ -782,6 +847,10 @@ async def isabelle_command_status(positions: list[LinePosition]) -> ToolResult:
         positions: The positions to ask about, each a file_path and a 1-indexed line.
     """
     client = await _ensure_lsp_started(footer=True)
+    positions = [
+        p.model_copy(update={"file_path": resolve_path(p.file_path, client.project_root)})
+        for p in positions
+    ]
     result = await command_status(client, positions)
     return ToolResult(
         content=[
@@ -844,8 +913,8 @@ async def isabelle_set_breakpoint(
             line.
     """
     client = await _ensure_lsp_started()
-    return _text_result(
-        await debugger.set_breakpoint(client, file_path, line, at_text))
+    return _text_result(await debugger.set_breakpoint(
+        client, resolve_path(file_path, client.project_root), line, at_text))
 
 
 @mcp.tool(output_schema=None)
@@ -873,7 +942,8 @@ async def isabelle_list_breakpoints(file_path: str | None = None) -> ToolResult:
             the whole registry.
     """
     client = await _ensure_lsp_started()
-    return _text_result(debugger.list_breakpoints(client, file_path))
+    return _text_result(debugger.list_breakpoints(
+        client, _optional_path(client, file_path)))
 
 
 @mcp.tool(output_schema=None)
@@ -895,7 +965,7 @@ async def isabelle_list_breakable_sites(
     """
     client = await _ensure_lsp_started()
     return _text_result(await debugger.list_breakable_sites(
-        client, file_path, start_line, end_line))
+        client, resolve_path(file_path, client.project_root), start_line, end_line))
 
 
 @mcp.tool(output_schema=None)
@@ -919,8 +989,8 @@ async def isabelle_enable_all_breakpoints(
             breakpoints.
     """
     client = await _ensure_lsp_started()
-    return _text_result(
-        await debugger.enable_all_breakpoints(client, file_path))
+    return _text_result(await debugger.enable_all_breakpoints(
+        client, _optional_path(client, file_path)))
 
 
 @mcp.tool(output_schema=None)
@@ -937,8 +1007,8 @@ async def isabelle_disable_all_breakpoints(
             breakpoints.
     """
     client = await _ensure_lsp_started()
-    return _text_result(
-        await debugger.disable_all_breakpoints(client, file_path))
+    return _text_result(await debugger.disable_all_breakpoints(
+        client, _optional_path(client, file_path)))
 
 
 @mcp.tool(output_schema=None)

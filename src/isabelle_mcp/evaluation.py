@@ -54,6 +54,7 @@ from isabelle_mcp.utils import (
     OwnedLock,
     acquire_within,
     plural,
+    relativize,
     resolve_caret,
 )
 
@@ -2264,20 +2265,6 @@ async def check_evaluation_guard(
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
-
-def relativize(path: str, root: str | None) -> str:
-    real = os.path.realpath(path)
-    if root is None:
-        return real
-    try:
-        rel = os.path.relpath(real, root)
-    except ValueError:
-        return real
-    # Only relativize when the file actually lives under root; otherwise relpath
-    # produces ugly ../../.. traversals (e.g. project_root=cwd but the .thy is
-    # elsewhere) — fall back to the absolute path in that case.
-    return real if rel.startswith("..") else rel
-
 
 def _fmt_spans(spans: list[tuple[int, int]]) -> str:
     """``line 45`` / ``lines 45-47`` / ``lines 45, 88-90``.

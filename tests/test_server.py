@@ -4,6 +4,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import types
 
+import asyncio
+
 import pytest
 import yaml
 
@@ -12,6 +14,7 @@ from isabelle_mcp.lsp_client import IsabelleLSPClient
 from isabelle_mcp.server import (
     isabelle_cancel_evaluation,
     isabelle_command_output,
+    isabelle_command_status,
     isabelle_definition,
     isabelle_evaluate_to,
     isabelle_evaluation_status,
@@ -37,6 +40,42 @@ class TestMCPServerTools:
     @pytest.fixture(autouse=True)
     async def _evaluated_up_front(self, evaluated_theory_file):
         """Queries never evaluate: the file is evaluated up front."""
+
+    @pytest.mark.asyncio
+    async def test_relative_file_path_resolves_against_the_project_root(
+        self, temp_theory_file, mock_lsp_client,
+    ):
+        """The form tool output prints (relative to the project root) is accepted
+        back as input, so a path copied out of an answer round-trips."""
+        import os
+
+        mock_lsp_client.hover_response = {"contents": "test"}
+        mock_lsp_client.project_root = os.path.dirname(temp_theory_file)
+        with _patch_ensure(mock_lsp_client):
+            data = _yaml(await isabelle_hover(os.path.basename(temp_theory_file), 5, "my_const"))
+        assert data["results"][0]["info"] == "test"
+
+    @pytest.mark.asyncio
+    async def test_command_status_positions_resolve_against_the_project_root(
+        self, temp_theory_file, mock_lsp_client,
+    ):
+        import os
+
+        import isabelle_mcp.server as server_mod
+        from isabelle_mcp.models import LinePosition
+
+        mock_lsp_client.project_root = os.path.dirname(temp_theory_file)
+        seen = []
+
+        async def fake_command_status(_client, positions):
+            seen.extend(positions)
+            return []
+
+        with _patch_ensure(mock_lsp_client), \
+                patch.object(server_mod, 'command_status', fake_command_status):
+            await isabelle_command_status(
+                [LinePosition(file_path=os.path.basename(temp_theory_file), line=9)])
+        assert [p.file_path for p in seen] == [os.path.realpath(temp_theory_file)]
 
     @pytest.mark.asyncio
     async def test_hover(self, temp_theory_file, mock_lsp_client):
@@ -278,6 +317,112 @@ def _text(result):
     return result.content[0].text
 
 
+class TestProjectRootMiddleware:
+    """The project root comes from the client's declared roots when it has any,
+    else it stays what the lifespan set (the cwd). Driven through a real
+    in-process FastMCP client, which declares the roots capability exactly when
+    it is given roots."""
+
+    @staticmethod
+    def _probe_server():
+        """A server carrying only the middleware; ping answers with the project
+        root the tool body saw, so a call that ran before adoption is visible."""
+        from fastmcp import FastMCP
+
+        from isabelle_mcp.server import ProjectRootMiddleware
+
+        srv = FastMCP("probe")
+        srv.add_middleware(ProjectRootMiddleware())
+
+        @srv.tool(output_schema=None)
+        async def ping() -> str:
+            import isabelle_mcp.server as server_mod
+            return server_mod._lsp_client.project_root
+
+        return srv
+
+    @staticmethod
+    def _counting_roots(root_uri, calls, delay=0.0):
+        """A roots handler (exercises the real capability path) that records each
+        roots/list request and can hold the reply, to widen the race window."""
+        async def handler(_ctx):
+            calls.append(root_uri)
+            await asyncio.sleep(delay)
+            return [root_uri]
+        return handler
+
+    @pytest.mark.asyncio
+    async def test_adopts_the_clients_first_file_root_asking_once(self, tmp_path):
+        import os
+
+        from fastmcp import Client
+
+        import isabelle_mcp.server as server_mod
+
+        client = _launch_mock(running=False)
+        client.project_root = "/cwd"
+        calls = []
+        with patch.object(server_mod, '_lsp_client', client):
+            srv = self._probe_server()
+            async with Client(srv, roots=self._counting_roots(tmp_path.as_uri(), calls)) as c:
+                await c.call_tool("ping", {})
+                await c.call_tool("ping", {})
+        assert client.project_root == os.path.realpath(str(tmp_path))
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_concurrent_first_calls_all_wait_for_the_adoption(self, tmp_path):
+        """Regression: the flag used to be set before the roots/list round trip, so
+        a call arriving during it ran with the un-adopted root."""
+        import os
+
+        from fastmcp import Client
+
+        import isabelle_mcp.server as server_mod
+
+        client = _launch_mock(running=False)
+        client.project_root = "/cwd"
+        calls = []
+        with patch.object(server_mod, '_lsp_client', client):
+            srv = self._probe_server()
+            roots = self._counting_roots(tmp_path.as_uri(), calls, delay=0.2)
+            async with Client(srv, roots=roots) as c:
+                results = await asyncio.gather(c.call_tool("ping", {}), c.call_tool("ping", {}))
+        seen = [r.content[0].text for r in results]
+        assert seen == [os.path.realpath(str(tmp_path))] * 2
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_failing_roots_request_never_fails_the_tool_call(self, tmp_path):
+        from fastmcp import Client
+        from fastmcp.server.context import Context
+
+        import isabelle_mcp.server as server_mod
+
+        client = _launch_mock(running=False)
+        client.project_root = "/cwd"
+        with patch.object(server_mod, '_lsp_client', client), \
+                patch.object(Context, 'list_roots', side_effect=RuntimeError("no roots")):
+            async with Client(self._probe_server(), roots=[tmp_path.as_uri()]) as c:
+                first = await c.call_tool("ping", {})
+                second = await c.call_tool("ping", {})
+        assert [first.content[0].text, second.content[0].text] == ["/cwd", "/cwd"]
+        assert client.project_root == "/cwd"
+
+    @pytest.mark.asyncio
+    async def test_without_roots_capability_keeps_the_cwd(self):
+        from fastmcp import Client
+
+        import isabelle_mcp.server as server_mod
+
+        client = _launch_mock(running=False)
+        client.project_root = "/cwd"
+        with patch.object(server_mod, '_lsp_client', client):
+            async with Client(self._probe_server()) as c:
+                await c.call_tool("ping", {})
+        assert client.project_root == "/cwd"
+
+
 def _launch_mock(*, running: bool, logic: str = "HOL"):
     """A mock IsabelleLSPClient for the launch/terminate tests."""
     client = MagicMock()
@@ -341,8 +486,7 @@ class TestSessionManagement:
 
         root = os.path.realpath(str(tmp_path))
         (tmp_path / "ROOTS").write_text("contrib\n")
-        with patch('isabelle_mcp.server.os.getcwd', return_value=root):
-            assert server_mod._default_session_dirs() == [root]
+        assert server_mod._default_session_dirs(root) == [root]
 
     def test_default_session_dirs_without_root(self, tmp_path):
         import os
@@ -350,9 +494,9 @@ class TestSessionManagement:
         import isabelle_mcp.server as server_mod
 
         root = os.path.realpath(str(tmp_path))
-        with patch('isabelle_mcp.server.os.getcwd', return_value=root):
-            # isabelle rejects a -d dir without ROOT/ROOTS, so default to none.
-            assert server_mod._default_session_dirs() == []
+        # isabelle rejects a -d dir without ROOT/ROOTS, so default to none.
+        assert server_mod._default_session_dirs(root) == []
+        assert server_mod._default_session_dirs(None) == []
 
     @pytest.mark.asyncio
     async def test_launch_explicit_session_dirs(self):

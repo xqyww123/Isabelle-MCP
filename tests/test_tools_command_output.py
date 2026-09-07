@@ -29,6 +29,18 @@ class TestCommandOutputTool:
         assert result.messages[0].message == "Success"
 
     @pytest.mark.asyncio
+    async def test_positions_are_relative_to_the_clients_project_root(
+        self, mock_lsp_client, temp_theory_file,
+    ):
+        mock_lsp_client.project_root = "/proj"
+        mock_lsp_client.output_at_position_response = (
+            "by simp", RANGE,
+            '<div class="writeln">rule<span class="position"> /proj/A.thy:12</span></div>',
+        )
+        result = await command_output(mock_lsp_client, temp_theory_file, MCPLine(9))
+        assert result.messages[0].message == "rule A.thy:12"
+
+    @pytest.mark.asyncio
     async def test_with_after_text(self, mock_lsp_client, temp_theory_file):
         # Line 9 is "  by (simp add: my_const_def)"
         mock_lsp_client.output_at_position_response = (

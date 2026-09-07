@@ -15,11 +15,11 @@ import os
 from collections import OrderedDict
 
 from isabelle_mcp import processing
-from isabelle_mcp.evaluation import relativize, reopen_held_theory, wait_until_fresh
+from isabelle_mcp.evaluation import reopen_held_theory, wait_until_fresh
 from isabelle_mcp.lsp_client import IsabelleLSPClient
 from isabelle_mcp.models import CommandStatusLine, CommandStatusPosition, LinePosition
 from isabelle_mcp.processing import ProcessingTracker
-from isabelle_mcp.utils import IsabelleToolError, LSPLine, MCPLine, plural
+from isabelle_mcp.utils import IsabelleToolError, LSPLine, MCPLine, plural, relativize
 
 logger = logging.getLogger(__name__)
 
