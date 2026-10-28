@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.0
 
 - **`isabelle-mcp install --isabelle-bin …` registers into Claude Code.** It
   failed with `error: missing required argument 'commandOrUrl'`: the pinned
