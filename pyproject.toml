@@ -49,10 +49,10 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/xqyww123/Isabelle-MCP"
-Documentation = "https://github.com/xqyww123/Isabelle-MCP/tree/main/docs"
+Documentation = "https://github.com/xqyww123/Isabelle-MCP/tree/master/docs"
 Repository = "https://github.com/xqyww123/Isabelle-MCP"
 Issues = "https://github.com/xqyww123/Isabelle-MCP/issues"
-Changelog = "https://github.com/xqyww123/Isabelle-MCP/blob/main/CHANGELOG.md"
+Changelog = "https://github.com/xqyww123/Isabelle-MCP/blob/master/CHANGELOG.md"
 
 [project.scripts]
 isabelle-mcp = "isabelle_mcp.server:main"

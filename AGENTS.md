@@ -93,12 +93,11 @@ It is idempotent (re-running re-registers cleanly) and registers an absolute
 path to `isabelle-mcp` so the client need not share your `PATH`. It also registers the Isabelle
 Scala component up front, so an install that cannot work fails there, in front of a
 human, rather than at the first `isabelle_launch`.
-`scripts/install.sh` in a repo checkout does the same thing.
 
 **Or register manually** — the two CLIs take the same `add NAME -- COMMAND` form:
 
 ```sh
-# Claude Code (user scope; options go BEFORE the name)
+# Claude Code (user scope)
 claude mcp add -s user isabelle-lsp -- isabelle-mcp
 
 # Codex (writes ~/.codex/config.toml)

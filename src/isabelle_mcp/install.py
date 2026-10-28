@@ -1,8 +1,7 @@
 """Register the isabelle-mcp server with Claude Code and/or Codex.
 
-Python port of ``scripts/install.sh`` exposed as ``isabelle-mcp install`` so the
-registration works from any pip/pipx/uv installation, without a checkout of the
-repository.
+Exposed as ``isabelle-mcp install`` so the registration works from any pip/pipx/uv
+installation, without a checkout of the repository.
 """
 
 from __future__ import annotations
