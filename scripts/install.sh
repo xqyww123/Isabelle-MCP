@@ -85,7 +85,8 @@ did=0
 if [ "$DO_CLAUDE" -eq 1 ]; then
   if command -v claude >/dev/null 2>&1; then
     claude mcp remove "$NAME" -s user >/dev/null 2>&1 || true   # idempotent
-    claude mcp add -s user "${CLAUDE_ENV[@]+"${CLAUDE_ENV[@]}"}" "$NAME" -- "$CMD"
+    # The name goes before -e: Claude Code's -e is variadic and would swallow it.
+    claude mcp add -s user "$NAME" "${CLAUDE_ENV[@]+"${CLAUDE_ENV[@]}"}" -- "$CMD"
     echo "✓ registered '$NAME' into Claude Code (user scope)"
     did=1
   else

@@ -119,21 +119,37 @@ class TestMain:
         assert install.main(["--claude", "--name", "my-isa"]) == 0
         assert ["claude", "mcp", "remove", "my-isa", "-s", "user"] in run.calls
 
-    def test_isabelle_bin_pins_path(self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize("client", ["claude", "codex"])
+    def test_isabelle_bin_pins_path(self, monkeypatch, tmp_path, client):
         # install() pins the Isabelle bin dir into this process's PATH so that everything after it
         # (ensure_component, and the registration itself) sees the requested Isabelle. That is a
         # real, wanted side effect — so the *test* has to contain it, or the stub `isabelle` below
         # leaks into every later test that resolves a real one.
-        monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
+        monkeypatch.setenv("PATH", "/usr/bin")
+        monkeypatch.setattr(
+            shutil,
+            "which",
+            _fake_which({"isabelle-mcp": "/opt/tools/isabelle-mcp", client: f"/usr/bin/{client}"}),
+        )
         isa = tmp_path / "isabelle"
         isa.write_text("#!/bin/sh\n")
         isa.chmod(0o755)
         run = RecordingRun()
         monkeypatch.setattr(subprocess, "run", run)
-        assert install.main(["--claude", "--isabelle-bin", str(isa)]) == 0
-        add = next(c for c in run.calls if c[1:3] == ["mcp", "add"])
-        env_arg = add[add.index("-e") + 1]
-        assert env_arg.startswith(f"PATH={tmp_path}")
+        assert install.main([f"--{client}", "--isabelle-bin", str(isa)]) == 0
+        pin = f"PATH={tmp_path}{os.pathsep}/usr/bin"
+        # The whole command, not just the env value: where the env flag sits matters
+        # (Claude Code's -e is variadic and swallows a name placed after it).
+        assert {
+            "claude": [
+                "claude", "mcp", "add", "-s", "user", "isabelle-lsp", "-e", pin,
+                "--", "/opt/tools/isabelle-mcp",
+            ],
+            "codex": [
+                "codex", "mcp", "add", "isabelle-lsp", "--env", pin,
+                "--", "/opt/tools/isabelle-mcp",
+            ],
+        }[client] in run.calls
 
     def test_isabelle_bin_rejects_bad_path(self, tmp_path, capsys):
         assert (

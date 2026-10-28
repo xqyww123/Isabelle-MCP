@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **`isabelle-mcp install --isabelle-bin …` registers into Claude Code.** It
+  failed with `error: missing required argument 'commandOrUrl'`: the pinned
+  `PATH` was passed before the server name, and Claude Code's `-e` takes any
+  number of values, so it took the name as a second one. The name now comes
+  first. `scripts/install.sh` had the same fault.
+
 ## 0.6.0
 
 - **The two-second guess is gone: every picture now says which document

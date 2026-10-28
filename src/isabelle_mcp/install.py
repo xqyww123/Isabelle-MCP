@@ -165,9 +165,10 @@ def _register_claude(
     subprocess.run(  # idempotent
         ["claude", "mcp", "remove", name, "-s", "user"], capture_output=True
     )
+    # The name goes before -e: Claude Code's -e is variadic and would swallow it.
     env_args = ["-e", f"PATH={path_env}"] if path_env else []
     _run_add(
-        ["claude", "mcp", "add", "-s", "user", *env_args, name, "--", cmd, *server_args],
+        ["claude", "mcp", "add", "-s", "user", name, *env_args, "--", cmd, *server_args],
         "claude",
     )
     print(f"✓ registered '{name}' into Claude Code (user scope)")
