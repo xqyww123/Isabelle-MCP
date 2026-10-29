@@ -266,7 +266,7 @@ class TestPushPathsConvert:
 class TestUnicodeWarningMiddleware:
     @pytest.mark.asyncio
     async def test_appends_warning_then_passes_through(self, tmp_path):
-        from fastmcp.tools.tool import ToolResult
+        from fastmcp.tools import ToolResult
         from mcp.types import TextContent
 
         from isabelle_mcp.server import UnicodeWarningMiddleware
@@ -291,7 +291,7 @@ class TestUnicodeWarningMiddleware:
 
     @pytest.mark.asyncio
     async def test_tool_error_keeps_queue_for_next_call(self, tmp_path):
-        from fastmcp.tools.tool import ToolResult
+        from fastmcp.tools import ToolResult
         from mcp.types import TextContent
 
         from isabelle_mcp.server import UnicodeWarningMiddleware
@@ -340,7 +340,7 @@ class TestUnicodeWarningMiddleware:
         """Phase D wiring: the middleware reconciles the dirty marks after
         the tool body, and the demotion notice lands in THIS call's result
         — not one call late."""
-        from fastmcp.tools.tool import ToolResult
+        from fastmcp.tools import ToolResult
         from mcp.types import TextContent
 
         from isabelle_mcp import debugger, server

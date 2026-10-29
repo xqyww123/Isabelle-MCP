@@ -278,7 +278,7 @@ class TestCatastropheMiddleware:
         drives a real server + client in production middleware order, which the
         direct on_call_tool test above cannot cover."""
         from fastmcp import Client, FastMCP
-        from fastmcp.tools.tool import ToolResult
+        from fastmcp.tools import ToolResult
 
         import isabelle_mcp.server as server_mod
         from isabelle_mcp.server import CatastropheMiddleware, UnicodeWarningMiddleware
@@ -364,11 +364,31 @@ class TestProjectRootMiddleware:
         calls = []
         with patch.object(server_mod, '_lsp_client', client):
             srv = self._probe_server()
-            async with Client(srv, roots=self._counting_roots(tmp_path.as_uri(), calls)) as c:
+            # mode="legacy": the handshake protocol Claude Code speaks; roots/list
+            # needs a server-initiated request, which the 2026-07-28 protocol lacks.
+            roots = self._counting_roots(tmp_path.as_uri(), calls)
+            async with Client(srv, roots=roots, mode="legacy") as c:
                 await c.call_tool("ping", {})
                 await c.call_tool("ping", {})
         assert client.project_root == os.path.realpath(str(tmp_path))
         assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_on_the_2026_07_28_protocol_keeps_the_cwd(self, tmp_path):
+        from fastmcp import Client
+
+        import isabelle_mcp.server as server_mod
+
+        client = _launch_mock(running=False)
+        client.project_root = "/cwd"
+        calls = []
+        with patch.object(server_mod, '_lsp_client', client):
+            roots = self._counting_roots(tmp_path.as_uri(), calls)
+            async with Client(self._probe_server(), roots=roots, mode="2026-07-28") as c:
+                first = await c.call_tool("ping", {})
+        assert first.content[0].text == "/cwd"
+        assert client.project_root == "/cwd"
+        assert calls == []
 
     @pytest.mark.asyncio
     async def test_concurrent_first_calls_all_wait_for_the_adoption(self, tmp_path):
@@ -386,7 +406,7 @@ class TestProjectRootMiddleware:
         with patch.object(server_mod, '_lsp_client', client):
             srv = self._probe_server()
             roots = self._counting_roots(tmp_path.as_uri(), calls, delay=0.2)
-            async with Client(srv, roots=roots) as c:
+            async with Client(srv, roots=roots, mode="legacy") as c:
                 results = await asyncio.gather(c.call_tool("ping", {}), c.call_tool("ping", {}))
         seen = [r.content[0].text for r in results]
         assert seen == [os.path.realpath(str(tmp_path))] * 2
@@ -395,15 +415,16 @@ class TestProjectRootMiddleware:
     @pytest.mark.asyncio
     async def test_failing_roots_request_never_fails_the_tool_call(self, tmp_path):
         from fastmcp import Client
-        from fastmcp.server.context import Context
+        from mcp.server.session import ServerSession
 
         import isabelle_mcp.server as server_mod
 
         client = _launch_mock(running=False)
         client.project_root = "/cwd"
         with patch.object(server_mod, '_lsp_client', client), \
-                patch.object(Context, 'list_roots', side_effect=RuntimeError("no roots")):
-            async with Client(self._probe_server(), roots=[tmp_path.as_uri()]) as c:
+                patch.object(ServerSession, 'list_roots', side_effect=RuntimeError("no roots")):
+            roots = [tmp_path.as_uri()]
+            async with Client(self._probe_server(), roots=roots, mode="legacy") as c:
                 first = await c.call_tool("ping", {})
                 second = await c.call_tool("ping", {})
         assert [first.content[0].text, second.content[0].text] == ["/cwd", "/cwd"]
@@ -760,7 +781,7 @@ class TestFooterPlumbing:
 
     @pytest.mark.asyncio
     async def test_footer_set_during_the_call_is_appended_after_it(self):
-        from fastmcp.tools.tool import ToolResult
+        from fastmcp.tools import ToolResult
         from mcp.types import TextContent
 
         from isabelle_mcp import unicode_guard
@@ -784,7 +805,7 @@ class TestFooterPlumbing:
 
     @pytest.mark.asyncio
     async def test_a_footer_from_an_earlier_call_is_not_reused(self):
-        from fastmcp.tools.tool import ToolResult
+        from fastmcp.tools import ToolResult
         from mcp.types import TextContent
 
         from isabelle_mcp import unicode_guard
@@ -889,7 +910,7 @@ class TestFooterScope:
     async def test_unicode_warning_comes_before_the_footer(self):
         """§4.2: a rare, actionable warning must not be buried under a constant
         line the agent learns to skim."""
-        from fastmcp.tools.tool import ToolResult
+        from fastmcp.tools import ToolResult
         from mcp.types import TextContent
 
         from isabelle_mcp import unicode_guard
@@ -954,7 +975,7 @@ class TestDebuggerToolPlumbing:
 
     @pytest.mark.asyncio
     async def test_middleware_appends_notices_before_the_warning(self):
-        from fastmcp.tools.tool import ToolResult
+        from fastmcp.tools import ToolResult
         from mcp.types import TextContent
 
         from isabelle_mcp import debugger, unicode_guard

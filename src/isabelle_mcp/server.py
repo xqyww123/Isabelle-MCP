@@ -12,7 +12,7 @@ from typing import Any
 
 from fastmcp import Context, FastMCP
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
-from fastmcp.tools.tool import ToolResult
+from fastmcp.tools import ToolResult
 from mcp.types import ClientCapabilities, RootsCapability, TextContent
 from pydantic import BaseModel
 
@@ -233,6 +233,9 @@ async def _adopt_client_roots(ctx: Context | None) -> None:
     (roots/list) — Claude Code does, Codex does not. The cwd stays in place when
     the client declares no such capability, lists no file:// root, or the request
     fails: the root is a display convenience, never worth failing a tool call.
+    The request fails on the 2026-07-28 protocol, which has no server-initiated
+    requests. FastMCP 4 has no `Context.list_roots`; the SDK session's call,
+    deprecated with roots, still serves the handshake protocols.
     """
     client = _lsp_client
     if client is None or ctx is None:
@@ -242,11 +245,11 @@ async def _adopt_client_roots(ctx: Context | None) -> None:
             ClientCapabilities(roots=RootsCapability()),
         ):
             return
-        roots = await asyncio.wait_for(ctx.list_roots(), timeout=10)
+        result = await asyncio.wait_for(ctx.session.list_roots(), timeout=10)
     except Exception:
         logger.exception("roots/list failed; keeping the cwd as the project root")
         return
-    root = project_root_from_roots([str(r.uri) for r in roots])
+    root = project_root_from_roots([str(r.uri) for r in result.roots])
     if root is not None:
         client.project_root = root
 

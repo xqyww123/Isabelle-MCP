@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **Runs on FastMCP 4 and the MCP SDK 2** (`fastmcp>=4.1,<5`, `mcp>=2.3`).
+  The project root still comes from the client's roots on the handshake
+  protocols (2025-11-25 and earlier, which Claude Code and Codex speak); on
+  the 2026-07-28 protocol, which has no server-initiated requests, the server
+  keeps its working directory as the root.
+
 ## 0.7.0
 
 - **`isabelle-mcp install --isabelle-bin …` registers into Claude Code.** It
