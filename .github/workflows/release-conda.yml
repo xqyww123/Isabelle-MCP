@@ -18,7 +18,7 @@ on:
       dry_run:
         description: "Build and verify only -- do NOT publish to the channel"
         type: boolean
-        default: false
+        default: true
       build_number:
         description: "conda build number - BUMP if republishing the same version with changed content"
         type: string
