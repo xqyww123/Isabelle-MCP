@@ -35,7 +35,7 @@ jobs:
     name: "Build isabelle-mcp (noarch: python)"
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Step outputs do not cross jobs; `verify` reads the version through this.
+    # Step outputs do not cross jobs; `verify` and `smoke` read the version through this.
     outputs:
       version: ${{ steps.ver.outputs.version }}
     steps:
@@ -169,9 +169,11 @@ jobs:
         run: |
           set -euo pipefail
           # conda-forge is required: python and the five libraries are not on our channel.
+          # The package is named with the local channel: by bare name conda silently
+          # installs the published build whenever this one cannot be solved.
           conda create -y -n v \
             -c "file://$CH" -c https://conda.qiyuan.me -c conda-forge --override-channels \
-            isabelle-mcp
+            "file://$CH::isabelle-mcp"
           conda activate v
           conda list isabelle
 
@@ -212,7 +214,7 @@ jobs:
 
   smoke:
     name: "Smoke: conda install from conda.qiyuan.me (${{ matrix.os }})"
-    needs: publish
+    needs: [build, publish]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -231,9 +233,11 @@ jobs:
       - name: "conda install -c https://conda.qiyuan.me isabelle-mcp"
         run: |
           set -euo pipefail
+          # Pinned to the build just published: by bare name conda would install an older
+          # build whenever this one cannot be solved.
           conda create -y -n t \
             -c https://conda.qiyuan.me -c conda-forge --override-channels \
-            isabelle-mcp
+            "isabelle-mcp==${{ needs.build.outputs.version }}=*_${{ inputs.build_number || '0' }}"
           conda activate t
           conda list isabelle-mcp
 
