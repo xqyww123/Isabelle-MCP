@@ -119,5 +119,5 @@ workflow and the `isabelle` command-line tips.
 
 ## Releasing it
 
-**Do not `uv publish`.** A release is a pushed `vX.Y.Z` tag — see
-[CONTRIBUTING.md § Releasing](CONTRIBUTING.md#releasing).
+**Do not `uv publish`.** Release by the SKILL conda-release (xqyww123/isabelle-packaging-ci)
+and this repository's [RELEASE.md](RELEASE.md).
