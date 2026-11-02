@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.1
 
 - **Runs on Isabelle2026, and only on it.** The Scala component (`isabelle
   mcp_server`) is re-forked onto Isabelle2026's VSCode sources and its jar is
