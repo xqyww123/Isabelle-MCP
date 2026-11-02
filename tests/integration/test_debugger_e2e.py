@@ -9,7 +9,7 @@ edit.
 
 Same selection as the probes:
 
-    PATH=contrib/Isabelle2025-2/bin:$PATH pytest tests/integration -m integration
+    PATH=contrib/Isabelle2026/bin:$PATH pytest tests/integration -m integration
 """
 import asyncio
 import os
@@ -264,7 +264,7 @@ async def test_eval_timeout_busy_and_abort(dbg):
         await debugger.eval_at_breakpoint(
             client,
             "Thread_Attributes.with_attributes Thread_Attributes.no_interrupts "
-            "(fn _ => OS.Process.sleep (Time.fromSeconds 45))",
+            "(fn _ => Time.sleep (Time.fromSeconds 45))",
             None, 0, 3.0)
     assert str(exc.value) == debugger.EVAL_BACKSTOP_TIMEOUT.format(seconds=3)
 

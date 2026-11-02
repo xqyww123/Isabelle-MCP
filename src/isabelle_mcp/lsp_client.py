@@ -200,7 +200,7 @@ def _detect_isabelle_version() -> tuple[str, int | None]:
 
 
 def isabelle_version() -> str:
-    """Full version string of the `isabelle` on PATH, e.g. ``"Isabelle2025-2"``."""
+    """Full version string of the `isabelle` on PATH, e.g. ``"Isabelle2026"``."""
     return _detect_isabelle_version()[0]
 
 
@@ -456,14 +456,11 @@ class IsabelleLSPClient:
             # with a later "-o editor_output_state=true" in extra_args to include it.
             "-o", "editor_output_state=false",
         ]
-        # Isabelle2025 routes the state/dynamic panels through Pretty_Text_Panel, which
-        # by default emits plain text + decorations — but that path is broken upstream
-        # (`decorations.map(_.json)` eta-expands `Decoration.json(file)` into a lambda →
-        # "Bad JSON value"). No tool consumes those panels any more, but the server still
-        # RUNS Dynamic_Output and pushes on every caret move (evaluate_to makes one),
-        # so leaving the broken branch enabled would put errors on the wire for output
-        # nobody reads. The option does not exist pre-2025 (passing it aborts the
-        # server), so gate it.
+        # The state/dynamic panels go through Pretty_Text_Panel. No tool consumes them, but
+        # the server still RUNS Dynamic_Output and pushes on every caret move (evaluate_to
+        # makes one); in HTML mode Isabelle2026 sends the raw output and skips the
+        # formatting and decoration pass. The option does not exist pre-2025 (passing it
+        # aborts the server), so gate it.
         if (isabelle_year() or 0) >= 2025:
             cmd += ["-o", "vscode_html_output=true"]
         if self.debug:

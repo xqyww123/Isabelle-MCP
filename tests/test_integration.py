@@ -73,13 +73,15 @@ class TestToolsIntegration:
     @pytest.mark.asyncio
     async def test_hover(self, lsp_client, theory_file):
         from isabelle_mcp.tools import hover_info
-        await lsp_client.open_document(theory_file)
+        from tests.integration.test_query_tools_e2e import _evaluate_through
+        assert await _evaluate_through(lsp_client, theory_file, -1)
         result = await hover_info(lsp_client, theory_file, MCPLine(5), "my_const")
-        assert isinstance(result.line_context, str)
+        assert any(e.info == 'constant "TestTheory.my_const"' for e in result.results), result
 
     @pytest.mark.asyncio
     async def test_definition(self, lsp_client, theory_file):
         from isabelle_mcp.tools import declaration_location
-        await lsp_client.open_document(theory_file)
+        from tests.integration.test_query_tools_e2e import _evaluate_through
+        assert await _evaluate_through(lsp_client, theory_file, -1)
         result = await declaration_location(lsp_client, theory_file, MCPLine(8), "my_const")
-        assert isinstance(result.locations, list)
+        assert [(l.file_path, l.line, l.column) for l in result.locations] == [(theory_file, 5, 12)]

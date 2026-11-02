@@ -14,7 +14,7 @@ before concluding a negative.
 Marked ``integration`` (deselected by default) and skipped unless ``isabelle``
 is on PATH:
 
-    PATH=contrib/Isabelle2025-2/bin:$PATH pytest tests/integration -m integration
+    PATH=contrib/Isabelle2026/bin:$PATH pytest tests/integration -m integration
 """
 import asyncio
 import os
@@ -65,7 +65,7 @@ val top_level_val = 42;
 ML \<open>
 datatype mcp_slow = MCP_Slow;
 val _ = Isabelle_MCP_PolyML.addPrettyPrinter (fn _ => fn _ => fn (_: mcp_slow) =>
-  (OS.Process.sleep (Time.fromSeconds 30); PolyML.PrettyString "MCP_Slow"));
+  (Time.sleep (Time.fromSeconds 30); PolyML.PrettyString "MCP_Slow"));
 fun slow_target (n: int) =
   let
     val sluggish = MCP_Slow;
@@ -493,7 +493,7 @@ val _ =
     fun wait 0 = ()
       | wait k =
           if OS.FileSys.access ("SENTINEL_PATH_PLACEHOLDER", []) then ()
-          else (OS.Process.sleep (Time.fromReal 0.25); wait (k - 1));
+          else (Time.sleep (Time.fromReal 0.25); wait (k - 1));
   in wait 240 end;
 val gated_result = gated_target 3;
 \<close>
@@ -656,7 +656,7 @@ async def test_r2_abort_on_indebted_thread_replies_aborting(prover):
     result = await _eval_at(
         client, thread,
         "Thread_Attributes.with_attributes Thread_Attributes.no_interrupts "
-        "(fn _ => OS.Process.sleep (Time.fromSeconds 60))",
+        "(fn _ => Time.sleep (Time.fromSeconds 60))",
         timeout_s=3, request_timeout=120.0)
     assert result["status"] == "timeout", result
 

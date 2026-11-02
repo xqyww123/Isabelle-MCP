@@ -49,8 +49,8 @@ object Query {
 }
 
 /* Correlation.  Nothing in Protocol_Command, Protocol_Handlers or Session tracks
-   pending requests -- every handler keeps its own table (Scala.Handler is the model,
-   scala.scala:292-351).
+   pending requests -- every handler keeps its own table (Scala.Handler in scala.scala is
+   the model).
 
    Taking a request out of the table is the permission to answer it, the same
    discipline the prelude follows on its side: the prover's reply, the client's

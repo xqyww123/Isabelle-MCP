@@ -197,7 +197,7 @@ fun mcp_failed id exn =
 (* Resolving a command to its final Toplevel.state.  Everything here runs on the protocol
    thread and is cheap; the failure modes are the classification of QUERY_TOOLS_UPGRADE.md
    section 5.3.  Document.command_exec RAISES for an unknown node or command id rather than
-   returning NONE (document.ML:480-484), and any edit to a file re-creates every command id
+   returning NONE (document.ML), and any edit to a file re-creates every command id
    in it, so that is a routine path, not a corner. *)
 
 datatype mcp_command =
@@ -233,11 +233,16 @@ fun mcp_bad id (status, msg) =
 
 (* The expensive half, in a forked task.  interrupts = false keeps the REPLY out of reach of
    an asynchronous interrupt -- Future.forks applies the job's attributes to the whole body,
-   work and reply alike (future.ML:441-455) -- while Future.interruptible_task lets a cancel
-   reach the work.  This is Build.build_session's pattern (build.ML:107-118).  Urgent
-   priority so the reply does not queue behind a busy document's proofs, as
-   query_operation.ML:49 does for the same reason.  The group is ours, not NONE: a fresh
-   root group would be unreachable from Isabelle_MCP.cancel_query. *)
+   work and reply alike (Future.future_job in future.ML) -- while Future.interruptible_task
+   lets a cancel reach the work.  This is the pattern of the "build_session" protocol command
+   (Pure/Build/build.ML).  Urgent priority so the reply does not queue behind a busy
+   document's proofs, as query_operation.ML:49 does for the same reason.  The group is ours,
+   not NONE: a fresh root group would be unreachable from Isabelle_MCP.cancel_query.
+
+   Known limitation: unlike Command.eval and Command.print, the work runs without the
+   theory's inlined header options (Isabelle2026), so e.g. "options [show_types]" does not
+   reach a query's rendering; "declare [[show_types]]" does (it lives in the context).
+   Document does not export a node's options. *)
 
 fun mcp_fork id group notes work =
   ignore (Future.forks
@@ -338,7 +343,7 @@ val _ =
 
 val _ =
   Context.setmp_generic_context
-    (SOME (Context.Theory (Thy_Info.get_theory "ML_Bootstrap")
+    (SOME (Context.Theory (Build.get_theory "ML_Bootstrap")
       |> Config.put_generic ML_Env.ML_write_global true))
     (fn () =>
       ML_Context.eval ML_Compiler.flags Position.none
@@ -605,9 +610,9 @@ val _ =
 (* At --use time there is no message channel yet, so nothing can go out over the protocol:
    Output.protocol_message is still protocol_message_undefined and RAISES Protocol_Message
    (output.ML:96, :112), and Isabelle_Process.init installs the real one only afterwards
-   (isabelle_process.ML:141-142).  The plain channels do work -- init_channels has already
-   pointed Output.system_message at physical stdout (output.ML:99-113) -- so TextIO.print
-   here is the same destination by the shortest route.  Language_Server captures raw prover
-   output during startup, which is exactly when this line matters: a prelude that fails to
-   compile is fatal to the prover. *)
+   (the protocol_message_fn setmp in Isabelle_Process.init_protocol).  The plain channels do
+   work -- init_channels has already pointed Output.system_message at physical stdout
+   (output.ML:99-113) -- so TextIO.print here is the same destination by the shortest route.
+   Language_Server captures raw prover output during startup, which is exactly when this
+   line matters: a prelude that fails to compile is fatal to the prover. *)
 val _ = TextIO.print ("Isabelle_MCP: prelude " ^ mcp_prelude_version ^ " loaded\n");

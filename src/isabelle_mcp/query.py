@@ -5,7 +5,7 @@ The prover answers with a status word and never with a sentence, because ML
 cannot map a command back to a line and every sentence here names one. The
 wording lives on this side, where it is unit-tested character for character and
 where changing a word costs no jar rebuild. The status vocabulary is the same on
-both sides — see ``scala/Isabelle2025-2/src/query.scala`` — and the design is
+both sides — see ``scala/Isabelle2026/src/query.scala`` — and the design is
 docs/archive/QUERY_TOOLS_UPGRADE.md §5.1 and §5.3.
 """
 

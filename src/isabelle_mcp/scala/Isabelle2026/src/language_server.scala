@@ -177,6 +177,7 @@ object Language_Server {
 
   class Editor(server: Language_Server) extends isabelle.Editor {
     type Context = Unit
+    type Session = VSCode_Session
 
 
     /* PIDE session and document model */
@@ -189,8 +190,8 @@ object Language_Server {
 
     /* input from client */
 
-    private val delay_input: Delay =
-      Delay.last(server.options.seconds("vscode_input_delay"), server.channel.Error_Logger) {
+    private lazy val delay_input: Delay =
+      server.channel.Delay.last(server.options.seconds("vscode_input_delay")) {
         session.resources.flush_input(session, server.channel)
       }
 
@@ -243,10 +244,49 @@ object Language_Server {
 
     /* hyperlinks */
 
+    def hyperlink_file(
+      name: String,
+      line: Int = 0,
+      offset: Text.Offset = 0,
+      focus: Boolean = false
+    ): Hyperlink = {
+      val pos = Line.Position(line, offset)
+      new Hyperlink {
+        def follow(editor_context: Context): Unit =
+          server.channel.write(LSP.Caret_Update(Line.Node_Position(name, pos), focus))
+      }
+    }
+
+    def hyperlink_source_file(
+      source_name: String,
+      line1: Int,
+      offset: Symbol.Offset,
+      focus: Boolean = false
+    ): Option[Hyperlink] = {
+      for (platform_path <- session.store.source_file(source_name)) yield {
+        def hyperlink(pos: Line.Position) =
+          hyperlink_file(platform_path, line = pos.line, offset = pos.column, focus = focus)
+
+        if (offset > 0) {
+          val node_name = session.resources.node_name(Path.explode(platform_path).file)
+          session.resources.get_file_content(node_name) match {
+            case Some(text) =>
+              hyperlink(
+                Symbol.iterator(text).zipWithIndex.takeWhile(p => p._2 < offset - 1).map(_._1).
+                  foldLeft(Line.Position.zero)(_.advance(_)))
+            case None =>
+              hyperlink(Line.Position((line1 - 1) max 0))
+          }
+        }
+        else hyperlink(Line.Position((line1 - 1) max 0))
+      }
+    }
+
     override def hyperlink_command(
       snapshot: Document.Snapshot,
       id: Document_ID.Generic,
       offset: Symbol.Offset = 0,
+      description: String = "",
       focus: Boolean = false,
     ): Option[Hyperlink] = {
       if (snapshot.is_outdated) None
@@ -265,6 +305,11 @@ object Language_Server {
     override def send_dispatcher(body: => Unit): Unit = session.send_dispatcher(body)
     override def send_wait_dispatcher(body: => Unit): Unit = session.send_wait_dispatcher(body)
   }
+
+
+  /* supported active markup */
+
+  val active_elements = Markup.Elements(Markup.SENDBACK, Markup.DIALOG)
 }
 
 class Language_Server(
@@ -277,7 +322,6 @@ class Language_Server(
   session_requirements: Boolean = false,
   session_no_build: Boolean = false,
   modes: List[String] = Nil,
-  log: Logger = new Logger
 ) {
   server =>
 
@@ -289,7 +333,6 @@ class Language_Server(
   private val session_ = Synchronized(None: Option[VSCode_Session])
   def session: VSCode_Session = session_.value getOrElse error("Server inactive")
   def resources: VSCode_Resources = session.resources
-  def ml_settings: ML_Settings = session.store.ml_settings
 
   private val sledgehammer = new VSCode_Sledgehammer(server)
   private val find_theorems = new VSCode_Find_Theorems(server)
@@ -306,11 +349,11 @@ class Language_Server(
 
   /* input from client or file-system */
 
-  private val file_watcher: MCP_File_Watcher =
-    MCP_File_Watcher(sync_documents, options.seconds("vscode_load_delay"))
+  private lazy val file_watcher: MCP_File_Watcher =
+    MCP_File_Watcher(sync_documents, resources, options.seconds("vscode_load_delay"))
 
-  private val delay_load: Delay =
-    Delay.last(options.seconds("vscode_load_delay"), channel.Error_Logger) {
+  private lazy val delay_load: Delay =
+    channel.Delay.last(options.seconds("vscode_load_delay")) {
       val (invoke_input, invoke_load) =
         resources.resolve_dependencies(session, editor, file_watcher)
       if (invoke_input) editor.invoke()
@@ -347,8 +390,8 @@ class Language_Server(
 
   /* caret handling */
 
-  private val delay_caret_update: Delay =
-    Delay.last(options.seconds("vscode_input_delay"), channel.Error_Logger) {
+  private lazy val delay_caret_update: Delay =
+    channel.Delay.last(options.seconds("vscode_input_delay")) {
       session.caret_focus.post(Session.Caret_Focus)
     }
 
@@ -364,7 +407,7 @@ class Language_Server(
   private lazy val preview_panel = new Preview_Panel(resources)
 
   private lazy val delay_preview: Delay =
-    Delay.last(options.seconds("vscode_output_delay"), channel.Error_Logger) {
+    channel.Delay.last(options.seconds("vscode_output_delay")) {
       if (preview_panel.flush(channel)) delay_preview.invoke()
     }
 
@@ -382,18 +425,18 @@ class Language_Server(
      in principle).  So from the first signal to flush_output is at most
      vscode_output_delay, and every visible model is rendered on each run (I-2). */
 
-  private val delay_output: Delay =
-    Delay.first(options.seconds("vscode_output_delay"), channel.Error_Logger) {
+  private lazy val delay_output: Delay =
+    channel.Delay.first(options.seconds("vscode_output_delay")) {
       if (resources.flush_output(session, channel)) delay_output.invoke()
     }
 
   private val prover_output =
-    Session.Consumer[Session.Commands_Changed](getClass.getName) {
+    Session.Consumer[Session.Commands_Changed](this.class_name) {
       case _ => delay_output.invoke()
     }
 
   private val syslog_messages =
-    Session.Consumer[Prover.Output](getClass.getName) {
+    Session.Consumer[Prover.Output](this.class_name) {
       case output => channel.log_writeln(resources.output_text(XML.content(output.message)))
     }
 
@@ -436,7 +479,11 @@ class Language_Server(
               progress.echo(msg)
               error(msg) })
 
-        val session_resources = new VSCode_Resources(options, session_background, log)
+        /* Since Isabelle2026, Pure reports internal failures (session consumers, protocol
+           handlers, the prover process) via resources.log: send them to stderr, which
+           lsp_client reads. */
+        val session_resources =
+          new VSCode_Resources(options, session_background, Logger.console)
         val session_options = options.bool.update("editor_output_state", true)
         val session =
           new VSCode_Session(session_options, session_resources) {
@@ -471,8 +518,8 @@ class Language_Server(
 
       val raw_output = Synchronized(List.empty[String])
       val raw_output_capture =
-        Session.Consumer[Prover.Output](getClass.getName + "/startup") { output =>
-          val text = XML.content(output.message).trim
+        Session.Consumer[Prover.Output](this.class_name + "/startup") { output =>
+          val text = Library.trim_string(XML.content(output.message))
           if (text.nonEmpty) raw_output.change(text :: _)
         }
 
@@ -554,7 +601,7 @@ class Language_Server(
   }
 
   def exit(): Unit = {
-    log("\n")
+    channel.log_file("\n")
     sys.exit(if (session_.value.isEmpty) Process_Result.RC.ok else Process_Result.RC.failure)
   }
 
@@ -608,14 +655,27 @@ class Language_Server(
   }
 
 
-  /* goto definition */
+  /* gotos */
 
   def goto_definition(id: LSP.Id, node_pos: Line.Node_Position): Unit = {
     val result =
-      (for ((rendering, offset) <- rendering_offset(node_pos))
-        yield rendering.hyperlinks(Text.Range(offset, offset + 1))) getOrElse Nil
-    channel.write(LSP.GotoDefinition.reply(id, result))
+      rendering_offset(node_pos) match {
+        case Some((rendering, offset)) => rendering.hyperlinks(Text.Range(offset, offset + 1))
+        case None => Nil
+      }
+    channel.write(LSP.GotoDefinition.reply(id, result.map(_.info)))
   }
+
+  def goto_file(file: String): Unit = editor.hyperlink_file(file).follow(())
+
+  def goto_source_file(file: String, line: Int, offset: Symbol.Offset): Unit =
+    editor.hyperlink_source_file(file, line, offset, focus = true).foreach(_.follow(()))
+
+  def goto_command(id: Long, offset: Symbol.Offset): Unit =
+    for {
+      snapshot <- editor.current_node_snapshot(())
+      hyperlink <- editor.hyperlink_command(snapshot, id, offset = offset, focus = true)
+    } hyperlink.follow(())
 
 
   /* document highlights */
@@ -632,14 +692,40 @@ class Language_Server(
   }
 
 
-  /* code actions */
+  /* actions */
 
-  def code_action_request(id: LSP.Id, file: JFile, range: Line.Range): Unit = {
+  private def text_edit(
+    props: Properties.T,
+    text: String,
+    model: VSCode_Model
+  ): Option[LSP.TextEdit] = {
+    val snapshot = resources.snapshot(model)
+    val doc = model.content.doc
+
+    for {
+      id <- Position.Id.unapply(props)
+      command <- snapshot.get_command(id)
+      start <- snapshot.command_start(command)
+      range = snapshot.convert(command.core_range + start)
+      current_text <- model.get_text(range)
+    } yield {
+      val line_range = doc.range(range)
+      val edit_text =
+        if (props.contains(Markup.PADDING_COMMAND)) {
+          val whole_line = doc.lines(line_range.start.line)
+          val indent = whole_line.text.takeWhile(_.isWhitespace)
+          current_text + "\n" + Library.prefix_lines(indent, text)
+        }
+        else current_text + text
+      LSP.TextEdit(line_range, resources.output_edit(edit_text))
+    }
+  }
+
+  def code_action_request(id: LSP.Id, file: JFile, range: Line.Range): Unit =
     for {
       model <- resources.get_model(file)
       version <- model.version
-      doc = model.content.doc
-      text_range <- doc.text_range(range)
+      text_range <- model.content.doc.text_range(range)
     } {
       val snapshot = resources.snapshot(model)
       val results =
@@ -649,38 +735,42 @@ class Language_Server(
         List.from(
           for {
             (snippet, props) <- Protocol.sendback_snippets(results).iterator
-            id <- Position.Id.unapply(props)
-            (node, command) <- snapshot.find_command(id)
-            start <- node.command_start(command)
-            range = command.core_range + start
-            current_text <- model.get_text(range)
-          } yield {
-            val line_range = doc.range(range)
-            val edit_text =
-              if (props.contains(Markup.PADDING_COMMAND)) {
-                val whole_line = doc.lines(line_range.start.line)
-                val indent = whole_line.text.takeWhile(_.isWhitespace)
-                current_text + "\n" + Library.prefix_lines(indent, snippet)
-              }
-              else current_text + snippet
-            val edit = LSP.TextEdit(line_range, resources.output_edit(edit_text))
-            LSP.CodeAction(snippet, List(LSP.TextDocumentEdit(file, Some(version), List(edit))))
-          })
+            text_edit <- text_edit(props, snippet, model)
+            document_edit = LSP.TextDocumentEdit(file, Some(version), List(text_edit))
+          } yield LSP.CodeAction(snippet, List(document_edit)))
       channel.write(LSP.CodeActionRequest.reply(id, actions))
     }
-  }
+
+  def markup_action(active: XML.Elem, text: String): Unit =
+    active match {
+      case XML.Elem(Markup(Markup.SENDBACK, props), _) =>
+        for {
+          id <- Position.Id.unapply(props)
+          command <- session.snapshot().get_command(id)
+          node_name = command.node_name
+          model <- resources.get_model(node_name)
+          text_edit <- text_edit(props, text, model)
+          file = resources.node_file(node_name)
+          end_pos = text_edit.range.start.advance(text_edit.new_text)
+        } channel.write(LSP.Document_Edit(file, model.version, text_edit, end_pos))
+
+      case Protocol.Dialog(id, serial, result) =>
+        session.dialog_result(id, serial, result)
+
+      case _ =>
+    }
 
 
   /* abbrevs */
 
   def abbrevs_request(): Unit = {
-    val syntax = session.resources.session_base.overall_syntax
+    val syntax = session.resources.current_background.base.overall_syntax
     channel.write(LSP.Abbrevs_Request.reply(syntax.abbrevs))
   }
 
 
   def documentation_request(): Unit =
-    channel.write(LSP.Documentation_Response(ml_settings))
+    channel.write(LSP.Documentation_Response(session.doc_contents))
 
 
   /* theory status: every row from ONE document state, stamped with its version (I-1a) */
@@ -702,7 +792,7 @@ class Language_Server(
         model.node_name.json ++
           JSON.Object(
             "external" -> model.external_file,
-            "imports" -> snapshot.node.header.imports.map(_.json)) ++
+            "imports" -> snapshot.node.thy.imports_no_pos.map(_.json)) ++
           status.json
       }).toList
     channel.write(LSP.Theory_Status.reply(id, document_version, theories))
@@ -793,10 +883,10 @@ class Language_Server(
       }
       catch {
         case exn: VSCode_Resources.Request_Failure =>
-          log("flush failed: " + exn.reason)
+          channel.log_file("flush failed: " + exn.reason)
           reply = LSP.Flush.error(id, exn.reason)
         case exn: Throwable =>
-          log("flush failed: " + Exn.message(exn))
+          channel.log_file("flush failed: " + Exn.message(exn))
           reply = LSP.Flush.error(id, "internal failure: " + Exn.message(exn))
       }
       finally { channel.write(reply) }
@@ -876,10 +966,10 @@ class Language_Server(
       try { reply = cancel_evaluation_body(deadline) }
       catch {
         case exn: VSCode_Resources.Request_Failure =>
-          log("cancel_evaluation aborted: " + exn.reason)
+          channel.log_file("cancel_evaluation aborted: " + exn.reason)
           reply = cancel_aborted(exn.reason)
         case exn: Throwable =>
-          log("cancel_evaluation failed: " + Exn.message(exn))
+          channel.log_file("cancel_evaluation failed: " + Exn.message(exn))
           reply = cancel_aborted("internal failure: " + Exn.message(exn))
       }
       finally { channel.write(LSP.Cancel_Evaluation.reply(id, reply)) }
@@ -964,7 +1054,7 @@ class Language_Server(
       (for {
         (name, node) <- v0.nodes.iterator
         (command, _) <- node.command_iterator()
-        exec_id <- assignment0.command_execs.getOrElse(command.id, Nil).headOption
+        exec_id <- assignment0.get(command.id).headOption
       } yield exec_id -> (name, command.id)).toMap
 
     val serial = cancel_serial().toString
@@ -976,7 +1066,7 @@ class Language_Server(
         XML.string(serial), XML.string(cancel_ids.mkString(",")),
         XML.string(probe.keys.mkString(",")))
       session.protocol_command("Isabelle_MCP.ping", XML.string(serial))
-      log("cancel_evaluation " + serial + ": " + cancel_ids.length + " execs, " +
+      channel.log_file("cancel_evaluation " + serial + ": " + cancel_ids.length + " execs, " +
         probe.size + " probed")
 
       var report: Option[Language_Server.Cancel_Report] = None
@@ -996,8 +1086,8 @@ class Language_Server(
 
       val active: Map[Document_ID.Exec, (Document.Node.Name, Document_ID.Command)] =
         (for (exec_id <- report.get.alive; target <- probe.get(exec_id)) yield exec_id -> target).toMap
-      log("cancel_evaluation " + serial + ": " + report.get.alive.length + " alive after " +
-        report.get.calls + " probe calls, " + active.size + " to retire")
+      channel.log_file("cancel_evaluation " + serial + ": " + report.get.alive.length +
+        " alive after " + report.get.calls + " probe calls, " + active.size + " to retire")
 
       /* step 0: retract */
 
@@ -1301,7 +1391,7 @@ class Language_Server(
       case Some((node_name, command_id)) =>
         val token = params.token
         val timer =
-          Event_Timer.request(Time.now() + Time.seconds(params.timeout)) {
+          Event_Timer.request(channel.log_message, Time.now() + Time.seconds(params.timeout)) {
             for (respond_timeout <- query_handler.take(token)) {
               session.protocol_command("Isabelle_MCP.cancel_query", XML.string(token))
               respond_timeout(Query.Result(Query.TIMEOUT))
@@ -1377,7 +1467,7 @@ class Language_Server(
   /* main loop */
 
   def start(): Unit = {
-    log("Server started " + Date.now())
+    channel.log_file("Server started " + Date.now())
 
     def handle(json: JSON.T): Unit = {
       try {
@@ -1400,8 +1490,12 @@ class Language_Server(
           case LSP.Reset_Words() => reset_dictionary()
           case LSP.Hover(id, node_pos) => hover(id, node_pos)
           case LSP.GotoDefinition(id, node_pos) => goto_definition(id, node_pos)
+          case LSP.Goto_File(name) => goto_file(name)
+          case LSP.Goto_Source_File(name, line, offset) => goto_source_file(name, line, offset)
+          case LSP.Goto_Command(id, offset) => goto_command(id, offset)
           case LSP.DocumentHighlights(id, node_pos) => document_highlights(id, node_pos)
           case LSP.CodeActionRequest(id, file, range) => code_action_request(id, file, range)
+          case LSP.Markup_Action(active, text) => markup_action(active, text)
           case LSP.Decoration_Request(file) => decoration_request(file)
           case LSP.Caret_Update(caret) => update_caret(caret)
           case LSP.Output_Set_Margin(margin) => dynamic_output.set_margin(margin)
@@ -1419,7 +1513,6 @@ class Language_Server(
           case LSP.Sledgehammer_Request(args) => sledgehammer.request(args)
           case LSP.Sledgehammer_Cancel() => sledgehammer.cancel()
           case LSP.Sledgehammer_Locate() => sledgehammer.locate()
-          case LSP.Sledgehammer_Sendback(text) => sledgehammer.sendback(text)
           case LSP.Theory_Status(id) => theory_status(id)
           case LSP.Cancel_Evaluation(id) => cancel_evaluation(id)
           case LSP.Flush(id, resync_dependencies) => flush(id, resync_dependencies)
@@ -1441,7 +1534,8 @@ class Language_Server(
           case LSP.Debugger_Print_Vals(id, params) => debugger_adapter.print_vals(id, params)
           case LSP.Debugger_Abort(id, thread, token) => debugger_adapter.abort(id, thread, token)
           case LSP.Debugger_Input(id, thread, verbs) => debugger_adapter.input(id, thread, verbs)
-          case _ => if (!LSP.ResponseMessage.is_empty(json)) log("### IGNORED")
+          case _ =>
+            if (!LSP.ResponseMessage.is_empty(json)) channel.log_file.warning("IGNORED")
         }
       }
       catch { case exn: Throwable => channel.log_error_message(Exn.message(exn)) }
@@ -1455,7 +1549,7 @@ class Language_Server(
             case _ => handle(json)
           }
           loop()
-        case None => log("### TERMINATE")
+        case None => channel.log_file.warning("TERMINATE")
       }
     }
     loop()

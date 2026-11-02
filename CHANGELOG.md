@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Runs on Isabelle2026, and only on it.** The Scala component (`isabelle
+  mcp_server`) is re-forked onto Isabelle2026's VSCode sources and its jar is
+  compiled against Isabelle2026. Isabelle2025-2 is no longer supported — the
+  last release that supports it, 0.7.0, is tagged `last-isabelle2025-2-support`. If you
+  still run Isabelle2025-2 after upgrading, it prints `### Missing Isabelle
+  component: …/scala/Isabelle2025-2`; remove that line with Isabelle2025-2's own
+  `isabelle components -x <the path it names>`. `isabelle-mcp uninstall` cannot
+  do it: it works only with a supported Isabelle, and it also removes the
+  installed skills.
 - **Runs on FastMCP 4 and the MCP SDK 2** (`fastmcp>=4.1,<5`, `mcp>=2.3`).
   The project root still comes from the client's roots on the handshake
   protocols (2025-11-25 and earlier, which Claude Code and Codex speak); on

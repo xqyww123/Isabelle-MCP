@@ -55,8 +55,11 @@ object MCP_File_Watcher {
     override def toString: String = "MCP_File_Watcher.none"
   }
 
-  def apply(handle: Set[JFile] => Unit, delay: => Time = Time.seconds(0.5)): MCP_File_Watcher =
-    if (Platform.is_windows) none else new Impl(handle, delay)
+  def apply(
+    handle: Set[JFile] => Unit,
+    resources: Resources,
+    delay: => Time = Time.seconds(0.5)
+  ): MCP_File_Watcher = if (Platform.is_windows) none else new Impl(handle, resources, delay)
 
   private val trigger_extensions = List(".thy", ".ml", ".sml")
 
@@ -78,10 +81,13 @@ object MCP_File_Watcher {
     registered: Map[JFile, Set[String]] = Map.empty,
     changed: Set[JFile] = Set.empty)
 
-  class Impl private[MCP_File_Watcher](handle: Set[JFile] => Unit, delay: Time)
-  extends MCP_File_Watcher {
+  class Impl private[MCP_File_Watcher](
+    handle: Set[JFile] => Unit,
+    resources: Resources,
+    delay: Time
+  ) extends MCP_File_Watcher {
     private val state = Synchronized(MCP_File_Watcher.State())
-    private val watcher = FileSystems.getDefault.newWatchService()
+    private val watcher = FileSystems.getDefault.nn.newWatchService().nn
 
     override def toString: String =
       state.value.dirs.keySet.mkString("MCP_File_Watcher(", ", ", ")")
@@ -94,19 +100,20 @@ object MCP_File_Watcher {
         st.dirs.get(dir) match {
           case Some(key) if key.isValid => st
           case _ =>
-            val key = dir.toPath.register(watcher, ENTRY_CREATE, ENTRY_DELETE, ENTRY_MODIFY)
+            val key = dir.java_path.register(watcher, ENTRY_CREATE, ENTRY_DELETE, ENTRY_MODIFY).nn
             st.copy(dirs = st.dirs + (dir -> key))
         })
 
     override def register_parent(file: JFile): Unit = {
-      val dir = file.getParentFile
-      if (dir != null && dir.isDirectory) {
-        // record the file identity FIRST: register(dir) short-circuits on an existing
-        // WatchKey, and the table must not be skipped along with it.
-        state.change(st =>
-          st.copy(registered =
-            st.registered + (dir -> (st.registered.getOrElse(dir, Set.empty) + file.getName))))
-        register(dir)
+      proper_value(file.getParentFile) match {
+        case Some(dir) if dir.isDirectory =>
+          // record the file identity FIRST: register(dir) short-circuits on an existing
+          // WatchKey, and the table must not be skipped along with it.
+          state.change(st =>
+            st.copy(registered =
+              st.registered + (dir -> (st.registered.getOrElse(dir, Set.empty) + file.file_name))))
+          register(dir)
+        case _ =>
       }
     }
 
@@ -127,7 +134,7 @@ object MCP_File_Watcher {
 
     /* changed directory entries */
 
-    private val delay_changed = Delay.last(delay) {
+    private val delay_changed = resources.Delay.last(delay) {
       val changed = state.change_result(st => (st.changed, st.copy(changed = Set.empty)))
       handle(changed)
     }
@@ -135,18 +142,18 @@ object MCP_File_Watcher {
     private val watcher_thread = Isabelle_Thread.fork(name = "file_watcher", daemon = true) {
       try {
         while (true) {
-          val key = watcher.take
+          val key = watcher.take.nn
           val trigger =
             state.change_result { st =>
               val (remove, changed, trigger) =
                 st.dirs.collectFirst({ case (dir, key1) if key == key1 => dir }) match {
                   case Some(dir) =>
                     val events: Iterable[WatchEvent[JPath]] =
-                      key.pollEvents.asInstanceOf[JList[WatchEvent[JPath]]].asScala
+                      key.pollEvents.nn.asInstanceOf[JList[WatchEvent[JPath]]].asScala
                     val remove = if (key.reset) None else Some(dir)
                     val changed =
                       events.iterator.foldLeft(Set.empty[JFile]) {
-                        case (set, event) => set + dir.toPath.resolve(event.context).toFile
+                        case (set, event) => set + dir.java_path.resolve(event.context).nn.java_file
                       }
                     val registered = st.registered.getOrElse(dir, Set.empty)
                     val trigger =
@@ -366,8 +373,8 @@ object VSCode_Resources {
 class VSCode_Resources(
   val options: Options,
   session_background: Sessions.Background,
-  log: Logger = new Logger)
-extends Resources(session_background, log = log) {
+  log_file: Logger)
+extends Resources(session_background, session_background, log = log_file) {
   resources =>
 
   private val state = new VSCode_Resources.Monitor(VSCode_Resources.State())
@@ -391,7 +398,7 @@ extends Resources(session_background, log = log) {
 
   def node_name(file: JFile): Document.Node.Name =
     find_theory(file) getOrElse {
-      val node = file.getPath
+      val node = file.getPath.nn
       val theory = theory_name(Sessions.DRAFT, Thy_Header.theory_name(node))
       if (loaded_theory(theory)) Document.Node.Name.loaded_theory(theory)
       else Document.Node.Name(node, theory = theory)
@@ -407,7 +414,7 @@ extends Resources(session_background, log = log) {
     else if (path.is_basic && !prefix.endsWith("/") && !prefix.endsWith(JFile.separator))
       prefix + JFile.separator + File.platform_path(path)
     else if (path.is_basic) prefix + File.platform_path(path)
-    else File.absolute(new JFile(prefix + JFile.separator + File.platform_path(path))).getPath
+    else File.absolute(new JFile(prefix + JFile.separator.nn + File.platform_path(path))).getPath.nn
   }
 
   override def read_dir(dir: String): List[String] =
@@ -447,6 +454,9 @@ extends Resources(session_background, log = log) {
 
 
   /* file content */
+
+  /* Deliberately not Symbol.decode'd, unlike upstream 2026: disk, model and prover text stay
+     byte-identical (unicode_guard.py), so positions in server-read files match the disk. */
 
   def read_file_content(name: Document.Node.Name): Option[String] = {
     make_theory_content(name) orElse {
@@ -561,7 +571,8 @@ extends Resources(session_background, log = log) {
       val stable_tip_version = session.stable_tip_version(st.models.values)
 
       val thy_files =
-        resources.resolve_dependencies(st.models.values, editor.document_required())
+        resources.resolve_dependencies(session.conditions,
+          st.models.values, editor.document_required())
 
       val aux_files = stable_tip_version.toList.flatMap(undefined_blobs)
 
@@ -752,7 +763,7 @@ extends Resources(session_background, log = log) {
             perspective = cancel_perspective(st, doc_state, pending_edits, model, st.overlays)
             if model.pending_edits.nonEmpty || model.last_perspective != perspective
           } yield {
-            val edits = model.node_edits(model.node_header, model.pending_edits, perspective)
+            val edits = model.node_edits(model.get_thy(), model.pending_edits, perspective)
             (edits, (file, model.copy(pending_edits = Nil, last_perspective = perspective)))
           }).toList
         val edits = changed.flatMap(_._1)
@@ -783,7 +794,7 @@ extends Resources(session_background, log = log) {
                   if wanted(command.id)
                 } yield command.id -> (command, start)).toMap
               for ((exec_id, (_, command_id)) <- node_targets) {
-                val eval_exec = assignment.command_execs.getOrElse(command_id, Nil).headOption
+                val eval_exec = assignment.get(command_id).headOption
                 if (!doc_state.execs.isDefinedAt(exec_id)) {
                   excluded += VSCode_Resources.Excluded(name, command_id,
                     located.get(command_id).map(_._1), "gone")

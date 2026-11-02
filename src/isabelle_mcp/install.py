@@ -205,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         metavar="BIN",
         help="the isabelle binary to pin into the server's PATH (e.g. "
-        ".../Isabelle2025-2/bin/isabelle; its directory is accepted too)",
+        ".../Isabelle2026/bin/isabelle; its directory is accepted too)",
     )
     parser.add_argument(
         "--claude", action="store_true", help="register only into Claude Code"
@@ -238,7 +238,7 @@ def main(argv: list[str] | None = None) -> int:
         if not (os.path.isfile(isa) and os.access(isa, os.X_OK)):
             _eprint(
                 f"error: --isabelle-bin: no executable 'isabelle' at {isa}",
-                "       (pass the isabelle binary, e.g. /path/to/Isabelle2025-2/bin/isabelle)",
+                "       (pass the isabelle binary, e.g. /path/to/Isabelle2026/bin/isabelle)",
             )
             return 1
         path_env = f"{isa_dir}{os.pathsep}{os.environ.get('PATH', '')}"

@@ -12,7 +12,7 @@ flight, because they and the evaluation both drove Isabelle's global caret.
 Marked ``integration`` (deselected by default) and skipped unless ``isabelle``
 is on PATH:
 
-    PATH=contrib/Isabelle2025-2/bin:$PATH pytest tests/integration -m integration
+    PATH=contrib/Isabelle2026/bin:$PATH pytest tests/integration -m integration
 """
 import asyncio
 import os
@@ -52,7 +52,7 @@ lemma target: "(x::nat) + 0 = x"
   apply simp
   done
 
-ML \\<open>OS.Process.sleep (Time.fromSeconds 90)\\<close>
+ML \\<open>Time.sleep (Time.fromSeconds 90)\\<close>
 
 lemma after_the_sleep: "two + 0 = two"
   by (simp add: two_def)

@@ -238,7 +238,7 @@ class Debugger_Adapter(server: Language_Server) {
   }
 
   private val consumer =
-    Session.Consumer[Prover.Message](getClass.getName) {
+    Session.Consumer[Prover.Message](this.class_name) {
       case msg: Prover.Protocol_Output =>
         msg.properties match {
           case Markup.Debugger_State(thread_name) => handle_state(thread_name, msg)
@@ -345,7 +345,7 @@ class Debugger_Adapter(server: Language_Server) {
               }
               else reply(result.status, true, Nil)
             val timer =
-              Event_Timer.request(Time.now() + Time.seconds(timeout)) {
+              Event_Timer.request(channel.log_message, Time.now() + Time.seconds(timeout)) {
                 for (respond_timeout <- server.query_handler.take(token))
                   respond_timeout(Query.Result(Query.TIMEOUT))
               }
@@ -395,7 +395,7 @@ class Debugger_Adapter(server: Language_Server) {
                 reply(result.status,
                   if (result.status == Query.OK) Value.Boolean.unapply(result.text) else None)
               val timer =
-                Event_Timer.request(Time.now() + Time.seconds(timeout)) {
+                Event_Timer.request(channel.log_message, Time.now() + Time.seconds(timeout)) {
                   for (respond_timeout <- server.query_handler.take(token))
                     respond_timeout(Query.Result(Query.TIMEOUT))
                 }
@@ -439,7 +439,8 @@ class Debugger_Adapter(server: Language_Server) {
       else {
         val serial = eval_counter()
         val timer =
-          Event_Timer.request(Time.now() + Time.seconds(params.timeout + BACKSTOP_MARGIN)) {
+          Event_Timer.request(channel.log_message,
+              Time.now() + Time.seconds(params.timeout + BACKSTOP_MARGIN)) {
             // Runs on the shared Timer thread; the whole body is posted to the dispatcher.
             // cancel() cannot stop an already-fired closure, so answer only if the entry
             // is still THIS request (look up, compare the serial, then remove).

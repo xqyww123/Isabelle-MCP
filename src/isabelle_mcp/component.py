@@ -53,7 +53,7 @@ class Component:
     """The ``isabelle`` executable, as resolved on PATH."""
 
     identifier: str
-    """``isabelle version``, e.g. ``Isabelle2025-2``. This is the key the asset is stored under."""
+    """``isabelle version``, e.g. ``Isabelle2026``. This is the key the asset is stored under."""
 
     path: Path
     """The component directory: ``isabelle_mcp/scala/<identifier>/``."""

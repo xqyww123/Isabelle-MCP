@@ -14,7 +14,7 @@
 
 Isabelle-MCP is a Python-based MCP (Model Context Protocol) server that acts as a bridge between AI agents and Isabelle's Language Server Protocol (LSP) implementation.
 
-> **`isabelle mcp_server`** is *our* LSP server: an Isabelle Scala component that Isabelle-MCP ships (a fork of Isabelle2025-2's `vscode_server` sources, package `isabelle.mcp`). The stock `vscode_server` does not expose the PIDE requests this design needs — `PIDE/theory_status`, `PIDE/flush`, `PIDE/cancel_evaluation`, `PIDE/command_at_position`, `PIDE/output_at_position`, `PIDE/symbols`, `PIDE/find_theorems_*` — nor the document-version stamp every `PIDE/decoration` push and `PIDE/theory_status` reply carries, so they used to be patched into the Isabelle distribution. They are now our own code, and **no Isabelle patch is required**. See `docs/COMPONENT_INSTALL_PLAN.md` and `src/isabelle_mcp/scala/Isabelle2025-2/docs/CANCELLATION.md`. The architecture follows the proven patterns from `lean-lsp-mcp` while adapting to Isabelle's PIDE (Prover IDE) specific features.
+> **`isabelle mcp_server`** is *our* LSP server: an Isabelle Scala component that Isabelle-MCP ships (a fork of Isabelle2026's `vscode_server` sources, package `isabelle.mcp`). The stock `vscode_server` does not expose the PIDE requests this design needs — `PIDE/theory_status`, `PIDE/flush`, `PIDE/cancel_evaluation`, `PIDE/command_at_position`, `PIDE/output_at_position`, `PIDE/symbols`, `PIDE/find_theorems_*` — nor the document-version stamp every `PIDE/decoration` push and `PIDE/theory_status` reply carries, so they used to be patched into the Isabelle distribution. They are now our own code, and **no Isabelle patch is required**. See `docs/COMPONENT_INSTALL_PLAN.md` and `src/isabelle_mcp/scala/Isabelle2026/docs/CANCELLATION.md`. The architecture follows the proven patterns from `lean-lsp-mcp` while adapting to Isabelle's PIDE (Prover IDE) specific features.
 
 ### 1.1 High-Level Architecture
 
@@ -616,7 +616,7 @@ never evaluate; the guard dispatches on the requested position, in this order:
 ``cancel_evaluation`` calls ``IsabelleLSPClient.force_interrupt()``: one
 ``PIDE/cancel_evaluation`` request, no parameters, one reply. The server does the
 whole job (design: ``ISABELLE_MCP_CANCELLATION_REDESIGN_PLAN.md`` rev 6; component
-account: ``src/isabelle_mcp/scala/Isabelle2025-2/docs/CANCELLATION.md``):
+account: ``src/isabelle_mcp/scala/Isabelle2026/docs/CANCELLATION.md``):
 
 1. **Stanch + probe** — the injected ML prelude discontinues the execution, probes
    which eval execs still have live tasks, and cancels every exec the server knows
@@ -789,7 +789,7 @@ All `IsabelleToolError` exceptions are caught by FastMCP and returned as error r
 
 ### 6.2 Isabelle Dependencies
 
-- **Isabelle2024**: Includes `isabelle mcp_server`
+- **Isabelle2026** (the only supported release; `isabelle mcp_server` is this package's own Scala component)
 - **Logic Images**: Pre-built session heaps (HOL, Main, etc.)
 
 ### 6.3 Development Dependencies
@@ -899,7 +899,7 @@ Design, rationale and measurements: `docs/archive/QUERY_TOOLS_UPGRADE.md` §5.
 - Complete shutdown lifecycle
 
 **Requirements:**
-- Isabelle2024 installed
+- Isabelle2026 installed
 - HOL session built
 - Test theory files
 

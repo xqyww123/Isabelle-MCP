@@ -1,5 +1,5 @@
 """End-to-end regression test for the event-driven file-sync against a REAL
-Isabelle ``vscode_server``.
+Isabelle ``mcp_server``.
 
 Drives the actual server code paths (not reimplementations):
   - ``server._file_change_sink``   — the inotify event sink (Layer 1)
@@ -11,8 +11,8 @@ Marked ``integration`` (deselected by default: ``-m "not integration"``) and ski
 unless ``isabelle`` is on PATH and an inotify-backed watcher actually starts — the
 headline behaviour under test is the event-driven push, which needs inotify.
 
-Run with the vendored Isabelle2024:
-    PATH=contrib/Isabelle2024/bin:$PATH pytest tests/integration -m integration
+Run with the vendored Isabelle2026:
+    PATH=contrib/Isabelle2026/bin:$PATH pytest tests/integration -m integration
 """
 import asyncio
 import os

@@ -7,7 +7,7 @@ Guidance for AI coding agents (Claude Code, Codex, …) that want to use the
 
 ### 1. Isabelle (REQUIRED — but no patching)
 
-**Isabelle-MCP needs Isabelle2025-2, and nothing else.** It used to require a patched
+**Isabelle-MCP needs Isabelle2026, and nothing else.** It used to require a patched
 Isabelle: the server drove the stock `isabelle vscode_server`, which lacks the PIDE
 requests it needs (`PIDE/output_at_position`, `PIDE/cancel_execution`, …), so the
 distribution had to be patched by
@@ -26,9 +26,11 @@ first session launch. The component carries a prebuilt jar and declares
 
 Requirements:
 
-- **Isabelle2025-2.** Isabelle2024 is no longer supported (the fork is cut from 2025-2's
-  VSCode sources; three of its files do not exist in 2024). The last supporting commit is
-  tagged `last-isabelle2024-support` in both repositories.
+- **Isabelle2026.** The Scala component is a fork of 2026's VSCode sources and is compiled
+  against 2026's `isabelle.jar`, so no other release can load it. On Isabelle2025-2, use
+  release 0.7.0 (`pip install 'isabelle-mcp==0.7.0'`). The last releases supporting
+  Isabelle2025-2 and Isabelle2024 are tagged `last-isabelle2025-2-support` (0.7.0) and
+  `last-isabelle2024-support` (0.2.1).
 - `isabelle` on `PATH`, or pinned with
   `isabelle-mcp install --isabelle-bin /path/to/Isabelle/bin/isabelle` (the binary itself);
   that pins the directory into the registered server's `PATH`.
@@ -40,7 +42,7 @@ stderr of every `isabelle` command (exit code stays 0) until you run
 
 Design and rationale: `docs/COMPONENT_INSTALL_PLAN.md`; the cancellation mechanism (an ML
 prelude injected at prover startup, built from the public `EXECUTION` API) is in
-`src/isabelle_mcp/scala/Isabelle2025-2/docs/CANCELLATION.md`.
+`src/isabelle_mcp/scala/Isabelle2026/docs/CANCELLATION.md`.
 
 ### 2. Install the package
 
@@ -70,9 +72,9 @@ Confirm it resolves: `command -v isabelle-mcp`.
 
 ### 3. Make the `isabelle` binary reachable
 
-At runtime the server spawns `isabelle vscode_server`, so the `isabelle` binary
+At runtime the server spawns `isabelle mcp_server`, so the `isabelle` binary
 must be on `PATH` (check with `command -v isabelle`). If you use a non-global
-Isabelle (e.g. a vendored `.../Isabelle2024/bin/isabelle`), note that binary —
+Isabelle (e.g. a vendored `.../Isabelle2026/bin/isabelle`), note that binary —
 the registration step below can pin it into the server's environment.
 
 ### 4. Register the server with your agent
@@ -82,7 +84,7 @@ the registration step below can pin it into the server's environment.
 ```sh
 isabelle-mcp install
 # pin a non-global Isabelle:
-isabelle-mcp install --isabelle-bin /path/to/Isabelle2024/bin/isabelle
+isabelle-mcp install --isabelle-bin /path/to/Isabelle2026/bin/isabelle
 # target one client / rename the server:
 isabelle-mcp install --claude --name isabelle-lsp
 ```

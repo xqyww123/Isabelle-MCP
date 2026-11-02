@@ -39,9 +39,11 @@ AI ↔ Isabelle, no-human-in-the-loop model.
 > carries a prebuilt jar and declares `no_build = true`), so `site-packages` may even be
 > read-only, and **no session heap is invalidated**.
 >
-> Requirements: **Isabelle2025-2**, with `isabelle` on `PATH` (or pinned with
-> `isabelle-mcp install --isabelle-bin /path/to/Isabelle/bin/isabelle`). Isabelle2024 is
-> no longer supported — see the `last-isabelle2024-support` tag.
+> Requirements: **Isabelle2026**, with `isabelle` on `PATH` (or pinned with
+> `isabelle-mcp install --isabelle-bin /path/to/Isabelle/bin/isabelle`). Isabelle2025-2 and
+> Isabelle2024 are no longer supported; on Isabelle2025-2, use release 0.7.0
+> (`pip install 'isabelle-mcp==0.7.0'`). The last releases supporting them are tagged
+> `last-isabelle2025-2-support` (0.7.0) and `last-isabelle2024-support` (0.2.1).
 >
 > To undo the registration: `isabelle-mcp uninstall`. If you remove the package without
 > it, Isabelle will print `### Missing Isabelle component: …` on every command until you

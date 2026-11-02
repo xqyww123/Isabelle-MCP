@@ -10,7 +10,7 @@ the path to the project root.  Both halves are pinned here: the raw reply of
 `PIDE/output_at_position` carries the absolute path (the contract the unit
 fixtures assume), and the tool's message carries the relative one.
 
-    PATH=contrib/Isabelle2025-2/bin:$PATH pytest tests/integration -m integration \
+    PATH=contrib/Isabelle2026/bin:$PATH pytest tests/integration -m integration \
         -k here_positions
 """
 import os

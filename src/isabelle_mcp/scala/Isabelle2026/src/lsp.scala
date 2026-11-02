@@ -21,7 +21,7 @@ object LSP {
   object Message {
     val empty: JSON.Object.T = JSON.Object("jsonrpc" -> "2.0")
 
-    def log(prefix: String, json: JSON.T, logger: Logger, verbose: Boolean): Unit = {
+    def log(prefix: => String, json: JSON.T, logger: Logger, verbose: Boolean): Unit = {
       val header =
         json match {
           case JSON.Object(obj) => obj -- (obj.keySet - "method" - "id")
@@ -47,6 +47,8 @@ object LSP {
   }
 
   class Notification0(name: String) {
+    def apply(): JSON.T = Message.empty + ("method" -> name)
+
     def unapply(json: JSON.T): Boolean =
       json match {
         case Notification(method, _) => method == name
@@ -336,6 +338,17 @@ object LSP {
     def json: JSON.T = JSON.Object("range" -> Range(range), "newText" -> new_text)
   }
 
+  object Document_Edit {
+    def apply(file: JFile, version: Option[Long], edit: TextEdit, end_pos: Line.Position): JSON.T =
+      Notification("PIDE/document_edit",
+        JSON.Object(
+          "uri" -> Url.print_file(file),
+          "edit" -> edit.json,
+          "line" -> end_pos.line,
+          "character" -> end_pos.column) ++
+        JSON.optional("version" -> version))
+  }
+
   sealed case class TextDocumentEdit(file: JFile, version: Option[Long], edits: List[TextEdit]) {
     def json: JSON.T =
       JSON.Object(
@@ -458,13 +471,54 @@ object LSP {
   }
 
 
-  /* goto definition request */
+  /* goto requests */
 
   object GotoDefinition extends RequestTextDocumentPosition("textDocument/definition") {
     def reply(id: Id, result: List[Line.Node_Range]): JSON.T =
       ResponseMessage(id, Some(result.map(Location.apply)))
   }
 
+  object Goto_File {
+    def apply(name: String): JSON.T = Notification("PIDE/goto_file", JSON.Object("name" -> name))
+
+    def unapply(json: JSON.T): Option[String] =
+      json match {
+        case Notification("PIDE/goto_file", Some(params)) => JSON.string(params, "name")
+        case _ => None
+      }
+  }
+
+  object Goto_Source_File {
+    def apply(name: String, line: Int, offset: Symbol.Offset): JSON.T =
+      Notification("PIDE/goto_source_file",
+        JSON.Object("name" -> name, "line" -> line, "offset" -> offset))
+
+    def unapply(json: JSON.T): Option[(String, Int, Symbol.Offset)] =
+      json match {
+        case Notification("PIDE/goto_source_file", Some(params)) =>
+          for {
+            name <- JSON.string(params, "name")
+            line <- JSON.int(params, "line")
+            offset <- JSON.int(params, "offset")
+          } yield (name, line, offset)
+        case _ => None
+      }
+  }
+
+  object Goto_Command {
+    def apply(id: Long, offset: Symbol.Offset): JSON.T =
+      Notification("PIDE/goto_command", JSON.Object("id" -> id, "offset" -> offset))
+
+    def unapply(json: JSON.T): Option[(Long, Symbol.Offset)] =
+      json match {
+        case Notification("PIDE/goto_command", Some(params)) =>
+          for {
+            id <- JSON.long(params, "id")
+            offset <- JSON.int(params, "offset")
+          } yield (id, offset)
+        case _ => None
+      }
+  }
 
   /* document highlights request */
 
@@ -518,7 +572,7 @@ object LSP {
   }
 
 
-  /* code actions */
+  /* actions */
 
   sealed case class CodeAction(title: String, edits: List[TextDocumentEdit]) {
     def json: JSON.T =
@@ -539,6 +593,23 @@ object LSP {
 
     def reply(id: Id, actions: List[CodeAction]): JSON.T =
       ResponseMessage(id, Some(actions.map(_.json)))
+  }
+
+  object Markup_Action {
+    def apply(active: XML.Elem, text: String): JSON.T =
+      Notification("PIDE/markup_action",
+        JSON.Object("active" -> YXML.string_of_tree(active), "text" -> text))
+
+    def unapply(json: JSON.T): Option[(XML.Elem, String)] =
+      json match {
+        case Notification("PIDE/markup_action", Some(params)) =>
+          for {
+            active <- JSON.string(params, "active")
+            text <- JSON.string(params, "text")
+            case XML.Elem(markup, body) <- Some(YXML.parse_elem(YXML.Source(active)))
+          } yield (XML.Elem(markup, body), text)
+        case _ => None
+      }
   }
 
 
@@ -562,11 +633,12 @@ object LSP {
      rendered from (VSCode_Rendering.decoration_output).  A required key: the client drops a
      push without it.  Empty entries with a stamp is an acknowledgement push. */
   sealed case class Decoration(entries: List[Decoration_Entry]) {
-    def json(file: JFile, document_version: Long): JSON.T =
+    def json_entries: JSON.T = entries.map(_.json)
+    def notification(file: JFile, document_version: Long): JSON.T =
       Notification("PIDE/decoration",
         JSON.Object(
           "uri" -> Url.print_file(file),
-          "entries" -> entries.map(_.json),
+          "entries" -> json_entries,
           "document_version" -> document_version))
   }
 
@@ -612,7 +684,7 @@ object LSP {
     def apply(content: String, decorations: Option[Decoration] = None): JSON.T =
       Notification("PIDE/dynamic_output",
         JSON.Object("content" -> content) ++
-        JSON.optional("decorations" -> decorations.map(_.json)))
+        JSON.optional("decorations" -> decorations.map(_.json_entries)))
   }
 
   object Output_Set_Margin {
@@ -636,7 +708,7 @@ object LSP {
     ): JSON.T =
       Notification("PIDE/state_output",
         JSON.Object("id" -> id, "content" -> content, "auto_update" -> auto_update) ++
-        JSON.optional("decorations" -> decorations.map(_.json)))
+        JSON.optional("decorations" -> decorations.map(_.json_entries)))
   }
 
   class State_Id_Notification(name: String) {
@@ -934,8 +1006,9 @@ object LSP {
   object Doc_Entry {
     def apply(entry: Doc.Entry): JSON.T =
       JSON.Object(
-        "print_html" -> entry.print_html,
-        "platform_path" -> File.platform_path(entry.path))
+        "name" -> entry.name,
+        "path" -> File.platform_path(entry.path),
+        "title" -> entry.title)
   }
 
   object Doc_Section {
@@ -947,11 +1020,9 @@ object LSP {
   }
 
   object Documentation_Response {
-    def apply(ml_settings: ML_Settings): JSON.T = {
-      val doc_contents = Doc.contents(ml_settings)
+    def apply(doc_contents: Doc.Contents): JSON.T =
       Notification("PIDE/documentation_response",
         JSON.Object("sections" -> doc_contents.sections.map(Doc_Section.apply)))
-    }
   }
 
 
@@ -966,6 +1037,10 @@ object LSP {
   }
 
   object Sledgehammer_Request {
+    def apply(provers: String, isar: Boolean, try0: Boolean): JSON.T =
+      Notification("PIDE/sledgehammer_request",
+        JSON.Object("provers" -> provers, "isar" -> isar, "try0" -> try0))
+
     def unapply(json: JSON.T): Option[List[String]] =
       json match {
         case Notification("PIDE/sledgehammer_request", Some(params)) =>
@@ -991,25 +1066,6 @@ object LSP {
   object Sledgehammer_Cancel extends Notification0("PIDE/sledgehammer_cancel")
 
   object Sledgehammer_Locate extends Notification0("PIDE/sledgehammer_locate")
-
-  object Sledgehammer_Sendback {
-    def unapply(json: JSON.T): Option[String] =
-      json match {
-        case Notification("PIDE/sledgehammer_sendback", Some(params)) =>
-          JSON.string(params, "text")
-        case _ => None
-      }
-  }
-
-  object Sledgehammer_Insert {
-    def apply(node_pos: Line.Node_Position, text: String): JSON.T =
-      Notification("PIDE/sledgehammer_insert",
-        JSON.Object(
-          "uri" -> Url.print_file_name(node_pos.name),
-          "line" -> node_pos.pos.line,
-          "character" -> node_pos.pos.column,
-          "text" -> text))
-  }
 
 
   /* ML debugger (docs/archive/DEBUGGER_DESIGN.md section 7.1)

@@ -107,7 +107,7 @@ class State_Panel private(val server: Language_Server) {
   /* main */
 
   private val main =
-    Session.Consumer[Any](getClass.getName) {
+    Session.Consumer[Session.Commands_Changed | Session.Caret_Focus.type](this.class_name) {
       case changed: Session.Commands_Changed =>
         if (changed.assignment) auto_update()
 

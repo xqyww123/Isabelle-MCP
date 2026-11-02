@@ -84,6 +84,13 @@ sealed case class VSCode_Model(
 
   def node_name: Document.Node.Name = content.node_name
 
+  def get_thy(): Resources.Thy = {
+    val thy0 =
+      session.resources.special_thy(node_name) getOrElse
+        session.resources.check_thy(node_name, Scan.char_reader(content.text))
+    thy0.eval_conditions(session.conditions)
+  }
+
   def get_text(range: Text.Range): Option[String] = content.doc.get_text(range)
 
   def set_version(new_version: Long): VSCode_Model = copy(version = Some(new_version))
@@ -94,13 +101,6 @@ sealed case class VSCode_Model(
   def external(b: Boolean): VSCode_Model = copy(external_file = b)
 
   def node_visible: Boolean = !external_file
-
-
-  /* header */
-
-  def node_header: Document.Node.Header =
-    session.resources.special_header(node_name) getOrElse
-      session.resources.check_thy(node_name, Scan.char_reader(content.text))
 
 
   /* perspective */
@@ -199,13 +199,13 @@ sealed case class VSCode_Model(
   }
 
   def flush_edits(
-      doc_blobs: Document.Blobs,
-      file: JFile,
-      caret: Option[Line.Position]
+    doc_blobs: Document.Blobs,
+    file: JFile,
+    caret: Option[Line.Position]
   ): Option[(List[Document.Edit_Text], VSCode_Model)] = {
     val (reparse, perspective) = node_perspective(doc_blobs, caret)
     if (reparse || pending_edits.nonEmpty || last_perspective != perspective) {
-      val prover_edits = node_edits(node_header, pending_edits, perspective)
+      val prover_edits = node_edits(get_thy(), pending_edits, perspective)
       Some(prover_edits, copy(pending_edits = Nil, last_perspective = perspective))
     }
     else None

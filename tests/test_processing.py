@@ -272,7 +272,7 @@ async def test_position_state_reports_each_decoration():
 
 async def test_position_state_follows_isabelle_precedence():
     # One line covering several commands: the least-finished one names the line,
-    # which is the order rendering.scala:515-518 itself uses.
+    # which is the order Rendering.background itself uses.
     t = await _tracker(
         unprocessed=[(5, 0, 5, 0)], running=[(5, 0, 5, 0)], canceled=[(5, 0, 5, 0)],
     )

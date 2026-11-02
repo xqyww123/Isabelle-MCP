@@ -9,7 +9,7 @@ loaderId)` raised.  Fixed by sending the command's own node through
 `Language_Server.command_ref`.  A jar with the bug fails HERE: the query status
 reads `undefined` instead of `ok`.
 
-    PATH=contrib/Isabelle2025-2/bin:$PATH pytest tests/integration -m integration \
+    PATH=contrib/Isabelle2026/bin:$PATH pytest tests/integration -m integration \
         -k blob_query
 """
 import asyncio

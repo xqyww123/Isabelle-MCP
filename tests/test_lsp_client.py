@@ -76,10 +76,9 @@ class TestIsabelleLSPClient:
 
     @pytest.mark.asyncio
     async def test_start_html_output_version_gated(self):
-        # vscode_html_output=true is required on 2025+ (the plain-text state panel is
-        # broken upstream) but does NOT exist pre-2025 — passing it would abort the
-        # server. Gate it on the detected major year. Capture the launch cmd by raising
-        # right after it is built.
+        # vscode_html_output exists only from 2025 on (passing it earlier would abort the
+        # server), so it is gated on the detected major year; IsabelleLSPClient.start says
+        # why it is passed. Capture the launch cmd by raising right after it is built.
         import isabelle_mcp.lsp_client as lc
         captured = {}
 

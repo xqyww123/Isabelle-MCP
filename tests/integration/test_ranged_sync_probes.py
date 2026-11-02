@@ -11,7 +11,7 @@ Sentinels make re-execution measurable: a 20s sleep before the definer (the
 prefix) and a 10s sleep between the two edit targets (the middle).  Probe
 policy as in test_debugger_probes: measure, positive controls, generous waits.
 
-    PATH=contrib/Isabelle2025-2/bin:$PATH pytest tests/integration -m integration
+    PATH=contrib/Isabelle2026/bin:$PATH pytest tests/integration -m integration
 """
 import logging
 import os
@@ -46,7 +46,7 @@ THEORY = r'''theory RangedSync
 imports Main
 begin
 
-ML \<open>OS.Process.sleep (Time.fromSeconds 20)\<close>
+ML \<open>Time.sleep (Time.fromSeconds 20)\<close>
 
 ML \<open>
 fun ranged_target (n: int) =
@@ -57,7 +57,7 @@ fun ranged_target (n: int) =
 
 ML \<open>val ranged_result = ranged_target 4\<close>
 
-ML \<open>OS.Process.sleep (Time.fromSeconds 10)\<close>
+ML \<open>Time.sleep (Time.fromSeconds 10)\<close>
 
 ML \<open>val ranged_other = 7\<close>
 

@@ -469,9 +469,10 @@ which the MCP layer renders to a plain-text `ToolResult` (`format_command_output
    → `command=None`, empty `messages`.
 3. The prover still runs its `Dynamic_Output` panel and pushes
    `PIDE/dynamic_output` on every caret move, but the client no longer reads it.
-   That is why the server is still started with `vscode_html_output=true`: the
-   plain-text branch of that panel is broken upstream, and leaving it enabled
-   would put errors on the wire for output nobody consumes.
+   The server is still started with `vscode_html_output=true`: in HTML mode
+   Isabelle2026 sends that output raw and skips the formatting and decoration
+   pass. (Under Isabelle2025 the reason was stronger: the plain-text branch was
+   broken upstream and put errors on the wire.)
 5. Parse HTML to extract message type and text. Isabelle2024 commonly emits
    message spans such as `writeln_message`, `error_message`, and
    `state_message`; older/simple examples may use `writeln`, `warning`, or

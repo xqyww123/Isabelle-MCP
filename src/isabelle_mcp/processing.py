@@ -403,8 +403,8 @@ class ProcessingTracker:
         single ``False``, so a caller acting on it re-evaluates lines that were
         finished long ago.
 
-        The order of the tests is Isabelle's own precedence
-        (``rendering.scala:515-518``): unprocessed, then running, then canceled.
+        The order of the tests is Isabelle's own precedence (the command status
+        order in ``Rendering.background``): unprocessed, then running, then canceled.
         The three background colours are computed from one command status, so at a
         given offset they are mutually exclusive; the order only decides what a
         line covering SEVERAL commands is called, and there the least-finished

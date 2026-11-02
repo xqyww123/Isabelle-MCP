@@ -11,7 +11,7 @@ because there the two nodes coincide.  A jar that sends `rendering.model.node_na
 instead of `command.node_name` (debugger.scala) fails HERE: the blob states read a
 non-boolean `undefined` and the caller never stops.
 
-    PATH=contrib/Isabelle2025-2/bin:$PATH pytest tests/integration -m integration \
+    PATH=contrib/Isabelle2026/bin:$PATH pytest tests/integration -m integration \
         -k blob_breakpoint
 """
 import asyncio
