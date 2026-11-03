@@ -165,14 +165,14 @@ jobs:
           "$CONDA/bin/python" -m conda_index "$CH" --no-zst --no-bz2 --channeldata --channel-name local
           echo "CH=$CH" >> "$GITHUB_ENV"
 
-      - name: "Install it -- local channel for us, the rest from conda.qiyuan.me + conda-forge"
+      - name: "Install it -- local channel for us, the rest from conda-ci.qiyuan.me + conda-forge"
         run: |
           set -euo pipefail
           # conda-forge is required: python and the five libraries are not on our channel.
           # The package is named with the local channel: by bare name conda silently
           # installs the published build whenever this one cannot be solved.
           conda create -y -n v \
-            -c "file://$CH" -c https://conda.qiyuan.me -c conda-forge --override-channels \
+            -c "file://$CH" -c https://conda-ci.qiyuan.me -c conda-forge --override-channels \
             "file://$CH::isabelle-mcp"
           conda activate v
           conda list isabelle
@@ -213,7 +213,7 @@ jobs:
       CONDA_R2_SECRET_ACCESS_KEY: ${{ secrets.CONDA_R2_SECRET_ACCESS_KEY }}
 
   smoke:
-    name: "Smoke: conda install from conda.qiyuan.me (${{ matrix.os }})"
+    name: "Smoke: conda install from conda-ci.qiyuan.me (${{ matrix.os }})"
     needs: [build, publish]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -230,13 +230,13 @@ jobs:
         with:
           auto-update-conda: true
 
-      - name: "conda install -c https://conda.qiyuan.me isabelle-mcp"
+      - name: "conda install -c https://conda-ci.qiyuan.me isabelle-mcp"
         run: |
           set -euo pipefail
           # Pinned to the build just published: by bare name conda would install an older
           # build whenever this one cannot be solved.
           conda create -y -n t \
-            -c https://conda.qiyuan.me -c conda-forge --override-channels \
+            -c https://conda-ci.qiyuan.me -c conda-forge --override-channels \
             "isabelle-mcp==${{ needs.build.outputs.version }}=*_${{ inputs.build_number || '0' }}"
           conda activate t
           conda list isabelle-mcp
